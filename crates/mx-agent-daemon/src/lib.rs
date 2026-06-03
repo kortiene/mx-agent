@@ -9,6 +9,7 @@ pub mod lifecycle;
 pub mod matrix;
 pub mod session;
 pub mod sync;
+pub mod workspace;
 
 pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
@@ -23,6 +24,11 @@ pub use session::{
 };
 pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
+};
+pub use workspace::{
+    create_workspace, create_workspace_for_session, join_workspace, join_workspace_for_session,
+    workspace_status, workspace_status_for_session, CreateWorkspaceOptions, MemberSummary,
+    WorkspaceError, WorkspaceInfo, WorkspaceStatus, WorkspaceVisibility,
 };
 
 use mx_agent_ipc::default_socket_name;

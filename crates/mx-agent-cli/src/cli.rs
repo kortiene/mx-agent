@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 /// Top-level parser for the `mx-agent` binary.
 #[derive(Debug, Parser)]
@@ -133,13 +133,52 @@ struct AuthLoginArgs {
 #[derive(Debug, Subcommand)]
 enum WorkspaceCommand {
     /// Create a new workspace room.
-    Create,
+    Create(WorkspaceCreateArgs),
     /// Join an existing workspace room.
-    Join,
+    Join(WorkspaceJoinArgs),
     /// Attach the current directory to a workspace.
     Attach,
     /// Show workspace status.
-    Status,
+    Status(WorkspaceStatusArgs),
+}
+
+/// Room privacy for `workspace create`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Visibility {
+    /// Invite-only; hidden from the public room directory.
+    Private,
+    /// Publicly joinable and listed in the room directory.
+    Public,
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceCreateArgs {
+    /// Room alias localpart, e.g. `my-project` for `#my-project:server`.
+    #[arg(long, value_name = "ALIAS")]
+    alias: Option<String>,
+    /// Human-readable room name.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+    /// Room topic.
+    #[arg(long, value_name = "TOPIC")]
+    topic: Option<String>,
+    /// Room visibility (privacy).
+    #[arg(long, value_enum, default_value_t = Visibility::Private)]
+    visibility: Visibility,
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceJoinArgs {
+    /// Room alias (`#name:server`) or room ID (`!id:server`) to join.
+    #[arg(value_name = "ROOM")]
+    room: String,
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceStatusArgs {
+    /// Room alias (`#name:server`) or room ID (`!id:server`) to inspect.
+    #[arg(long, value_name = "ROOM")]
+    room: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -287,6 +326,7 @@ pub fn run() -> ExitCode {
     match &cli.command {
         Command::Daemon(cmd) => handle_daemon(g, cmd),
         Command::Auth(cmd) => handle_auth(g, cmd),
+        Command::Workspace(cmd) => handle_workspace(g, cmd),
         _ => unimplemented(g, &path),
     }
 }
@@ -433,6 +473,162 @@ fn auth_logout(global: &GlobalArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Handle the `workspace` command group.
+fn handle_workspace(global: &GlobalArgs, cmd: &WorkspaceCommand) -> ExitCode {
+    match cmd {
+        WorkspaceCommand::Create(args) => workspace_create(global, args),
+        WorkspaceCommand::Join(args) => workspace_join(global, args),
+        WorkspaceCommand::Status(args) => workspace_status(global, args),
+        WorkspaceCommand::Attach => unimplemented(global, "workspace attach"),
+    }
+}
+
+/// Build a single-threaded async runtime, reporting a clear error on failure.
+fn build_runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            eprintln!("mx-agent: could not start async runtime: {e}");
+            ExitCode::FAILURE
+        })
+}
+
+/// Load the persisted Matrix session, reporting a clear error if absent.
+fn load_session_or_exit() -> Result<mx_agent_daemon::StoredSession, ExitCode> {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    match mx_agent_daemon::load_session(&paths) {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => {
+            eprintln!("mx-agent: not logged in; run `mx-agent auth login` first");
+            Err(ExitCode::from(3))
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not read session: {e}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Print a [`WorkspaceInfo`] and return success.
+fn report_workspace_info(global: &GlobalArgs, info: &mx_agent_daemon::WorkspaceInfo, verb: &str) {
+    if global.json {
+        println!("{}", info.to_json());
+    } else {
+        println!("mx-agent: {verb} workspace {}", info.room_id);
+        if let Some(alias) = &info.canonical_alias {
+            println!("  alias:     {alias}");
+        }
+        if let Some(name) = &info.name {
+            println!("  name:      {name}");
+        }
+        println!("  encrypted: {}", info.encrypted);
+        println!("  members:   {}", info.joined_members);
+    }
+}
+
+fn workspace_create(global: &GlobalArgs, args: &WorkspaceCreateArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let visibility = match args.visibility {
+        Visibility::Private => mx_agent_daemon::WorkspaceVisibility::Private,
+        Visibility::Public => mx_agent_daemon::WorkspaceVisibility::Public,
+    };
+    let options = mx_agent_daemon::CreateWorkspaceOptions {
+        alias: args.alias.clone(),
+        name: args.name.clone(),
+        topic: args.topic.clone(),
+        visibility,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    runtime.block_on(async {
+        match mx_agent_daemon::create_workspace_for_session(&session, &options).await {
+            Ok(info) => {
+                report_workspace_info(global, &info, "created");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not create workspace: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn workspace_join(global: &GlobalArgs, args: &WorkspaceJoinArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::join_workspace_for_session(&session, &args.room).await {
+            Ok(info) => {
+                report_workspace_info(global, &info, "joined");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not join workspace: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn workspace_status(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::workspace_status_for_session(&session, &args.room).await {
+            Ok(status) => {
+                if global.json {
+                    println!("{}", status.to_json());
+                } else {
+                    println!("Workspace: {}", status.room_id);
+                    if let Some(alias) = &status.canonical_alias {
+                        println!("  alias:     {alias}");
+                    }
+                    if let Some(name) = &status.name {
+                        println!("  name:      {name}");
+                    }
+                    println!("  encrypted: {}", status.encrypted);
+                    println!(
+                        "  members:   {} joined, {} invited",
+                        status.joined_members, status.invited_members
+                    );
+                    for member in &status.members {
+                        let label = member.display_name.as_deref().unwrap_or(&member.user_id);
+                        println!(
+                            "    {:<20} {:<8} {}",
+                            label, member.membership, member.user_id
+                        );
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not read workspace status: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 /// Handle the `daemon` command group.
@@ -591,10 +787,10 @@ fn command_path(command: &Command) -> String {
         Command::Workspace(c) => format!(
             "workspace {}",
             match c {
-                WorkspaceCommand::Create => "create",
-                WorkspaceCommand::Join => "join",
+                WorkspaceCommand::Create(_) => "create",
+                WorkspaceCommand::Join(_) => "join",
                 WorkspaceCommand::Attach => "attach",
-                WorkspaceCommand::Status => "status",
+                WorkspaceCommand::Status(_) => "status",
             }
         ),
         Command::Agent(c) => format!(
@@ -734,6 +930,75 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(command_path(&cli.command), "auth login");
+    }
+
+    #[test]
+    fn workspace_create_defaults_to_private() {
+        let cli = Cli::try_parse_from(["mx-agent", "workspace", "create"]).unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Create(args)) => {
+                assert_eq!(args.visibility, Visibility::Private);
+                assert!(args.alias.is_none());
+            }
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_create_accepts_flags() {
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "workspace",
+            "create",
+            "--alias",
+            "my-project",
+            "--name",
+            "My Project",
+            "--visibility",
+            "public",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Create(args)) => {
+                assert_eq!(args.alias.as_deref(), Some("my-project"));
+                assert_eq!(args.name.as_deref(), Some("My Project"));
+                assert_eq!(args.visibility, Visibility::Public);
+            }
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "workspace create");
+    }
+
+    #[test]
+    fn workspace_join_requires_room_argument() {
+        assert!(Cli::try_parse_from(["mx-agent", "workspace", "join"]).is_err());
+        let cli =
+            Cli::try_parse_from(["mx-agent", "workspace", "join", "#proj:matrix.org"]).unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Join(args)) => {
+                assert_eq!(args.room, "#proj:matrix.org");
+            }
+            other => panic!("expected workspace join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_status_requires_room_flag() {
+        assert!(Cli::try_parse_from(["mx-agent", "workspace", "status"]).is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "workspace",
+            "status",
+            "--room",
+            "!abc:matrix.org",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Status(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+            }
+            other => panic!("expected workspace status, got {other:?}"),
+        }
     }
 
     #[test]
