@@ -11,12 +11,17 @@
 # A <spec> is an issue number (e.g. 15) or an inclusive range (15-18 or 15..18).
 # Specs are expanded left to right, preserving order and duplicates.
 #
+# Each issue is verified against GitHub by issue.sh: a run only counts as done
+# if the issue ends up CLOSED. Already-closed issues are skipped, so a batch is
+# safely resumable just by re-running it.
+#
 # Options:
 #   --keep-going       Continue to the next issue even if one fails
 #                      (default: stop at the first failure).
 #   --start <number>   Skip ahead: ignore issues before this number in the
 #                      expanded list (resume an interrupted run).
 #   --delay <seconds>  Sleep this many seconds between issues (default: 0).
+#   --log-dir <dir>    Forward --log-dir to issue.sh so each run is captured.
 #   --dry-run          Print what would run; do not invoke issue.sh.
 #   --                 Everything after is forwarded verbatim to issue.sh
 #                      (e.g. --json, --model sonnet:high, --dry-run).
@@ -42,7 +47,10 @@ SPECS=()
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo ">> $*" >&2; }
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the leading comment block (after the shebang) as help text.
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
+
+LOG_DIR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +58,7 @@ while [ $# -gt 0 ]; do
     --keep-going) KEEP_GOING=1 ;;
     --start) shift; START="${1:?--start needs a value}" ;;
     --delay) shift; DELAY="${1:?--delay needs a value}" ;;
+    --log-dir) shift; LOG_DIR="${1:?--log-dir needs a value}" ;;
     --dry-run) DRY_RUN=1 ;;
     --) shift; PASSTHRU+=("$@"); break ;;
     -*) die "unknown option: $1" ;;
@@ -91,10 +100,22 @@ fi
 
 [ "${#ISSUES[@]}" -gt 0 ] || die "no issues to process after expansion/filtering"
 
+# Forward --log-dir to each issue.sh run.
+[ -n "$LOG_DIR" ] && PASSTHRU=(--log-dir "$LOG_DIR" "${PASSTHRU[@]}")
+
 note "processing ${#ISSUES[@]} issue(s) in order: ${ISSUES[*]}"
+
+# Print the running summary; used both on normal completion and on interrupt.
+print_summary() {
+  note "summary: ${#DONE[@]} completed, ${#FAILED[@]} failed"
+  [ "${#DONE[@]}" -eq 0 ]   || note "  completed: ${DONE[*]}"
+  [ "${#FAILED[@]}" -eq 0 ] || note "  failed:    ${FAILED[*]}"
+}
 
 FAILED=()
 DONE=()
+trap 'echo >&2; note "interrupted"; print_summary; exit 130' INT TERM
+
 total="${#ISSUES[@]}"
 i=0
 for n in "${ISSUES[@]}"; do
@@ -127,7 +148,6 @@ for n in "${ISSUES[@]}"; do
 done
 
 echo >&2
-note "summary: ${#DONE[@]} completed, ${#FAILED[@]} failed"
-[ "${#DONE[@]}" -eq 0 ]   || note "  completed: ${DONE[*]}"
-[ "${#FAILED[@]}" -eq 0 ] || { note "  failed:    ${FAILED[*]}"; exit 1; }
+print_summary
+[ "${#FAILED[@]}" -eq 0 ] || exit 1
 exit 0
