@@ -40,5 +40,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo run -p mx-agent-cli -- --help   # run the placeholder CLI
 ```
 
-The current build is a scaffold (issue #2); commands are placeholders pending
-later roadmap phases.
+The same checks run in CI (`.github/workflows/ci.yml`) and must pass on every PR.
+
+### Lint and format configuration
+
+- Formatting is pinned by `rustfmt.toml` (stable options only); run `cargo fmt`
+  to apply.
+- Clippy honors the MSRV in `clippy.toml`.
+- Shared lints are declared once in `[workspace.lints]` in the root `Cargo.toml`
+  and inherited by each crate via `[lints] workspace = true`. Notably,
+  `unsafe_code` is forbidden and `missing_docs` is a warning (treated as an
+  error in CI via `-D warnings`).
+- Minimum supported Rust version (MSRV): 1.74.
+
+The current build is a scaffold; commands are placeholders pending later roadmap
+phases.

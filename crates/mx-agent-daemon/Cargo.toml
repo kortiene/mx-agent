@@ -13,3 +13,6 @@ mx-agent-protocol.workspace = true
 mx-agent-ipc.workspace = true
 mx-agent-policy.workspace = true
 mx-agent-sandbox.workspace = true
+
+[lints]
+workspace = true
