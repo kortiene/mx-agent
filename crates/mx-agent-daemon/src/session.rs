@@ -128,6 +128,8 @@ pub struct SessionPaths {
     pub data_dir: PathBuf,
     /// JSON file storing the Matrix session.
     pub session_file: PathBuf,
+    /// Plain-text file storing the latest Matrix `/sync` batch token.
+    pub sync_token_file: PathBuf,
 }
 
 impl SessionPaths {
@@ -147,6 +149,7 @@ impl SessionPaths {
         };
         Self {
             session_file: data_dir.join("session.json"),
+            sync_token_file: data_dir.join("sync_token"),
             data_dir,
         }
     }
@@ -196,6 +199,46 @@ pub fn load_session(paths: &SessionPaths) -> io::Result<Option<StoredSession>> {
 /// Remove any persisted session (logout). Missing files are not an error.
 pub fn clear_session(paths: &SessionPaths) -> io::Result<()> {
     match fs::remove_file(&paths.session_file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Persist the latest Matrix `/sync` batch token to daemon-owned storage.
+///
+/// The sync token is not a credential, but it is written atomically with
+/// `0600` permissions to stay consistent with the rest of the daemon's private
+/// state and to survive a crash mid-write.
+pub fn save_sync_token(paths: &SessionPaths, token: &str) -> io::Result<()> {
+    paths.ensure_data_dir()?;
+    let tmp = paths.sync_token_file.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        f.write_all(token.as_bytes())?;
+        f.flush()?;
+    }
+    fs::rename(&tmp, &paths.sync_token_file)?;
+    Ok(())
+}
+
+/// Load the persisted Matrix `/sync` batch token, if one exists.
+///
+/// Returns `Ok(None)` when no token has been stored yet, so a fresh daemon
+/// performs an initial full sync.
+pub fn load_sync_token(paths: &SessionPaths) -> io::Result<Option<String>> {
+    match fs::read_to_string(&paths.sync_token_file) {
+        Ok(token) if token.trim().is_empty() => Ok(None),
+        Ok(token) => Ok(Some(token.trim().to_string())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove any persisted sync token. Missing files are not an error.
+pub fn clear_sync_token(paths: &SessionPaths) -> io::Result<()> {
+    match fs::remove_file(&paths.sync_token_file) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -346,6 +389,48 @@ mod tests {
         let status = auth_status(&paths).unwrap();
         assert!(!status.logged_in);
         assert_eq!(status.to_json(), "{\"logged_in\":false}");
+    }
+
+    #[test]
+    fn sync_token_survives_save_and_reload() {
+        let _data = TempData::new("synctoken");
+        let paths = SessionPaths::resolve();
+        assert!(load_sync_token(&paths).unwrap().is_none());
+        save_sync_token(&paths, "s_batch_token_123").unwrap();
+        // Simulate a restart by reloading from disk.
+        assert_eq!(
+            load_sync_token(&paths).unwrap().as_deref(),
+            Some("s_batch_token_123")
+        );
+        // A later sync overwrites the token in place.
+        save_sync_token(&paths, "s_batch_token_456").unwrap();
+        assert_eq!(
+            load_sync_token(&paths).unwrap().as_deref(),
+            Some("s_batch_token_456")
+        );
+    }
+
+    #[test]
+    fn sync_token_file_is_private() {
+        let _data = TempData::new("synctokenperms");
+        let paths = SessionPaths::resolve();
+        save_sync_token(&paths, "s_batch_token_123").unwrap();
+        let mode = fs::metadata(&paths.sync_token_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "sync token file must be private");
+    }
+
+    #[test]
+    fn clear_sync_token_is_idempotent() {
+        let _data = TempData::new("synctokenclear");
+        let paths = SessionPaths::resolve();
+        clear_sync_token(&paths).unwrap(); // no file yet
+        save_sync_token(&paths, "s_batch_token_123").unwrap();
+        clear_sync_token(&paths).unwrap();
+        assert!(load_sync_token(&paths).unwrap().is_none());
     }
 
     #[test]

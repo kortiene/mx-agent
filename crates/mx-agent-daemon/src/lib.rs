@@ -8,16 +8,21 @@
 pub mod lifecycle;
 pub mod matrix;
 pub mod session;
+pub mod sync;
 
 pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
 };
 pub use matrix::{
-    build_client, login_password, ClientError, ConfigError, LoginError, MatrixConfig,
+    build_client, login_password, restore_client, ClientError, ConfigError, LoginError,
+    MatrixConfig,
 };
 pub use session::{
-    auth_status, clear_session, load_session, save_session, AuthStatus, Secret, SessionPaths,
-    StoredSession,
+    auth_status, clear_session, clear_sync_token, load_session, load_sync_token, save_session,
+    save_sync_token, AuthStatus, Secret, SessionPaths, StoredSession,
+};
+pub use sync::{
+    run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
 };
 
 use mx_agent_ipc::default_socket_name;
