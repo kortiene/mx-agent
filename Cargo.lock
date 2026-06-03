@@ -216,6 +216,9 @@ dependencies = [
 [[package]]
 name = "mx-agent-ipc"
 version = "0.0.1"
+dependencies = [
+ "nix",
+]
 
 [[package]]
 name = "mx-agent-policy"

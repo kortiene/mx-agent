@@ -59,10 +59,16 @@ impl Paths {
         }
     }
 
-    /// Ensure the runtime directory exists with `0700` permissions.
+    /// Ensure the runtime directory exists, creating it with `0700` permissions.
+    ///
+    /// An existing directory is left untouched so that unsafe permissions are
+    /// surfaced (and refused) at socket-bind time rather than silently widened
+    /// or narrowed.
     pub fn ensure_runtime_dir(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.runtime_dir)?;
-        fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o700))?;
+        if !self.runtime_dir.exists() {
+            fs::create_dir_all(&self.runtime_dir)?;
+            fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o700))?;
+        }
         Ok(())
     }
 }
@@ -184,7 +190,13 @@ pub fn status() -> io::Result<Option<RunningStatus>> {
 /// Writes the status file on startup and removes it on shutdown.
 pub fn run_foreground() -> io::Result<()> {
     let paths = Paths::resolve();
+    paths.ensure_runtime_dir()?;
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
+
+    // Bind the IPC socket before announcing readiness. The guard unlinks the
+    // socket on shutdown. Binding validates that the runtime directory is
+    // private to the current user.
+    let _socket = mx_agent_ipc::bind(&paths.socket_path)?;
 
     let pid = std::process::id();
     let status = StatusFile {
@@ -212,6 +224,9 @@ pub fn run_foreground() -> io::Result<()> {
 pub fn start_background() -> io::Result<RunningStatus> {
     let paths = Paths::resolve();
     paths.ensure_runtime_dir()?;
+
+    // Fail fast (before spawning) if the runtime directory is unsafe.
+    mx_agent_ipc::ensure_safe_parent_dir(&paths.runtime_dir)?;
 
     let exe = std::env::current_exe()?;
     let log = fs::OpenOptions::new()

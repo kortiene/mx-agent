@@ -4,6 +4,10 @@
 //! `docs/architecture.md`, section 10). This crate currently only defines the
 //! default socket file name.
 
+pub mod socket;
+
+pub use socket::{bind, ensure_safe_parent_dir, BindError, SocketGuard, SOCKET_MODE};
+
 /// Default Unix domain socket file name, created under the runtime directory.
 pub const DEFAULT_SOCKET_NAME: &str = "daemon.sock";
 

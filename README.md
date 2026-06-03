@@ -89,7 +89,12 @@ mx-agent daemon stop               # graceful shutdown (SIGTERM, then SIGKILL)
 ```
 
 Runtime state lives under `$XDG_RUNTIME_DIR/mx-agent/` (override with
-`MX_AGENT_RUNTIME_DIR`): a `daemon.json` status file, the intended
-`daemon.sock` path, and a `daemon.log` for background output.
+`MX_AGENT_RUNTIME_DIR`): a `daemon.json` status file, the `daemon.sock` IPC
+socket, and a `daemon.log` for background output.
+
+The IPC socket is created with mode `0600` and the daemon refuses to run if its
+runtime directory is group- or world-accessible or owned by another user. Stale
+sockets from a previous run are cleaned up automatically when no daemon is
+listening.
 
 Most other commands are still placeholders pending later roadmap phases.
