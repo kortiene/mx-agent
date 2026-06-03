@@ -1,0 +1,15 @@
+[package]
+name = "mx-agent-daemon"
+description = "Long-running daemon: Matrix sync, crypto, policy, and process supervision."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+mx-agent-protocol.workspace = true
+mx-agent-ipc.workspace = true
+mx-agent-policy.workspace = true
+mx-agent-sandbox.workspace = true

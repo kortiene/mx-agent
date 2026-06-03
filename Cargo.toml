@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mx-agent-cli",
+    "crates/mx-agent-daemon",
+    "crates/mx-agent-protocol",
+    "crates/mx-agent-ipc",
+    "crates/mx-agent-policy",
+    "crates/mx-agent-sandbox",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+repository = "https://github.com/kortiene/mx-agent"
+authors = ["mx-agent contributors"]
+
+[workspace.dependencies]
+mx-agent-protocol = { path = "crates/mx-agent-protocol", version = "0.0.1" }
+mx-agent-ipc = { path = "crates/mx-agent-ipc", version = "0.0.1" }
+mx-agent-policy = { path = "crates/mx-agent-policy", version = "0.0.1" }
+mx-agent-sandbox = { path = "crates/mx-agent-sandbox", version = "0.0.1" }
+mx-agent-daemon = { path = "crates/mx-agent-daemon", version = "0.0.1" }
+
+[profile.release]
+strip = true

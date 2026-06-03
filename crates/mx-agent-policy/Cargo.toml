@@ -1,0 +1,11 @@
+[package]
+name = "mx-agent-policy"
+description = "Local authorization policy engine for mx-agent remote actions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
