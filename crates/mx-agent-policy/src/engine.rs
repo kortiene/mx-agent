@@ -1,0 +1,585 @@
+//! Policy decision engine.
+//!
+//! Given a parsed [`Policy`](crate::Policy) and the context of an incoming
+//! `exec`/`call` request, the engine decides whether the request is permitted
+//! and, when permitted, returns the resolved runtime/output caps and sandbox
+//! settings the caller must enforce before spawning anything.
+//!
+//! The engine is deny-by-default and purely a pure function over its inputs: it
+//! never touches the filesystem, network, or spawns processes. A [`Deny`]
+//! outcome therefore guarantees no process is started, because the engine is
+//! the gate the runner consults first. See `docs/architecture.md` §13.3.
+
+use std::path::Path;
+
+use regex::Regex;
+
+use crate::file::{AgentPolicy, NetworkPolicy, Policy, RawExecDefault, RoomPolicy, Sandbox};
+
+/// The outcome of evaluating a request against the policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The request is permitted with the given resolved limits.
+    Allow(Allowance),
+    /// The request is denied for the given reason.
+    Deny(DenyReason),
+}
+
+impl Outcome {
+    /// Whether this outcome permits the request.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Outcome::Allow(_))
+    }
+
+    /// Whether this outcome denies the request.
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Outcome::Deny(_))
+    }
+
+    /// The resolved allowance, if the request was permitted.
+    pub fn allowance(&self) -> Option<&Allowance> {
+        match self {
+            Outcome::Allow(a) => Some(a),
+            Outcome::Deny(_) => None,
+        }
+    }
+}
+
+/// Resolved limits and settings for a permitted request.
+///
+/// The caller (the execution runner) must enforce these before and during the
+/// execution: clamp the wall-clock runtime to `max_runtime_ms`, cap captured
+/// output at `max_output_bytes`, apply the `sandbox` backend and `network`
+/// policy, and pause for approval when `requires_approval` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Allowance {
+    /// Maximum wall-clock runtime in milliseconds, if capped.
+    pub max_runtime_ms: Option<u64>,
+    /// Maximum captured output in bytes, if capped.
+    pub max_output_bytes: Option<u64>,
+    /// Sandbox backend to apply (agent override, else execution default).
+    pub sandbox: Option<Sandbox>,
+    /// Network policy to apply (agent override, else execution default).
+    pub network: Option<NetworkPolicy>,
+    /// Whether the request requires interactive approval before running.
+    pub requires_approval: bool,
+}
+
+/// Machine-readable reason a request was denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenyReason {
+    /// No policy entry exists for the requesting room.
+    UnknownRoom,
+    /// The room is not trusted for privileged (raw `exec`) requests.
+    UntrustedRoom,
+    /// No policy entry exists for the requesting agent in this room.
+    UnknownAgent,
+    /// The command argv was empty.
+    EmptyCommand,
+    /// Raw `exec` is not permitted for this agent/room.
+    ExecNotAllowed,
+    /// The command basename is not in the allowlist.
+    CommandNotAllowed {
+        /// The rejected command (as supplied).
+        command: String,
+    },
+    /// The requested working directory is not within an allowed directory.
+    CwdNotAllowed {
+        /// The rejected working directory.
+        cwd: String,
+    },
+    /// A `deny_args_regex` pattern matched the request arguments.
+    DeniedArguments {
+        /// The pattern that triggered the denial.
+        pattern: String,
+    },
+    /// The requested tool is not in the allowlist.
+    ToolNotAllowed {
+        /// The rejected tool name.
+        tool: String,
+    },
+}
+
+impl std::fmt::Display for DenyReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownRoom => write!(f, "no policy for requesting room"),
+            Self::UntrustedRoom => write!(f, "room is not trusted for raw exec"),
+            Self::UnknownAgent => write!(f, "no policy for requesting agent in this room"),
+            Self::EmptyCommand => write!(f, "command argv is empty"),
+            Self::ExecNotAllowed => write!(f, "raw exec is not permitted"),
+            Self::CommandNotAllowed { command } => {
+                write!(f, "command {command:?} is not allowlisted")
+            }
+            Self::CwdNotAllowed { cwd } => {
+                write!(f, "working directory {cwd:?} is not allowlisted")
+            }
+            Self::DeniedArguments { pattern } => {
+                write!(f, "arguments matched deny pattern {pattern:?}")
+            }
+            Self::ToolNotAllowed { tool } => write!(f, "tool {tool:?} is not allowlisted"),
+        }
+    }
+}
+
+/// Context for evaluating a raw `exec` request.
+#[derive(Debug, Clone)]
+pub struct ExecContext<'a> {
+    /// Matrix room id the request arrived in.
+    pub room_id: &'a str,
+    /// Matrix user id of the requesting agent.
+    pub requesting_agent: &'a str,
+    /// Command argv (program followed by arguments).
+    pub command: &'a [String],
+    /// Requested working directory.
+    pub cwd: &'a str,
+}
+
+/// Context for evaluating a `call` (named tool) request.
+#[derive(Debug, Clone)]
+pub struct CallContext<'a> {
+    /// Matrix room id the request arrived in.
+    pub room_id: &'a str,
+    /// Matrix user id of the requesting agent.
+    pub requesting_agent: &'a str,
+    /// Tool name being invoked.
+    pub tool: &'a str,
+}
+
+impl Policy {
+    /// Evaluate a raw `exec` request.
+    ///
+    /// Raw exec is privileged: it requires a trusted room, an explicit agent
+    /// rule permitting exec, an allowlisted command basename and working
+    /// directory, and must not match any `deny_args_regex` pattern.
+    pub fn evaluate_exec(&self, ctx: &ExecContext<'_>) -> Outcome {
+        let (room, agent) = match self.lookup(ctx.room_id, ctx.requesting_agent) {
+            Ok(pair) => pair,
+            Err(reason) => return Outcome::Deny(reason),
+        };
+
+        if ctx.command.is_empty() {
+            return Outcome::Deny(DenyReason::EmptyCommand);
+        }
+
+        // Requester permission: raw exec must be explicitly enabled, either by
+        // the agent rule or the room's raw_exec_default.
+        let exec_allowed =
+            agent.allow_exec || matches!(room.raw_exec_default, Some(RawExecDefault::Allow));
+        if !exec_allowed {
+            return Outcome::Deny(DenyReason::ExecNotAllowed);
+        }
+
+        // Room trust gate for privileged execution.
+        if !room.trusted {
+            return Outcome::Deny(DenyReason::UntrustedRoom);
+        }
+
+        // Allowlisted command basename (deny-by-default: empty list allows
+        // nothing).
+        let program = &ctx.command[0];
+        if !command_allowed(program, &agent.allow_commands) {
+            return Outcome::Deny(DenyReason::CommandNotAllowed {
+                command: program.clone(),
+            });
+        }
+
+        // Allowlisted working directory (deny-by-default).
+        if !cwd_allowed(ctx.cwd, &agent.allow_cwd) {
+            return Outcome::Deny(DenyReason::CwdNotAllowed {
+                cwd: ctx.cwd.to_string(),
+            });
+        }
+
+        // Deny patterns against the full argv.
+        if let Some(pattern) = matched_deny_pattern(ctx.command, &agent.deny_args_regex) {
+            return Outcome::Deny(DenyReason::DeniedArguments { pattern });
+        }
+
+        Outcome::Allow(self.allowance_for(agent))
+    }
+
+    /// Evaluate a `call` (named tool) request.
+    ///
+    /// A tool is permitted only when it appears in the agent's `allow_tools`
+    /// list for the requesting room.
+    pub fn evaluate_call(&self, ctx: &CallContext<'_>) -> Outcome {
+        let (_room, agent) = match self.lookup(ctx.room_id, ctx.requesting_agent) {
+            Ok(pair) => pair,
+            Err(reason) => return Outcome::Deny(reason),
+        };
+
+        if !agent.allow_tools.iter().any(|t| t == ctx.tool) {
+            return Outcome::Deny(DenyReason::ToolNotAllowed {
+                tool: ctx.tool.to_string(),
+            });
+        }
+
+        Outcome::Allow(self.allowance_for(agent))
+    }
+
+    /// Resolve the room/agent rule pair, mapping missing entries to a deny
+    /// reason.
+    fn lookup(
+        &self,
+        room_id: &str,
+        agent_id: &str,
+    ) -> Result<(&RoomPolicy, &AgentPolicy), DenyReason> {
+        let room = self.rooms.get(room_id).ok_or(DenyReason::UnknownRoom)?;
+        let agent = room.agents.get(agent_id).ok_or(DenyReason::UnknownAgent)?;
+        Ok((room, agent))
+    }
+
+    /// Resolve the effective limits for a permitted request, applying execution
+    /// defaults where the agent rule does not override them.
+    fn allowance_for(&self, agent: &AgentPolicy) -> Allowance {
+        Allowance {
+            max_runtime_ms: agent.max_runtime_ms,
+            max_output_bytes: agent.max_output_bytes,
+            sandbox: agent.sandbox.or(self.execution.default_sandbox),
+            network: agent.network.or(self.execution.network),
+            requires_approval: agent.requires_approval,
+        }
+    }
+}
+
+/// Whether `program` is permitted by `allow_commands`.
+///
+/// A command matches if its full path equals an allowlist entry or its file
+/// basename equals an allowlist entry (which may itself be a bare name or a
+/// path). An empty allowlist permits nothing.
+fn command_allowed(program: &str, allow_commands: &[String]) -> bool {
+    let program_base = basename(program);
+    allow_commands
+        .iter()
+        .any(|allowed| allowed == program || basename(allowed) == program_base)
+}
+
+/// Whether `cwd` is within one of the allowed directories. An empty allowlist
+/// permits nothing.
+fn cwd_allowed(cwd: &str, allow_cwd: &[std::path::PathBuf]) -> bool {
+    let cwd_path = Path::new(cwd);
+    // Only absolute working directories can be safely matched against the
+    // absolute allowlist entries.
+    if !cwd_path.is_absolute() {
+        return false;
+    }
+    allow_cwd
+        .iter()
+        .any(|allowed| cwd_path.starts_with(allowed))
+}
+
+/// Return the first `deny_args_regex` pattern that matches any token of the
+/// command, or the whitespace-joined command line.
+fn matched_deny_pattern(command: &[String], deny_args_regex: &[String]) -> Option<String> {
+    if deny_args_regex.is_empty() {
+        return None;
+    }
+    let joined = command.join(" ");
+    for pattern in deny_args_regex {
+        // Patterns are validated at parse time, so compilation should not fail;
+        // if it somehow does, fail safe by treating it as a match (deny).
+        let re = match Regex::new(pattern) {
+            Ok(re) => re,
+            Err(_) => return Some(pattern.clone()),
+        };
+        if re.is_match(&joined) || command.iter().any(|arg| re.is_match(arg)) {
+            return Some(pattern.clone());
+        }
+    }
+    None
+}
+
+/// Final path component of a path-like string.
+fn basename(s: &str) -> &str {
+    Path::new(s)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROOM: &str = "!abc:matrix.org";
+    const AGENT: &str = "@claude:matrix.org";
+
+    fn policy() -> Policy {
+        let toml = r#"
+[execution]
+default_sandbox = "bubblewrap"
+network = "deny"
+
+[rooms."!abc:matrix.org"]
+trusted = true
+raw_exec_default = "deny"
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_tools = ["run_tests", "lint"]
+allow_commands = ["cargo", "/usr/bin/git"]
+allow_cwd = ["/home/me/code/project"]
+deny_args_regex = ["rm\\s+-rf\\s+/", "ssh"]
+max_runtime_ms = 900000
+max_output_bytes = 5000000
+requires_approval = false
+"#;
+        Policy::parse(toml).expect("policy parses")
+    }
+
+    fn exec<'a>(command: &'a [String], cwd: &'a str) -> ExecContext<'a> {
+        ExecContext {
+            room_id: ROOM,
+            requesting_agent: AGENT,
+            command,
+            cwd,
+        }
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn exec_allowed_command_in_allowed_cwd() {
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert!(outcome.is_allowed(), "got {outcome:?}");
+        let a = outcome.allowance().unwrap();
+        assert_eq!(a.max_runtime_ms, Some(900_000));
+        assert_eq!(a.max_output_bytes, Some(5_000_000));
+        assert_eq!(a.sandbox, Some(Sandbox::Bubblewrap));
+        assert_eq!(a.network, Some(NetworkPolicy::Deny));
+        assert!(!a.requires_approval);
+    }
+
+    #[test]
+    fn exec_allows_command_in_subdirectory_of_allowed_cwd() {
+        let p = policy();
+        let cmd = argv(&["cargo", "build"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project/crates/foo"));
+        assert!(outcome.is_allowed(), "got {outcome:?}");
+    }
+
+    #[test]
+    fn exec_allows_command_by_full_path_via_basename() {
+        let p = policy();
+        let cmd = argv(&["git", "status"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert!(outcome.is_allowed(), "got {outcome:?}");
+    }
+
+    #[test]
+    fn exec_denied_unknown_room() {
+        let p = policy();
+        let cmd = argv(&["cargo"]);
+        let outcome = p.evaluate_exec(&ExecContext {
+            room_id: "!other:matrix.org",
+            requesting_agent: AGENT,
+            command: &cmd,
+            cwd: "/home/me/code/project",
+        });
+        assert_eq!(outcome, Outcome::Deny(DenyReason::UnknownRoom));
+    }
+
+    #[test]
+    fn exec_denied_unknown_agent() {
+        let p = policy();
+        let cmd = argv(&["cargo"]);
+        let outcome = p.evaluate_exec(&ExecContext {
+            room_id: ROOM,
+            requesting_agent: "@mallory:matrix.org",
+            command: &cmd,
+            cwd: "/home/me/code/project",
+        });
+        assert_eq!(outcome, Outcome::Deny(DenyReason::UnknownAgent));
+    }
+
+    #[test]
+    fn exec_denied_empty_command() {
+        let p = policy();
+        let cmd: Vec<String> = Vec::new();
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert_eq!(outcome, Outcome::Deny(DenyReason::EmptyCommand));
+    }
+
+    #[test]
+    fn exec_denied_command_not_allowlisted() {
+        let p = policy();
+        let cmd = argv(&["python", "evil.py"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert_eq!(
+            outcome,
+            Outcome::Deny(DenyReason::CommandNotAllowed {
+                command: "python".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn exec_denied_cwd_not_allowlisted() {
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/etc"));
+        assert_eq!(
+            outcome,
+            Outcome::Deny(DenyReason::CwdNotAllowed {
+                cwd: "/etc".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn exec_denied_relative_cwd() {
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "relative/dir"));
+        assert!(matches!(
+            outcome,
+            Outcome::Deny(DenyReason::CwdNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn exec_denied_by_args_regex() {
+        let p = policy();
+        let cmd = argv(&["cargo", "run", "--", "rm", "-rf", "/"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert!(matches!(
+            outcome,
+            Outcome::Deny(DenyReason::DeniedArguments { .. })
+        ));
+    }
+
+    #[test]
+    fn exec_denied_by_args_regex_single_token() {
+        let p = policy();
+        let cmd = argv(&["cargo", "ssh"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert_eq!(
+            outcome,
+            Outcome::Deny(DenyReason::DeniedArguments {
+                pattern: "ssh".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn exec_denied_when_agent_disallows_exec() {
+        let toml = r#"
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = false
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+"#;
+        let p = Policy::parse(toml).unwrap();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert_eq!(outcome, Outcome::Deny(DenyReason::ExecNotAllowed));
+    }
+
+    #[test]
+    fn exec_allowed_via_room_raw_exec_default() {
+        let toml = r#"
+[rooms."!abc:matrix.org"]
+trusted = true
+raw_exec_default = "allow"
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = false
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+"#;
+        let p = Policy::parse(toml).unwrap();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert!(outcome.is_allowed(), "got {outcome:?}");
+    }
+
+    #[test]
+    fn exec_denied_when_room_untrusted() {
+        let toml = r#"
+[rooms."!abc:matrix.org"]
+trusted = false
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+"#;
+        let p = Policy::parse(toml).unwrap();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert_eq!(outcome, Outcome::Deny(DenyReason::UntrustedRoom));
+    }
+
+    #[test]
+    fn call_allowed_for_allowlisted_tool() {
+        let p = policy();
+        let outcome = p.evaluate_call(&CallContext {
+            room_id: ROOM,
+            requesting_agent: AGENT,
+            tool: "run_tests",
+        });
+        assert!(outcome.is_allowed(), "got {outcome:?}");
+    }
+
+    #[test]
+    fn call_denied_for_unknown_tool() {
+        let p = policy();
+        let outcome = p.evaluate_call(&CallContext {
+            room_id: ROOM,
+            requesting_agent: AGENT,
+            tool: "delete_everything",
+        });
+        assert_eq!(
+            outcome,
+            Outcome::Deny(DenyReason::ToolNotAllowed {
+                tool: "delete_everything".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn call_denied_for_unknown_room() {
+        let p = policy();
+        let outcome = p.evaluate_call(&CallContext {
+            room_id: "!nope:matrix.org",
+            requesting_agent: AGENT,
+            tool: "run_tests",
+        });
+        assert_eq!(outcome, Outcome::Deny(DenyReason::UnknownRoom));
+    }
+
+    #[test]
+    fn call_denied_for_unknown_agent() {
+        let p = policy();
+        let outcome = p.evaluate_call(&CallContext {
+            room_id: ROOM,
+            requesting_agent: "@mallory:matrix.org",
+            tool: "run_tests",
+        });
+        assert_eq!(outcome, Outcome::Deny(DenyReason::UnknownAgent));
+    }
+
+    #[test]
+    fn empty_policy_denies_everything() {
+        let p = Policy::default();
+        let cmd = argv(&["cargo"]);
+        assert!(p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .is_denied());
+        assert!(p
+            .evaluate_call(&CallContext {
+                room_id: ROOM,
+                requesting_agent: AGENT,
+                tool: "run_tests",
+            })
+            .is_denied());
+    }
+}
