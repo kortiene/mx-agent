@@ -247,6 +247,10 @@ version = "0.0.1"
 [[package]]
 name = "mx-agent-protocol"
 version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "mx-agent-sandbox"
