@@ -170,7 +170,7 @@ pub async fn register_agent_for_session(
 
 /// Read the `com.mxagent.agent.v1` state event for `agent_id` from a room,
 /// returning `None` when the agent has not registered yet.
-async fn read_agent_state(
+pub(crate) async fn read_agent_state(
     room: &Room,
     agent_id: &str,
 ) -> Result<Option<AgentState>, WorkspaceError> {
