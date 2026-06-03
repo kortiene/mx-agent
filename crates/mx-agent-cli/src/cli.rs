@@ -508,6 +508,16 @@ fn daemon_status(global: &GlobalArgs) -> ExitCode {
                 println!("  uptime:  {}s", running.uptime_seconds);
                 println!("  socket:  {}", running.socket_path);
                 println!("  version: {}", running.version);
+                if let Some(sync) = &running.sync {
+                    println!("  sync:    {:?}", sync.state);
+                    println!("    syncs:    {}", sync.total_syncs);
+                    if sync.consecutive_failures > 0 {
+                        println!("    failures: {}", sync.consecutive_failures);
+                    }
+                    if let Some(err) = &sync.last_error {
+                        println!("    last err: {err}");
+                    }
+                }
             }
             ExitCode::SUCCESS
         }

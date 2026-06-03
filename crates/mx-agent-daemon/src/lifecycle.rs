@@ -9,6 +9,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mx_agent_ipc::rpc::{Request, Response, INTERNAL_ERROR, METHOD_NOT_FOUND};
@@ -18,7 +20,15 @@ use serde::{Deserialize, Serialize};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+use crate::session::{load_session, SessionPaths};
+use crate::sync::{BackoffConfig, SyncHealth};
 use crate::DaemonInfo;
+
+/// Shared, optional sync-loop health surfaced through `daemon.status`.
+///
+/// `None` means the sync loop is not running (e.g. no Matrix session yet);
+/// otherwise the inner handle is the live health updated by the sync loop.
+type SharedHealth = Option<Arc<Mutex<SyncHealth>>>;
 
 /// Version reported by the daemon, taken from the crate version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -96,6 +106,9 @@ pub struct RunningStatus {
     pub socket_path: String,
     /// Daemon version.
     pub version: String,
+    /// Matrix sync-loop health, if the sync loop is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncHealth>,
 }
 
 impl RunningStatus {
@@ -183,6 +196,9 @@ pub fn status() -> io::Result<Option<RunningStatus>> {
         uptime_seconds: uptime,
         socket_path: sf.socket_path,
         version: sf.version,
+        // The on-disk status file does not carry live sync health; the live
+        // value is obtained from the running daemon over IPC.
+        sync: None,
     }))
 }
 
@@ -210,12 +226,20 @@ pub fn run_foreground() -> io::Result<()> {
     };
     write_status_file(&paths, &status)?;
 
+    // Start the Matrix sync loop if a session is present. The loop's health is
+    // shared with the IPC handler so `daemon.status` reports live progress. The
+    // loop runs on its own Tokio runtime and is signalled to stop on shutdown.
+    let sync_running = Arc::new(AtomicBool::new(true));
+    let (sync_thread, health) = spawn_sync_loop(sync_running.clone());
+
     // Serve IPC requests on a background thread. The thread is torn down when
     // the process exits after shutdown.
     let listener = socket.listener().try_clone()?;
     let handler_socket = socket_path.clone();
+    let handler_health = health.clone();
     let _server = std::thread::spawn(move || {
-        let handler = move |req: &Request| dispatch(req, pid, started_at, &handler_socket);
+        let handler =
+            move |req: &Request| dispatch(req, pid, started_at, &handler_socket, &handler_health);
         if let Err(e) = mx_agent_ipc::serve(&listener, handler) {
             tracing::warn!(error = %e, "ipc server stopped");
         }
@@ -228,23 +252,103 @@ pub fn run_foreground() -> io::Result<()> {
         tracing::info!(signal, "received shutdown signal");
     }
 
+    // Signal the sync loop to stop and wait briefly for it to wind down.
+    sync_running.store(false, Ordering::SeqCst);
+    if let Some(handle) = sync_thread {
+        let _ = handle.join();
+    }
+
     remove_status_file(&paths);
     drop(socket);
     tracing::info!(pid, "daemon stopped");
     Ok(())
 }
 
+/// Spawn the Matrix sync loop on a dedicated thread, if a session is stored.
+///
+/// Returns `None` (and does nothing) when no Matrix session exists yet, so the
+/// daemon runs cleanly before login. The thread owns a current-thread Tokio
+/// runtime that drives [`crate::sync::run_matrix_sync`].
+fn spawn_sync_loop(
+    running: Arc<AtomicBool>,
+) -> (Option<std::thread::JoinHandle<()>>, SharedHealth) {
+    let session_paths = SessionPaths::resolve();
+    let session = match load_session(&session_paths) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            tracing::info!("no Matrix session stored; sync loop not started");
+            return (None, None);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not load Matrix session; sync loop not started");
+            return (None, None);
+        }
+    };
+
+    // The health handle is created up front and shared with the IPC handler so
+    // status reflects the loop's progress live.
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let loop_health = health.clone();
+    let handle = std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build sync runtime");
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            let client = match crate::matrix::restore_client(&session).await {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to restore Matrix session for sync");
+                    loop_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_fatal(e.to_string());
+                    return;
+                }
+            };
+            if let Err(e) = crate::sync::run_matrix_sync(
+                &client,
+                &SessionPaths::resolve(),
+                loop_health,
+                BackoffConfig::default(),
+                running,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "sync loop exited with error");
+            }
+        });
+    });
+    (Some(handle), Some(health))
+}
+
 /// Dispatch a single IPC request against the running daemon.
-fn dispatch(req: &Request, pid: u32, started_at: u64, socket_path: &str) -> Response {
+fn dispatch(
+    req: &Request,
+    pid: u32,
+    started_at: u64,
+    socket_path: &str,
+    health: &SharedHealth,
+) -> Response {
     match req.method.as_str() {
         "daemon.ping" => Response::result(req.id.clone(), serde_json::json!({"pong": true})),
         "daemon.status" => {
+            let sync = health
+                .as_ref()
+                .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone());
             let status = RunningStatus {
                 running: true,
                 pid,
                 uptime_seconds: now_unix().saturating_sub(started_at),
                 socket_path: socket_path.to_string(),
                 version: DAEMON_VERSION.to_string(),
+                sync,
             };
             match serde_json::to_value(&status) {
                 Ok(value) => Response::result(req.id.clone(), value),

@@ -253,6 +253,43 @@ pub async fn login_password(
     })
 }
 
+/// Build a [`Client`] and restore a previously persisted [`StoredSession`].
+///
+/// The client is pointed at the session's homeserver and the stored tokens are
+/// re-imported so the daemon resumes as the same device after a restart. No
+/// network round-trip is performed by the restore itself; the access token is
+/// validated lazily on the next request (e.g. the first `/sync`).
+pub async fn restore_client(session: &StoredSession) -> Result<Client, LoginError> {
+    use matrix_sdk::authentication::matrix::MatrixSession;
+    use matrix_sdk::authentication::SessionTokens;
+    use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
+    use matrix_sdk::SessionMeta;
+
+    let config = MatrixConfig {
+        homeserver_url: session.homeserver.clone(),
+    };
+    let client = build_client(&config).await?;
+
+    let user_id = OwnedUserId::try_from(session.user_id.as_str())
+        .map_err(|e| LoginError::Matrix(matrix_sdk::Error::from(e)))?;
+    let device_id = OwnedDeviceId::from(session.device_id.as_str());
+    let matrix_session = MatrixSession {
+        meta: SessionMeta { user_id, device_id },
+        tokens: SessionTokens {
+            access_token: session.access_token.expose().to_string(),
+            refresh_token: session
+                .refresh_token
+                .as_ref()
+                .map(|t| t.expose().to_string()),
+        },
+    };
+    client
+        .restore_session(matrix_session)
+        .await
+        .map_err(LoginError::Matrix)?;
+    Ok(client)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
