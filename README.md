@@ -53,5 +53,28 @@ The same checks run in CI (`.github/workflows/ci.yml`) and must pass on every PR
   error in CI via `-D warnings`).
 - Minimum supported Rust version (MSRV): 1.74.
 
+### Logging
+
+All mx-agent processes emit structured logs via `tracing` (to stderr, so `--json`
+command output on stdout is never corrupted). Configure logging with:
+
+| Variable | Values | Default | Purpose |
+|---|---|---|---|
+| `MX_AGENT_LOG` | `RUST_LOG`-style directive | unset | Log filter (preferred) |
+| `RUST_LOG` | `RUST_LOG`-style directive | unset | Log filter fallback |
+| `MX_AGENT_LOG_FORMAT` | `human` \| `json` | `human` | Output format |
+
+The CLI `-v`/`-vv`/`-vvv` flags raise the default level (`warn` → `info` →
+`debug` → `trace`) when no filter env var is set.
+
+```bash
+MX_AGENT_LOG_FORMAT=json mx-agent -vv agent list   # JSON logs on stderr
+MX_AGENT_LOG=mx_agent_daemon=debug,info mx-agent daemon status
+```
+
+Credentials are wrapped in `mx_agent_telemetry::Secret`, which renders as
+`***redacted***` in `Debug`/`Display`, and `mx_agent_telemetry::redact` blanks
+values for secret-looking keys. Never log raw tokens or keys.
+
 The current build is a scaffold; commands are placeholders pending later roadmap
 phases.

@@ -239,19 +239,33 @@ enum TrustCommand {
     Revoke,
 }
 
+/// Map repeated `-v` flags to a default log filter directive.
+fn verbosity_directive(verbose: u8) -> &'static str {
+    match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    }
+}
+
 /// Parse arguments and dispatch. Returns the process exit code.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let g = &cli.global;
 
-    if g.verbose > 0 {
-        eprintln!(
-            "mx-agent: verbose={} json={} config={:?} socket={:?}",
-            g.verbose, g.json, g.config, g.socket
-        );
-    }
+    // Best-effort: logging is a diagnostic aid, never fatal to set up.
+    let _ = mx_agent_telemetry::init(verbosity_directive(g.verbose));
 
     let path = command_path(&cli.command);
+    tracing::debug!(
+        command = %path,
+        json = g.json,
+        verbose = g.verbose,
+        config = ?g.config,
+        socket = ?g.socket,
+        "dispatching command"
+    );
     unimplemented(g, &path)
 }
 
