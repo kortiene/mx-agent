@@ -1,0 +1,3 @@
+# Clippy expectations for the mx-agent workspace.
+# Pin the MSRV so clippy does not suggest APIs newer than we support.
+msrv = "1.74"
