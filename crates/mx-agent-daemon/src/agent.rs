@@ -191,6 +191,170 @@ pub(crate) async fn read_agent_state(
     Ok(content)
 }
 
+/// Options for [`list_agents`].
+#[derive(Debug, Clone, Default)]
+pub struct ListAgentsOptions {
+    /// Room ID or alias to list agents in.
+    pub room: String,
+    /// Capability filters. An agent is included only when it declares *every*
+    /// capability listed here (logical AND). Empty means "no filter".
+    pub capabilities: Vec<String>,
+}
+
+/// Placeholder view of the tools an agent offers, derived from its registered
+/// [`AgentState`].
+///
+/// Tools negotiation is a later roadmap phase; for now `agent tools` simply
+/// reports the tools and capabilities the agent advertised at registration so
+/// callers can discover what is on offer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentTools {
+    /// Agent identifier.
+    pub agent_id: String,
+    /// Agent kind, e.g. `pi`.
+    pub kind: String,
+    /// Current status, e.g. `active`.
+    pub status: String,
+    /// Declared capabilities.
+    pub capabilities: Vec<String>,
+    /// Available named tools.
+    pub tools: Vec<String>,
+}
+
+impl AgentTools {
+    /// Build a tools view from a registered agent state.
+    pub fn from_state(state: &AgentState) -> Self {
+        Self {
+            agent_id: state.agent_id.clone(),
+            kind: state.kind.clone(),
+            status: state.status.clone(),
+            capabilities: state.capabilities.clone(),
+            tools: state.tools.clone(),
+        }
+    }
+}
+
+/// Sync once, resolve the room, and return its [`Room`] handle.
+async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, WorkspaceError> {
+    let id = parse_room_or_alias(target)?;
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .map_err(WorkspaceError::from)?;
+    let room_id = resolve_room_id(client, &id).await?;
+    client
+        .get_room(&room_id)
+        .ok_or_else(|| WorkspaceError::RoomNotFound(target.to_string()))
+}
+
+/// Read every `com.mxagent.agent.v1` state event from a room.
+async fn read_all_agent_states(room: &Room) -> Result<Vec<AgentState>, WorkspaceError> {
+    use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState as RawState;
+
+    let raws = room
+        .get_state_events(StateEventType::from(AGENT_STATE_TYPE))
+        .await
+        .map_err(WorkspaceError::from)?;
+
+    let mut agents = Vec::with_capacity(raws.len());
+    for raw in raws {
+        let content = match raw {
+            RawState::Sync(raw) => raw.get_field::<AgentState>("content"),
+            RawState::Stripped(raw) => raw.get_field::<AgentState>("content"),
+        }
+        .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+        // A removed agent leaves an empty state event behind; skip those.
+        if let Some(agent) = content {
+            agents.push(agent);
+        }
+    }
+    Ok(agents)
+}
+
+/// Return `true` when `agent` declares every capability in `wanted` (logical
+/// AND). An empty `wanted` always matches.
+fn matches_capabilities(agent: &AgentState, wanted: &[String]) -> bool {
+    wanted
+        .iter()
+        .all(|w| agent.capabilities.iter().any(|have| have == w))
+}
+
+/// List agents registered in a workspace room, optionally filtered by declared
+/// capabilities.
+///
+/// Reads every `com.mxagent.agent.v1` state event in the room. When
+/// `options.capabilities` is non-empty, only agents declaring *all* of the
+/// requested capabilities are returned. Results are sorted by `agent_id` for a
+/// stable, deterministic ordering.
+pub async fn list_agents(
+    client: &Client,
+    options: &ListAgentsOptions,
+) -> Result<Vec<AgentState>, WorkspaceError> {
+    let room = sync_and_get_room(client, &options.room).await?;
+    let mut agents = read_all_agent_states(&room).await?;
+    agents.retain(|agent| matches_capabilities(agent, &options.capabilities));
+    agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    Ok(agents)
+}
+
+/// List agents in a workspace, restoring the authenticated client from
+/// `session`.
+pub async fn list_agents_for_session(
+    session: &StoredSession,
+    options: &ListAgentsOptions,
+) -> Result<Vec<AgentState>, WorkspaceError> {
+    let client = restore_client(session).await?;
+    list_agents(&client, options).await
+}
+
+/// Show the registered state of a single agent in a workspace room.
+///
+/// Returns [`WorkspaceError::RoomNotFound`] semantics via `None` only when the
+/// room is missing; an unregistered `agent_id` yields `Ok(None)`.
+pub async fn show_agent(
+    client: &Client,
+    room: &str,
+    agent_id: &str,
+) -> Result<Option<AgentState>, WorkspaceError> {
+    let room = sync_and_get_room(client, room).await?;
+    read_agent_state(&room, agent_id).await
+}
+
+/// Show one agent, restoring the authenticated client from `session`.
+pub async fn show_agent_for_session(
+    session: &StoredSession,
+    room: &str,
+    agent_id: &str,
+) -> Result<Option<AgentState>, WorkspaceError> {
+    let client = restore_client(session).await?;
+    show_agent(&client, room, agent_id).await
+}
+
+/// Report the tools a single agent offers, derived from its registered state.
+///
+/// Placeholder behavior: returns the tools and capabilities advertised at
+/// registration. Returns `Ok(None)` when the agent has not registered.
+pub async fn agent_tools(
+    client: &Client,
+    room: &str,
+    agent_id: &str,
+) -> Result<Option<AgentTools>, WorkspaceError> {
+    Ok(show_agent(client, room, agent_id)
+        .await?
+        .as_ref()
+        .map(AgentTools::from_state))
+}
+
+/// Report an agent's tools, restoring the authenticated client from `session`.
+pub async fn agent_tools_for_session(
+    session: &StoredSession,
+    room: &str,
+    agent_id: &str,
+) -> Result<Option<AgentTools>, WorkspaceError> {
+    let client = restore_client(session).await?;
+    agent_tools(&client, room, agent_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +370,61 @@ mod tests {
     #[test]
     fn derive_agent_id_falls_back_to_full_user_id() {
         assert_eq!(derive_agent_id("weird-id", "DEV"), "weird-id-DEV");
+    }
+
+    fn sample_state(agent_id: &str, capabilities: &[&str], tools: &[&str]) -> AgentState {
+        AgentState {
+            agent_id: agent_id.to_string(),
+            kind: "pi".to_string(),
+            matrix_user_id: "@a:server".to_string(),
+            device_id: "DEV".to_string(),
+            signing_key_id: String::new(),
+            status: "active".to_string(),
+            capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
+            tools: tools.iter().map(|s| s.to_string()).collect(),
+            workspace: AgentWorkspace {
+                cwd: "/tmp".to_string(),
+                project_id: String::new(),
+                git_commit: String::new(),
+            },
+            load: AgentLoad {
+                running_invocations: 0,
+                max_invocations: 1,
+            },
+            last_seen_ts: 0,
+            state_rev: 1,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn capability_filter_requires_all_capabilities() {
+        let agent = sample_state("dev-pi", &["shell", "edit", "test"], &[]);
+        assert!(matches_capabilities(&agent, &[]));
+        assert!(matches_capabilities(&agent, &["shell".to_string()]));
+        assert!(matches_capabilities(
+            &agent,
+            &["shell".to_string(), "test".to_string()]
+        ));
+        assert!(!matches_capabilities(&agent, &["deploy".to_string()]));
+        assert!(!matches_capabilities(
+            &agent,
+            &["shell".to_string(), "deploy".to_string()]
+        ));
+    }
+
+    #[test]
+    fn agent_tools_view_is_derived_from_state() {
+        let agent = sample_state("dev-pi", &["shell"], &["run_tests@1.0.0", "lint@1.0.0"]);
+        let tools = AgentTools::from_state(&agent);
+        assert_eq!(tools.agent_id, "dev-pi");
+        assert_eq!(tools.kind, "pi");
+        assert_eq!(tools.status, "active");
+        assert_eq!(tools.capabilities, vec!["shell".to_string()]);
+        assert_eq!(
+            tools.tools,
+            vec!["run_tests@1.0.0".to_string(), "lint@1.0.0".to_string()]
+        );
     }
 
     #[test]
