@@ -16,6 +16,7 @@ pub mod replay;
 pub mod runner;
 pub mod session;
 pub mod signing;
+pub mod stream;
 pub mod sync;
 pub mod tool_exec;
 pub mod tools;
@@ -57,6 +58,10 @@ pub use session::{
 };
 pub use signing::{
     load_or_create_signing_key, DaemonSigningKey, SigningKeyError, KEY_ALG, KEY_ID_PREFIX,
+};
+pub use stream::{
+    capture_child_output, capture_stream, StreamCaptureConfig, DEFAULT_BATCH_FLUSH_INTERVAL,
+    DEFAULT_INTERACTIVE_FLUSH_INTERVAL, DEFAULT_MAX_CHUNK_BYTES,
 };
 pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
