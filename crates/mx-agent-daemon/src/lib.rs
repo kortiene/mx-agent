@@ -9,6 +9,7 @@ pub mod agent;
 pub mod heartbeat;
 pub mod lifecycle;
 pub mod matrix;
+pub mod replay;
 pub mod session;
 pub mod signing;
 pub mod sync;
@@ -30,6 +31,7 @@ pub use matrix::{
     build_client, login_password, restore_client, ClientError, ConfigError, LoginError,
     MatrixConfig,
 };
+pub use replay::{ReplayCache, ReplayError, DEFAULT_CAPACITY};
 pub use session::{
     auth_status, clear_session, clear_sync_token, load_session, load_sync_token, save_session,
     save_sync_token, AuthStatus, Secret, SessionPaths, StoredSession,
