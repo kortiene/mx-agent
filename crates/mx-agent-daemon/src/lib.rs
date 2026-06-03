@@ -14,8 +14,9 @@ pub mod sync;
 pub mod workspace;
 
 pub use agent::{
-    register_agent, register_agent_for_session, RegisterAgentOptions, DEFAULT_AGENT_KIND,
-    DEFAULT_MAX_INVOCATIONS,
+    agent_tools, agent_tools_for_session, list_agents, list_agents_for_session, register_agent,
+    register_agent_for_session, show_agent, show_agent_for_session, AgentTools, ListAgentsOptions,
+    RegisterAgentOptions, DEFAULT_AGENT_KIND, DEFAULT_MAX_INVOCATIONS,
 };
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,

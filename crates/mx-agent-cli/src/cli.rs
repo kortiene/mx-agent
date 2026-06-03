@@ -199,11 +199,41 @@ enum AgentCommand {
     /// Register the current agent session.
     Register(AgentRegisterArgs),
     /// List agents in a workspace.
-    List,
+    List(AgentListArgs),
     /// Show details for one agent.
-    Show,
+    Show(AgentShowArgs),
     /// List tools offered by an agent.
-    Tools,
+    Tools(AgentToolsArgs),
+}
+
+#[derive(Debug, Args)]
+struct AgentListArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Only list agents declaring this capability (repeatable; AND-combined).
+    #[arg(long = "capability", value_name = "CAPABILITY")]
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct AgentShowArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Agent identifier to show.
+    #[arg(long = "agent-id", value_name = "AGENT_ID")]
+    agent_id: String,
+}
+
+#[derive(Debug, Args)]
+struct AgentToolsArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Agent identifier whose tools to list.
+    #[arg(long = "agent-id", value_name = "AGENT_ID")]
+    agent_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -750,8 +780,168 @@ fn workspace_status(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode
 fn handle_agent(global: &GlobalArgs, cmd: &AgentCommand) -> ExitCode {
     match cmd {
         AgentCommand::Register(args) => agent_register(global, args),
-        _ => unimplemented(global, "agent"),
+        AgentCommand::List(args) => agent_list(global, args),
+        AgentCommand::Show(args) => agent_show(global, args),
+        AgentCommand::Tools(args) => agent_tools(global, args),
     }
+}
+
+fn agent_list(global: &GlobalArgs, args: &AgentListArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::ListAgentsOptions {
+        room: args.room.clone(),
+        capabilities: args.capabilities.clone(),
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::list_agents_for_session(&session, &options).await {
+            Ok(agents) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&agents).unwrap_or_else(|_| "[]".to_string())
+                    );
+                } else if agents.is_empty() {
+                    println!("mx-agent: no agents registered in {}", args.room);
+                } else {
+                    println!("mx-agent: {} agent(s) in {}", agents.len(), args.room);
+                    for agent in &agents {
+                        let caps = if agent.capabilities.is_empty() {
+                            "-".to_string()
+                        } else {
+                            agent.capabilities.join(",")
+                        };
+                        println!(
+                            "  {:<24} {:<8} {:<8} {}",
+                            agent.agent_id, agent.kind, agent.status, caps
+                        );
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not list agents: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn agent_show(global: &GlobalArgs, args: &AgentShowArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::show_agent_for_session(&session, &args.room, &args.agent_id).await {
+            Ok(Some(state)) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("mx-agent: agent {}", state.agent_id);
+                    println!("  kind:         {}", state.kind);
+                    println!("  status:       {}", state.status);
+                    println!("  user:         {}", state.matrix_user_id);
+                    println!("  device:       {}", state.device_id);
+                    println!("  cwd:          {}", state.workspace.cwd);
+                    if !state.workspace.project_id.is_empty() {
+                        println!("  project:      {}", state.workspace.project_id);
+                    }
+                    if !state.workspace.git_commit.is_empty() {
+                        println!("  git commit:   {}", state.workspace.git_commit);
+                    }
+                    if !state.capabilities.is_empty() {
+                        println!("  capabilities: {}", state.capabilities.join(", "));
+                    }
+                    if !state.tools.is_empty() {
+                        println!("  tools:        {}", state.tools.join(", "));
+                    }
+                    println!(
+                        "  load:         {}/{} invocations",
+                        state.load.running_invocations, state.load.max_invocations
+                    );
+                    println!("  state_rev:    {}", state.state_rev);
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                if global.json {
+                    println!("null");
+                } else {
+                    eprintln!(
+                        "mx-agent: agent {} not found in {}",
+                        args.agent_id, args.room
+                    );
+                }
+                ExitCode::from(3)
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not show agent: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn agent_tools(global: &GlobalArgs, args: &AgentToolsArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::agent_tools_for_session(&session, &args.room, &args.agent_id).await {
+            Ok(Some(tools)) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&tools).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("mx-agent: tools for agent {}", tools.agent_id);
+                    if tools.tools.is_empty() {
+                        println!("  (no tools advertised)");
+                    } else {
+                        for tool in &tools.tools {
+                            println!("  {tool}");
+                        }
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                if global.json {
+                    println!("null");
+                } else {
+                    eprintln!(
+                        "mx-agent: agent {} not found in {}",
+                        args.agent_id, args.room
+                    );
+                }
+                ExitCode::from(3)
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not list agent tools: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 fn agent_register(global: &GlobalArgs, args: &AgentRegisterArgs) -> ExitCode {
@@ -991,9 +1181,9 @@ fn command_path(command: &Command) -> String {
             "agent {}",
             match c {
                 AgentCommand::Register(_) => "register",
-                AgentCommand::List => "list",
-                AgentCommand::Show => "show",
-                AgentCommand::Tools => "tools",
+                AgentCommand::List(_) => "list",
+                AgentCommand::Show(_) => "show",
+                AgentCommand::Tools(_) => "tools",
             }
         ),
         Command::Call(_) => "call".to_string(),
@@ -1104,9 +1294,92 @@ mod tests {
 
     #[test]
     fn global_flags_parse_after_subcommand() {
-        let cli = Cli::try_parse_from(["mx-agent", "agent", "list", "--json", "-vv"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "agent",
+            "list",
+            "--room",
+            "!abc:matrix.org",
+            "--json",
+            "-vv",
+        ])
+        .unwrap();
         assert!(cli.global.json);
         assert_eq!(cli.global.verbose, 2);
+    }
+
+    #[test]
+    fn agent_list_requires_room_and_collects_capabilities() {
+        assert!(Cli::try_parse_from(["mx-agent", "agent", "list"]).is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "agent",
+            "list",
+            "--room",
+            "!abc:matrix.org",
+            "--capability",
+            "shell",
+            "--capability",
+            "test",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Agent(AgentCommand::List(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.capabilities, vec!["shell", "test"]);
+            }
+            other => panic!("expected agent list, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "agent list");
+    }
+
+    #[test]
+    fn agent_show_requires_room_and_agent_id() {
+        assert!(
+            Cli::try_parse_from(["mx-agent", "agent", "show", "--room", "!abc:matrix.org"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "agent",
+            "show",
+            "--room",
+            "!abc:matrix.org",
+            "--agent-id",
+            "dev-pi",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Agent(AgentCommand::Show(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.agent_id, "dev-pi");
+            }
+            other => panic!("expected agent show, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "agent show");
+    }
+
+    #[test]
+    fn agent_tools_requires_room_and_agent_id() {
+        assert!(Cli::try_parse_from(["mx-agent", "agent", "tools"]).is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "agent",
+            "tools",
+            "--room",
+            "!abc:matrix.org",
+            "--agent-id",
+            "dev-pi",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Agent(AgentCommand::Tools(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.agent_id, "dev-pi");
+            }
+            other => panic!("expected agent tools, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "agent tools");
     }
 
     #[test]
