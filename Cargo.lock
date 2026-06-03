@@ -1822,6 +1822,11 @@ dependencies = [
 [[package]]
 name = "mx-agent-policy"
 version = "0.0.1"
+dependencies = [
+ "regex",
+ "serde",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "mx-agent-protocol"
