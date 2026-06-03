@@ -219,6 +219,45 @@ scripts/work_issue.sh 3 --no-status  # skip board update (no project scope neede
 
 Requirements: `gh` (authenticated; `project` scope needed for board updates), `jq`, and `git`.
 
+## Automated Issue Processing
+
+For unattended runs, two scripts drive the [pi](https://github.com/earendil-works/pi-mono) coding agent headlessly through the same `/issue` workflow used interactively (defined in `.pi/prompts/issue.md`).
+
+### Single issue: `scripts/issue.sh`
+
+The CLI equivalent of typing `/issue <number> [notes]` in pi's editor. It expands the `.pi/prompts/issue.md` template (substituting `$1` and `${@:2}` exactly as pi does), then runs it via `pi -p` (print mode) so the agent implements the issue end-to-end: branch, code, test, open a PR, watch CI, and squash-merge.
+
+```bash
+scripts/issue.sh 15                            # implement issue #15 end-to-end
+scripts/issue.sh 15 "do not continue on unmet deps"   # notes fill the ${@:2} slot
+scripts/issue.sh 15 --json --model sonnet:high # JSON event stream, pick a model
+scripts/issue.sh 15 --print-prompt             # expand the template only; do not run
+scripts/issue.sh 15 --dry-run                  # show the exact pi invocation
+scripts/issue.sh 15 -- --thinking high -nc     # pass extra flags verbatim to pi
+```
+
+Notes:
+
+- Slash-command/template expansion only happens in pi's interactive editor, so the script performs the substitution itself before calling `pi -p`.
+- Headless mode cannot ask interactive questions, so the template's "ask whether to continue" step becomes "state the assumption and proceed"; pass a note to steer it.
+- Each run is fully autonomous (edits, pushes, opens a PR, and merges unattended). `pi` is resolved from `PATH`, then `~/.local/share/pi-node/current/bin/pi`, or `PI_BIN`.
+
+### Many issues in order: `scripts/issues.sh`
+
+Processes several issues sequentially via `scripts/issue.sh`, one fully completing (including its CI and merge) before the next begins — important because later backlog issues usually depend on earlier ones being merged to `main`.
+
+```bash
+scripts/issues.sh 15 16 17                      # explicit list, stop on first failure
+scripts/issues.sh 15-22                          # inclusive range (also N..M)
+scripts/issues.sh 15..30 --keep-going -- --json --model sonnet:high
+scripts/issues.sh 15-30 --start 21               # resume from #21
+scripts/issues.sh 15 16 18-20 --dry-run          # preview the plan
+```
+
+It stops at the first failure by default (`--keep-going` to continue), preserves the given order, supports number/range specs, is resumable with `--start`, forwards flags after `--` to `issue.sh`, and prints a completed/failed summary. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
+
+Requirements: `pi` on `PATH` (or `PI_BIN`), plus the same `gh`/`git`/`cargo` access the interactive workflow uses.
+
 ### Manual alternative with gh
 
 ```bash
