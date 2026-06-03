@@ -1,51 +1,92 @@
 # mx-agent Architecture
 
-## Purpose
+`mx-agent` is a Matrix-backed CLI and daemon for decentralized orchestration between autonomous coding agents such as Pi, Claude Code, and terminal-based LLM runners.
 
-`mx-agent` is a specialized CLI and local daemon for decentralized orchestration between autonomous coding agents. It uses the Matrix protocol as a federated event backplane, allowing agents running on different machines to discover each other, exchange context, invoke tools, stream terminal input/output, and coordinate multi-step workflows.
+It turns Matrix rooms into federated workspaces where agents can discover peers, share context, invoke tools, stream terminal I/O, and coordinate distributed task DAGs without central orchestration servers or inbound firewall access.
 
-The core design is:
+---
+
+## 0. Executive Summary
 
 ```text
 agent / shell / LLM runner
         |
-        | mx-agent CLI
+        | ephemeral mx-agent CLI
         v
 local mx-agent daemon
         |
-        | Matrix Client-Server API
+        | Matrix Client-Server API + E2EE
         v
 Matrix homeserver federation
 ```
 
-The ephemeral CLI provides a Unix-native interface. The daemon owns Matrix sync, credentials, encryption state, policy enforcement, process supervision, and stream routing.
+Core split:
+
+```text
+CLI     = stateless Unix UX, stdio bridge, output formatting, exit-code propagation
+Daemon  = Matrix sync, credentials, crypto, policy, process supervision, stream routing
+Matrix  = federated event log, room state store, workspace membership, distributed DAG state
+```
+
+Primary design constraints:
+
+- The coding agent must never see Matrix access tokens or device keys.
+- Matrix room membership must not imply remote execution permission.
+- Streaming terminal data over Matrix must be rate-limited, chunked, resumable, and fall back to artifact upload for large outputs.
+- Task and invocation state must be durable enough to survive daemon restarts and Matrix reconnects.
+- Raw shell execution should be optional; named tools should be the safer default.
 
 ---
 
-## 1. Command Surface and Agent UX
+## 1. System Model
 
-### Design Principles
+### 1.1 Core Entities
 
-- Stateless CLI invocations from the agent perspective.
-- Pipe-friendly stdin/stdout/stderr behavior.
-- JSON output for automation.
-- Human-readable output by default.
-- Long-lived Matrix sync hidden behind a local daemon.
-- Every operation addressable by workspace, agent, task, and invocation ID.
+| Entity | Description | Matrix Mapping |
+|---|---|---|
+| Workspace | Shared project coordination context | Matrix room |
+| Agent | Local daemon persona representing a coding agent/runtime | Matrix user/device plus `com.mxagent.agent.v1` state |
+| Capability | Advertised function or constraint | Agent state content |
+| Tool | Named, policy-controlled operation | `call` request/response events |
+| Exec | Raw or shell-like remote process invocation | `exec` request/response events |
+| Invocation | One running or completed remote call/exec | `com.mxagent.invocation.v1` state |
+| Task | Durable DAG node | `com.mxagent.task.v1` state |
+| Stream | stdin/stdout/stderr/pty data | chunked timeline events or media artifacts |
+| Context | Diffs, env snapshots, plans, summaries | timeline event or Matrix media object |
 
-### Core Concepts
+### 1.2 Trust Model
 
-| Concept | Matrix Mapping |
-|---|---|
-| Workspace | Matrix room |
-| Agent | Matrix user/device/session plus agent state event |
-| Remote execution | Request/response timeline events |
-| Task | Room state event keyed by task ID |
-| Stream | Chunked Matrix timeline events |
-| Shared context | Timeline or state events with typed payloads |
-| Capability | Agent state event |
+There are three independent identities:
 
-### Command Groups
+1. **Matrix user ID**: e.g. `@alice:matrix.org`.
+2. **Matrix device ID / E2EE identity**: homeserver/client cryptographic device identity.
+3. **mx-agent signing identity**: daemon-managed Ed25519 key used to sign privileged agent requests.
+
+All privileged operations should verify all applicable layers:
+
+```text
+room membership
++ Matrix event sender
++ Matrix device trust, if E2EE is enabled
++ mx-agent request signature
++ local policy
++ optional human approval
+```
+
+---
+
+## 2. CLI Command Surface
+
+### 2.1 Design Principles
+
+- Stateless invocations from the agent's perspective.
+- POSIX pipe friendly.
+- Human-readable by default, `--json` for automation.
+- `--` separates CLI options from remote command arguments.
+- Every operation can be scoped by `--room`, `--agent`, `--task`, and `--invocation`.
+- Long-lived Matrix session state lives only in the daemon.
+
+### 2.2 Command Groups
 
 ```bash
 mx-agent workspace ...
@@ -54,31 +95,35 @@ mx-agent exec ...
 mx-agent call ...
 mx-agent share ...
 mx-agent task ...
+mx-agent invocation ...
+mx-agent approval ...
 mx-agent daemon ...
 mx-agent auth ...
+mx-agent trust ...
 ```
 
 ---
 
-### Workspace Commands
+## 3. Workspace Commands
 
-Create a workspace:
+Create a Matrix-backed workspace:
 
 ```bash
 mx-agent workspace create \
   --alias my-project \
   --name "my-project orchestration" \
-  --visibility private
+  --visibility private \
+  --e2ee on
 ```
 
-Join a workspace:
+Join an existing workspace:
 
 ```bash
 mx-agent workspace join '#my-project:matrix.org'
 mx-agent workspace join '!abc123:matrix.org'
 ```
 
-Attach the current directory to a workspace:
+Attach the current repository/path:
 
 ```bash
 mx-agent workspace attach \
@@ -87,52 +132,73 @@ mx-agent workspace attach \
   --project-id 'repo:github.com/org/project'
 ```
 
-Show workspace status:
+Inspect status:
 
 ```bash
 mx-agent workspace status --room '!abc123:matrix.org'
 mx-agent workspace status --room '!abc123:matrix.org' --json
 ```
 
+Example output:
+
+```text
+Workspace: !abc123:matrix.org
+Project: repo:github.com/org/project
+Agents:
+  claude-local    active  plan,review
+  developer-pi    active  shell,test,edit,repo:node
+Tasks:
+  task-plan       succeeded
+  task-test       executing  developer-pi
+```
+
 ---
 
-### Agent Commands
+## 4. Agent Commands
 
-Register the current agent session:
+Register a Claude Code agent session:
 
 ```bash
 mx-agent agent register \
+  --room '!abc123:matrix.org' \
   --name claude-local \
   --kind claude-code \
   --capability plan \
-  --capability review \
-  --capability shell:limited
+  --capability review
 ```
 
 Register a Pi runner:
 
 ```bash
 mx-agent agent register \
+  --room '!abc123:matrix.org' \
   --name developer-pi \
   --kind pi \
   --capability shell \
   --capability edit \
   --capability test \
-  --capability repo:node
+  --capability repo:node \
+  --capability sandbox:docker
 ```
 
-List available agents:
+List agents:
 
 ```bash
 mx-agent agent list --room '!abc123:matrix.org'
-mx-agent agent list --room '!abc123:matrix.org' --json
+mx-agent agent list --room '!abc123:matrix.org' --capability test --json
+```
+
+Show one agent:
+
+```bash
+mx-agent agent show --room '!abc123:matrix.org' developer-pi --json
 ```
 
 ---
 
-### Remote Execution Commands
+## 5. Exec and Tool Invocation
 
-Run a command on a remote agent:
+### 5.1 Raw Remote Exec
 
 ```bash
 mx-agent exec \
@@ -143,7 +209,33 @@ mx-agent exec \
   -- npm test
 ```
 
-Invoke a named remote tool:
+Pipe stdin:
+
+```bash
+git diff | mx-agent exec \
+  --room '!abc123:matrix.org' \
+  --agent developer-pi \
+  --stdin \
+  -- bash -lc 'cat > /tmp/patch.diff && npm test'
+```
+
+Interactive PTY:
+
+```bash
+mx-agent exec --room '!abc123:matrix.org' --agent developer-pi --pty -- bash
+```
+
+Cancel an invocation:
+
+```bash
+mx-agent invocation cancel \
+  --room '!abc123:matrix.org' \
+  --invocation inv_01HZ...
+```
+
+### 5.2 Named Tool Calls
+
+Named tools are the preferred security boundary. They avoid arbitrary shell injection and allow strict input/output schemas.
 
 ```bash
 mx-agent call \
@@ -154,40 +246,71 @@ mx-agent call \
   --arg coverage=true
 ```
 
-Pipe stdin to a remote command:
+JSON input:
 
 ```bash
-git diff | mx-agent exec \
+mx-agent call \
   --room '!abc123:matrix.org' \
   --agent developer-pi \
-  --stdin \
-  -- bash -lc 'cat > /tmp/patch.diff && npm test'
+  --tool run_tests \
+  --input-json tests.request.json \
+  --json
 ```
 
-Remote command exit codes should propagate to the local process:
+Discover tools:
 
 ```bash
-mx-agent exec --agent developer-pi -- npm test
-echo $?
+mx-agent agent tools --room '!abc123:matrix.org' --agent developer-pi
+mx-agent agent tools --room '!abc123:matrix.org' --agent developer-pi --json
 ```
 
-Recommended reserved local/protocol exit codes:
+Tool metadata should include:
+
+```json
+{
+  "name": "run_tests",
+  "version": "1.0.0",
+  "description": "Run project test suites",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "package": { "type": "string" },
+      "coverage": { "type": "boolean" }
+    },
+    "required": ["package"]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "exit_code": { "type": "integer" },
+      "summary": { "type": "string" },
+      "log_mxc": { "type": "string" }
+    }
+  }
+}
+```
+
+### 5.3 Exit Codes
+
+The local CLI should exit with the remote process exit code when possible.
 
 | Code | Meaning |
 |---:|---|
 | 0 | Remote command succeeded |
 | 1-125 | Remote command exit code |
 | 126 | Local policy denied |
-| 127 | Agent or command not found |
-| 128 | Protocol or network failure |
+| 127 | Agent/tool/command not found |
+| 128 | Protocol/network failure |
 | 129 | Timeout |
-| 130 | Interrupted |
+| 130 | Interrupted/cancelled locally |
+| 131 | Remote rejected request |
+| 132 | Stream integrity failure |
 
 ---
 
-### Context Sharing Commands
+## 6. Context Sharing
 
-Share a git diff:
+Share a diff:
 
 ```bash
 mx-agent share diff \
@@ -214,105 +337,69 @@ mx-agent share env \
   --include node,npm,os,git
 ```
 
----
-
-### Task Commands
-
-Create a task:
-
-```bash
-mx-agent task create \
-  --room '!abc123:matrix.org' \
-  --title 'Run API tests' \
-  --depends-on task-plan \
-  --assign developer-pi
-```
-
-Update a task:
-
-```bash
-mx-agent task update \
-  --room '!abc123:matrix.org' \
-  --task task-test-api \
-  --state executing
-```
-
-List or watch tasks:
-
-```bash
-mx-agent task list --room '!abc123:matrix.org'
-mx-agent task watch --room '!abc123:matrix.org'
-mx-agent task graph --room '!abc123:matrix.org'
-```
-
----
-
-### Claude Code to Pi Example
-
-Claude Code asks a remote Pi agent to run tests:
-
-```bash
-mx-agent workspace join '#project-orchestration:matrix.org'
-
-mx-agent share diff \
-  --room '#project-orchestration:matrix.org' \
-  --base main
-
-mx-agent exec \
-  --room '#project-orchestration:matrix.org' \
-  --agent developer-pi \
-  --cwd /home/me/code/project \
-  --stream \
-  -- npm test
-```
-
-Structured task-backed version:
-
-```bash
-TASK_ID=$(mx-agent task create \
-  --room '#project-orchestration:matrix.org' \
-  --title 'Run npm test on latest diff' \
-  --assign developer-pi \
-  --json | jq -r .task_id)
-
-mx-agent exec \
-  --room '#project-orchestration:matrix.org' \
-  --agent developer-pi \
-  --task "$TASK_ID" \
-  --cwd /home/me/code/project \
-  --stream \
-  -- npm test
-```
-
----
-
-## 2. POSIX Stream Mapping to Matrix
-
-Matrix events are discrete JSON objects, while terminal I/O is byte-oriented. `mx-agent` maps process streams to chunked Matrix timeline events.
-
-```text
-local stdin  -> Matrix stream chunks -> remote child stdin
-local stdout <- Matrix stream chunks <- remote child stdout
-local stderr <- Matrix stream chunks <- remote child stderr
-exit status  <- Matrix finished event  <- remote child exit
-```
-
-### Invocation Request
-
-When a user runs:
-
-```bash
-mx-agent exec --room '!abc:matrix.org' --agent developer-pi -- npm test
-```
-
-The local daemon emits:
+Large context objects should be uploaded as Matrix media and referenced by URI:
 
 ```json
 {
-  "type": "com.mxagent.exec.request",
+  "type": "com.mxagent.context.share",
   "content": {
-    "schema": "com.mxagent.exec.request.v1",
+    "context_id": "ctx_01HZ...",
+    "name": "full-test-log.txt",
+    "mime_type": "text/plain",
+    "size_bytes": 2500000,
+    "sha256": "base64...",
+    "mxc_uri": "mxc://matrix.org/abcdef"
+  }
+}
+```
+
+---
+
+## 7. Matrix Protocol Mapping
+
+### 7.1 Event Namespace
+
+Timeline events:
+
+```text
+com.mxagent.exec.request.v1
+com.mxagent.exec.accepted.v1
+com.mxagent.exec.rejected.v1
+com.mxagent.exec.finished.v1
+com.mxagent.exec.cancel.v1
+com.mxagent.exec.cancelled.v1
+com.mxagent.call.request.v1
+com.mxagent.call.response.v1
+com.mxagent.stream.chunk.v1
+com.mxagent.stream.artifact.v1
+com.mxagent.context.share.v1
+com.mxagent.heartbeat.v1
+com.mxagent.approval.request.v1
+com.mxagent.approval.decision.v1
+com.mxagent.pty.resize.v1
+```
+
+State events:
+
+```text
+com.mxagent.agent.v1
+com.mxagent.task.v1
+com.mxagent.invocation.v1
+com.mxagent.tool.v1
+com.mxagent.workspace.v1
+com.mxagent.trust.v1
+```
+
+Use explicit `.v1` versions in Matrix event type names. Avoid changing semantics under the same version.
+
+### 7.2 Exec Request
+
+```json
+{
+  "type": "com.mxagent.exec.request.v1",
+  "content": {
     "invocation_id": "inv_01HZ...",
+    "request_id": "req_01HZ...",
     "target_agent": "developer-pi",
     "requesting_agent": "claude-local",
     "command": ["npm", "test"],
@@ -322,44 +409,25 @@ The local daemon emits:
     "stream": true,
     "pty": false,
     "timeout_ms": 600000,
-    "task_id": "task-test-api"
+    "task_id": "task-test-api",
+    "created_at": "2026-06-02T12:00:00Z",
+    "expires_at": "2026-06-02T12:05:00Z",
+    "nonce": "base64-random",
+    "idempotency_key": "exec:inv_01HZ...",
+    "signature": {
+      "alg": "ed25519",
+      "key_id": "mxagent-ed25519:abc123",
+      "sig": "base64..."
+    }
   }
 }
 ```
 
-The remote daemon verifies identity and policy, then responds with either accepted or rejected.
-
-Accepted:
+### 7.3 Stream Chunk
 
 ```json
 {
-  "type": "com.mxagent.exec.accepted",
-  "content": {
-    "invocation_id": "inv_01HZ...",
-    "agent": "developer-pi",
-    "pid": 18422,
-    "started_at": "2026-06-02T12:00:00Z"
-  }
-}
-```
-
-Rejected:
-
-```json
-{
-  "type": "com.mxagent.exec.rejected",
-  "content": {
-    "invocation_id": "inv_01HZ...",
-    "reason": "policy_denied"
-  }
-}
-```
-
-### Stream Chunk Event
-
-```json
-{
-  "type": "com.mxagent.stream.chunk",
+  "type": "com.mxagent.stream.chunk.v1",
   "content": {
     "invocation_id": "inv_01HZ...",
     "stream": "stdout",
@@ -367,113 +435,180 @@ Rejected:
     "encoding": "utf-8",
     "data": "PASS src/foo.test.ts\n",
     "eof": false,
+    "compressed": false,
+    "sha256": "optional-base64-chunk-digest",
     "timestamp": "2026-06-02T12:00:01.123Z"
   }
 }
 ```
 
-For binary data:
+Supported streams:
+
+```text
+stdin
+stdout
+stderr
+pty
+control
+```
+
+For non-UTF-8 data, use base64:
 
 ```json
 {
-  "type": "com.mxagent.stream.chunk",
-  "content": {
-    "invocation_id": "inv_01HZ...",
-    "stream": "stdout",
-    "seq": 43,
-    "encoding": "base64",
-    "data": "AAECAwQ=",
-    "eof": false
-  }
+  "encoding": "base64",
+  "data": "AAECAwQ="
 }
 ```
 
-End of stdin:
+### 7.4 Finished Event
 
 ```json
 {
-  "type": "com.mxagent.stream.chunk",
-  "content": {
-    "invocation_id": "inv_01HZ...",
-    "stream": "stdin",
-    "seq": 12,
-    "encoding": "utf-8",
-    "data": "",
-    "eof": true
-  }
-}
-```
-
-Finished event:
-
-```json
-{
-  "type": "com.mxagent.exec.finished",
+  "type": "com.mxagent.exec.finished.v1",
   "content": {
     "invocation_id": "inv_01HZ...",
     "exit_code": 1,
     "signal": null,
     "duration_ms": 18231,
     "stdout_bytes": 50231,
-    "stderr_bytes": 1409
+    "stderr_bytes": 1409,
+    "truncated": false,
+    "artifact_mxc": null
   }
 }
 ```
 
-### Chunking Defaults
+### 7.5 Cancellation
 
-Recommended defaults:
+Requester sends:
+
+```json
+{
+  "type": "com.mxagent.exec.cancel.v1",
+  "content": {
+    "invocation_id": "inv_01HZ...",
+    "reason": "caller_cancelled",
+    "created_at": "2026-06-02T12:01:00Z",
+    "nonce": "base64-random",
+    "signature": { "alg": "ed25519", "key_id": "mxagent-ed25519:abc123", "sig": "base64..." }
+  }
+}
+```
+
+Target acknowledges:
+
+```json
+{
+  "type": "com.mxagent.exec.cancelled.v1",
+  "content": {
+    "invocation_id": "inv_01HZ...",
+    "signal_sent": "SIGTERM",
+    "killed_process_group": true,
+    "finished_at": "2026-06-02T12:01:01Z"
+  }
+}
+```
+
+Cancellation policy:
+
+1. Send SIGTERM to process group.
+2. Wait grace period, e.g. 5 seconds.
+3. Send SIGKILL to process group.
+4. Emit `exec.cancelled` and final invocation state.
+
+---
+
+## 8. Stream Transport Semantics
+
+### 8.1 Chunking Defaults
 
 ```text
 max_chunk_bytes: 16 KiB
-max_flush_interval: 50 ms
-max_events_per_second: configurable
-compression: optional for large non-interactive payloads
+max_flush_interval: 50 ms interactive / 250 ms batch
+max_events_per_second: policy-controlled
+max_output_bytes: policy-controlled
+compression: zstd optional for non-interactive streams
 ```
 
-Stream sequencing is per invocation and per stream:
+Flush when any condition is met:
+
+- buffer reaches `max_chunk_bytes`
+- newline observed in interactive mode
+- flush interval expires
+- stream EOF
+
+### 8.2 Ordering and Reassembly
+
+Chunks are ordered by:
 
 ```text
 (invocation_id, stream, seq)
 ```
 
-The receiver buffers out-of-order chunks until missing sequence numbers arrive or a timeout expires.
+Receiver behavior:
 
-### PTY Mode
+- De-duplicate exact repeated `(invocation_id, stream, seq)` chunks.
+- Buffer out-of-order chunks for a bounded window.
+- If a gap persists past timeout, mark stream degraded.
+- If chunk hashes are present and invalid, mark integrity failure.
+- Continue rendering best-effort output unless strict mode is enabled.
 
-Interactive commands can request PTY mode:
+Strict mode:
 
 ```bash
-mx-agent exec --agent developer-pi --pty -- bash
+mx-agent exec --strict-stream --agent developer-pi -- npm test
 ```
 
-PTY mode:
+In strict mode, missing or invalid chunks cause local exit code `132`.
 
-- Merges stdout and stderr.
-- Preserves ANSI escape sequences.
-- Uses raw local terminal input.
-- Propagates terminal size changes.
+### 8.3 Backpressure
 
-Resize event:
+The daemon must protect both Matrix and local processes:
+
+- Apply per-invocation output caps.
+- Pause local child reads only when safe.
+- Drop or summarize excessive output according to policy.
+- Switch to artifact mode when output exceeds timeline budget.
+- Surface truncation explicitly.
+
+### 8.4 Large Output Artifact Mode
+
+For high-output commands, Matrix timeline events should carry summaries and references, not every byte.
+
+Trigger conditions:
+
+```text
+output_bytes > max_timeline_output_bytes
+or events_per_second exceeds homeserver rate limits
+or receiver explicitly requested --artifact-output
+```
+
+Artifact event:
 
 ```json
 {
-  "type": "com.mxagent.pty.resize",
+  "type": "com.mxagent.stream.artifact.v1",
   "content": {
     "invocation_id": "inv_01HZ...",
-    "cols": 120,
-    "rows": 40
+    "stream": "stdout",
+    "name": "stdout.log.zst",
+    "mime_type": "text/plain+zstd",
+    "size_bytes": 10485760,
+    "sha256": "base64...",
+    "mxc_uri": "mxc://matrix.org/abcdef",
+    "tail_preview": "last 4KB of output..."
   }
 }
 ```
 
 ---
 
-## 3. Orchestration State Machine and DAG Tracking
+## 9. Distributed State Machine and DAG Tracking
 
-Use Matrix room state events for durable workflow state and timeline events for logs and streaming output.
+Matrix room state is used for durable state. Timeline events are used for activity and stream logs.
 
-### Agent State
+### 9.1 Agent State
 
 State event:
 
@@ -482,26 +617,16 @@ type: com.mxagent.agent.v1
 state_key: <agent_id>
 ```
 
-Content:
-
 ```json
 {
   "agent_id": "developer-pi",
   "kind": "pi",
+  "matrix_user_id": "@pi:matrix.org",
   "device_id": "MXAGENTDEVICE01",
+  "signing_key_id": "mxagent-ed25519:abc123",
   "status": "active",
-  "capabilities": [
-    "shell",
-    "edit",
-    "test",
-    "repo:node",
-    "sandbox:docker"
-  ],
-  "policy": {
-    "requires_approval": false,
-    "allowed_commands": ["npm", "pnpm", "pytest", "go", "cargo"],
-    "max_runtime_ms": 900000
-  },
+  "capabilities": ["shell", "edit", "test", "repo:node", "sandbox:docker"],
+  "tools": ["run_tests@1.0.0", "lint@1.0.0"],
   "workspace": {
     "cwd": "/home/me/code/project",
     "project_id": "repo:github.com/org/project",
@@ -511,13 +636,20 @@ Content:
     "running_invocations": 1,
     "max_invocations": 4
   },
-  "last_seen_ts": 1780392000000
+  "last_seen_ts": 1780392000000,
+  "state_rev": 7
 }
 ```
 
-Agents should update durable state periodically and optionally emit lower-cost heartbeat events for liveness.
+Liveness should combine:
 
-### Task State
+- latest durable `agent` state
+- recent `heartbeat` event
+- room membership
+- optional Matrix presence
+- trusted signing/device key status
+
+### 9.2 Task State
 
 State event:
 
@@ -525,8 +657,6 @@ State event:
 type: com.mxagent.task.v1
 state_key: <task_id>
 ```
-
-Content:
 
 ```json
 {
@@ -541,92 +671,53 @@ Content:
   "invocation_id": "inv_01HZ...",
   "created_at": "2026-06-02T12:00:00Z",
   "updated_at": "2026-06-02T12:01:12Z",
+  "state_rev": 4,
+  "previous_event_id": "$eventid",
   "result": null
 }
 ```
 
-Allowed task states:
+Task states:
 
 ```text
-proposed
-pending
-assigned
-executing
-blocked
-succeeded
-failed
-cancelled
-superseded
+proposed -> pending -> assigned -> executing -> succeeded
+                                      -> failed
+                                      -> cancelled
+        -> blocked
+        -> superseded
 ```
 
 A task is runnable when:
 
 ```text
-state is pending or assigned
+state in [pending, assigned]
 all depends_on tasks are succeeded
 assigned agent is active
-local policy permits execution
+local policy permits the operation
+no conflicting newer state_rev exists
 ```
 
-### Invocation State
+### 9.3 Conflict Handling
 
-State event:
+Matrix room state is last-write-wins per `(type, state_key)`. To reduce accidental overwrites:
 
-```text
-type: com.mxagent.invocation.v1
-state_key: <invocation_id>
-```
+- Include `state_rev` on mutable state events.
+- Include `previous_event_id` when updating known state.
+- Treat lower or repeated `state_rev` as stale in clients.
+- Restrict task mutation by Matrix power levels and mx-agent policy.
+- For contentious workflows, append timeline decision events and let a coordinator agent resolve state.
 
-Content:
-
-```json
-{
-  "invocation_id": "inv_01HZ...",
-  "task_id": "task-test-api",
-  "requester": "claude-local",
-  "target": "developer-pi",
-  "command": ["npm", "test"],
-  "state": "running",
-  "started_at": "2026-06-02T12:00:00Z",
-  "updated_at": "2026-06-02T12:00:05Z"
-}
-```
-
-Invocation transitions:
-
-```text
-requested -> accepted -> running -> succeeded
-                              -> failed
-                              -> cancelled
-                              -> timed_out
-                              -> rejected
-```
-
-### Querying State
-
-List active agents:
-
-```bash
-mx-agent agent list --room '!abc:matrix.org' --json
-```
-
-Implementation:
-
-1. Fetch room state.
-2. Filter `com.mxagent.agent.v1` events.
-3. Check Matrix membership and latest heartbeat.
-4. Verify device or signing key trust where required.
-
-List tasks:
+### 9.4 Query Commands
 
 ```bash
 mx-agent task list --room '!abc:matrix.org'
 mx-agent task list --room '!abc:matrix.org' --state pending
 mx-agent task list --room '!abc:matrix.org' --assigned developer-pi
 mx-agent task graph --room '!abc:matrix.org'
+mx-agent invocation list --room '!abc:matrix.org' --state running
 ```
 
-Example graph output:
+Graph output:
 
 ```text
 task-plan       succeeded
@@ -637,74 +728,49 @@ task-plan       succeeded
 
 ---
 
-## 4. Daemon and IPC Architecture
+## 10. Daemon and IPC Architecture
 
-### Why a Daemon Exists
+### 10.1 Why the Daemon Exists
 
-Matrix clients need long-lived state:
+The daemon owns long-lived Matrix state:
 
-- `/sync` loop.
-- End-to-end encryption sessions.
-- Device verification.
-- Event retries and backoff.
-- Room state cache.
-- Stream reassembly.
-- Incoming exec handling.
-- Policy enforcement.
+- `/sync` loop
+- E2EE sessions and device verification
+- Matrix access token
+- room state cache
+- event send queues and retry backoff
+- incoming request routing
+- local policy enforcement
+- process supervision
+- stream chunking/reassembly
+- audit logging
 
-Ephemeral CLI commands should not each perform a full Matrix login/sync lifecycle.
+### 10.2 IPC Transport
 
-### Component Split
-
-The CLI owns:
-
-- Argument parsing.
-- Local stdin/stdout/stderr bridging.
-- Output formatting.
-- Exit code propagation.
-- Short-lived user interaction.
-
-The daemon owns:
-
-- Matrix access token.
-- Device and E2EE keys.
-- Matrix sync loop.
-- Event send/receive routing.
-- Room state cache.
-- Agent registration and heartbeat.
-- Local authorization policy.
-- Process spawning for local executions.
-- Stream chunking and reassembly.
-- Retry queues.
-- Rate limiting.
-- Audit logging.
-
-### IPC Transport
-
-Preferred POSIX transport:
+POSIX:
 
 ```text
 $XDG_RUNTIME_DIR/mx-agent/daemon.sock
 ```
 
-Properties:
-
-- Unix domain socket.
-- Mode `0600`.
-- Owned by the current user.
-- Supports peer credential checks with `SO_PEERCRED` on Linux.
-
-Windows equivalent:
+Windows:
 
 ```text
 \\.\pipe\mx-agent-daemon
 ```
 
-### IPC Protocol
+Security:
 
-Initial recommendation: JSON-RPC over a framed Unix socket.
+- socket mode `0600`
+- owned by current user
+- verify peer credentials where supported, e.g. `SO_PEERCRED`
+- optional local IPC auth token stored outside agent-visible env
 
-Example request:
+### 10.3 IPC Protocol
+
+Start with framed JSON-RPC over Unix socket. The framing should support streaming messages and cancellation.
+
+Request:
 
 ```json
 {
@@ -729,13 +795,11 @@ Response:
 {
   "jsonrpc": "2.0",
   "id": "req-123",
-  "result": {
-    "invocation_id": "inv_01HZ..."
-  }
+  "result": { "invocation_id": "inv_01HZ..." }
 }
 ```
 
-Streaming frame from daemon to CLI:
+Stream from daemon to CLI:
 
 ```json
 {
@@ -747,7 +811,7 @@ Streaming frame from daemon to CLI:
 }
 ```
 
-Streaming frame from CLI to daemon:
+Stream from CLI to daemon:
 
 ```json
 {
@@ -760,30 +824,145 @@ Streaming frame from CLI to daemon:
 }
 ```
 
+Cancel:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-124",
+  "method": "invocation.cancel",
+  "params": {
+    "room": "!abc:matrix.org",
+    "invocation_id": "inv_01HZ...",
+    "reason": "caller_cancelled"
+  }
+}
+```
+
 ---
 
-## 5. Security Boundary and Token Isolation
+## 11. Reliability Model
 
-`mx-agent` can trigger remote code execution, so room membership must never imply execution permission.
+### 11.1 Delivery Assumptions
 
-### Security Goals
+Matrix provides durable event history, but clients must still handle:
 
-1. Matrix access tokens are never exposed to coding agents.
-2. Device keys are never readable by child processes.
-3. Remote execution requires explicit local policy.
-4. Privileged requests are signed and auditable.
-5. E2EE is used where possible.
-6. Agents run commands in restricted environments by default.
+- duplicate events
+- delayed events
+- out-of-order stream chunks
+- homeserver rate limits
+- federation delay
+- daemon restarts
+- E2EE decryption delays
+- partial media upload failures
 
-### Credential Storage
+### 11.2 Idempotency
 
-The daemon owns all credentials.
+Privileged request events should include:
 
-Recommended Linux paths:
+```text
+request_id
+invocation_id
+idempotency_key
+nonce
+expires_at
+```
+
+Daemon behavior:
+
+- Ignore expired requests.
+- Reject replayed nonces.
+- De-duplicate by idempotency key.
+- Persist invocation state before starting local child process.
+- On restart, reconcile running child processes and Matrix invocation state.
+
+### 11.3 Reconnect and Recovery
+
+On daemon startup or reconnect:
+
+1. Resume Matrix sync from stored sync token.
+2. Load active invocations from local store.
+3. Fetch room state for agent/task/invocation snapshots.
+4. Reconcile local process table with invocation state.
+5. Emit recovery updates for orphaned, failed, or completed invocations.
+6. Rebuild stream cursors per `(invocation_id, stream)`.
+
+### 11.4 Failure Modes
+
+| Failure | Expected behavior |
+|---|---|
+| Target agent offline | request remains pending until timeout or is rejected by caller policy |
+| Homeserver rate limit | daemon backs off, chunks less frequently, may switch to artifact mode |
+| Missing stream chunk | receiver buffers then marks degraded or fails in strict mode |
+| Daemon crashes while child runs | supervisor kills or recovers child according to policy |
+| Request arrives after expiry | target rejects without execution |
+| E2EE decryption fails | event ignored or marked undecryptable; no execution |
+| Policy changes during run | new requests use new policy; running invocations follow configured behavior |
+
+---
+
+## 12. Approval Workflow
+
+Policy can require approval before executing privileged requests.
+
+Policy flag:
+
+```toml
+requires_approval = true
+```
+
+Commands:
+
+```bash
+mx-agent approval list --room '!abc:matrix.org'
+mx-agent approval show req_01HZ...
+mx-agent approval approve req_01HZ...
+mx-agent approval deny req_01HZ... --reason 'unsafe command'
+```
+
+Approval request event:
+
+```json
+{
+  "type": "com.mxagent.approval.request.v1",
+  "content": {
+    "request_id": "req_01HZ...",
+    "invocation_id": "inv_01HZ...",
+    "requester": "claude-local",
+    "target": "developer-pi",
+    "summary": "Run npm test in /home/me/code/project",
+    "risk": "medium",
+    "expires_at": "2026-06-02T12:05:00Z"
+  }
+}
+```
+
+Approval decision event:
+
+```json
+{
+  "type": "com.mxagent.approval.decision.v1",
+  "content": {
+    "request_id": "req_01HZ...",
+    "decision": "approved",
+    "approved_by": "local-user",
+    "created_at": "2026-06-02T12:00:30Z"
+  }
+}
+```
+
+---
+
+## 13. Security Boundary and Token Isolation
+
+### 13.1 Credential Storage
+
+Daemon-owned paths on Linux:
 
 ```text
 ~/.local/share/mx-agent/session.db
 ~/.local/share/mx-agent/crypto-store/
+~/.local/share/mx-agent/signing-keys/
 ~/.config/mx-agent/config.toml
 ~/.config/mx-agent/policy.toml
 $XDG_RUNTIME_DIR/mx-agent/daemon.sock
@@ -795,44 +974,70 @@ Permissions:
 chmod 0700 ~/.local/share/mx-agent
 chmod 0600 ~/.local/share/mx-agent/session.db
 chmod 0700 ~/.local/share/mx-agent/crypto-store
+chmod 0700 ~/.local/share/mx-agent/signing-keys
 chmod 0600 ~/.config/mx-agent/policy.toml
 ```
 
 macOS should use Keychain for tokens. Windows should use Credential Manager or DPAPI.
 
-Never expose Matrix tokens through:
+Never expose tokens through:
 
-- Environment variables.
-- Command arguments.
-- Logs.
-- Shell history.
-- stdout/stderr.
-- Matrix messages.
-- Agent-readable config files.
+- environment variables
+- command arguments
+- logs
+- shell history
+- stdout/stderr
+- Matrix messages
+- agent-readable config files
 
-### Daemon Socket Protection
+### 13.2 Trust Bootstrap
 
-The daemon should reject IPC clients that do not match the current UID. On Linux, verify peer credentials via `SO_PEERCRED`.
+Supported trust modes:
 
-Socket path:
+| Mode | Description | Security |
+|---|---|---|
+| manual | user verifies signing key fingerprint | strongest operational default |
+| Matrix device verified | trust follows verified Matrix device | strong if Matrix verification is used correctly |
+| room-admin grant | trusted admin publishes trust state | convenient for teams |
+| TOFU | first key seen is trusted | convenient but vulnerable on first contact |
 
-```text
-$XDG_RUNTIME_DIR/mx-agent/daemon.sock
+Trust commands:
+
+```bash
+mx-agent trust list --room '!abc:matrix.org'
+mx-agent trust fingerprint --agent developer-pi
+mx-agent trust approve --room '!abc:matrix.org' --agent developer-pi --key mxagent-ed25519:abc123
+mx-agent trust revoke --room '!abc:matrix.org' --agent developer-pi --key mxagent-ed25519:abc123
 ```
 
-Permissions:
+Trust state event:
 
 ```text
-0600
+type: com.mxagent.trust.v1
+state_key: <agent_id>|<key_id>
 ```
 
-### Execution Policy
+```json
+{
+  "agent_id": "developer-pi",
+  "key_id": "mxagent-ed25519:abc123",
+  "fingerprint": "SHA256:...",
+  "status": "trusted",
+  "trusted_by": "@owner:matrix.org",
+  "created_at": "2026-06-02T12:00:00Z",
+  "expires_at": null,
+  "revoked_at": null
+}
+```
 
-Example policy:
+### 13.3 Execution Policy
+
+Example:
 
 ```toml
 [rooms."!abc:matrix.org"]
 trusted = true
+raw_exec_default = "deny"
 
 [rooms."!abc:matrix.org".agents."@claude:matrix.org"]
 allow_exec = true
@@ -848,54 +1053,23 @@ deny_args_regex = [
 max_runtime_ms = 900000
 max_output_bytes = 5000000
 requires_approval = false
+sandbox = "bubblewrap"
+network = "deny"
 ```
 
-Prefer named tools over arbitrary shell commands:
+Policy recommendations:
 
-```bash
-mx-agent call --tool run_tests
-```
+- Prefer `call` tools over raw `exec`.
+- Disable raw shell execution by default.
+- Use allowlists for commands, cwd, tools, and environment variables.
+- Apply network deny-by-default for remote execution.
+- Enforce output and runtime caps.
 
-Raw shell execution should be disabled in high-security environments.
+### 13.4 Environment Scrubbing
 
-### Signed Requests
+Child process environment should be allowlist-based.
 
-Each daemon manages an Ed25519 signing key. Privileged requests include a signature over canonical JSON.
-
-```json
-{
-  "type": "com.mxagent.exec.request",
-  "content": {
-    "invocation_id": "inv_01HZ...",
-    "requester_agent": "claude-local",
-    "target_agent": "developer-pi",
-    "command": ["npm", "test"],
-    "nonce": "random",
-    "created_at": "2026-06-02T12:00:00Z",
-    "expires_at": "2026-06-02T12:05:00Z",
-    "signature": {
-      "alg": "ed25519",
-      "key_id": "mxagent-ed25519:abc123",
-      "sig": "base64..."
-    }
-  }
-}
-```
-
-The receiver verifies:
-
-- Signature validity.
-- Trusted key for the room.
-- Matrix sender and device match expected identity.
-- Nonce has not been replayed.
-- Request has not expired.
-- Local policy allows the operation.
-
-### Environment Scrubbing
-
-Remote child processes should receive a sanitized environment. Default behavior should be allowlist-based.
-
-Sensitive values to exclude unless explicitly allowed:
+Exclude unless explicitly allowed:
 
 ```text
 MATRIX_ACCESS_TOKEN
@@ -910,27 +1084,28 @@ AZURE_*
 NPM_TOKEN
 ```
 
-### Sandboxing
+### 13.5 Sandboxing
 
 Minimum controls:
 
-- Restricted cwd.
-- Sanitized env.
-- Timeout.
-- Output cap.
-- Kill process group on timeout.
+- restricted cwd
+- sanitized env
+- timeout
+- output cap
+- kill process group on timeout/cancel
 
 Stronger controls:
 
-- Docker or Podman.
-- bubblewrap or firejail.
-- chroot.
-- user namespace.
-- seccomp.
-- Read-only filesystem except workspace.
-- Network disabled by default.
+- Docker or Podman
+- bubblewrap or firejail
+- chroot
+- user namespace
+- seccomp
+- read-only root filesystem
+- writable workspace and temp only
+- network disabled by default
 
-Example sandbox config:
+Example:
 
 ```toml
 [execution]
@@ -940,20 +1115,9 @@ read_only_paths = ["/usr", "/bin", "/lib"]
 writable_paths = ["/home/me/code/project", "/tmp/mx-agent"]
 ```
 
-### Room Security Recommendations
+### 13.6 Audit Logging
 
-- Private rooms.
-- Invite-only membership.
-- E2EE enabled.
-- History visibility set to joined members only.
-- Power levels restrict state events.
-- Only trusted agents can send task or exec events.
-- Separate rooms per workspace/repository.
-- Optional per-task rooms for sensitive workflows.
-
-### Audit Logging
-
-Every privileged operation should produce a local audit record without secrets.
+Every privileged decision should be logged locally without secrets:
 
 ```json
 {
@@ -970,43 +1134,23 @@ Every privileged operation should produce a local audit record without secrets.
 
 ---
 
-## Event Namespace
+## 14. Matrix Room Security
 
-Recommended custom event types:
+Recommended room settings:
 
-```text
-com.mxagent.agent.v1
-com.mxagent.task.v1
-com.mxagent.invocation.v1
-com.mxagent.exec.request
-com.mxagent.exec.accepted
-com.mxagent.exec.rejected
-com.mxagent.exec.finished
-com.mxagent.stream.chunk
-com.mxagent.context.share
-com.mxagent.pty.resize
-```
+- private invite-only rooms
+- E2EE enabled
+- history visibility: joined members only
+- power levels restrict state-event mutation
+- only trusted agents can send `task`, `exec`, `call`, and `trust` events
+- one workspace room per repository/project
+- optional per-task rooms for highly sensitive workflows
 
 ---
 
-## Suggested Implementation Structure
+## 15. Implementation Layout
 
-Rust and Go are both strong candidates.
-
-Rust advantages:
-
-- Strong async ecosystem.
-- Matrix support via `matrix-rust-sdk`.
-- Memory safety.
-- Good Unix socket and PTY support.
-
-Go advantages:
-
-- Simple static binaries.
-- Excellent process, CLI, and networking support.
-- Operational simplicity.
-
-Suggested source layout:
+Suggested Rust/Go layout:
 
 ```text
 mx-agent/
@@ -1018,8 +1162,11 @@ mx-agent/
     call
     share
     task
+    invocation
+    approval
     daemon
     auth
+    trust
   daemon/
     matrix_sync
     event_router
@@ -1027,37 +1174,99 @@ mx-agent/
     process_runner
     policy_engine
     crypto_store
+    approval_queue
+    audit_log
   protocol/
     events
     canonical_json
     signing
     stream_chunking
+    artifact_upload
+    dag
   sandbox/
     docker
     bubblewrap
     none
 ```
 
+Rust advantages:
+
+- strong async ecosystem
+- `matrix-rust-sdk`
+- memory safety
+- good Unix socket and PTY support
+
+Go advantages:
+
+- simple static binaries
+- excellent process/networking support
+- operational simplicity
+
 ---
 
-## End-to-End Flow
+## 16. End-to-End Example
 
-1. Claude Code runs `mx-agent exec --agent developer-pi -- npm test`.
-2. The CLI sends `exec.start` to the local daemon over Unix socket.
-3. The local daemon signs and emits `com.mxagent.exec.request` to the Matrix room.
-4. The remote Pi daemon receives the request via Matrix sync.
-5. The remote daemon verifies identity, signature, replay nonce, expiry, and local policy.
-6. The remote daemon starts the command in a restricted environment.
-7. stdout/stderr are chunked into `com.mxagent.stream.chunk` events.
-8. The local daemon receives chunks and forwards them over IPC.
-9. The local CLI writes data to stdout/stderr.
-10. The remote daemon emits `com.mxagent.exec.finished`.
-11. The local CLI exits with the remote process exit code.
+Claude Code asks a remote Pi agent to run tests:
 
-The fundamental split remains:
+```bash
+mx-agent workspace join '#project-orchestration:matrix.org'
 
-```text
-CLI = stateless Unix UX
-Daemon = Matrix session, crypto, policy, process orchestration
-Matrix = federated event log and distributed state machine
+mx-agent share diff \
+  --room '#project-orchestration:matrix.org' \
+  --base main
+
+TASK_ID=$(mx-agent task create \
+  --room '#project-orchestration:matrix.org' \
+  --title 'Run npm test on latest diff' \
+  --assign developer-pi \
+  --json | jq -r .task_id)
+
+mx-agent exec \
+  --room '#project-orchestration:matrix.org' \
+  --agent developer-pi \
+  --task "$TASK_ID" \
+  --cwd /home/me/code/project \
+  --stream \
+  -- npm test
 ```
+
+Flow:
+
+1. CLI sends `exec.start` to the local daemon over Unix socket.
+2. Local daemon creates signed `com.mxagent.exec.request.v1`.
+3. Matrix federates the event to the workspace room.
+4. Remote Pi daemon receives the event through `/sync`.
+5. Remote daemon verifies Matrix sender, device trust, mx-agent signature, nonce, expiry, and local policy.
+6. If required, approval is requested and awaited.
+7. Remote daemon starts `npm test` in the configured sandbox.
+8. stdout/stderr are streamed as `com.mxagent.stream.chunk.v1` or uploaded as artifacts if large.
+9. Local daemon receives chunks and forwards them over IPC.
+10. Local CLI writes stdout/stderr to the terminal.
+11. Remote daemon emits `com.mxagent.exec.finished.v1`.
+12. Local CLI exits with the remote exit code.
+
+---
+
+## 17. MVP Scope
+
+Recommended MVP:
+
+1. Daemon with Matrix login, sync, room join/create.
+2. Unix socket JSON-RPC IPC.
+3. Agent registration and listing.
+4. Signed `call` requests for named tools.
+5. One built-in tool: `run_tests`.
+6. Basic `exec` behind explicit local policy.
+7. stdout/stderr chunk streaming with output cap.
+8. Task state create/list/update.
+9. Local credential isolation and audit log.
+
+Defer until after MVP:
+
+- PTY mode.
+- Large artifact mode.
+- Multi-writer conflict resolution UI.
+- Rich approval UX.
+- Advanced sandboxing presets.
+- Cross-platform named pipes.
+- Full key rotation/revocation automation.
