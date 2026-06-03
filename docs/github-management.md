@@ -236,11 +236,18 @@ scripts/issue.sh 15 --dry-run                  # show the exact pi invocation
 scripts/issue.sh 15 -- --thinking high -nc     # pass extra flags verbatim to pi
 ```
 
+```bash
+scripts/issue.sh 15 --log-dir ./logs            # tee the transcript to a per-issue log
+scripts/issue.sh 15 --no-verify                 # skip the post-run CLOSED check
+scripts/issue.sh 15 --force                      # run even if already CLOSED
+```
+
 Notes:
 
 - Slash-command/template expansion only happens in pi's interactive editor, so the script performs the substitution itself before calling `pi -p`.
+- **Outcome is verified against GitHub.** pi's print-mode exit code only reflects whether the model responded, not whether the issue shipped, so after the run the script checks that the issue is `CLOSED` and fails otherwise. Already-closed issues are skipped and unknown numbers fail fast (before spending tokens). Disable with `--no-verify`; re-run anyway with `--force`.
 - Headless mode cannot ask interactive questions, so the template's "ask whether to continue" step becomes "state the assumption and proceed"; pass a note to steer it.
-- Each run is fully autonomous (edits, pushes, opens a PR, and merges unattended). `pi` is resolved from `PATH`, then `~/.local/share/pi-node/current/bin/pi`, or `PI_BIN`.
+- Each run is fully autonomous (edits, pushes, opens a PR, and merges unattended). `pi` is resolved from `PATH`, then `~/.local/share/pi-node/current/bin/pi`, or `PI_BIN`; `gh` from `PATH` then `~/.local/bin/gh` or `GH_BIN`. `PI_MODEL`, `PI_THINKING`, and `MX_AGENT_LOG_DIR` set defaults for the matching flags.
 
 ### Many issues in order: `scripts/issues.sh`
 
@@ -254,7 +261,7 @@ scripts/issues.sh 15-30 --start 21               # resume from #21
 scripts/issues.sh 15 16 18-20 --dry-run          # preview the plan
 ```
 
-It stops at the first failure by default (`--keep-going` to continue), preserves the given order, supports number/range specs, is resumable with `--start`, forwards flags after `--` to `issue.sh`, and prints a completed/failed summary. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
+It stops at the first failure by default (`--keep-going` to continue), preserves the given order, supports number/range specs, forwards flags after `--` to `issue.sh`, and prints a completed/failed summary (also on Ctrl-C). Because each run verifies closure and already-closed issues are skipped, a batch is safely **resumable just by re-running it**; `--start <n>` and `--log-dir <dir>` (forwarded to each run) are also available. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
 
 Requirements: `pi` on `PATH` (or `PI_BIN`), plus the same `gh`/`git`/`cargo` access the interactive workflow uses.
 

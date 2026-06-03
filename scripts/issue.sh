@@ -7,6 +7,11 @@
 # result to `pi -p` (print mode) so the agent implements the issue end-to-end:
 # branch, code, test, PR, watch CI, merge.
 #
+# Because pi's print-mode exit code only reflects whether the model responded
+# (not whether the issue actually shipped), this script verifies against GitHub
+# afterward: a run "succeeds" only if the issue ends up CLOSED. Already-closed
+# issues are skipped, and unknown issue numbers fail fast before spending tokens.
+#
 # Usage:
 #   scripts/issue.sh <issue-number> [notes...] [-- <extra pi flags>]
 #
@@ -16,10 +21,19 @@
 #   --model <pattern>  Pass through to pi (e.g. sonnet:high, openai/gpt-4o).
 #   --thinking <level> Pass through to pi (off|minimal|low|medium|high|xhigh).
 #   --name <name>      Session display name (default: "issue #<number>").
+#   --repo <owner/repo> Repository for issue lookups (default: gh-detected).
+#   --log-dir <dir>    Tee pi output to <dir>/issue-<n>-<timestamp>.log.
+#   --no-verify        Do not check that the issue is CLOSED after the run.
+#   --force            Run even if the issue is already CLOSED.
 #   --print-prompt     Expand the template and print it; do not run pi.
 #   --dry-run          Print the exact pi command; do not run it.
 #   --                 Everything after is passed verbatim to pi.
 #   -h, --help         Show this help.
+#
+# Environment:
+#   PI_BIN, GH_BIN     Override the pi / gh executables.
+#   REPO               Default repository (owner/repo).
+#   PI_MODEL, PI_THINKING, MX_AGENT_LOG_DIR  Defaults for the matching flags.
 #
 # Notes:
 #   - In headless mode pi cannot ask interactive questions. The template's
@@ -34,13 +48,22 @@ TEMPLATE=".pi/prompts/issue.md"
 MODE_ARGS=()
 PASSTHRU=()
 SESSION_NAME=""
+REPO="${REPO:-}"
+LOG_DIR="${MX_AGENT_LOG_DIR:-}"
+VERIFY=1
+FORCE=0
 PRINT_PROMPT=0
 DRY_RUN=0
 ARGS=()
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo ">> $*" >&2; }
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the leading comment block (after the shebang) as help text.
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
+
+# Seed model/thinking from the environment (overridable by explicit flags).
+[ -n "${PI_MODEL:-}" ] && PASSTHRU+=(--model "$PI_MODEL")
+[ -n "${PI_THINKING:-}" ] && PASSTHRU+=(--thinking "$PI_THINKING")
 
 # Split CLI args at `--`: before it are our flags/positional args, after it are
 # verbatim pi flags.
@@ -52,6 +75,10 @@ while [ $# -gt 0 ]; do
     --model) shift; PASSTHRU+=(--model "${1:?--model needs a value}") ;;
     --thinking) shift; PASSTHRU+=(--thinking "${1:?--thinking needs a value}") ;;
     --name) shift; SESSION_NAME="${1:?--name needs a value}" ;;
+    --repo) shift; REPO="${1:?--repo needs a value}" ;;
+    --log-dir) shift; LOG_DIR="${1:?--log-dir needs a value}" ;;
+    --no-verify) VERIFY=0 ;;
+    --force) FORCE=1 ;;
     --print-prompt) PRINT_PROMPT=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --) shift; PASSTHRU+=("$@"); break ;;
@@ -77,6 +104,24 @@ if [ -z "$PI_BIN" ]; then
     die "pi CLI not found; install pi or set PI_BIN"
   fi
 fi
+
+# Resolve the gh binary (used for skip/verify). Optional unless verification is on.
+GH_BIN="${GH_BIN:-}"
+if [ -z "$GH_BIN" ]; then
+  if command -v gh >/dev/null 2>&1; then
+    GH_BIN="$(command -v gh)"
+  elif [ -x "$HOME/.local/bin/gh" ]; then
+    GH_BIN="$HOME/.local/bin/gh"
+  fi
+fi
+
+# Report an issue's state via gh, or "UNKNOWN" if it cannot be determined.
+issue_state() {
+  [ -n "$GH_BIN" ] || { echo "UNKNOWN"; return; }
+  local repo_args=()
+  [ -n "$REPO" ] && repo_args=(--repo "$REPO")
+  "$GH_BIN" issue view "$ISSUE" "${repo_args[@]}" --json state -q .state 2>/dev/null || echo "UNKNOWN"
+}
 
 # Strip an optional leading YAML frontmatter block (--- ... ---).
 strip_frontmatter() {
@@ -131,5 +176,58 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+# Resolve the repository once (needed for skip/verify) if gh is available.
+if [ -z "$REPO" ] && [ -n "$GH_BIN" ]; then
+  REPO="$("$GH_BIN" repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+fi
+
+# Preflight: skip already-closed issues and fail fast on unknown numbers.
+if [ "$VERIFY" -eq 1 ] || [ "$FORCE" -eq 0 ]; then
+  if [ -z "$GH_BIN" ]; then
+    [ "$VERIFY" -eq 1 ] && die "gh not found but verification is on; install gh, set GH_BIN, or pass --no-verify"
+  else
+    state="$(issue_state)"
+    case "$state" in
+      CLOSED)
+        if [ "$FORCE" -eq 0 ]; then
+          note "issue #$ISSUE is already CLOSED; skipping (use --force to run anyway)"
+          exit 0
+        fi
+        ;;
+      UNKNOWN)
+        die "issue #$ISSUE not found in ${REPO:-the current repo} (is gh authenticated?)"
+        ;;
+    esac
+  fi
+fi
+
+# Run pi, optionally teeing the transcript to a per-issue log file.
+LOG_FILE=""
+if [ -n "$LOG_DIR" ]; then
+  mkdir -p "$LOG_DIR"
+  LOG_FILE="$LOG_DIR/issue-$ISSUE-$(date +%Y%m%dT%H%M%S).log"
+  note "logging transcript to $LOG_FILE"
+fi
+
 note "running /issue $ISSUE headlessly via $PI_BIN (session: $SESSION_NAME)"
-exec "${CMD[@]}"
+set +e
+if [ -n "$LOG_FILE" ]; then
+  "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+  pi_rc=${PIPESTATUS[0]}
+else
+  "${CMD[@]}"
+  pi_rc=$?
+fi
+set -e
+
+# Verify the outcome against GitHub: a real success means the issue is CLOSED.
+if [ "$VERIFY" -eq 1 ]; then
+  state="$(issue_state)"
+  if [ "$state" = "CLOSED" ]; then
+    note "verified: issue #$ISSUE is CLOSED"
+    exit 0
+  fi
+  die "issue #$ISSUE is still ${state} after the run (pi exit ${pi_rc}); treating as failure"
+fi
+
+exit "$pi_rc"
