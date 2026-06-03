@@ -15,6 +15,7 @@ pub mod replay;
 pub mod session;
 pub mod signing;
 pub mod sync;
+pub mod tool_exec;
 pub mod tools;
 pub mod trust;
 pub mod trust_state;
@@ -27,8 +28,8 @@ pub use agent::{
 };
 pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE_NAME};
 pub use call::{
-    authorize_call_request, build_signed_call_request, emit_call_response, rejection_response,
-    send_call_request, success_response, CallRejection,
+    authorize_call_request, build_signed_call_request, emit_call_response, execute_authorized_call,
+    rejection_response, send_call_request, success_response, CallRejection,
 };
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
@@ -52,6 +53,7 @@ pub use signing::{
 pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
 };
+pub use tool_exec::{execute_tool, ToolError, ToolResult, RUN_TESTS};
 pub use tools::{builtin_tools, ToolRegistry};
 pub use trust::{fingerprint_from_key_id, TrustEntry, TrustStatus, TrustStore};
 pub use trust_state::{

@@ -223,6 +223,26 @@ pub fn success_response(request_id: impl Into<String>, result: Value) -> CallRes
     }
 }
 
+/// Execute an authorized [`CallRequest`] and build its [`CallResponse`].
+///
+/// This is the receive-side bridge from the verification pipeline
+/// ([`authorize_call_request`]) to the built-in tool runner
+/// ([`crate::tool_exec::execute_tool`]). A tool that runs and reports a nonzero
+/// exit code still produces a successful (`ok: true`) response carrying its
+/// structured result; only a failure to *invoke* the tool yields `ok: false`.
+pub fn execute_authorized_call(request: &CallRequest) -> CallResponse {
+    match crate::tool_exec::execute_tool(&request.tool, &request.args) {
+        Ok(result) => success_response(request.request_id.clone(), result.to_value()),
+        Err(err) => CallResponse {
+            request_id: request.request_id.clone(),
+            ok: false,
+            result: None,
+            error: Some(err.to_string()),
+            extra: Default::default(),
+        },
+    }
+}
+
 /// Build a failed [`CallResponse`] for `request_id` from a [`CallRejection`].
 pub fn rejection_response(
     request_id: impl Into<String>,
@@ -515,6 +535,29 @@ allow_tools = ["run_tests", "lint"]
         assert_eq!(response.request_id, "req_01HZ");
         assert!(response.result.is_none());
         assert_eq!(response.error.as_deref(), Some("unsigned"));
+    }
+
+    #[test]
+    fn execute_authorized_call_reports_invoke_failure() {
+        // An unknown tool cannot be invoked, so the response is ok: false with a
+        // machine-readable error rather than a tool result.
+        let request = CallRequest {
+            invocation_id: "inv".to_string(),
+            request_id: "req_01HZ".to_string(),
+            tool: "definitely_not_a_tool".to_string(),
+            args: json!({}),
+            signature: Signature {
+                alg: signing::ALG_ED25519.to_string(),
+                key_id: "k".to_string(),
+                sig: String::new(),
+            },
+            extra: Default::default(),
+        };
+        let response = execute_authorized_call(&request);
+        assert!(!response.ok);
+        assert_eq!(response.request_id, "req_01HZ");
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
     }
 
     #[test]
