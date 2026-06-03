@@ -14,6 +14,7 @@ pub mod session;
 pub mod signing;
 pub mod sync;
 pub mod trust;
+pub mod trust_state;
 pub mod workspace;
 
 pub use agent::{
@@ -44,6 +45,11 @@ pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
 };
 pub use trust::{fingerprint_from_key_id, TrustEntry, TrustStatus, TrustStore};
+pub use trust_state::{
+    effective_trust, effective_trust_table, list_trust_states, list_trust_states_for_session,
+    publish_trust_state, publish_trust_state_for_session, trust_state_from_entry, trust_state_key,
+    EffectiveTrust, TrustSource,
+};
 pub use workspace::{
     attach_workspace, attach_workspace_for_session, create_workspace, create_workspace_for_session,
     join_workspace, join_workspace_for_session, workspace_status, workspace_status_for_session,

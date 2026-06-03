@@ -364,6 +364,10 @@ enum TrustCommand {
     Approve(TrustApproveArgs),
     /// Revoke an agent signing key.
     Revoke(TrustRevokeArgs),
+    /// Publish a local trust record to a workspace room as room state.
+    Publish(TrustPublishArgs),
+    /// Inspect trust state published in a workspace room (local store wins).
+    State(TrustStateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -400,6 +404,29 @@ struct TrustRevokeArgs {
     /// Signing key identifier (`mxagent-ed25519:<base64>`).
     #[arg(long, value_name = "KEY")]
     key: String,
+}
+
+#[derive(Debug, Args)]
+struct TrustPublishArgs {
+    /// Workspace room to publish the trust state into.
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Agent identifier the key belongs to.
+    #[arg(long = "agent", value_name = "AGENT")]
+    agent: String,
+    /// Signing key identifier (`mxagent-ed25519:<base64>`).
+    #[arg(long, value_name = "KEY")]
+    key: String,
+}
+
+#[derive(Debug, Args)]
+struct TrustStateArgs {
+    /// Workspace room to read published trust state from.
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Only show records for this agent.
+    #[arg(long = "agent", value_name = "AGENT")]
+    agent: Option<String>,
 }
 
 /// Map repeated `-v` flags to a default log filter directive.
@@ -591,6 +618,8 @@ fn handle_trust(global: &GlobalArgs, cmd: &TrustCommand) -> ExitCode {
         TrustCommand::List(args) => trust_list(global, args),
         TrustCommand::Approve(args) => trust_approve(global, args),
         TrustCommand::Revoke(args) => trust_revoke(global, args),
+        TrustCommand::Publish(args) => trust_publish(global, args),
+        TrustCommand::State(args) => trust_state(global, args),
     }
 }
 
@@ -715,6 +744,138 @@ fn trust_revoke(global: &GlobalArgs, args: &TrustRevokeArgs) -> ExitCode {
             ExitCode::from(3)
         }
     }
+}
+
+/// Publish a local trust record to a workspace room as `com.mxagent.trust.v1`
+/// state. The record must already exist in the local store; publication is
+/// purely advisory and never changes local trust.
+fn trust_publish(global: &GlobalArgs, args: &TrustPublishArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    let store = match mx_agent_daemon::TrustStore::load(&paths) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("mx-agent: could not read trust store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let entry = match store.entry(&args.agent, &args.key) {
+        Some(entry) => entry.clone(),
+        None => {
+            eprintln!(
+                "mx-agent: no local trust record for agent {} key {}; \
+                 approve it first with `mx-agent trust approve`",
+                args.agent, args.key
+            );
+            return ExitCode::from(3);
+        }
+    };
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::publish_trust_state_for_session(&session, &args.room, &entry).await {
+            Ok(state) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!(
+                        "mx-agent: published {} trust for agent {} to {}",
+                        state.status, state.agent_id, args.room
+                    );
+                    println!("  key:         {}", state.key_id);
+                    println!("  fingerprint: {}", state.fingerprint);
+                    println!("  trusted_by:  {}", state.trusted_by);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not publish trust state: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// Inspect trust state published in a workspace room, combined with the local
+/// store. The local store is the final authority: a local revocation overrides
+/// any room-published trust.
+fn trust_state(global: &GlobalArgs, args: &TrustStateArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    let local = match mx_agent_daemon::TrustStore::load(&paths) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("mx-agent: could not read trust store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::list_trust_states_for_session(&session, &args.room).await {
+            Ok(states) => {
+                let states: Vec<_> = states
+                    .into_iter()
+                    .filter(|s| args.agent.as_deref().map_or(true, |a| s.agent_id == a))
+                    .collect();
+                let effective = mx_agent_daemon::effective_trust_table(&local, &states);
+                let effective: Vec<_> = effective
+                    .into_iter()
+                    .filter(|t| args.agent.as_deref().map_or(true, |a| t.agent_id == a))
+                    .collect();
+                if global.json {
+                    let obj = serde_json::json!({
+                        "published": states,
+                        "effective": effective.iter().map(|t| serde_json::json!({
+                            "agent_id": t.agent_id,
+                            "key_id": t.key_id,
+                            "trusted": t.trusted,
+                            "source": format!("{:?}", t.source).to_lowercase(),
+                        })).collect::<Vec<_>>(),
+                    });
+                    println!("{obj}");
+                } else if states.is_empty() {
+                    println!("mx-agent: no trust state published in {}", args.room);
+                } else {
+                    println!(
+                        "mx-agent: {} published trust record(s) in {}",
+                        states.len(),
+                        args.room
+                    );
+                    for s in &states {
+                        println!("  {} {}", s.status, s.key_id);
+                        println!("    agent:       {}", s.agent_id);
+                        println!("    fingerprint: {}", s.fingerprint);
+                        println!("    trusted_by:  {}", s.trusted_by);
+                    }
+                    println!("mx-agent: effective trust (local store wins):");
+                    for t in &effective {
+                        let label = if t.trusted { "trusted" } else { "untrusted" };
+                        let source = format!("{:?}", t.source).to_lowercase();
+                        println!("  {label} {} {} (via {source})", t.agent_id, t.key_id);
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not read trust state: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 /// Show the local daemon signing key fingerprint, generating the key on first
@@ -1427,6 +1588,8 @@ fn command_path(command: &Command) -> String {
                 TrustCommand::Fingerprint => "fingerprint",
                 TrustCommand::Approve(_) => "approve",
                 TrustCommand::Revoke(_) => "revoke",
+                TrustCommand::Publish(_) => "publish",
+                TrustCommand::State(_) => "state",
             }
         ),
     }
@@ -1644,6 +1807,61 @@ mod tests {
             }
             other => panic!("expected trust list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trust_publish_requires_room_agent_and_key() {
+        assert!(Cli::try_parse_from(["mx-agent", "trust", "publish"]).is_err());
+        assert!(Cli::try_parse_from([
+            "mx-agent", "trust", "publish", "--agent", "dev-pi", "--key", "k",
+        ])
+        .is_err());
+
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "trust",
+            "publish",
+            "--room",
+            "!abc:matrix.org",
+            "--agent",
+            "dev-pi",
+            "--key",
+            "mxagent-ed25519:abc123",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Trust(TrustCommand::Publish(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.agent, "dev-pi");
+                assert_eq!(args.key, "mxagent-ed25519:abc123");
+            }
+            other => panic!("expected trust publish, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "trust publish");
+    }
+
+    #[test]
+    fn trust_state_requires_room_and_accepts_agent_filter() {
+        assert!(Cli::try_parse_from(["mx-agent", "trust", "state"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "trust",
+            "state",
+            "--room",
+            "!abc:matrix.org",
+            "--agent",
+            "dev-pi",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Trust(TrustCommand::State(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.agent.as_deref(), Some("dev-pi"));
+            }
+            other => panic!("expected trust state, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "trust state");
     }
 
     #[test]
