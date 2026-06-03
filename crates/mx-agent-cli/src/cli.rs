@@ -113,11 +113,21 @@ struct DaemonStartArgs {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     /// Log in to a Matrix homeserver.
-    Login,
+    Login(AuthLoginArgs),
     /// Show authentication status.
     Status,
     /// Log out and clear the local session.
     Logout,
+}
+
+#[derive(Debug, Args)]
+struct AuthLoginArgs {
+    /// Homeserver base URL, e.g. `https://matrix.org`.
+    #[arg(long, value_name = "URL")]
+    homeserver: String,
+    /// Matrix user localpart or full user ID.
+    #[arg(long, value_name = "USER")]
+    user: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -276,7 +286,152 @@ pub fn run() -> ExitCode {
 
     match &cli.command {
         Command::Daemon(cmd) => handle_daemon(g, cmd),
+        Command::Auth(cmd) => handle_auth(g, cmd),
         _ => unimplemented(g, &path),
+    }
+}
+
+/// Environment variable used to pass the login password without exposing it on
+/// the command line (where it could be captured in shell history or `ps`).
+const ENV_PASSWORD: &str = "MX_AGENT_PASSWORD";
+
+/// Handle the `auth` command group.
+fn handle_auth(global: &GlobalArgs, cmd: &AuthCommand) -> ExitCode {
+    match cmd {
+        AuthCommand::Login(args) => auth_login(global, args),
+        AuthCommand::Status => auth_status(global),
+        AuthCommand::Logout => auth_logout(global),
+    }
+}
+
+/// Read the login password from `MX_AGENT_PASSWORD`, or prompt on stdin.
+///
+/// The password is never echoed back, logged, or passed as an argument.
+fn read_password() -> std::io::Result<String> {
+    if let Ok(pw) = std::env::var(ENV_PASSWORD) {
+        if !pw.is_empty() {
+            return Ok(pw);
+        }
+    }
+    eprint!("Matrix password: ");
+    use std::io::Write;
+    std::io::stderr().flush()?;
+    let mut pw = String::new();
+    std::io::stdin().read_line(&mut pw)?;
+    Ok(pw.trim_end_matches(['\n', '\r']).to_string())
+}
+
+fn auth_login(global: &GlobalArgs, args: &AuthLoginArgs) -> ExitCode {
+    let config = mx_agent_daemon::MatrixConfig {
+        homeserver_url: args.homeserver.clone(),
+    };
+    if let Err(e) = config.validate() {
+        eprintln!("mx-agent: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let password = match read_password() {
+        Ok(pw) if !pw.is_empty() => pw,
+        Ok(_) => {
+            eprintln!(
+                "mx-agent: no password provided; set {ENV_PASSWORD} or enter it when prompted"
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not read password: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("mx-agent: could not start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = runtime.block_on(mx_agent_daemon::login_password(
+        &config, &args.user, &password,
+    ));
+    // Drop the password as soon as login finishes.
+    drop(password);
+
+    match result {
+        Ok(session) => {
+            let paths = mx_agent_daemon::SessionPaths::resolve();
+            if let Err(e) = mx_agent_daemon::save_session(&paths, &session) {
+                eprintln!("mx-agent: login succeeded but saving the session failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            let status = mx_agent_daemon::AuthStatus::from_session(&session);
+            if global.json {
+                println!("{}", status.to_json());
+            } else {
+                println!("mx-agent: logged in as {}", session.user_id);
+                println!("  device: {}", session.device_id);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("mx-agent: login failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn auth_status(global: &GlobalArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    match mx_agent_daemon::auth_status(&paths) {
+        Ok(status) => {
+            if global.json {
+                println!("{}", status.to_json());
+            } else if status.logged_in {
+                println!("mx-agent: logged in");
+                if let Some(user) = &status.user_id {
+                    println!("  user:       {user}");
+                }
+                if let Some(device) = &status.device_id {
+                    println!("  device:     {device}");
+                }
+                if let Some(hs) = &status.homeserver {
+                    println!("  homeserver: {hs}");
+                }
+            } else {
+                println!("mx-agent: not logged in");
+            }
+            if status.logged_in {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            }
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not read auth status: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn auth_logout(global: &GlobalArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    match mx_agent_daemon::clear_session(&paths) {
+        Ok(()) => {
+            if global.json {
+                println!("{{\"logged_in\":false}}");
+            } else {
+                println!("mx-agent: logged out");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not clear session: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -418,7 +573,7 @@ fn command_path(command: &Command) -> String {
         Command::Auth(c) => format!(
             "auth {}",
             match c {
-                AuthCommand::Login => "login",
+                AuthCommand::Login(_) => "login",
                 AuthCommand::Status => "status",
                 AuthCommand::Logout => "logout",
             }
@@ -552,6 +707,23 @@ mod tests {
         let cli = Cli::try_parse_from(["mx-agent", "agent", "list", "--json", "-vv"]).unwrap();
         assert!(cli.global.json);
         assert_eq!(cli.global.verbose, 2);
+    }
+
+    #[test]
+    fn auth_login_requires_homeserver_and_user() {
+        // Both flags are required.
+        assert!(Cli::try_parse_from(["mx-agent", "auth", "login"]).is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "auth",
+            "login",
+            "--homeserver",
+            "https://matrix.org",
+            "--user",
+            "alice",
+        ])
+        .unwrap();
+        assert_eq!(command_path(&cli.command), "auth login");
     }
 
     #[test]
