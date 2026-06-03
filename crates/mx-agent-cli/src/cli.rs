@@ -1898,11 +1898,22 @@ fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
     let mut out = stdout.lock();
     let mut err = stderr.lock();
     match crate::stream::render_stream(frames, &mut out, &mut err) {
-        Ok(Some(code)) => ExitCode::from(code),
-        Ok(None) => {
-            eprintln!("mx-agent: stream ended without exec.finished");
-            ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
-        }
+        // Missing chunks (degraded mode) are surfaced to the user by the
+        // renderer as they are detected; best-effort output continues here.
+        Ok(outcome) => match outcome.exit_code {
+            Some(code) if outcome.degraded() => {
+                eprintln!(
+                    "mx-agent: warning: output was degraded ({} chunk(s) missing)",
+                    outcome.missing.len()
+                );
+                ExitCode::from(code)
+            }
+            Some(code) => ExitCode::from(code),
+            None => {
+                eprintln!("mx-agent: stream ended without exec.finished");
+                ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
+            }
+        },
         Err(e) => {
             eprintln!("mx-agent: failed writing output: {e}");
             ExitCode::FAILURE
