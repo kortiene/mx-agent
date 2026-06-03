@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod audit;
+pub mod call;
 pub mod heartbeat;
 pub mod lifecycle;
 pub mod matrix;
@@ -25,6 +26,10 @@ pub use agent::{
     RegisterAgentOptions, DEFAULT_AGENT_KIND, DEFAULT_MAX_INVOCATIONS,
 };
 pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE_NAME};
+pub use call::{
+    authorize_call_request, build_signed_call_request, emit_call_response, rejection_response,
+    send_call_request, success_response, CallRejection,
+};
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
     DEFAULT_OFFLINE_AFTER, DEFAULT_STALE_AFTER, DEFAULT_STATE_REFRESH,
