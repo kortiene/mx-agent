@@ -92,7 +92,7 @@ where
 /// This is intentionally small: the runner only needs the argv, the working
 /// directory, and any explicit environment overrides. Protocol bookkeeping
 /// (invocation ids, signatures, timeouts) lives with the request itself.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunSpec {
     /// Command argv: program followed by its arguments.
     pub command: Vec<String>,
@@ -100,6 +100,14 @@ pub struct RunSpec {
     pub cwd: PathBuf,
     /// Explicit environment overrides layered on top of the sanitized env.
     pub env: BTreeMap<String, String>,
+    /// Bytes to feed to the child's standard input, if any.
+    ///
+    /// `None` runs the command with stdin connected to `/dev/null` (the
+    /// non-interactive default). `Some(bytes)` writes `bytes` to the child's
+    /// stdin and then closes it, propagating end-of-file exactly once
+    /// (architecture §7.7). An empty `Some(Vec::new())` still opens and closes
+    /// the pipe, so the child observes an immediate EOF.
+    pub stdin: Option<Vec<u8>>,
 }
 
 /// The captured result of a finished, non-interactive command.
@@ -158,8 +166,9 @@ impl std::error::Error for RunError {
 ///
 /// Validates the argv and cwd, applies the sanitized environment, sets the
 /// working directory, and (on Unix) places the child in its own process group.
-/// Stdout and stderr are piped so they can be captured; stdin is null because
-/// this is the non-interactive path.
+/// Stdout and stderr are piped so they can be captured. Stdin is piped when the
+/// spec carries input bytes (so they can be written and the pipe closed),
+/// otherwise it is connected to `/dev/null` for the non-interactive path.
 ///
 /// Kept separate from [`run`] so the command construction is testable without
 /// actually waiting on a child.
@@ -172,13 +181,19 @@ fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
 
     let env = sanitize_env(std::env::vars(), &spec.env);
 
+    let stdin = if spec.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+
     let mut command = Command::new(program);
     command
         .args(args)
         .current_dir(&spec.cwd)
         .env_clear()
         .envs(env)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Reap the child if the runner is dropped before it finishes.
@@ -208,8 +223,24 @@ fn is_existing_dir(path: &Path) -> bool {
 /// missing cwd, or a spawn failure); a command that runs and exits nonzero is a
 /// successful [`RunOutput`] with a nonzero `exit_code`.
 pub async fn run(spec: &RunSpec) -> Result<RunOutput, RunError> {
+    use tokio::io::AsyncWriteExt as _;
+
     let mut command = build_command(spec)?;
-    let output = command.output().await.map_err(RunError::Spawn)?;
+    let mut child = command.spawn().map_err(RunError::Spawn)?;
+
+    // Feed piped stdin (if any) to the child, then drop the handle so the child
+    // sees end-of-file exactly once. The handle is moved out of the child and
+    // explicitly dropped here, before we wait, so even an empty input still
+    // closes the pipe and unblocks a reader like `cat`.
+    if let Some(input) = &spec.stdin {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input).await.map_err(RunError::Spawn)?;
+            stdin.flush().await.map_err(RunError::Spawn)?;
+            drop(stdin);
+        }
+    }
+
+    let output = child.wait_with_output().await.map_err(RunError::Spawn)?;
 
     #[cfg(unix)]
     let signal = {
@@ -299,6 +330,7 @@ mod tests {
             command: vec![],
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
+            stdin: None,
         };
         assert!(matches!(build_command(&spec), Err(RunError::EmptyCommand)));
     }
@@ -309,6 +341,7 @@ mod tests {
             command: vec!["true".to_string()],
             cwd: PathBuf::from("/this/path/should/not/exist/mx-agent"),
             env: BTreeMap::new(),
+            stdin: None,
         };
         assert!(matches!(build_command(&spec), Err(RunError::MissingCwd(_))));
     }
@@ -319,6 +352,7 @@ mod tests {
             command: vec!["true".to_string()],
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
+            stdin: None,
         };
         let out = run(&spec).await.expect("runs");
         assert_eq!(out.exit_code, Some(0));
@@ -328,6 +362,7 @@ mod tests {
             command: vec!["false".to_string()],
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
+            stdin: None,
         };
         let out = run(&spec).await.expect("runs");
         assert_eq!(out.exit_code, Some(1));
@@ -342,6 +377,7 @@ mod tests {
             command: vec!["pwd".to_string()],
             cwd: dir.clone(),
             env: BTreeMap::new(),
+            stdin: None,
         };
         let out = run(&spec).await.expect("runs");
         let printed = String::from_utf8(out.stdout).unwrap();
@@ -361,6 +397,7 @@ mod tests {
             command: vec!["env".to_string()],
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
+            stdin: None,
         };
         let out = run(&spec).await.expect("runs");
         let env_dump = String::from_utf8(out.stdout).unwrap();
@@ -379,6 +416,7 @@ mod tests {
             command: vec!["env".to_string()],
             cwd: std::env::temp_dir(),
             env: overrides(&[("MX_AGENT_RUN_MARKER", "present")]),
+            stdin: None,
         };
         let out = run(&spec).await.expect("runs");
         let env_dump = String::from_utf8(out.stdout).unwrap();
@@ -386,5 +424,50 @@ mod tests {
             env_dump.contains("MX_AGENT_RUN_MARKER=present"),
             "got: {env_dump}"
         );
+    }
+
+    #[tokio::test]
+    async fn piped_stdin_is_forwarded_to_child() {
+        // Acceptance: `echo hi | ... -- cat` returns `hi`. The bytes written to
+        // the child's stdin must come back out of `cat` unchanged.
+        let spec = RunSpec {
+            command: vec!["cat".to_string()],
+            cwd: std::env::temp_dir(),
+            env: BTreeMap::new(),
+            stdin: Some(b"hi\n".to_vec()),
+        };
+        let out = run(&spec).await.expect("runs");
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(out.stdout, b"hi\n");
+    }
+
+    #[tokio::test]
+    async fn empty_piped_stdin_closes_with_eof() {
+        // An empty input still opens and closes the pipe, so a reader like
+        // `cat` observes an immediate EOF and exits cleanly with no output.
+        let spec = RunSpec {
+            command: vec!["cat".to_string()],
+            cwd: std::env::temp_dir(),
+            env: BTreeMap::new(),
+            stdin: Some(Vec::new()),
+        };
+        let out = run(&spec).await.expect("runs");
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn null_stdin_yields_immediate_eof() {
+        // The non-interactive default (no stdin) connects /dev/null, so a
+        // reader sees EOF right away rather than blocking.
+        let spec = RunSpec {
+            command: vec!["cat".to_string()],
+            cwd: std::env::temp_dir(),
+            env: BTreeMap::new(),
+            stdin: None,
+        };
+        let out = run(&spec).await.expect("runs");
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout.is_empty());
     }
 }

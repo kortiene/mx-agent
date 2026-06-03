@@ -1764,6 +1764,7 @@ fn signal_name(n: i32) -> Option<String> {
 async fn collect_exec_frames(
     command: &[String],
     cwd: &std::path::Path,
+    stdin: Option<Vec<u8>>,
 ) -> Result<Vec<crate::stream::StreamFrame>, mx_agent_daemon::RunError> {
     use crate::stream::StreamFrame;
     use mx_agent_protocol::schema::ExecFinished;
@@ -1772,6 +1773,7 @@ async fn collect_exec_frames(
         command: command.to_vec(),
         cwd: cwd.to_path_buf(),
         env: Default::default(),
+        stdin,
     };
     let output = mx_agent_daemon::run(&spec).await?;
 
@@ -1813,6 +1815,24 @@ async fn collect_exec_frames(
 
 /// Run a command and render its forwarded output stream locally, exiting with
 /// the remote command's exit code (architecture §5.3, §7.3).
+fn read_piped_stdin() -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::{IsTerminal as _, Read as _};
+
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        // An interactive terminal is left as the non-interactive `/dev/null`
+        // default; interactive PTY exec is handled separately.
+        return Ok(None);
+    }
+    // Stdin has been redirected (a pipe, file, or here-string): buffer it so it
+    // can be forwarded to the remote command and the remote stdin closed on EOF
+    // (architecture §7.7). The whole input is buffered because the present CLI
+    // frame source is a local loopback that runs the command in one shot.
+    let mut buf = Vec::new();
+    stdin.read_to_end(&mut buf)?;
+    Ok(Some(buf))
+}
+
 fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
     if args.command.is_empty() {
         eprintln!("mx-agent: exec requires a command after `--`");
@@ -1840,7 +1860,19 @@ fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
         }
     };
 
-    let frames = match runtime.block_on(collect_exec_frames(&args.command, &cwd)) {
+    // Detect piped stdin: when our standard input is not a terminal it has been
+    // redirected (a pipe, file, or here-string), so forward those bytes to the
+    // remote command and close on EOF. An interactive terminal is left as the
+    // non-interactive `/dev/null` default (interactive PTY exec is separate).
+    let stdin = match read_piped_stdin() {
+        Ok(stdin) => stdin,
+        Err(e) => {
+            eprintln!("mx-agent: failed reading stdin: {e}");
+            return ExitCode::from(64);
+        }
+    };
+
+    let frames = match runtime.block_on(collect_exec_frames(&args.command, &cwd, stdin)) {
         Ok(frames) => frames,
         Err(e) => {
             eprintln!("mx-agent: exec failed: {e}");
