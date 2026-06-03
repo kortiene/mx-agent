@@ -467,6 +467,7 @@ pub fn run() -> ExitCode {
         Command::Agent(cmd) => handle_agent(g, cmd),
         Command::Trust(cmd) => handle_trust(g, cmd),
         Command::Call(args) => cmd_call(g, args),
+        Command::Exec(args) => cmd_exec(g, args),
         _ => unimplemented(g, &path),
     }
 }
@@ -1728,6 +1729,150 @@ fn cmd_call(global: &GlobalArgs, args: &CallArgs) -> ExitCode {
                 }
                 mx_agent_daemon::ToolError::Spawn(_) => ExitCode::from(128),
             }
+        }
+    }
+}
+
+/// Map a Unix signal number to its name, for reporting signal death.
+fn signal_name(n: i32) -> Option<String> {
+    Some(
+        match n {
+            1 => "SIGHUP",
+            2 => "SIGINT",
+            3 => "SIGQUIT",
+            6 => "SIGABRT",
+            8 => "SIGFPE",
+            9 => "SIGKILL",
+            11 => "SIGSEGV",
+            13 => "SIGPIPE",
+            14 => "SIGALRM",
+            15 => "SIGTERM",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// Run `command` in `cwd` and collect its output as a sequence of exec stream
+/// frames (chunks followed by a terminal finished frame).
+///
+/// This is the CLI's frame source for `exec` today: a local loopback over the
+/// daemon's process runner and stream-capture stages. The Matrix transport that
+/// carries frames from a remote agent's daemon plugs in here later; the
+/// rendering/exit-code layer ([`crate::stream`]) consumes frames the same way
+/// regardless of source.
+async fn collect_exec_frames(
+    command: &[String],
+    cwd: &std::path::Path,
+) -> Result<Vec<crate::stream::StreamFrame>, mx_agent_daemon::RunError> {
+    use crate::stream::StreamFrame;
+    use mx_agent_protocol::schema::ExecFinished;
+
+    let spec = mx_agent_daemon::RunSpec {
+        command: command.to_vec(),
+        cwd: cwd.to_path_buf(),
+        env: Default::default(),
+    };
+    let output = mx_agent_daemon::run(&spec).await?;
+
+    const INVOCATION: &str = "inv-local";
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let stdout_bytes = output.stdout.clone();
+    let stderr_bytes = output.stderr.clone();
+    // Capture concurrently so a full channel never deadlocks the drain below.
+    let capture = tokio::spawn(async move {
+        mx_agent_daemon::capture_child_output(
+            &stdout_bytes[..],
+            &stderr_bytes[..],
+            INVOCATION,
+            mx_agent_daemon::StreamCaptureConfig::batch(),
+            tx,
+        )
+        .await;
+    });
+
+    let mut frames = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        frames.push(StreamFrame::Chunk(chunk));
+    }
+    let _ = capture.await;
+
+    frames.push(StreamFrame::Finished(ExecFinished {
+        invocation_id: INVOCATION.to_string(),
+        exit_code: output.exit_code,
+        signal: output.signal.and_then(signal_name),
+        duration_ms: 0,
+        stdout_bytes: output.stdout.len() as u64,
+        stderr_bytes: output.stderr.len() as u64,
+        truncated: false,
+        artifact_mxc: None,
+        extra: Default::default(),
+    }));
+    Ok(frames)
+}
+
+/// Run a command and render its forwarded output stream locally, exiting with
+/// the remote command's exit code (architecture §5.3, §7.3).
+fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
+    if args.command.is_empty() {
+        eprintln!("mx-agent: exec requires a command after `--`");
+        return ExitCode::from(64);
+    }
+    let cwd = match &args.cwd {
+        Some(p) => p.clone(),
+        None => match std::env::current_dir() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("mx-agent: cannot determine working directory: {e}");
+                return ExitCode::from(64);
+            }
+        },
+    };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("mx-agent: could not start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let frames = match runtime.block_on(collect_exec_frames(&args.command, &cwd)) {
+        Ok(frames) => frames,
+        Err(e) => {
+            eprintln!("mx-agent: exec failed: {e}");
+            return match e {
+                // Command/cwd not found maps to "not found" (architecture §5.3).
+                mx_agent_daemon::RunError::MissingCwd(_) => ExitCode::from(127),
+                mx_agent_daemon::RunError::Spawn(ref io)
+                    if io.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    ExitCode::from(127)
+                }
+                mx_agent_daemon::RunError::EmptyCommand => ExitCode::from(64),
+                mx_agent_daemon::RunError::Spawn(_) => {
+                    ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
+                }
+            };
+        }
+    };
+
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut out = stdout.lock();
+    let mut err = stderr.lock();
+    match crate::stream::render_stream(frames, &mut out, &mut err) {
+        Ok(Some(code)) => ExitCode::from(code),
+        Ok(None) => {
+            eprintln!("mx-agent: stream ended without exec.finished");
+            ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
+        }
+        Err(e) => {
+            eprintln!("mx-agent: failed writing output: {e}");
+            ExitCode::FAILURE
         }
     }
 }
