@@ -12,8 +12,21 @@
 //! iterator of [`StreamFrame`] values, so the same logic serves whatever
 //! delivers the frames (a live daemon IPC stream, or the local runner loopback
 //! used by the `exec` command today).
+//!
+//! ## Reordering and missing chunks (degraded mode)
+//!
+//! Federated, at-least-once delivery means the CLI can see a chunk more than
+//! once, see chunks out of order, or never see a chunk at all. To keep terminal
+//! output faithful the renderer **buffers** chunks that arrive ahead of the
+//! next contiguous sequence number and releases them in order once the gap
+//! fills. A missing chunk would otherwise stall all later output, so each
+//! stream tolerates only a bounded reorder window
+//! ([`RenderConfig::reorder_window`]); once that many chunks are buffered ahead
+//! of a gap, the lowest missing sequence number(s) are declared lost. When a
+//! chunk is declared lost the stream is marked **degraded**: a warning is
+//! surfaced to the user and best-effort output continues by default.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 
 use mx_agent_protocol::schema::{ExecFinished, StreamChunk, StreamKind};
@@ -21,6 +34,11 @@ use mx_agent_protocol::schema::{ExecFinished, StreamChunk, StreamKind};
 /// Local exit code used when the stream ends without an `exec.finished` frame
 /// (architecture §5.3: protocol/network failure).
 pub const EXIT_PROTOCOL_FAILURE: u8 = 128;
+
+/// Default reorder window: how many chunks may be buffered ahead of a gap on a
+/// single stream before the missing sequence number is declared lost. Bounds
+/// the head-of-line blocking introduced by waiting for an out-of-order chunk.
+pub const DEFAULT_REORDER_WINDOW: usize = 64;
 
 /// One frame in the forwarded exec stream.
 #[derive(Debug, Clone)]
@@ -31,63 +49,173 @@ pub enum StreamFrame {
     Finished(ExecFinished),
 }
 
-/// Per-stream sequence state used to suppress duplicate or replayed chunks.
-///
-/// The daemon tags every chunk with a monotonic, per-stream sequence number
-/// (see the daemon `stream` module). At-least-once federated delivery means the
-/// CLI can observe a chunk more than once, or observe chunks out of order. To
-/// keep terminal output faithful, the renderer must render each `(stream, seq)`
-/// pair **exactly once**.
-///
-/// State is kept independently per [`StreamKind`] so stdout and stderr each have
-/// their own monotonic sequence space, matching the producer. For each stream
-/// we track the next contiguous sequence number expected plus a small set of
-/// already-accepted sequence numbers that arrived ahead of that boundary; the
-/// set stays empty under in-order delivery and bounded by the reorder window
-/// otherwise.
-#[derive(Debug, Default)]
-pub struct SequenceTracker {
-    streams: HashMap<StreamKind, StreamSeqState>,
+/// Tuning for [`render_stream_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderConfig {
+    /// Maximum number of chunks buffered ahead of a gap, per stream, before the
+    /// missing sequence number is declared lost and the stream marked degraded.
+    pub reorder_window: usize,
 }
 
+impl Default for RenderConfig {
+    fn default() -> Self {
+        Self {
+            reorder_window: DEFAULT_REORDER_WINDOW,
+        }
+    }
+}
+
+/// A sequence number that was never delivered and has been declared lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingChunk {
+    /// The stream the gap was detected on.
+    pub stream: StreamKind,
+    /// The missing sequence number.
+    pub seq: u64,
+}
+
+/// Outcome of rendering a forwarded exec stream.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StreamOutcome {
+    /// Resolved local exit code, or `None` if the stream ended without an
+    /// `exec.finished` frame (treat as [`EXIT_PROTOCOL_FAILURE`]).
+    pub exit_code: Option<u8>,
+    /// Sequence numbers that were declared lost, in detection order.
+    pub missing: Vec<MissingChunk>,
+}
+
+impl StreamOutcome {
+    /// `true` if any chunk was declared lost, i.e. the stream ran degraded.
+    pub fn degraded(&self) -> bool {
+        !self.missing.is_empty()
+    }
+}
+
+/// Per-stream reorder state: chunks arriving ahead of the contiguous boundary
+/// are buffered until the gap fills (or the window forces them out).
 #[derive(Debug, Default)]
-struct StreamSeqState {
-    /// Lowest sequence number not yet accepted contiguously.
+struct StreamReorder {
+    /// Lowest sequence number not yet released contiguously.
     next_expected: u64,
-    /// Accepted sequence numbers at or above `next_expected` (gaps ahead).
-    ahead: HashSet<u64>,
+    /// Accepted chunks at or above `next_expected`, keyed by sequence number.
+    ahead: BTreeMap<u64, StreamChunk>,
 }
 
-impl SequenceTracker {
-    /// Create an empty tracker with no per-stream state.
-    pub fn new() -> Self {
-        Self::default()
+impl StreamReorder {
+    /// Accept `chunk`, returning the chunks now ready to render in sequence
+    /// order. Sequence numbers declared lost (because the reorder `window` was
+    /// exceeded) are appended to `missing`.
+    fn push(
+        &mut self,
+        chunk: StreamChunk,
+        window: usize,
+        missing: &mut Vec<u64>,
+    ) -> Vec<StreamChunk> {
+        let seq = chunk.seq;
+        if seq < self.next_expected || self.ahead.contains_key(&seq) {
+            // Already released below the boundary, or already buffered: a
+            // duplicate/replay. Drop it so output is not duplicated.
+            return Vec::new();
+        }
+
+        let mut ready = Vec::new();
+        if seq == self.next_expected {
+            // Fills the boundary: release it plus any contiguous run buffered
+            // ahead of it.
+            ready.push(chunk);
+            self.next_expected += 1;
+            self.drain_contiguous(&mut ready);
+        } else {
+            // Arrived ahead of the boundary: buffer until the gap fills.
+            self.ahead.insert(seq, chunk);
+        }
+
+        // Bound head-of-line blocking: if too many chunks are buffered ahead of
+        // the gap, give up on the missing sequence number(s) and release what
+        // we have so best-effort output keeps flowing.
+        while self.ahead.len() > window {
+            let first = *self.ahead.keys().next().expect("non-empty when len > 0");
+            while self.next_expected < first {
+                missing.push(self.next_expected);
+                self.next_expected += 1;
+            }
+            self.drain_contiguous(&mut ready);
+        }
+        ready
     }
 
-    /// Record `seq` for `stream`, returning `true` if it is the first time this
-    /// `(stream, seq)` pair has been seen and `false` if it is a duplicate.
-    ///
-    /// A `false` return means the caller should drop the chunk so it does not
-    /// produce duplicate terminal output. Out-of-order arrivals are accepted
-    /// (returning `true`) the first time and suppressed on any replay.
-    pub fn accept(&mut self, stream: StreamKind, seq: u64) -> bool {
-        let state = self.streams.entry(stream).or_default();
-        if seq < state.next_expected || state.ahead.contains(&seq) {
-            // Already delivered: either below the contiguous boundary or
-            // recorded as an out-of-order arrival.
-            return false;
-        }
-        if seq == state.next_expected {
-            // Advance the boundary, draining any contiguous run buffered ahead.
-            state.next_expected += 1;
-            while state.ahead.remove(&state.next_expected) {
-                state.next_expected += 1;
+    /// Release all buffered chunks, declaring every remaining gap lost.
+    fn flush(&mut self, missing: &mut Vec<u64>) -> Vec<StreamChunk> {
+        let mut ready = Vec::new();
+        while let Some(&first) = self.ahead.keys().next() {
+            while self.next_expected < first {
+                missing.push(self.next_expected);
+                self.next_expected += 1;
             }
-        } else {
-            // Arrived ahead of the boundary; remember it to suppress replays.
-            state.ahead.insert(seq);
+            self.drain_contiguous(&mut ready);
         }
-        true
+        ready
+    }
+
+    /// Pop the contiguous run starting at `next_expected` into `ready`.
+    fn drain_contiguous(&mut self, ready: &mut Vec<StreamChunk>) {
+        while let Some(chunk) = self.ahead.remove(&self.next_expected) {
+            ready.push(chunk);
+            self.next_expected += 1;
+        }
+    }
+}
+
+/// Reorder buffer that delivers chunks in per-stream sequence order, suppresses
+/// duplicates, and detects missing sequence numbers.
+///
+/// State is kept independently per [`StreamKind`] so stdout and stderr each have
+/// their own monotonic sequence space, matching the producer.
+#[derive(Debug)]
+pub struct ReorderBuffer {
+    streams: HashMap<StreamKind, StreamReorder>,
+    window: usize,
+}
+
+impl ReorderBuffer {
+    /// Create an empty buffer with the given per-stream reorder `window`.
+    pub fn new(window: usize) -> Self {
+        Self {
+            streams: HashMap::new(),
+            // A zero window would declare any out-of-order chunk lost
+            // immediately, defeating reordering; keep at least one slot.
+            window: window.max(1),
+        }
+    }
+
+    /// Accept `chunk`, returning the chunks now ready to render in order.
+    /// Sequence numbers declared lost are appended to `missing`.
+    pub fn accept(
+        &mut self,
+        chunk: StreamChunk,
+        missing: &mut Vec<MissingChunk>,
+    ) -> Vec<StreamChunk> {
+        let stream = chunk.stream;
+        let window = self.window;
+        let state = self.streams.entry(stream).or_default();
+        let mut lost = Vec::new();
+        let ready = state.push(chunk, window, &mut lost);
+        missing.extend(lost.into_iter().map(|seq| MissingChunk { stream, seq }));
+        ready
+    }
+
+    /// Release every buffered chunk, declaring remaining gaps lost.
+    pub fn flush(&mut self, missing: &mut Vec<MissingChunk>) -> Vec<StreamChunk> {
+        let mut ready = Vec::new();
+        for (stream, state) in self.streams.iter_mut() {
+            let mut lost = Vec::new();
+            ready.append(&mut state.flush(&mut lost));
+            missing.extend(lost.into_iter().map(|seq| MissingChunk {
+                stream: *stream,
+                seq,
+            }));
+        }
+        ready
     }
 }
 
@@ -164,38 +292,114 @@ where
     }
 }
 
-/// Render a forwarded exec stream, returning the resolved exit code.
+/// Human-readable label for a stream, used in degraded-mode warnings.
+fn stream_label(stream: StreamKind) -> &'static str {
+    match stream {
+        StreamKind::Stdout => "stdout",
+        StreamKind::Stderr => "stderr",
+        StreamKind::Pty => "pty",
+        StreamKind::Stdin => "stdin",
+        StreamKind::Control => "control",
+    }
+}
+
+/// Surface freshly detected missing chunks to the user (on `err`) and record
+/// them on `outcome`. Best-effort output continues; this is purely advisory.
+fn surface_missing<E>(
+    detected: &[MissingChunk],
+    outcome: &mut StreamOutcome,
+    err: &mut E,
+) -> io::Result<()>
+where
+    E: Write,
+{
+    for m in detected {
+        writeln!(
+            err,
+            "mx-agent: warning: {} stream degraded: missing chunk {} (best-effort output continues)",
+            stream_label(m.stream),
+            m.seq
+        )?;
+        outcome.missing.push(*m);
+    }
+    Ok(())
+}
+
+/// Render a forwarded exec stream with the default [`RenderConfig`].
 ///
-/// Writes each chunk to `out`/`err`, stops at the first [`StreamFrame::Finished`]
-/// and returns its resolved exit code. Returns `None` if the stream ends
-/// without a finished frame, which the caller should treat as
-/// [`EXIT_PROTOCOL_FAILURE`].
-pub fn render_stream<I, O, E>(frames: I, out: &mut O, err: &mut E) -> io::Result<Option<u8>>
+/// See [`render_stream_with`]. Returns a [`StreamOutcome`] carrying the resolved
+/// exit code and any chunks declared lost.
+pub fn render_stream<I, O, E>(frames: I, out: &mut O, err: &mut E) -> io::Result<StreamOutcome>
 where
     I: IntoIterator<Item = StreamFrame>,
     O: Write,
     E: Write,
 {
-    let mut code = None;
-    let mut tracker = SequenceTracker::new();
+    render_stream_with(frames, RenderConfig::default(), out, err)
+}
+
+/// Render a forwarded exec stream, returning the resolved exit code and any
+/// degraded-mode detail.
+///
+/// Buffers out-of-order chunks and releases them in sequence order, suppresses
+/// duplicates, and declares chunks lost once the reorder window is exceeded or
+/// the stream ends with gaps still outstanding. Lost chunks are surfaced to the
+/// user on `err` and recorded on the returned [`StreamOutcome`]; output
+/// continues best-effort. [`StreamOutcome::exit_code`] is `None` if the stream
+/// ends without a finished frame (treat as [`EXIT_PROTOCOL_FAILURE`]).
+pub fn render_stream_with<I, O, E>(
+    frames: I,
+    config: RenderConfig,
+    out: &mut O,
+    err: &mut E,
+) -> io::Result<StreamOutcome>
+where
+    I: IntoIterator<Item = StreamFrame>,
+    O: Write,
+    E: Write,
+{
+    let mut outcome = StreamOutcome::default();
+    let mut buf = ReorderBuffer::new(config.reorder_window);
+    let mut detected = Vec::new();
+    let mut finished_seen = false;
+
     for frame in frames {
         match frame {
             StreamFrame::Chunk(chunk) => {
-                // Suppress duplicate/replayed chunks so terminal output is not
-                // duplicated; sequence state is tracked per stream.
-                if tracker.accept(chunk.stream, chunk.seq) {
-                    render_chunk(&chunk, out, err)?;
+                detected.clear();
+                for ready in buf.accept(chunk, &mut detected) {
+                    render_chunk(&ready, out, err)?;
                 }
+                surface_missing(&detected, &mut outcome, err)?;
             }
             StreamFrame::Finished(finished) => {
-                code = Some(resolve_exit_code(&finished));
+                // Flush anything still buffered before reporting the exit code;
+                // remaining gaps are declared lost.
+                detected.clear();
+                for ready in buf.flush(&mut detected) {
+                    render_chunk(&ready, out, err)?;
+                }
+                surface_missing(&detected, &mut outcome, err)?;
+                outcome.exit_code = Some(resolve_exit_code(&finished));
+                finished_seen = true;
                 break;
             }
         }
     }
+
+    if !finished_seen {
+        // Stream ended without a finished frame: still flush buffered output
+        // best-effort, then leave the exit code unset (protocol failure).
+        detected.clear();
+        for ready in buf.flush(&mut detected) {
+            render_chunk(&ready, out, err)?;
+        }
+        surface_missing(&detected, &mut outcome, err)?;
+    }
+
     out.flush()?;
     err.flush()?;
-    Ok(code)
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -271,8 +475,9 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = render_stream(frames, &mut out, &mut err).unwrap();
-        assert_eq!(code, Some(0));
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(!outcome.degraded());
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "PASS src/foo.test.ts\n1 passing\n"
@@ -289,8 +494,8 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = render_stream(frames, &mut out, &mut err).unwrap();
-        assert_eq!(code, Some(1));
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(outcome.exit_code, Some(1));
         assert_eq!(String::from_utf8(err).unwrap(), "1 failing\n");
         assert!(out.is_empty());
     }
@@ -332,8 +537,8 @@ mod tests {
         ))];
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = render_stream(frames, &mut out, &mut err).unwrap();
-        assert_eq!(code, None);
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(outcome.exit_code, None);
         assert_eq!(String::from_utf8(out).unwrap(), "partial output\n");
     }
 
@@ -346,8 +551,8 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = render_stream(frames, &mut out, &mut err).unwrap();
-        assert_eq!(code, Some(7));
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(outcome.exit_code, Some(7));
         assert_eq!(String::from_utf8(out).unwrap(), "before\n");
     }
 
@@ -395,19 +600,20 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = render_stream(frames, &mut out, &mut err).unwrap();
-        assert_eq!(code, Some(0));
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(!outcome.degraded());
         assert_eq!(String::from_utf8(out).unwrap(), "line one\nline two\n");
     }
 
     #[test]
-    fn out_of_order_chunks_are_each_rendered_once() {
-        // Acceptance: sequence state is tracked per stream; out-of-order input
-        // is accepted once and replays are suppressed.
+    fn out_of_order_chunks_are_buffered_and_rendered_in_order() {
+        // Out-of-order arrivals are buffered and released in sequence order, so
+        // the gap (seq 0) is rendered before the chunk that arrived first.
         let frames = vec![
             StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 1, "utf-8", "second\n", false)),
             StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "first\n", false)),
-            // Replays of both, now below/at the contiguous boundary.
+            // Replays, now below/at the contiguous boundary, are suppressed.
             StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 1, "utf-8", "second\n", false)),
             StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "first\n", false)),
             StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "third\n", false)),
@@ -415,9 +621,9 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut err = Vec::new();
-        render_stream(frames, &mut out, &mut err).unwrap();
-        // Rendered in arrival order, but each (stream, seq) exactly once.
-        assert_eq!(String::from_utf8(out).unwrap(), "second\nfirst\nthird\n");
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert!(!outcome.degraded());
+        assert_eq!(String::from_utf8(out).unwrap(), "first\nsecond\nthird\n");
     }
 
     #[test]
@@ -440,18 +646,102 @@ mod tests {
     }
 
     #[test]
-    fn tracker_reports_first_sight_and_duplicates() {
-        let mut tracker = SequenceTracker::new();
-        assert!(tracker.accept(StreamKind::Stdout, 0));
-        assert!(!tracker.accept(StreamKind::Stdout, 0));
-        // Out-of-order: seq 2 accepted, then the gap (seq 1) accepted.
-        assert!(tracker.accept(StreamKind::Stdout, 2));
-        assert!(!tracker.accept(StreamKind::Stdout, 2));
-        assert!(tracker.accept(StreamKind::Stdout, 1));
-        assert!(!tracker.accept(StreamKind::Stdout, 1));
-        // Contiguous boundary advanced past 2, so its replay is suppressed.
-        assert!(!tracker.accept(StreamKind::Stdout, 2));
-        // A different stream has independent state.
-        assert!(tracker.accept(StreamKind::Stderr, 0));
+    fn missing_chunk_is_detected_when_window_exceeded() {
+        // A small reorder window means a never-delivered seq 0 is declared lost
+        // once enough later chunks pile up, and best-effort output continues.
+        let config = RenderConfig { reorder_window: 2 };
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 1, "utf-8", "b\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "c\n", false)),
+            // Buffering seq 3 puts three chunks ahead of the gap at seq 0,
+            // exceeding the window of 2 -> seq 0 is declared lost.
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 3, "utf-8", "d\n", false)),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream_with(frames, config, &mut out, &mut err).unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.degraded());
+        assert_eq!(
+            outcome.missing,
+            vec![MissingChunk {
+                stream: StreamKind::Stdout,
+                seq: 0,
+            }]
+        );
+        // Best-effort: the chunks we did receive are still rendered in order.
+        assert_eq!(String::from_utf8(out).unwrap(), "b\nc\nd\n");
+        // The loss is surfaced to the user on stderr.
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(stderr.contains("stdout stream degraded"), "got: {stderr}");
+        assert!(stderr.contains("missing chunk 0"), "got: {stderr}");
+        assert!(
+            stderr.contains("best-effort output continues"),
+            "got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn trailing_gap_is_declared_missing_on_finish() {
+        // A gap that never fills before the stream finishes is declared lost
+        // when the buffer is flushed, and surfaced to the user.
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "a\n", false)),
+            // seq 1 never arrives; seq 2 is buffered ahead of the gap.
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "c\n", false)),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert!(outcome.degraded());
+        assert_eq!(
+            outcome.missing,
+            vec![MissingChunk {
+                stream: StreamKind::Stdout,
+                seq: 1,
+            }]
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "a\nc\n");
+        assert!(String::from_utf8(err).unwrap().contains("missing chunk 1"));
+    }
+
+    #[test]
+    fn reorder_buffer_orders_and_reports_missing() {
+        let mut buf = ReorderBuffer::new(2);
+        let mut missing = Vec::new();
+
+        // seq 1 buffered ahead; nothing ready yet.
+        let ready = buf.accept(
+            chunk_seq(StreamKind::Stdout, 1, "utf-8", "b\n", false),
+            &mut missing,
+        );
+        assert!(ready.is_empty());
+        assert!(missing.is_empty());
+
+        // seq 0 fills the gap and releases both, in order.
+        let ready = buf.accept(
+            chunk_seq(StreamKind::Stdout, 0, "utf-8", "a\n", false),
+            &mut missing,
+        );
+        let datas: Vec<String> = ready.iter().map(|c| c.data.clone()).collect();
+        assert_eq!(datas, vec!["a\n", "b\n"]);
+        assert!(missing.is_empty());
+
+        // Replay of seq 0 is suppressed.
+        let ready = buf.accept(
+            chunk_seq(StreamKind::Stdout, 0, "utf-8", "a\n", false),
+            &mut missing,
+        );
+        assert!(ready.is_empty());
+
+        // A different stream has independent sequence state.
+        let ready = buf.accept(
+            chunk_seq(StreamKind::Stderr, 0, "utf-8", "e\n", false),
+            &mut missing,
+        );
+        assert_eq!(ready.len(), 1);
+        assert!(missing.is_empty());
     }
 }
