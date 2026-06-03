@@ -1827,6 +1827,8 @@ version = "0.0.1"
 name = "mx-agent-protocol"
 version = "0.0.1"
 dependencies = [
+ "base64",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "ulid",
