@@ -330,9 +330,21 @@ fn daemon_start(global: &GlobalArgs, foreground: bool) -> ExitCode {
     }
 }
 
+/// Query the live status of a running daemon over IPC, falling back to `None`
+/// if the daemon cannot be reached.
+fn query_status_over_ipc(socket_path: &str) -> Option<mx_agent_daemon::RunningStatus> {
+    let mut client = mx_agent_ipc::Client::connect(socket_path).ok()?;
+    let response = client.call("daemon.status", serde_json::Value::Null).ok()?;
+    let result = response.result?;
+    serde_json::from_value(result).ok()
+}
+
 fn daemon_status(global: &GlobalArgs) -> ExitCode {
     match mx_agent_daemon::status() {
-        Ok(Some(running)) => {
+        Ok(Some(file_status)) => {
+            // Prefer the daemon's live status over IPC; fall back to the status
+            // file if the socket cannot be reached.
+            let running = query_status_over_ipc(&file_status.socket_path).unwrap_or(file_status);
             if global.json {
                 println!("{}", running.to_json());
             } else {

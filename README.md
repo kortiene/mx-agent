@@ -97,4 +97,10 @@ runtime directory is group- or world-accessible or owned by another user. Stale
 sockets from a previous run are cleaned up automatically when no daemon is
 listening.
 
+The CLI and daemon communicate over this socket using length-delimited
+(4-byte big-endian prefix) JSON-RPC 2.0 frames. For example, `mx-agent daemon
+status` queries the running daemon with a `daemon.status` request and renders
+the live response. Malformed input yields a controlled JSON-RPC error rather
+than a dropped connection.
+
 Most other commands are still placeholders pending later roadmap phases.

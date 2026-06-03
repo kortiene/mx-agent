@@ -4,8 +4,16 @@
 //! `docs/architecture.md`, section 10). This crate currently only defines the
 //! default socket file name.
 
+pub mod client;
+pub mod frame;
+pub mod rpc;
+pub mod server;
 pub mod socket;
 
+pub use client::Client;
+pub use frame::{read_frame, write_frame, MAX_FRAME_LEN};
+pub use rpc::{Request, Response, RpcError};
+pub use server::{handle_message, serve};
 pub use socket::{bind, ensure_safe_parent_dir, BindError, SocketGuard, SOCKET_MODE};
 
 /// Default Unix domain socket file name, created under the runtime directory.
