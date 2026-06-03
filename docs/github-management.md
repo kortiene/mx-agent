@@ -158,6 +158,39 @@ Validate parsing without touching GitHub:
 python scripts/populate_github.py --dry-run
 ```
 
+## Project Board Wiring
+
+Issues are organized on a GitHub Projects v2 board titled `mx-agent roadmap`.
+
+Projects v2 are owned by a user/org, not a repository, so the default Actions `GITHUB_TOKEN` cannot manage them. A personal access token (PAT) with `project` scope is required for board automation.
+
+### One-time setup
+
+1. Authenticate with project scope and create/backfill the board:
+
+   ```bash
+   gh auth login --scopes "repo,project"
+   scripts/wire_project.sh
+   ```
+
+   This creates (or reuses) the `mx-agent roadmap` board and adds every issue labeled `roadmap:auto` to it. It prints the board's `PROJECT_URL`.
+
+2. Store the project URL as a repo variable so new issues auto-add:
+
+   ```bash
+   gh variable set PROJECT_URL --body "<printed project url>"
+   ```
+
+3. Store a PAT with `project` scope as a secret for the sync workflow:
+
+   ```bash
+   gh secret set PROJECT_TOKEN --body "<pat>"
+   ```
+
+### Ongoing automation
+
+The workflow `.github/workflows/project-sync.yml` runs `actions/add-to-project` whenever an issue or PR is opened, reopened, or labeled, and adds it to `PROJECT_URL`. It is a no-op until `PROJECT_URL` is set.
+
 ### Manual alternative with gh
 
 ```bash

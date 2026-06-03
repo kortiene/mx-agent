@@ -1,0 +1,31 @@
+name: project-sync
+
+# Automatically add issues (and PRs) to the roadmap Projects v2 board.
+#
+# Setup (one time):
+#   1. Create the board and backfill existing issues:
+#        gh auth login --scopes "repo,project"
+#        scripts/wire_project.sh
+#   2. Store the project URL as a repo variable:
+#        gh variable set PROJECT_URL --body "https://github.com/users/<owner>/projects/<n>"
+#   3. Create a PAT with `project` (and `repo`) scope and store it as a secret:
+#        gh secret set PROJECT_TOKEN --body "<pat>"
+#
+# Projects v2 are owned by a user/org, so the default GITHUB_TOKEN cannot manage
+# them; a PAT with project scope is required.
+
+on:
+  issues:
+    types: [opened, reopened, labeled]
+  pull_request:
+    types: [opened, reopened, labeled]
+
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    if: ${{ vars.PROJECT_URL != '' }}
+    steps:
+      - uses: actions/add-to-project@v1.0.2
+        with:
+          project-url: ${{ vars.PROJECT_URL }}
+          github-token: ${{ secrets.PROJECT_TOKEN }}
