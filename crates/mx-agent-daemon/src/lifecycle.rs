@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mx_agent_ipc::rpc::{Request, Response, INTERNAL_ERROR, METHOD_NOT_FOUND};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
@@ -83,7 +84,7 @@ struct StatusFile {
 }
 
 /// A snapshot of a running daemon, suitable for display.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunningStatus {
     /// Always `true`; present so JSON output is self-describing.
     pub running: bool,
@@ -196,27 +197,66 @@ pub fn run_foreground() -> io::Result<()> {
     // Bind the IPC socket before announcing readiness. The guard unlinks the
     // socket on shutdown. Binding validates that the runtime directory is
     // private to the current user.
-    let _socket = mx_agent_ipc::bind(&paths.socket_path)?;
+    let socket = mx_agent_ipc::bind(&paths.socket_path)?;
 
     let pid = std::process::id();
+    let started_at = now_unix();
+    let socket_path = paths.socket_path.to_string_lossy().into_owned();
     let status = StatusFile {
         pid,
-        started_at_unix: now_unix(),
-        socket_path: paths.socket_path.to_string_lossy().into_owned(),
+        started_at_unix: started_at,
+        socket_path: socket_path.clone(),
         version: DAEMON_VERSION.to_string(),
     };
     write_status_file(&paths, &status)?;
 
+    // Serve IPC requests on a background thread. The thread is torn down when
+    // the process exits after shutdown.
+    let listener = socket.listener().try_clone()?;
+    let handler_socket = socket_path.clone();
+    let _server = std::thread::spawn(move || {
+        let handler = move |req: &Request| dispatch(req, pid, started_at, &handler_socket);
+        if let Err(e) = mx_agent_ipc::serve(&listener, handler) {
+            tracing::warn!(error = %e, "ipc server stopped");
+        }
+    });
+
     DaemonInfo::new().log_summary();
-    tracing::info!(pid, socket = %status.socket_path, "daemon started (foreground)");
+    tracing::info!(pid, socket = %socket_path, "daemon started (foreground)");
 
     if let Some(signal) = signals.forever().next() {
         tracing::info!(signal, "received shutdown signal");
     }
 
     remove_status_file(&paths);
+    drop(socket);
     tracing::info!(pid, "daemon stopped");
     Ok(())
+}
+
+/// Dispatch a single IPC request against the running daemon.
+fn dispatch(req: &Request, pid: u32, started_at: u64, socket_path: &str) -> Response {
+    match req.method.as_str() {
+        "daemon.ping" => Response::result(req.id.clone(), serde_json::json!({"pong": true})),
+        "daemon.status" => {
+            let status = RunningStatus {
+                running: true,
+                pid,
+                uptime_seconds: now_unix().saturating_sub(started_at),
+                socket_path: socket_path.to_string(),
+                version: DAEMON_VERSION.to_string(),
+            };
+            match serde_json::to_value(&status) {
+                Ok(value) => Response::result(req.id.clone(), value),
+                Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+            }
+        }
+        other => Response::error(
+            req.id.clone(),
+            METHOD_NOT_FOUND,
+            format!("unknown method: {other}"),
+        ),
+    }
 }
 
 /// Spawn the daemon as a detached background process and wait for it to report
