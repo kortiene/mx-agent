@@ -766,6 +766,20 @@ Security:
 - verify peer credentials where supported, e.g. `SO_PEERCRED`
 - optional local IPC auth token stored outside agent-visible env
 
+Peer credential verification works as follows (implemented in
+`mx-agent-ipc`, module `peercred`):
+
+- On Linux/Android the daemon reads the connecting peer's UID via
+  `SO_PEERCRED` and rejects any client whose UID does not match the daemon's
+  effective UID. Rejections are audited via a `tracing::warn!` log that records
+  only the peer and daemon UIDs — no request payloads or other peer data are
+  read before rejection.
+- On platforms without a supported peer credential mechanism the check returns
+  `Unsupported`: the daemon logs a single warning and falls back to the
+  socket's `0600` filesystem permissions and user-owned parent directory as the
+  sole access control. This keeps behavior well defined and observable rather
+  than silently allowing or failing.
+
 ### 10.3 IPC Protocol
 
 Start with framed JSON-RPC over Unix socket. The framing should support streaming messages and cancellation.

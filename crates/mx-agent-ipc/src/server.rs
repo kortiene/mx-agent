@@ -6,6 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use serde_json::Value;
 
 use crate::frame::{read_frame, write_frame};
+use crate::peercred::{verify_peer, PeerCredCheck};
 use crate::rpc::{Request, Response, PARSE_ERROR};
 
 /// Parse one frame's bytes into a [`Request`], dispatch it, and return the
@@ -49,9 +50,36 @@ pub fn serve<F>(listener: &UnixListener, handler: F) -> io::Result<()>
 where
     F: Fn(&Request) -> Response,
 {
+    let mut warned_unsupported = false;
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                match verify_peer(&stream) {
+                    PeerCredCheck::Allowed { .. } => {}
+                    PeerCredCheck::Denied {
+                        peer_uid,
+                        daemon_uid,
+                    } => {
+                        // Audit the rejection. Only UIDs are logged; no request
+                        // contents or other peer data are read or recorded.
+                        tracing::warn!(
+                            peer_uid,
+                            daemon_uid,
+                            "rejecting ipc client: peer uid does not match daemon uid"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                    PeerCredCheck::Unsupported => {
+                        if !warned_unsupported {
+                            warned_unsupported = true;
+                            tracing::warn!(
+                                "peer credential verification is unsupported on this platform; \
+                                 relying on socket filesystem permissions (mode 0600)"
+                            );
+                        }
+                    }
+                }
                 if let Err(e) = serve_connection(stream, &handler) {
                     tracing::debug!(error = %e, "ipc connection ended with error");
                 }
