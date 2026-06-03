@@ -312,6 +312,42 @@ pub struct ApprovalDecision {
     pub extra: Extra,
 }
 
+/// Git repository metadata for a [`WorkspaceState`] (architecture §9.3).
+///
+/// Each field is `None` when the corresponding git metadata cannot be
+/// determined (for example, a repository with no remote or no commits yet).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoInfo {
+    /// Remote URL of the `origin` remote, if any.
+    pub remote_url: Option<String>,
+    /// Currently checked-out branch, if on a branch.
+    pub branch: Option<String>,
+    /// Currently checked-out commit hash, if any.
+    pub commit: Option<String>,
+}
+
+/// `com.mxagent.workspace.v1` state content (architecture §9.3).
+///
+/// Published with an empty state key: one workspace metadata record per room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceState {
+    /// Project identifier, e.g. `repo:github.com/org/project`.
+    pub project_id: String,
+    /// Local filesystem path attached on the publishing agent.
+    pub path: String,
+    /// Git repository metadata, or `None` when `path` is not a git repository.
+    pub repo: Option<RepoInfo>,
+    /// Matrix user ID that published this workspace state.
+    pub attached_by: String,
+    /// Attachment timestamp (ms since epoch).
+    pub attached_at: u64,
+    /// State revision counter.
+    pub state_rev: u64,
+    /// Forward-compatible unknown fields.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// Workspace metadata embedded in [`AgentState`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentWorkspace {
@@ -612,6 +648,35 @@ mod tests {
             "load": { "running_invocations": 1, "max_invocations": 4 },
             "last_seen_ts": 1780392000000u64,
             "state_rev": 7
+        }));
+    }
+
+    #[test]
+    fn workspace_state_round_trips() {
+        // Matches the documented example in architecture.md §9.3.
+        assert_round_trip::<WorkspaceState>(json!({
+            "project_id": "repo:github.com/org/project",
+            "path": "/home/me/code/project",
+            "repo": {
+                "remote_url": "git@github.com:org/project.git",
+                "branch": "main",
+                "commit": "abc123"
+            },
+            "attached_by": "@alice:matrix.org",
+            "attached_at": 1780392000000u64,
+            "state_rev": 1
+        }));
+    }
+
+    #[test]
+    fn workspace_state_without_repo_round_trips() {
+        assert_round_trip::<WorkspaceState>(json!({
+            "project_id": "repo:github.com/org/project",
+            "path": "/home/me/code/project",
+            "repo": null,
+            "attached_by": "@alice:matrix.org",
+            "attached_at": 1780392000000u64,
+            "state_rev": 1
         }));
     }
 

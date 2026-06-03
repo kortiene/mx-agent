@@ -137,7 +137,7 @@ enum WorkspaceCommand {
     /// Join an existing workspace room.
     Join(WorkspaceJoinArgs),
     /// Attach the current directory to a workspace.
-    Attach,
+    Attach(WorkspaceAttachArgs),
     /// Show workspace status.
     Status(WorkspaceStatusArgs),
 }
@@ -172,6 +172,19 @@ struct WorkspaceJoinArgs {
     /// Room alias (`#name:server`) or room ID (`!id:server`) to join.
     #[arg(value_name = "ROOM")]
     room: String,
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceAttachArgs {
+    /// Room alias (`#name:server`) or room ID (`!id:server`) to attach to.
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Local path to attach (defaults to the current directory).
+    #[arg(long, value_name = "PATH")]
+    path: Option<PathBuf>,
+    /// Project identifier, e.g. `repo:github.com/org/project`.
+    #[arg(long = "project-id", value_name = "PROJECT_ID")]
+    project_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -481,7 +494,7 @@ fn handle_workspace(global: &GlobalArgs, cmd: &WorkspaceCommand) -> ExitCode {
         WorkspaceCommand::Create(args) => workspace_create(global, args),
         WorkspaceCommand::Join(args) => workspace_join(global, args),
         WorkspaceCommand::Status(args) => workspace_status(global, args),
-        WorkspaceCommand::Attach => unimplemented(global, "workspace attach"),
+        WorkspaceCommand::Attach(args) => workspace_attach(global, args),
     }
 }
 
@@ -586,6 +599,64 @@ fn workspace_join(global: &GlobalArgs, args: &WorkspaceJoinArgs) -> ExitCode {
     })
 }
 
+fn workspace_attach(global: &GlobalArgs, args: &WorkspaceAttachArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let path = match &args.path {
+        Some(p) => p.clone(),
+        None => match std::env::current_dir() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("mx-agent: could not resolve current directory: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let options = mx_agent_daemon::AttachWorkspaceOptions {
+        room: args.room.clone(),
+        path: path.to_string_lossy().into_owned(),
+        project_id: args.project_id.clone(),
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::attach_workspace_for_session(&session, &options).await {
+            Ok(state) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("mx-agent: attached workspace to {}", args.room);
+                    println!("  project:   {}", state.project_id);
+                    println!("  path:      {}", state.path);
+                    if let Some(repo) = &state.repo {
+                        if let Some(url) = &repo.remote_url {
+                            println!("  remote:    {url}");
+                        }
+                        if let Some(branch) = &repo.branch {
+                            println!("  branch:    {branch}");
+                        }
+                        if let Some(commit) = &repo.commit {
+                            println!("  commit:    {commit}");
+                        }
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not attach workspace: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
 fn workspace_status(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode {
     let runtime = match build_runtime() {
         Ok(rt) => rt,
@@ -607,6 +678,21 @@ fn workspace_status(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode
                     }
                     if let Some(name) = &status.name {
                         println!("  name:      {name}");
+                    }
+                    if let Some(ws) = &status.workspace {
+                        println!("  project:   {}", ws.project_id);
+                        println!("  path:      {}", ws.path);
+                        if let Some(repo) = &ws.repo {
+                            if let Some(url) = &repo.remote_url {
+                                println!("  remote:    {url}");
+                            }
+                            if let Some(branch) = &repo.branch {
+                                println!("  branch:    {branch}");
+                            }
+                            if let Some(commit) = &repo.commit {
+                                println!("  commit:    {commit}");
+                            }
+                        }
                     }
                     println!("  encrypted: {}", status.encrypted);
                     println!(
@@ -789,7 +875,7 @@ fn command_path(command: &Command) -> String {
             match c {
                 WorkspaceCommand::Create(_) => "create",
                 WorkspaceCommand::Join(_) => "join",
-                WorkspaceCommand::Attach => "attach",
+                WorkspaceCommand::Attach(_) => "attach",
                 WorkspaceCommand::Status(_) => "status",
             }
         ),

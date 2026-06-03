@@ -697,7 +697,37 @@ local policy permits the operation
 no conflicting newer state_rev exists
 ```
 
-### 9.3 Conflict Handling
+### 9.3 Workspace State
+
+State event:
+
+```text
+type: com.mxagent.workspace.v1
+state_key: "" (one workspace metadata per room)
+```
+
+```json
+{
+  "project_id": "repo:github.com/org/project",
+  "path": "/home/me/code/project",
+  "repo": {
+    "remote_url": "git@github.com:org/project.git",
+    "branch": "main",
+    "commit": "abc123"
+  },
+  "attached_by": "@alice:matrix.org",
+  "attached_at": 1780392000000,
+  "state_rev": 1
+}
+```
+
+The `attached_at` timestamp is milliseconds since the Unix epoch (matching
+`agent` state's `last_seen_ts`). The `repo` object is omitted (or `null`) when the attached path is not a git
+repository; each of its fields is `null` when the corresponding git metadata is
+unavailable. `path` is the local filesystem path attached on the agent that
+published the state.
+
+### 9.4 Conflict Handling
 
 Matrix room state is last-write-wins per `(type, state_key)`. To reduce accidental overwrites:
 
@@ -707,7 +737,7 @@ Matrix room state is last-write-wins per `(type, state_key)`. To reduce accident
 - Restrict task mutation by Matrix power levels and mx-agent policy.
 - For contentious workflows, append timeline decision events and let a coordinator agent resolve state.
 
-### 9.4 Query Commands
+### 9.5 Query Commands
 
 ```bash
 mx-agent task list --room '!abc:matrix.org'
