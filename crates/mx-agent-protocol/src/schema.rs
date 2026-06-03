@@ -400,6 +400,29 @@ pub struct AgentState {
     pub extra: Extra,
 }
 
+/// `com.mxagent.heartbeat.v1` timeline content (architecture §7.1, §9.1).
+///
+/// A heartbeat is a lightweight liveness signal an agent emits periodically
+/// into a workspace room's timeline. Peers combine the most recent heartbeat
+/// timestamp with the durable [`AgentState`] to compute whether an agent is
+/// active, stale, or offline (see architecture §9.1, "Liveness should
+/// combine"). Heartbeats are timeline events rather than state events so that
+/// frequent liveness updates do not churn room state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Heartbeat {
+    /// Agent identifier the heartbeat is for.
+    pub agent_id: String,
+    /// Self-reported status, e.g. `active`.
+    pub status: String,
+    /// Load metrics at the time of the heartbeat.
+    pub load: AgentLoad,
+    /// Heartbeat timestamp (ms since epoch).
+    pub ts: u64,
+    /// Forward-compatible unknown fields.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// `com.mxagent.task.v1` state content (architecture §9.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskState {
@@ -677,6 +700,16 @@ mod tests {
             "attached_by": "@alice:matrix.org",
             "attached_at": 1780392000000u64,
             "state_rev": 1
+        }));
+    }
+
+    #[test]
+    fn heartbeat_round_trips() {
+        assert_round_trip::<Heartbeat>(json!({
+            "agent_id": "developer-pi",
+            "status": "active",
+            "load": { "running_invocations": 1, "max_invocations": 4 },
+            "ts": 1780392000000u64
         }));
     }
 
