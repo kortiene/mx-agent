@@ -10,6 +10,7 @@ pub mod heartbeat;
 pub mod lifecycle;
 pub mod matrix;
 pub mod session;
+pub mod signing;
 pub mod sync;
 pub mod workspace;
 
@@ -32,6 +33,9 @@ pub use matrix::{
 pub use session::{
     auth_status, clear_session, clear_sync_token, load_session, load_sync_token, save_session,
     save_sync_token, AuthStatus, Secret, SessionPaths, StoredSession,
+};
+pub use signing::{
+    load_or_create_signing_key, DaemonSigningKey, SigningKeyError, KEY_ALG, KEY_ID_PREFIX,
 };
 pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
