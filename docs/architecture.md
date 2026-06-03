@@ -1074,6 +1074,33 @@ state_key: <agent_id>|<key_id>
 }
 ```
 
+Publishing trust state is **optional** and is offered as a convenience for
+team bootstrapping (the "room-admin grant" mode above):
+
+```bash
+# Publish a local trust record into a room as com.mxagent.trust.v1 state.
+mx-agent trust publish --room '!abc:matrix.org' --agent developer-pi --key mxagent-ed25519:abc123
+# Inspect published trust state in a room, reconciled with the local store.
+mx-agent trust state --room '!abc:matrix.org'
+```
+
+#### Trust precedence
+
+The **local trust store is always the final authority**. Room-published
+`com.mxagent.trust.v1` state is purely advisory; it never overrides a local
+decision. When resolving whether an `(agent_id, key_id)` pair is trusted:
+
+1. If the local store has a record for the pair, that record decides. In
+   particular, a **local revocation always overrides** any room-published
+   `trusted` state — revocation cannot be undone by a room admin.
+2. Only when the local store has *no* record for the pair is the
+   room-published state consulted, and then only a `trusted`, non-revoked
+   record grants trust. A published revocation (or any other status) never
+   grants trust.
+
+Publishing and reading trust state never mutate the local store; approval and
+revocation happen only through `mx-agent trust approve` / `trust revoke`.
+
 ### 13.3 Execution Policy
 
 Example:

@@ -152,6 +152,18 @@ impl TrustStore {
             .position(|e| e.agent_id == agent_id && e.key_id == key_id)
     }
 
+    /// Borrow the trust record for an `(agent_id, key_id)` pair, if one exists.
+    ///
+    /// Unlike [`TrustStore::is_trusted`], this returns the record regardless of
+    /// its status, so callers can distinguish "no local opinion" (returns
+    /// `None`) from an explicit local revocation (returns a record with
+    /// [`TrustStatus::Revoked`]). This distinction is what lets the local store
+    /// act as the final authority over room-published trust.
+    pub fn entry(&self, agent_id: &str, key_id: &str) -> Option<&TrustEntry> {
+        self.position(agent_id, key_id)
+            .map(|idx| &self.entries[idx])
+    }
+
     /// Approve a signing key for an agent.
     ///
     /// Inserts a new trusted record or, if the pair already exists, refreshes it
