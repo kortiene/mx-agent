@@ -13,6 +13,7 @@
 //! delivers the frames (a live daemon IPC stream, or the local runner loopback
 //! used by the `exec` command today).
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
 use mx_agent_protocol::schema::{ExecFinished, StreamChunk, StreamKind};
@@ -28,6 +29,66 @@ pub enum StreamFrame {
     Chunk(StreamChunk),
     /// The terminal frame carrying the remote exit status.
     Finished(ExecFinished),
+}
+
+/// Per-stream sequence state used to suppress duplicate or replayed chunks.
+///
+/// The daemon tags every chunk with a monotonic, per-stream sequence number
+/// (see the daemon `stream` module). At-least-once federated delivery means the
+/// CLI can observe a chunk more than once, or observe chunks out of order. To
+/// keep terminal output faithful, the renderer must render each `(stream, seq)`
+/// pair **exactly once**.
+///
+/// State is kept independently per [`StreamKind`] so stdout and stderr each have
+/// their own monotonic sequence space, matching the producer. For each stream
+/// we track the next contiguous sequence number expected plus a small set of
+/// already-accepted sequence numbers that arrived ahead of that boundary; the
+/// set stays empty under in-order delivery and bounded by the reorder window
+/// otherwise.
+#[derive(Debug, Default)]
+pub struct SequenceTracker {
+    streams: HashMap<StreamKind, StreamSeqState>,
+}
+
+#[derive(Debug, Default)]
+struct StreamSeqState {
+    /// Lowest sequence number not yet accepted contiguously.
+    next_expected: u64,
+    /// Accepted sequence numbers at or above `next_expected` (gaps ahead).
+    ahead: HashSet<u64>,
+}
+
+impl SequenceTracker {
+    /// Create an empty tracker with no per-stream state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `seq` for `stream`, returning `true` if it is the first time this
+    /// `(stream, seq)` pair has been seen and `false` if it is a duplicate.
+    ///
+    /// A `false` return means the caller should drop the chunk so it does not
+    /// produce duplicate terminal output. Out-of-order arrivals are accepted
+    /// (returning `true`) the first time and suppressed on any replay.
+    pub fn accept(&mut self, stream: StreamKind, seq: u64) -> bool {
+        let state = self.streams.entry(stream).or_default();
+        if seq < state.next_expected || state.ahead.contains(&seq) {
+            // Already delivered: either below the contiguous boundary or
+            // recorded as an out-of-order arrival.
+            return false;
+        }
+        if seq == state.next_expected {
+            // Advance the boundary, draining any contiguous run buffered ahead.
+            state.next_expected += 1;
+            while state.ahead.remove(&state.next_expected) {
+                state.next_expected += 1;
+            }
+        } else {
+            // Arrived ahead of the boundary; remember it to suppress replays.
+            state.ahead.insert(seq);
+        }
+        true
+    }
 }
 
 /// Map a signal name (e.g. `SIGTERM`) to its number, for the shell convention
@@ -116,9 +177,16 @@ where
     E: Write,
 {
     let mut code = None;
+    let mut tracker = SequenceTracker::new();
     for frame in frames {
         match frame {
-            StreamFrame::Chunk(chunk) => render_chunk(&chunk, out, err)?,
+            StreamFrame::Chunk(chunk) => {
+                // Suppress duplicate/replayed chunks so terminal output is not
+                // duplicated; sequence state is tracked per stream.
+                if tracker.accept(chunk.stream, chunk.seq) {
+                    render_chunk(&chunk, out, err)?;
+                }
+            }
             StreamFrame::Finished(finished) => {
                 code = Some(resolve_exit_code(&finished));
                 break;
@@ -135,10 +203,20 @@ mod tests {
     use super::*;
 
     fn chunk(stream: StreamKind, encoding: &str, data: &str, eof: bool) -> StreamChunk {
+        chunk_seq(stream, 0, encoding, data, eof)
+    }
+
+    fn chunk_seq(
+        stream: StreamKind,
+        seq: u64,
+        encoding: &str,
+        data: &str,
+        eof: bool,
+    ) -> StreamChunk {
         StreamChunk {
             invocation_id: "inv_1".to_string(),
             stream,
-            seq: 0,
+            seq,
             encoding: encoding.to_string(),
             data: data.to_string(),
             eof,
@@ -167,20 +245,28 @@ mod tests {
     fn remote_output_appears_locally_on_correct_streams() {
         // Acceptance: remote `npm test` output appears locally.
         let frames = vec![
-            StreamFrame::Chunk(chunk(
+            StreamFrame::Chunk(chunk_seq(
                 StreamKind::Stdout,
+                0,
                 "utf-8",
                 "PASS src/foo.test.ts\n",
                 false,
             )),
-            StreamFrame::Chunk(chunk(
+            StreamFrame::Chunk(chunk_seq(
                 StreamKind::Stderr,
+                0,
                 "utf-8",
                 "warning: deprecated\n",
                 false,
             )),
-            StreamFrame::Chunk(chunk(StreamKind::Stdout, "utf-8", "1 passing\n", false)),
-            StreamFrame::Chunk(chunk(StreamKind::Stdout, "utf-8", "", true)), // EOF marker
+            StreamFrame::Chunk(chunk_seq(
+                StreamKind::Stdout,
+                1,
+                "utf-8",
+                "1 passing\n",
+                false,
+            )),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "", true)), // EOF marker
             StreamFrame::Finished(finished(Some(0), None)),
         ];
         let mut out = Vec::new();
@@ -254,14 +340,118 @@ mod tests {
     #[test]
     fn frames_after_finished_are_ignored() {
         let frames = vec![
-            StreamFrame::Chunk(chunk(StreamKind::Stdout, "utf-8", "before\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "before\n", false)),
             StreamFrame::Finished(finished(Some(7), None)),
-            StreamFrame::Chunk(chunk(StreamKind::Stdout, "utf-8", "after\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 1, "utf-8", "after\n", false)),
         ];
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = render_stream(frames, &mut out, &mut err).unwrap();
         assert_eq!(code, Some(7));
         assert_eq!(String::from_utf8(out).unwrap(), "before\n");
+    }
+
+    #[test]
+    fn duplicate_chunks_do_not_duplicate_terminal_output() {
+        // Acceptance: duplicate chunks do not duplicate terminal output.
+        // At-least-once delivery replays seq 0 and seq 1 on stdout.
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(
+                StreamKind::Stdout,
+                0,
+                "utf-8",
+                "line one\n",
+                false,
+            )),
+            StreamFrame::Chunk(chunk_seq(
+                StreamKind::Stdout,
+                0,
+                "utf-8",
+                "line one\n",
+                false,
+            )),
+            StreamFrame::Chunk(chunk_seq(
+                StreamKind::Stdout,
+                1,
+                "utf-8",
+                "line two\n",
+                false,
+            )),
+            StreamFrame::Chunk(chunk_seq(
+                StreamKind::Stdout,
+                1,
+                "utf-8",
+                "line two\n",
+                false,
+            )),
+            StreamFrame::Chunk(chunk_seq(
+                StreamKind::Stdout,
+                0,
+                "utf-8",
+                "line one\n",
+                false,
+            )),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(code, Some(0));
+        assert_eq!(String::from_utf8(out).unwrap(), "line one\nline two\n");
+    }
+
+    #[test]
+    fn out_of_order_chunks_are_each_rendered_once() {
+        // Acceptance: sequence state is tracked per stream; out-of-order input
+        // is accepted once and replays are suppressed.
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 1, "utf-8", "second\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "first\n", false)),
+            // Replays of both, now below/at the contiguous boundary.
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 1, "utf-8", "second\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "first\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "third\n", false)),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        render_stream(frames, &mut out, &mut err).unwrap();
+        // Rendered in arrival order, but each (stream, seq) exactly once.
+        assert_eq!(String::from_utf8(out).unwrap(), "second\nfirst\nthird\n");
+    }
+
+    #[test]
+    fn sequence_state_is_tracked_per_stream() {
+        // Acceptance: sequence state is tracked per stream. The same seq number
+        // on stdout and stderr are independent and both render.
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "out0\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stderr, 0, "utf-8", "err0\n", false)),
+            // Replays on each stream are suppressed independently.
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "out0\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stderr, 0, "utf-8", "err0\n", false)),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "out0\n");
+        assert_eq!(String::from_utf8(err).unwrap(), "err0\n");
+    }
+
+    #[test]
+    fn tracker_reports_first_sight_and_duplicates() {
+        let mut tracker = SequenceTracker::new();
+        assert!(tracker.accept(StreamKind::Stdout, 0));
+        assert!(!tracker.accept(StreamKind::Stdout, 0));
+        // Out-of-order: seq 2 accepted, then the gap (seq 1) accepted.
+        assert!(tracker.accept(StreamKind::Stdout, 2));
+        assert!(!tracker.accept(StreamKind::Stdout, 2));
+        assert!(tracker.accept(StreamKind::Stdout, 1));
+        assert!(!tracker.accept(StreamKind::Stdout, 1));
+        // Contiguous boundary advanced past 2, so its replay is suppressed.
+        assert!(!tracker.accept(StreamKind::Stdout, 2));
+        // A different stream has independent state.
+        assert!(tracker.accept(StreamKind::Stderr, 0));
     }
 }

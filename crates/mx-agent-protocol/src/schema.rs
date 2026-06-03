@@ -33,7 +33,7 @@ pub struct Signature {
 }
 
 /// Stream channel for [`StreamChunk`] / [`StreamArtifact`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamKind {
     /// Standard input.
