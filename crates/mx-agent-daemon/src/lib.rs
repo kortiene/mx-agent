@@ -51,7 +51,9 @@ pub use matrix::{
     MatrixConfig,
 };
 pub use replay::{ReplayCache, ReplayError, DEFAULT_CAPACITY};
-pub use runner::{is_secret_var, run, sanitize_env, RunError, RunOutput, RunSpec};
+pub use runner::{
+    is_secret_var, run, sanitize_env, RunError, RunOutput, RunSpec, DEFAULT_GRACE_PERIOD,
+};
 pub use session::{
     auth_status, clear_session, clear_sync_token, load_session, load_sync_token, save_session,
     save_sync_token, AuthStatus, Secret, SessionPaths, StoredSession,

@@ -1774,6 +1774,7 @@ async fn collect_exec_frames(
         cwd: cwd.to_path_buf(),
         env: Default::default(),
         stdin,
+        ..Default::default()
     };
     let output = mx_agent_daemon::run(&spec).await?;
 

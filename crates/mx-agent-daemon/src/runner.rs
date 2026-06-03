@@ -30,8 +30,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::process::Command;
+
+/// Default grace period between the SIGTERM and the SIGKILL escalation when a
+/// command exceeds its timeout (architecture §7.4: "wait grace period, e.g. 5
+/// seconds").
+pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Known secret environment variable names that must never be passed to a
 /// child process unless explicitly provided as an override.
@@ -92,7 +98,7 @@ where
 /// This is intentionally small: the runner only needs the argv, the working
 /// directory, and any explicit environment overrides. Protocol bookkeeping
 /// (invocation ids, signatures, timeouts) lives with the request itself.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RunSpec {
     /// Command argv: program followed by its arguments.
     pub command: Vec<String>,
@@ -108,6 +114,30 @@ pub struct RunSpec {
     /// (architecture §7.7). An empty `Some(Vec::new())` still opens and closes
     /// the pipe, so the child observes an immediate EOF.
     pub stdin: Option<Vec<u8>>,
+    /// Maximum wall-clock runtime for the command.
+    ///
+    /// `None` runs the command with no enforced limit. `Some(dur)` enforces a
+    /// max runtime (architecture §7.4): once `dur` elapses the runner signals
+    /// the child's process group and reports the result with
+    /// [`RunOutput::timed_out`] set.
+    pub timeout: Option<Duration>,
+    /// Grace period to wait after SIGTERM before escalating to SIGKILL when a
+    /// timed-out command is being terminated. Defaults to
+    /// [`DEFAULT_GRACE_PERIOD`].
+    pub grace_period: Duration,
+}
+
+impl Default for RunSpec {
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            cwd: PathBuf::new(),
+            env: BTreeMap::new(),
+            stdin: None,
+            timeout: None,
+            grace_period: DEFAULT_GRACE_PERIOD,
+        }
+    }
 }
 
 /// The captured result of a finished, non-interactive command.
@@ -121,6 +151,12 @@ pub struct RunOutput {
     pub stdout: Vec<u8>,
     /// Everything the process wrote to stderr.
     pub stderr: Vec<u8>,
+    /// Whether the command was terminated because it exceeded its timeout.
+    ///
+    /// When `true` the runner enforced [`RunSpec::timeout`] by signalling the
+    /// child's process group; `exit_code`/`signal` then reflect how the child
+    /// (or its group) actually died.
+    pub timed_out: bool,
 }
 
 impl RunOutput {
@@ -223,10 +259,14 @@ fn is_existing_dir(path: &Path) -> bool {
 /// missing cwd, or a spawn failure); a command that runs and exits nonzero is a
 /// successful [`RunOutput`] with a nonzero `exit_code`.
 pub async fn run(spec: &RunSpec) -> Result<RunOutput, RunError> {
-    use tokio::io::AsyncWriteExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let mut command = build_command(spec)?;
     let mut child = command.spawn().map_err(RunError::Spawn)?;
+    // Capture the pid up front: once the child exits we still want it to signal
+    // the (now possibly-orphaned) process group, and after `wait` the handle no
+    // longer reports an id.
+    let pid = child.id();
 
     // Feed piped stdin (if any) to the child, then drop the handle so the child
     // sees end-of-file exactly once. The handle is moved out of the child and
@@ -240,23 +280,102 @@ pub async fn run(spec: &RunSpec) -> Result<RunOutput, RunError> {
         }
     }
 
-    let output = child.wait_with_output().await.map_err(RunError::Spawn)?;
+    // Drain stdout/stderr concurrently with the wait so the child never blocks
+    // on a full pipe (which would otherwise deadlock against our timeout).
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    // Wait for the child, enforcing the max runtime if one was requested. On
+    // timeout we terminate the whole process group (SIGTERM, then SIGKILL after
+    // the grace period) so no descendant is left orphaned.
+    let mut timed_out = false;
+    let status = match spec.timeout {
+        Some(limit) => match tokio::time::timeout(limit, child.wait()).await {
+            Ok(result) => result.map_err(RunError::Spawn)?,
+            Err(_elapsed) => {
+                timed_out = true;
+                signal_process_group(pid, TermSignal::Term);
+                match tokio::time::timeout(spec.grace_period, child.wait()).await {
+                    Ok(result) => result.map_err(RunError::Spawn)?,
+                    Err(_elapsed) => {
+                        signal_process_group(pid, TermSignal::Kill);
+                        child.wait().await.map_err(RunError::Spawn)?
+                    }
+                }
+            }
+        },
+        None => child.wait().await.map_err(RunError::Spawn)?,
+    };
+
+    // The reader tasks complete once the pipes hit EOF, which happens when the
+    // child (and anything holding its stdout/stderr) is gone.
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
 
     #[cfg(unix)]
     let signal = {
         use std::os::unix::process::ExitStatusExt as _;
-        output.status.signal()
+        status.signal()
     };
     #[cfg(not(unix))]
     let signal = None;
 
     Ok(RunOutput {
-        exit_code: output.status.code(),
+        exit_code: status.code(),
         signal,
-        stdout: output.stdout,
-        stderr: output.stderr,
+        stdout,
+        stderr,
+        timed_out,
     })
 }
+
+/// Which terminating signal to deliver to a process group.
+#[derive(Debug, Clone, Copy)]
+enum TermSignal {
+    /// Polite request to terminate (SIGTERM).
+    Term,
+    /// Forceful, uncatchable kill (SIGKILL).
+    Kill,
+}
+
+/// Signal the entire process group led by `pid`.
+///
+/// The child is placed in its own process group (see [`build_command`]), whose
+/// id equals the child's pid. Signalling the group (rather than just the child)
+/// ensures grandchildren spawned by the command are torn down too, so nothing
+/// is left orphaned after a timeout (architecture §7.4). On platforms without
+/// process groups this is a best-effort no-op.
+#[cfg(unix)]
+fn signal_process_group(pid: Option<u32>, signal: TermSignal) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let Some(pid) = pid else { return };
+    let signal = match signal {
+        TermSignal::Term => Signal::SIGTERM,
+        TermSignal::Kill => Signal::SIGKILL,
+    };
+    // ESRCH (group already gone) and other errors are ignored: the goal is
+    // best-effort teardown, and a vanished group needs no further signalling.
+    let _ = killpg(Pid::from_raw(pid as i32), signal);
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_pid: Option<u32>, _signal: TermSignal) {}
 
 #[cfg(test)]
 mod tests {
@@ -331,6 +450,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             stdin: None,
+            ..RunSpec::default()
         };
         assert!(matches!(build_command(&spec), Err(RunError::EmptyCommand)));
     }
@@ -342,6 +462,7 @@ mod tests {
             cwd: PathBuf::from("/this/path/should/not/exist/mx-agent"),
             env: BTreeMap::new(),
             stdin: None,
+            ..RunSpec::default()
         };
         assert!(matches!(build_command(&spec), Err(RunError::MissingCwd(_))));
     }
@@ -353,6 +474,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             stdin: None,
+            ..RunSpec::default()
         };
         let out = run(&spec).await.expect("runs");
         assert_eq!(out.exit_code, Some(0));
@@ -363,6 +485,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             stdin: None,
+            ..RunSpec::default()
         };
         let out = run(&spec).await.expect("runs");
         assert_eq!(out.exit_code, Some(1));
@@ -378,6 +501,7 @@ mod tests {
             cwd: dir.clone(),
             env: BTreeMap::new(),
             stdin: None,
+            ..RunSpec::default()
         };
         let out = run(&spec).await.expect("runs");
         let printed = String::from_utf8(out.stdout).unwrap();
@@ -398,6 +522,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             stdin: None,
+            ..RunSpec::default()
         };
         let out = run(&spec).await.expect("runs");
         let env_dump = String::from_utf8(out.stdout).unwrap();
@@ -417,6 +542,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: overrides(&[("MX_AGENT_RUN_MARKER", "present")]),
             stdin: None,
+            ..RunSpec::default()
         };
         let out = run(&spec).await.expect("runs");
         let env_dump = String::from_utf8(out.stdout).unwrap();
@@ -435,6 +561,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             stdin: Some(b"hi\n".to_vec()),
+            ..RunSpec::default()
         };
         let out = run(&spec).await.expect("runs");
         assert_eq!(out.exit_code, Some(0));
@@ -450,10 +577,83 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             stdin: Some(Vec::new()),
+            ..RunSpec::default()
         };
         let out = run(&spec).await.expect("runs");
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_command_is_terminated() {
+        // Acceptance: timed-out commands are terminated. `sleep 60` cannot
+        // finish within the 100ms limit, so it must be signalled and reported
+        // as timed out rather than running to completion.
+        let spec = RunSpec {
+            command: vec!["sleep".to_string(), "60".to_string()],
+            cwd: std::env::temp_dir(),
+            timeout: Some(Duration::from_millis(100)),
+            grace_period: Duration::from_millis(100),
+            ..RunSpec::default()
+        };
+        let start = std::time::Instant::now();
+        let out = run(&spec).await.expect("runs");
+        assert!(out.timed_out, "command should be marked timed out");
+        // It must not have run anywhere near the full 60s.
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Terminated by a signal, so there is no clean exit code.
+        assert!(out.exit_code.is_none());
+        #[cfg(unix)]
+        assert!(out.signal.is_some(), "expected a terminating signal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_whole_process_group() {
+        // Acceptance: child process groups do not remain orphaned. The command
+        // spawns a long-lived grandchild and prints its pid, then sleeps. On
+        // timeout the whole group must be signalled, so the grandchild dies
+        // too rather than being left orphaned.
+        let spec = RunSpec {
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 60 & echo $! ; wait".to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+            timeout: Some(Duration::from_millis(200)),
+            grace_period: Duration::from_millis(100),
+            ..RunSpec::default()
+        };
+        let out = run(&spec).await.expect("runs");
+        assert!(out.timed_out);
+        let printed = String::from_utf8(out.stdout).unwrap();
+        let grandchild: i32 = printed.trim().parse().expect("grandchild pid");
+
+        // Give the kernel a moment to reap the signalled group.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        // ESRCH means the process is gone; anything else means it survived.
+        let alive = matches!(
+            kill(Pid::from_raw(grandchild), None),
+            Ok(()) | Err(nix::errno::Errno::EPERM)
+        );
+        assert!(!alive, "grandchild {grandchild} was left orphaned");
+    }
+
+    #[tokio::test]
+    async fn command_within_timeout_is_not_marked_timed_out() {
+        let spec = RunSpec {
+            command: vec!["true".to_string()],
+            cwd: std::env::temp_dir(),
+            timeout: Some(Duration::from_secs(30)),
+            ..RunSpec::default()
+        };
+        let out = run(&spec).await.expect("runs");
+        assert!(!out.timed_out);
+        assert_eq!(out.exit_code, Some(0));
     }
 
     #[tokio::test]
@@ -465,6 +665,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             stdin: None,
+            ..RunSpec::default()
         };
         let out = run(&spec).await.expect("runs");
         assert_eq!(out.exit_code, Some(0));
