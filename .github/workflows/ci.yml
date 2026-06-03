@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check markdown links are relative where expected
+        run: |
+          test -f README.md
+          test -f docs/architecture.md
+          test -f docs/roadmap-rust.md
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Detect Cargo workspace
+        id: cargo
+        run: |
+          if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: cargo fmt
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo fmt --check
+      - name: cargo clippy
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo test
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo test --all

@@ -4,4 +4,9 @@
 
 The CLI treats Matrix rooms as federated workspaces where agents can discover peers, share execution context, stream terminal I/O, and coordinate distributed task graphs without requiring central orchestration servers or inbound firewall access.
 
-See [docs/architecture.md](docs/architecture.md) for the full technical architecture.
+Documentation:
+
+- [Architecture](docs/architecture.md)
+- [Rust implementation roadmap](docs/roadmap-rust.md)
+- [GitHub project management](docs/github-management.md)
+- [GitHub issue backlog](docs/github-issue-backlog.md)

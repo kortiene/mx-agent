@@ -1,0 +1,29 @@
+name: Security hardening task
+description: Track non-sensitive security work. Do not disclose vulnerabilities publicly.
+labels: ["type:security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For suspected vulnerabilities, use GitHub private vulnerability reporting instead of a public issue.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+    validations:
+      required: true
+  - type: textarea
+    id: threat
+    attributes:
+      label: Threat Model / Risk
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
