@@ -25,6 +25,19 @@
 //! of a gap, the lowest missing sequence number(s) are declared lost. When a
 //! chunk is declared lost the stream is marked **degraded**: a warning is
 //! surfaced to the user and best-effort output continues by default.
+//!
+//! ## Strict stream mode
+//!
+//! Best-effort rendering is the right default for interactive use, but some
+//! callers need a guarantee that what they saw is exactly what the remote
+//! produced (e.g. capturing a build log for an audit). [`RenderConfig::strict`]
+//! turns any stream-integrity problem into a hard failure: a missing chunk
+//! (declared lost as above) or an *invalid* chunk (one whose payload cannot be
+//! decoded, or whose `sha256` digest does not match its bytes) marks the
+//! outcome as an integrity failure. The CLI maps that to exit code
+//! [`EXIT_STREAM_INTEGRITY`] (`132`). Output is still rendered best-effort so
+//! the user can see what was received, but the non-zero exit makes the
+//! corruption impossible to ignore.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -34,6 +47,10 @@ use mx_agent_protocol::schema::{ExecFinished, StreamChunk, StreamKind};
 /// Local exit code used when the stream ends without an `exec.finished` frame
 /// (architecture §5.3: protocol/network failure).
 pub const EXIT_PROTOCOL_FAILURE: u8 = 128;
+
+/// Local exit code returned in strict mode when stream integrity is violated:
+/// a chunk is missing or fails validation (architecture §5.3).
+pub const EXIT_STREAM_INTEGRITY: u8 = 132;
 
 /// Default reorder window: how many chunks may be buffered ahead of a gap on a
 /// single stream before the missing sequence number is declared lost. Bounds
@@ -55,12 +72,17 @@ pub struct RenderConfig {
     /// Maximum number of chunks buffered ahead of a gap, per stream, before the
     /// missing sequence number is declared lost and the stream marked degraded.
     pub reorder_window: usize,
+    /// Treat any stream-integrity problem (a missing or invalid chunk) as a
+    /// hard failure rather than continuing best-effort. See the module-level
+    /// "Strict stream mode" section.
+    pub strict: bool,
 }
 
 impl Default for RenderConfig {
     fn default() -> Self {
         Self {
             reorder_window: DEFAULT_REORDER_WINDOW,
+            strict: false,
         }
     }
 }
@@ -82,6 +104,9 @@ pub struct StreamOutcome {
     pub exit_code: Option<u8>,
     /// Sequence numbers that were declared lost, in detection order.
     pub missing: Vec<MissingChunk>,
+    /// `true` if strict mode detected a stream-integrity violation (a missing
+    /// or invalid chunk). Always `false` in best-effort (default) mode.
+    pub integrity_failure: bool,
 }
 
 impl StreamOutcome {
@@ -292,6 +317,44 @@ where
     }
 }
 
+/// Validate a chunk's payload integrity, returning a human-readable reason if
+/// the chunk is invalid.
+///
+/// A chunk is invalid when its declared encoding cannot decode its payload
+/// (e.g. malformed base64), or when it carries a `sha256` digest that does not
+/// match its decoded bytes. Used only in strict mode; best-effort rendering
+/// tolerates such chunks by falling back to raw bytes.
+fn chunk_integrity_error(chunk: &StreamChunk) -> Option<String> {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let bytes = if chunk.encoding.as_str() == "base64" {
+        match engine.decode(chunk.data.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Some(format!(
+                    "{} chunk {}: invalid base64 payload: {e}",
+                    stream_label(chunk.stream),
+                    chunk.seq
+                ))
+            }
+        }
+    } else {
+        chunk.data.clone().into_bytes()
+    };
+    if let Some(expected) = &chunk.sha256 {
+        use sha2::{Digest as _, Sha256};
+        let got = engine.encode(Sha256::digest(&bytes));
+        if &got != expected {
+            return Some(format!(
+                "{} chunk {}: sha256 digest mismatch",
+                stream_label(chunk.stream),
+                chunk.seq
+            ));
+        }
+    }
+    None
+}
+
 /// Human-readable label for a stream, used in degraded-mode warnings.
 fn stream_label(stream: StreamKind) -> &'static str {
     match stream {
@@ -308,19 +371,52 @@ fn stream_label(stream: StreamKind) -> &'static str {
 fn surface_missing<E>(
     detected: &[MissingChunk],
     outcome: &mut StreamOutcome,
+    strict: bool,
     err: &mut E,
 ) -> io::Result<()>
 where
     E: Write,
 {
     for m in detected {
-        writeln!(
-            err,
-            "mx-agent: warning: {} stream degraded: missing chunk {} (best-effort output continues)",
-            stream_label(m.stream),
-            m.seq
-        )?;
+        if strict {
+            writeln!(
+                err,
+                "mx-agent: error: {} stream integrity failure: missing chunk {}",
+                stream_label(m.stream),
+                m.seq
+            )?;
+            outcome.integrity_failure = true;
+        } else {
+            writeln!(
+                err,
+                "mx-agent: warning: {} stream degraded: missing chunk {} (best-effort output continues)",
+                stream_label(m.stream),
+                m.seq
+            )?;
+        }
         outcome.missing.push(*m);
+    }
+    Ok(())
+}
+
+/// In strict mode, validate `chunk` and, if it fails, surface the reason on
+/// `err` and mark the outcome as an integrity failure. Output still proceeds
+/// best-effort so the user can see what was received. A no-op when not strict.
+fn check_chunk_integrity<E>(
+    chunk: &StreamChunk,
+    outcome: &mut StreamOutcome,
+    strict: bool,
+    err: &mut E,
+) -> io::Result<()>
+where
+    E: Write,
+{
+    if !strict {
+        return Ok(());
+    }
+    if let Some(reason) = chunk_integrity_error(chunk) {
+        writeln!(err, "mx-agent: error: stream integrity failure: {reason}")?;
+        outcome.integrity_failure = true;
     }
     Ok(())
 }
@@ -368,18 +464,20 @@ where
             StreamFrame::Chunk(chunk) => {
                 detected.clear();
                 for ready in buf.accept(chunk, &mut detected) {
+                    check_chunk_integrity(&ready, &mut outcome, config.strict, err)?;
                     render_chunk(&ready, out, err)?;
                 }
-                surface_missing(&detected, &mut outcome, err)?;
+                surface_missing(&detected, &mut outcome, config.strict, err)?;
             }
             StreamFrame::Finished(finished) => {
                 // Flush anything still buffered before reporting the exit code;
                 // remaining gaps are declared lost.
                 detected.clear();
                 for ready in buf.flush(&mut detected) {
+                    check_chunk_integrity(&ready, &mut outcome, config.strict, err)?;
                     render_chunk(&ready, out, err)?;
                 }
-                surface_missing(&detected, &mut outcome, err)?;
+                surface_missing(&detected, &mut outcome, config.strict, err)?;
                 outcome.exit_code = Some(resolve_exit_code(&finished));
                 finished_seen = true;
                 break;
@@ -392,9 +490,10 @@ where
         // best-effort, then leave the exit code unset (protocol failure).
         detected.clear();
         for ready in buf.flush(&mut detected) {
+            check_chunk_integrity(&ready, &mut outcome, config.strict, err)?;
             render_chunk(&ready, out, err)?;
         }
-        surface_missing(&detected, &mut outcome, err)?;
+        surface_missing(&detected, &mut outcome, config.strict, err)?;
     }
 
     out.flush()?;
@@ -649,7 +748,10 @@ mod tests {
     fn missing_chunk_is_detected_when_window_exceeded() {
         // A small reorder window means a never-delivered seq 0 is declared lost
         // once enough later chunks pile up, and best-effort output continues.
-        let config = RenderConfig { reorder_window: 2 };
+        let config = RenderConfig {
+            reorder_window: 2,
+            strict: false,
+        };
         let frames = vec![
             StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 1, "utf-8", "b\n", false)),
             StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "c\n", false)),
@@ -705,6 +807,152 @@ mod tests {
         );
         assert_eq!(String::from_utf8(out).unwrap(), "a\nc\n");
         assert!(String::from_utf8(err).unwrap().contains("missing chunk 1"));
+    }
+
+    #[test]
+    fn strict_mode_fails_on_simulated_missing_chunk() {
+        // Acceptance: strict mode fails on a simulated missing chunk. seq 1
+        // never arrives; the trailing gap is declared lost on finish and, in
+        // strict mode, that is an integrity failure (CLI maps it to exit 132).
+        let config = RenderConfig {
+            strict: true,
+            ..Default::default()
+        };
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "a\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "c\n", false)),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream_with(frames, config, &mut out, &mut err).unwrap();
+        assert!(outcome.integrity_failure);
+        assert!(outcome.degraded());
+        // Output is still rendered best-effort so the user sees what arrived.
+        assert_eq!(String::from_utf8(out).unwrap(), "a\nc\n");
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("stream integrity failure: missing chunk 1"),
+            "got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn default_mode_remains_best_effort_on_missing_chunk() {
+        // Acceptance: default mode remains best-effort. The same missing chunk
+        // is degraded but never an integrity failure.
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 0, "utf-8", "a\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "c\n", false)),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert!(outcome.degraded());
+        assert!(!outcome.integrity_failure);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(String::from_utf8(out).unwrap(), "a\nc\n");
+    }
+
+    #[test]
+    fn strict_mode_fails_on_window_exceeded_missing_chunk() {
+        // A never-delivered seq 0 declared lost mid-stream (window exceeded) is
+        // also an integrity failure in strict mode.
+        let config = RenderConfig {
+            strict: true,
+            reorder_window: 2,
+        };
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 1, "utf-8", "b\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 2, "utf-8", "c\n", false)),
+            StreamFrame::Chunk(chunk_seq(StreamKind::Stdout, 3, "utf-8", "d\n", false)),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream_with(frames, config, &mut out, &mut err).unwrap();
+        assert!(outcome.integrity_failure);
+        assert_eq!(
+            outcome.missing,
+            vec![MissingChunk {
+                stream: StreamKind::Stdout,
+                seq: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn strict_mode_fails_on_invalid_base64_chunk() {
+        // An undecodable base64 payload is an invalid chunk: fatal in strict
+        // mode, tolerated (rendered raw) by default.
+        let config = RenderConfig {
+            strict: true,
+            ..Default::default()
+        };
+        let frames = vec![
+            StreamFrame::Chunk(chunk_seq(
+                StreamKind::Stdout,
+                0,
+                "base64",
+                "not valid base64 !!!",
+                false,
+            )),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream_with(frames, config, &mut out, &mut err).unwrap();
+        assert!(outcome.integrity_failure);
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(stderr.contains("invalid base64 payload"), "got: {stderr}");
+    }
+
+    #[test]
+    fn strict_mode_fails_on_sha256_mismatch() {
+        // A chunk whose declared sha256 does not match its bytes is invalid.
+        let config = RenderConfig {
+            strict: true,
+            ..Default::default()
+        };
+        let mut bad = chunk_seq(StreamKind::Stdout, 0, "utf-8", "hello\n", false);
+        bad.sha256 = Some("AAAA".to_string());
+        let frames = vec![
+            StreamFrame::Chunk(bad),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream_with(frames, config, &mut out, &mut err).unwrap();
+        assert!(outcome.integrity_failure);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("sha256 digest mismatch"));
+    }
+
+    #[test]
+    fn strict_mode_accepts_matching_sha256() {
+        // A correct sha256 digest passes strict validation.
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let data = "hello\n";
+        let digest =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data.as_bytes()));
+        let config = RenderConfig {
+            strict: true,
+            ..Default::default()
+        };
+        let mut good = chunk_seq(StreamKind::Stdout, 0, "utf-8", data, false);
+        good.sha256 = Some(digest);
+        let frames = vec![
+            StreamFrame::Chunk(good),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream_with(frames, config, &mut out, &mut err).unwrap();
+        assert!(!outcome.integrity_failure);
+        assert_eq!(String::from_utf8(out).unwrap(), data);
     }
 
     #[test]

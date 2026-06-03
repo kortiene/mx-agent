@@ -300,6 +300,11 @@ struct ExecArgs {
     /// Stream stdout/stderr live.
     #[arg(long)]
     stream: bool,
+    /// Fail (exit 132) if the output stream is incomplete or corrupt instead of
+    /// rendering best-effort. A missing chunk or one that fails validation
+    /// (bad encoding or sha256 mismatch) becomes a hard error.
+    #[arg(long = "strict-stream")]
+    strict_stream: bool,
     /// Allocate a pseudo-terminal.
     #[arg(long)]
     pty: bool,
@@ -1897,7 +1902,22 @@ fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
     let stderr = std::io::stderr();
     let mut out = stdout.lock();
     let mut err = stderr.lock();
-    match crate::stream::render_stream(frames, &mut out, &mut err) {
+    let render = if args.strict_stream {
+        let config = crate::stream::RenderConfig {
+            strict: true,
+            ..Default::default()
+        };
+        crate::stream::render_stream_with(frames, config, &mut out, &mut err)
+    } else {
+        crate::stream::render_stream(frames, &mut out, &mut err)
+    };
+    match render {
+        // In strict mode any integrity violation (a missing or invalid chunk)
+        // is fatal: exit 132 regardless of the remote command's own status.
+        Ok(outcome) if outcome.integrity_failure => {
+            eprintln!("mx-agent: error: stream integrity check failed (strict mode)");
+            ExitCode::from(crate::stream::EXIT_STREAM_INTEGRITY)
+        }
         // Missing chunks (degraded mode) are surfaced to the user by the
         // renderer as they are detected; best-effort output continues here.
         Ok(outcome) => match outcome.exit_code {
