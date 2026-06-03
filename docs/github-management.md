@@ -191,6 +191,34 @@ Projects v2 are owned by a user/org, not a repository, so the default Actions `G
 
 The workflow `.github/workflows/project-sync.yml` runs `actions/add-to-project` whenever an issue or PR is opened, reopened, or labeled, and adds it to `PROJECT_URL`. It is a no-op until `PROJECT_URL` is set.
 
+## Starting Work on an Issue
+
+`scripts/work_issue.sh` takes a GitHub issue number and bootstraps everything needed to start implementing it:
+
+```bash
+scripts/work_issue.sh 3
+```
+
+It will:
+
+1. Fetch the issue (title, body, labels, milestone, state).
+2. Derive a branch name from the issue's type label and title, e.g. `ci/3-add-rust-formatting-linting-and-baseline`.
+3. Create/check out that branch from an up-to-date `origin/main`.
+4. Assign the issue to the current user.
+5. Move the issue's project board card to `In Progress` (best effort).
+6. Print the scope and acceptance criteria.
+
+Useful flags:
+
+```bash
+scripts/work_issue.sh 3 --print      # only show issue context, change nothing
+scripts/work_issue.sh 3 --dry-run    # show all actions without performing them
+scripts/work_issue.sh 3 --base main --status "In Progress"
+scripts/work_issue.sh 3 --no-status  # skip board update (no project scope needed)
+```
+
+Requirements: `gh` (authenticated; `project` scope needed for board updates), `jq`, and `git`.
+
 ### Manual alternative with gh
 
 ```bash
