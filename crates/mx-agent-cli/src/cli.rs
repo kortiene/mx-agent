@@ -399,6 +399,7 @@ pub fn run() -> ExitCode {
         Command::Auth(cmd) => handle_auth(g, cmd),
         Command::Workspace(cmd) => handle_workspace(g, cmd),
         Command::Agent(cmd) => handle_agent(g, cmd),
+        Command::Trust(cmd) => handle_trust(g, cmd),
         _ => unimplemented(g, &path),
     }
 }
@@ -542,6 +543,51 @@ fn auth_logout(global: &GlobalArgs) -> ExitCode {
         }
         Err(e) => {
             eprintln!("mx-agent: could not clear session: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Handle the `trust` command group.
+fn handle_trust(global: &GlobalArgs, cmd: &TrustCommand) -> ExitCode {
+    match cmd {
+        TrustCommand::Fingerprint => trust_fingerprint(global),
+        _ => unimplemented(global, &format!("trust {}", trust_subcommand_name(cmd))),
+    }
+}
+
+/// Short name for a trust subcommand, used in diagnostics.
+fn trust_subcommand_name(cmd: &TrustCommand) -> &'static str {
+    match cmd {
+        TrustCommand::List => "list",
+        TrustCommand::Fingerprint => "fingerprint",
+        TrustCommand::Approve => "approve",
+        TrustCommand::Revoke => "revoke",
+    }
+}
+
+/// Show the local daemon signing key fingerprint, generating the key on first
+/// run. The fingerprint is stable across restarts.
+fn trust_fingerprint(global: &GlobalArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    match mx_agent_daemon::load_or_create_signing_key(&paths) {
+        Ok(key) => {
+            let fingerprint = key.fingerprint();
+            let key_id = key.key_id();
+            if global.json {
+                let obj = serde_json::json!({
+                    "alg": mx_agent_daemon::KEY_ALG,
+                    "key_id": key_id,
+                    "fingerprint": fingerprint,
+                });
+                println!("{obj}");
+            } else {
+                println!("{fingerprint}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not load signing key: {e}");
             ExitCode::FAILURE
         }
     }
