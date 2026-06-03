@@ -108,6 +108,7 @@ fn run_tests_tool() -> ToolSchema {
             "type": "object",
             "properties": {
                 "package": { "type": "string" },
+                "name": { "type": "string" },
                 "coverage": { "type": "boolean" }
             },
             "required": ["package"]

@@ -278,6 +278,9 @@ struct CallArgs {
     /// Tool argument as `key=value` (repeatable).
     #[arg(long = "arg", value_name = "KEY=VALUE")]
     args: Vec<String>,
+    /// Read the tool input as a JSON object from this file (`-` for stdin).
+    #[arg(long = "input-json", value_name = "FILE")]
+    input_json: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -463,6 +466,7 @@ pub fn run() -> ExitCode {
         Command::Workspace(cmd) => handle_workspace(g, cmd),
         Command::Agent(cmd) => handle_agent(g, cmd),
         Command::Trust(cmd) => handle_trust(g, cmd),
+        Command::Call(args) => cmd_call(g, args),
         _ => unimplemented(g, &path),
     }
 }
@@ -1607,6 +1611,127 @@ fn command_path(command: &Command) -> String {
     }
 }
 
+/// Parse repeated `--arg key=value` pairs into a JSON object.
+///
+/// Values are coerced with the lightest touch that matches operator intent:
+/// `true`/`false` become booleans and bare integers become numbers; everything
+/// else stays a string. This mirrors the examples in `docs/architecture.md`
+/// §5.2 (`--arg package=api --arg coverage=true`).
+fn parse_tool_args(pairs: &[String]) -> Result<serde_json::Value, String> {
+    let mut map = serde_json::Map::new();
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("argument {pair:?} is not in key=value form"))?;
+        if key.is_empty() {
+            return Err(format!("argument {pair:?} has an empty key"));
+        }
+        let json = match value {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            other => match other.parse::<i64>() {
+                Ok(n) => serde_json::Value::from(n),
+                Err(_) => serde_json::Value::String(other.to_string()),
+            },
+        };
+        map.insert(key.to_string(), json);
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+/// Handle `mx-agent call`: invoke a named built-in tool.
+///
+/// The CLI runs the tool locally and exits with the tool's own exit code, so
+/// `mx-agent call --tool run_tests ...` propagates test failures to the shell
+/// (architecture §5.3). The same signed request/response flow is used for
+/// remote agents (see `mx_agent_daemon::call`).
+fn cmd_call(global: &GlobalArgs, args: &CallArgs) -> ExitCode {
+    let tool = match &args.tool {
+        Some(t) => t.clone(),
+        None => {
+            eprintln!("mx-agent: --tool is required");
+            return ExitCode::from(64);
+        }
+    };
+
+    // Build the tool input: a JSON object from --input-json, otherwise from
+    // the repeated --arg key=value pairs.
+    let input = match &args.input_json {
+        Some(path) => {
+            let raw = if path.as_os_str() == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                    eprintln!("mx-agent: could not read stdin: {e}");
+                    return ExitCode::from(64);
+                }
+                buf
+            } else {
+                match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("mx-agent: could not read {}: {e}", path.display());
+                        return ExitCode::from(64);
+                    }
+                }
+            };
+            match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    eprintln!("mx-agent: --input-json must contain a JSON object");
+                    return ExitCode::from(64);
+                }
+                Err(e) => {
+                    eprintln!("mx-agent: invalid --input-json: {e}");
+                    return ExitCode::from(64);
+                }
+            }
+        }
+        None => match parse_tool_args(&args.args) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("mx-agent: {e}");
+                return ExitCode::from(64);
+            }
+        },
+    };
+
+    match mx_agent_daemon::execute_tool(&tool, &input) {
+        Ok(result) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: {}", result.summary);
+            }
+            // Propagate the tool's exit code so the shell sees failures.
+            let code = u8::try_from(result.exit_code).unwrap_or(1);
+            ExitCode::from(code)
+        }
+        Err(e) => {
+            if global.json {
+                let body = serde_json::json!({ "ok": false, "error": e.to_string() });
+                println!("{body}");
+            } else {
+                eprintln!("mx-agent: {e}");
+            }
+            // Map invocation failures to the exit codes in architecture §5.3.
+            match e {
+                mx_agent_daemon::ToolError::UnknownTool(_) => ExitCode::from(127),
+                mx_agent_daemon::ToolError::InvalidArgs(_) => ExitCode::from(64),
+                mx_agent_daemon::ToolError::Spawn(ref io)
+                    if io.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    ExitCode::from(127)
+                }
+                mx_agent_daemon::ToolError::Spawn(_) => ExitCode::from(128),
+            }
+        }
+    }
+}
+
 /// Report that a recognized command is not implemented yet.
 fn unimplemented(global: &GlobalArgs, path: &str) -> ExitCode {
     if global.json {
@@ -1651,6 +1776,45 @@ mod tests {
                 names.contains(&expected),
                 "missing command group: {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn parse_tool_args_coerces_types() {
+        let value = parse_tool_args(&[
+            "package=api".to_string(),
+            "coverage=true".to_string(),
+            "retries=3".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(value["package"], serde_json::json!("api"));
+        assert_eq!(value["coverage"], serde_json::json!(true));
+        assert_eq!(value["retries"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn parse_tool_args_rejects_malformed() {
+        assert!(parse_tool_args(&["nokey".to_string()]).is_err());
+        assert!(parse_tool_args(&["=value".to_string()]).is_err());
+    }
+
+    #[test]
+    fn call_parses_tool_and_args() {
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "call",
+            "--tool",
+            "run_tests",
+            "--arg",
+            "package=api",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Call(args) => {
+                assert_eq!(args.tool.as_deref(), Some("run_tests"));
+                assert_eq!(args.args, vec!["package=api".to_string()]);
+            }
+            other => panic!("expected call, got {other:?}"),
         }
     }
 
