@@ -13,6 +13,7 @@ pub mod replay;
 pub mod session;
 pub mod signing;
 pub mod sync;
+pub mod trust;
 pub mod workspace;
 
 pub use agent::{
@@ -42,6 +43,7 @@ pub use signing::{
 pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
 };
+pub use trust::{fingerprint_from_key_id, TrustEntry, TrustStatus, TrustStore};
 pub use workspace::{
     attach_workspace, attach_workspace_for_session, create_workspace, create_workspace_for_session,
     join_workspace, join_workspace_for_session, workspace_status, workspace_status_for_session,

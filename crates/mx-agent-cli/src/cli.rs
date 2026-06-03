@@ -357,13 +357,49 @@ enum ApprovalCommand {
 #[derive(Debug, Subcommand)]
 enum TrustCommand {
     /// List trusted keys.
-    List,
+    List(TrustListArgs),
     /// Show the local signing key fingerprint.
     Fingerprint,
     /// Approve an agent signing key.
-    Approve,
+    Approve(TrustApproveArgs),
     /// Revoke an agent signing key.
-    Revoke,
+    Revoke(TrustRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+struct TrustListArgs {
+    /// Only list keys scoped to this workspace room.
+    #[arg(long, value_name = "ROOM")]
+    room: Option<String>,
+    /// Only list keys for this agent.
+    #[arg(long = "agent", value_name = "AGENT")]
+    agent: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct TrustApproveArgs {
+    /// Agent identifier the key belongs to.
+    #[arg(long = "agent", value_name = "AGENT")]
+    agent: String,
+    /// Signing key identifier (`mxagent-ed25519:<base64>`).
+    #[arg(long, value_name = "KEY")]
+    key: String,
+    /// Workspace room to scope the trust to.
+    #[arg(long, value_name = "ROOM")]
+    room: Option<String>,
+    /// Key fingerprint (`SHA256:<base64>`); derived from the key id if omitted.
+    #[arg(long, value_name = "FINGERPRINT")]
+    fingerprint: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct TrustRevokeArgs {
+    /// Agent identifier the key belongs to.
+    #[arg(long = "agent", value_name = "AGENT")]
+    agent: String,
+    /// Signing key identifier (`mxagent-ed25519:<base64>`).
+    #[arg(long, value_name = "KEY")]
+    key: String,
 }
 
 /// Map repeated `-v` flags to a default log filter directive.
@@ -552,17 +588,132 @@ fn auth_logout(global: &GlobalArgs) -> ExitCode {
 fn handle_trust(global: &GlobalArgs, cmd: &TrustCommand) -> ExitCode {
     match cmd {
         TrustCommand::Fingerprint => trust_fingerprint(global),
-        _ => unimplemented(global, &format!("trust {}", trust_subcommand_name(cmd))),
+        TrustCommand::List(args) => trust_list(global, args),
+        TrustCommand::Approve(args) => trust_approve(global, args),
+        TrustCommand::Revoke(args) => trust_revoke(global, args),
     }
 }
 
-/// Short name for a trust subcommand, used in diagnostics.
-fn trust_subcommand_name(cmd: &TrustCommand) -> &'static str {
-    match cmd {
-        TrustCommand::List => "list",
-        TrustCommand::Fingerprint => "fingerprint",
-        TrustCommand::Approve => "approve",
-        TrustCommand::Revoke => "revoke",
+/// Render a single trust entry as a human-readable block.
+fn print_trust_entry(entry: &mx_agent_daemon::TrustEntry) {
+    println!("  {} {}", entry.status, entry.key_id);
+    println!("    agent:       {}", entry.agent_id);
+    println!("    fingerprint: {}", entry.fingerprint);
+    if let Some(room) = &entry.room {
+        println!("    room:        {room}");
+    }
+    if let Some(by) = &entry.trusted_by {
+        println!("    trusted_by:  {by}");
+    }
+}
+
+/// List trusted keys from the local trust store, with optional filters.
+fn trust_list(global: &GlobalArgs, args: &TrustListArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    let store = match mx_agent_daemon::TrustStore::load(&paths) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("mx-agent: could not read trust store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let entries: Vec<&mx_agent_daemon::TrustEntry> = store
+        .entries()
+        .iter()
+        .filter(|e| args.agent.as_deref().map_or(true, |a| e.agent_id == a))
+        .filter(|e| {
+            args.room
+                .as_deref()
+                .map_or(true, |r| e.room.as_deref() == Some(r))
+        })
+        .collect();
+    if global.json {
+        println!(
+            "{}",
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+        );
+    } else if entries.is_empty() {
+        println!("mx-agent: no trusted keys");
+    } else {
+        println!("mx-agent: {} trust record(s)", entries.len());
+        for entry in &entries {
+            print_trust_entry(entry);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Approve an agent signing key in the local trust store.
+fn trust_approve(global: &GlobalArgs, args: &TrustApproveArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    let mut store = match mx_agent_daemon::TrustStore::load(&paths) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("mx-agent: could not read trust store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let entry = store.approve(
+        args.agent.clone(),
+        args.key.clone(),
+        args.fingerprint.clone(),
+        args.room.clone(),
+        None,
+    );
+    if let Err(e) = store.save(&paths) {
+        eprintln!("mx-agent: could not save trust store: {e}");
+        return ExitCode::FAILURE;
+    }
+    if global.json {
+        println!(
+            "{}",
+            serde_json::to_string(&entry).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("mx-agent: approved key for agent {}", entry.agent_id);
+        print_trust_entry(&entry);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Revoke an agent signing key in the local trust store.
+fn trust_revoke(global: &GlobalArgs, args: &TrustRevokeArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    let mut store = match mx_agent_daemon::TrustStore::load(&paths) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("mx-agent: could not read trust store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match store.revoke(&args.agent, &args.key) {
+        Some(entry) => {
+            if let Err(e) = store.save(&paths) {
+                eprintln!("mx-agent: could not save trust store: {e}");
+                return ExitCode::FAILURE;
+            }
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&entry).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: revoked key for agent {}", entry.agent_id);
+                print_trust_entry(&entry);
+            }
+            ExitCode::SUCCESS
+        }
+        None => {
+            if global.json {
+                println!("null");
+            } else {
+                eprintln!(
+                    "mx-agent: no trust record for agent {} key {}",
+                    args.agent, args.key
+                );
+            }
+            ExitCode::from(3)
+        }
     }
 }
 
@@ -1272,10 +1423,10 @@ fn command_path(command: &Command) -> String {
         Command::Trust(c) => format!(
             "trust {}",
             match c {
-                TrustCommand::List => "list",
+                TrustCommand::List(_) => "list",
                 TrustCommand::Fingerprint => "fingerprint",
-                TrustCommand::Approve => "approve",
-                TrustCommand::Revoke => "revoke",
+                TrustCommand::Approve(_) => "approve",
+                TrustCommand::Revoke(_) => "revoke",
             }
         ),
     }
@@ -1426,6 +1577,73 @@ mod tests {
             other => panic!("expected agent tools, got {other:?}"),
         }
         assert_eq!(command_path(&cli.command), "agent tools");
+    }
+
+    #[test]
+    fn trust_approve_and_revoke_require_agent_and_key() {
+        // agent and key are required for approve/revoke.
+        assert!(Cli::try_parse_from(["mx-agent", "trust", "approve"]).is_err());
+        assert!(
+            Cli::try_parse_from(["mx-agent", "trust", "approve", "--agent", "dev-pi"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["mx-agent", "trust", "revoke", "--key", "k"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "trust",
+            "approve",
+            "--agent",
+            "dev-pi",
+            "--key",
+            "mxagent-ed25519:abc123",
+            "--room",
+            "!abc:matrix.org",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Trust(TrustCommand::Approve(args)) => {
+                assert_eq!(args.agent, "dev-pi");
+                assert_eq!(args.key, "mxagent-ed25519:abc123");
+                assert_eq!(args.room.as_deref(), Some("!abc:matrix.org"));
+            }
+            other => panic!("expected trust approve, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "trust approve");
+
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "trust",
+            "revoke",
+            "--agent",
+            "dev-pi",
+            "--key",
+            "mxagent-ed25519:abc123",
+        ])
+        .unwrap();
+        assert_eq!(command_path(&cli.command), "trust revoke");
+    }
+
+    #[test]
+    fn trust_list_accepts_optional_filters() {
+        let cli = Cli::try_parse_from(["mx-agent", "trust", "list"]).unwrap();
+        assert_eq!(command_path(&cli.command), "trust list");
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "trust",
+            "list",
+            "--agent",
+            "dev-pi",
+            "--room",
+            "!abc:matrix.org",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Trust(TrustCommand::List(args)) => {
+                assert_eq!(args.agent.as_deref(), Some("dev-pi"));
+                assert_eq!(args.room.as_deref(), Some("!abc:matrix.org"));
+            }
+            other => panic!("expected trust list, got {other:?}"),
+        }
     }
 
     #[test]
