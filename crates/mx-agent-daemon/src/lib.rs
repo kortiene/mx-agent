@@ -6,10 +6,12 @@
 //! together so the workspace builds end to end.
 
 pub mod lifecycle;
+pub mod matrix;
 
 pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
 };
+pub use matrix::{build_client, ClientError, ConfigError, MatrixConfig};
 
 use mx_agent_ipc::default_socket_name;
 use mx_agent_policy::{default_decision, Decision};
