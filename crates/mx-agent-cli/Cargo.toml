@@ -1,0 +1,16 @@
+[package]
+name = "mx-agent-cli"
+description = "The mx-agent command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mx-agent"
+path = "src/main.rs"
+
+[dependencies]
+mx-agent-protocol.workspace = true
