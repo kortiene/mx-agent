@@ -5,6 +5,7 @@
 //! operation is not implemented yet; behavior arrives in later roadmap phases.
 
 mod cli;
+mod stream;
 
 use std::process::ExitCode;
 
