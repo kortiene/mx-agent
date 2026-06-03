@@ -9,6 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+serde.workspace = true
+toml.workspace = true
+regex = "1"
 
 [lints]
 workspace = true

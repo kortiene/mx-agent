@@ -4,6 +4,13 @@
 //! based on the policy file described in `docs/architecture.md`, section 13.3.
 //! For now it exposes the default decision used before any policy is loaded.
 
+mod file;
+
+pub use file::{
+    AgentPolicy, ExecutionPolicy, NetworkPolicy, Policy, PolicyError, RawExecDefault, RoomPolicy,
+    Sandbox, ENV_CONFIG_DIR, POLICY_FILE_NAME,
+};
+
 /// The outcome of a policy evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
