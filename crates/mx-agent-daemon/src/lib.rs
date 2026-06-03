@@ -26,9 +26,10 @@ pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
 };
 pub use workspace::{
-    create_workspace, create_workspace_for_session, join_workspace, join_workspace_for_session,
-    workspace_status, workspace_status_for_session, CreateWorkspaceOptions, MemberSummary,
-    WorkspaceError, WorkspaceInfo, WorkspaceStatus, WorkspaceVisibility,
+    attach_workspace, attach_workspace_for_session, create_workspace, create_workspace_for_session,
+    join_workspace, join_workspace_for_session, workspace_status, workspace_status_for_session,
+    AttachWorkspaceOptions, CreateWorkspaceOptions, MemberSummary, WorkspaceError, WorkspaceInfo,
+    WorkspaceStatus, WorkspaceVisibility,
 };
 
 use mx_agent_ipc::default_socket_name;

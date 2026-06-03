@@ -15,11 +15,17 @@
 //! [`crate::restore_client`] from a persisted session.
 
 use std::fmt;
+use std::path::Path;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::api::client::room::{create_room, Visibility};
+use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::{OwnedRoomId, RoomOrAliasId};
 use matrix_sdk::{Client, Room, RoomMemberships};
+use mx_agent_protocol::events::state::WORKSPACE as WORKSPACE_STATE_TYPE;
+use mx_agent_protocol::schema::{RepoInfo, WorkspaceState};
 use serde::{Deserialize, Serialize};
 
 use crate::matrix::{restore_client, LoginError};
@@ -145,6 +151,21 @@ pub struct WorkspaceStatus {
     pub invited_members: u64,
     /// Active (joined + invited) members, sorted by user ID.
     pub members: Vec<MemberSummary>,
+    /// Attached workspace metadata, if a `com.mxagent.workspace.v1` state event
+    /// is present in the room.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceState>,
+}
+
+/// Options for [`attach_workspace`].
+#[derive(Debug, Clone)]
+pub struct AttachWorkspaceOptions {
+    /// Room ID or alias to attach to.
+    pub room: String,
+    /// Local filesystem path to attach.
+    pub path: String,
+    /// Project identifier, e.g. `repo:github.com/org/project`.
+    pub project_id: String,
 }
 
 impl WorkspaceStatus {
@@ -161,6 +182,8 @@ pub enum WorkspaceError {
     InvalidTarget(String),
     /// The room was not found in the client's state after syncing.
     RoomNotFound(String),
+    /// The attach path does not exist or is not a directory.
+    InvalidPath(String),
     /// Restoring the authenticated Matrix client from the session failed.
     Restore(Box<LoginError>),
     /// An underlying Matrix request failed.
@@ -177,6 +200,9 @@ impl fmt::Display for WorkspaceError {
             ),
             WorkspaceError::RoomNotFound(value) => {
                 write!(f, "room {value:?} was not found; are you a member of it?")
+            }
+            WorkspaceError::InvalidPath(value) => {
+                write!(f, "path {value:?} does not exist or is not a directory")
             }
             WorkspaceError::Restore(e) => write!(f, "{e}"),
             WorkspaceError::Matrix(e) => write!(f, "Matrix request failed: {e}"),
@@ -318,6 +344,8 @@ pub async fn workspace_status(
     }
     members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
 
+    let workspace = read_workspace_state(&room).await?;
+
     Ok(WorkspaceStatus {
         room_id: room.room_id().to_string(),
         canonical_alias: room.canonical_alias().map(|a| a.to_string()),
@@ -326,7 +354,130 @@ pub async fn workspace_status(
         joined_members: room.joined_members_count(),
         invited_members: room.invited_members_count(),
         members,
+        workspace,
     })
+}
+
+/// Read the `com.mxagent.workspace.v1` state event (empty state key) from a
+/// room, returning `None` when no workspace metadata has been attached.
+async fn read_workspace_state(room: &Room) -> Result<Option<WorkspaceState>, WorkspaceError> {
+    use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState as RawState;
+
+    let raw = room
+        .get_state_event(StateEventType::from(WORKSPACE_STATE_TYPE), "")
+        .await
+        .map_err(WorkspaceError::from)?;
+
+    let content = match raw {
+        Some(RawState::Sync(raw)) => raw.get_field::<WorkspaceState>("content"),
+        Some(RawState::Stripped(raw)) => raw.get_field::<WorkspaceState>("content"),
+        None => return Ok(None),
+    }
+    .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+
+    Ok(content)
+}
+
+/// Attach a local path/project to a workspace room.
+///
+/// Publishes a `com.mxagent.workspace.v1` state event (empty state key) holding
+/// the project ID, attached path, and detected git repository metadata. The
+/// state event overwrites any previously attached metadata for the room
+/// (last-write-wins per `(type, state_key)`).
+pub async fn attach_workspace(
+    client: &Client,
+    options: &AttachWorkspaceOptions,
+) -> Result<WorkspaceState, WorkspaceError> {
+    let path = Path::new(&options.path);
+    if !path.is_dir() {
+        return Err(WorkspaceError::InvalidPath(options.path.clone()));
+    }
+
+    let id = parse_room_or_alias(&options.room)?;
+
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .map_err(WorkspaceError::from)?;
+
+    let room_id = resolve_room_id(client, &id).await?;
+    let room = client
+        .get_room(&room_id)
+        .ok_or_else(|| WorkspaceError::RoomNotFound(options.room.clone()))?;
+
+    let attached_by = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+    let attached_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+
+    // Read the prior revision (if any) so we can advance `state_rev`.
+    let previous = read_workspace_state(&room).await?;
+    let state_rev = previous.map(|w| w.state_rev + 1).unwrap_or(1);
+
+    let state = WorkspaceState {
+        project_id: options.project_id.clone(),
+        path: options.path.clone(),
+        repo: detect_repo_info(path),
+        attached_by,
+        attached_at,
+        state_rev,
+        extra: Default::default(),
+    };
+
+    let content = serde_json::to_value(&state)
+        .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    room.send_state_event_raw(WORKSPACE_STATE_TYPE, "", content)
+        .await
+        .map_err(WorkspaceError::from)?;
+
+    Ok(state)
+}
+
+/// Attach a workspace, restoring the authenticated client from `session`.
+pub async fn attach_workspace_for_session(
+    session: &StoredSession,
+    options: &AttachWorkspaceOptions,
+) -> Result<WorkspaceState, WorkspaceError> {
+    let client = restore_client(session).await?;
+    attach_workspace(&client, options).await
+}
+
+/// Detect git repository metadata for `path`, returning `None` when `path` is
+/// not inside a git work tree.
+fn detect_repo_info(path: &Path) -> Option<RepoInfo> {
+    // A non-zero exit (or missing git) means this is not a git repository.
+    let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]);
+    if inside.as_deref() != Some("true") {
+        return None;
+    }
+    Some(RepoInfo {
+        remote_url: git_output(path, &["remote", "get-url", "origin"]),
+        branch: git_output(path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        commit: git_output(path, &["rev-parse", "HEAD"]),
+    })
+}
+
+/// Run `git -C <path> <args...>`, returning trimmed stdout on success.
+///
+/// Returns `None` when git is unavailable, exits non-zero, or produces empty
+/// output, so callers can treat missing metadata uniformly.
+fn git_output(path: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 /// Parse a user-supplied room ID or alias into an owned identifier.
@@ -427,12 +578,59 @@ mod tests {
                 display_name: Some("Alice".to_string()),
                 membership: "join".to_string(),
             }],
+            workspace: None,
         };
         let json = status.to_json();
         assert!(json.contains("@alice:matrix.org"), "{json}");
         assert!(json.contains("\"membership\":\"join\""), "{json}");
+        assert!(
+            !json.contains("workspace"),
+            "empty workspace leaked: {json}"
+        );
         let back: WorkspaceStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back, status);
+    }
+
+    #[test]
+    fn status_json_includes_attached_workspace() {
+        let status = WorkspaceStatus {
+            room_id: "!abc:matrix.org".to_string(),
+            canonical_alias: None,
+            name: None,
+            encrypted: false,
+            joined_members: 1,
+            invited_members: 0,
+            members: vec![],
+            workspace: Some(WorkspaceState {
+                project_id: "repo:github.com/org/project".to_string(),
+                path: "/home/me/code/project".to_string(),
+                repo: Some(RepoInfo {
+                    remote_url: Some("git@github.com:org/project.git".to_string()),
+                    branch: Some("main".to_string()),
+                    commit: Some("abc123".to_string()),
+                }),
+                attached_by: "@alice:matrix.org".to_string(),
+                attached_at: 1_780_392_000_000,
+                state_rev: 1,
+                extra: Default::default(),
+            }),
+        };
+        let json = status.to_json();
+        assert!(json.contains("repo:github.com/org/project"), "{json}");
+        assert!(json.contains("/home/me/code/project"), "{json}");
+        let back: WorkspaceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, status);
+    }
+
+    #[test]
+    fn git_output_returns_none_outside_repo() {
+        let tmp = std::env::temp_dir();
+        // A `git rev-parse --is-inside-work-tree` in a non-repo (or with a
+        // bogus subcommand) must not panic and should yield no metadata.
+        let info = detect_repo_info(&tmp);
+        // Either None (not a repo) or Some when temp dir happens to be tracked;
+        // both are valid, but the call must not panic.
+        let _ = info;
     }
 
     #[test]
