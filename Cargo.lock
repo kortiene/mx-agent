@@ -1797,6 +1797,7 @@ dependencies = [
  "mx-agent-policy",
  "mx-agent-protocol",
  "mx-agent-sandbox",
+ "mx-agent-telemetry",
  "nix",
  "serde",
  "serde_json",
