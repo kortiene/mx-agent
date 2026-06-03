@@ -5,12 +5,17 @@
 //! section 10). This is a placeholder that wires the supporting crates
 //! together so the workspace builds end to end.
 
+pub mod agent;
 pub mod lifecycle;
 pub mod matrix;
 pub mod session;
 pub mod sync;
 pub mod workspace;
 
+pub use agent::{
+    register_agent, register_agent_for_session, RegisterAgentOptions, DEFAULT_AGENT_KIND,
+    DEFAULT_MAX_INVOCATIONS,
+};
 pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
 };

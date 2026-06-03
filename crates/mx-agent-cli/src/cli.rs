@@ -197,13 +197,41 @@ struct WorkspaceStatusArgs {
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
     /// Register the current agent session.
-    Register,
+    Register(AgentRegisterArgs),
     /// List agents in a workspace.
     List,
     /// Show details for one agent.
     Show,
     /// List tools offered by an agent.
     Tools,
+}
+
+#[derive(Debug, Args)]
+struct AgentRegisterArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Agent identifier (also the state key). Defaults to `<user>-<device>`.
+    #[arg(long = "agent-id", value_name = "AGENT_ID")]
+    agent_id: Option<String>,
+    /// Agent kind, e.g. `pi` or `generic`.
+    #[arg(long, value_name = "KIND", default_value = mx_agent_daemon::DEFAULT_AGENT_KIND)]
+    kind: String,
+    /// Declared capability (repeatable), e.g. `shell`, `edit`, `test`.
+    #[arg(long = "capability", value_name = "CAPABILITY")]
+    capabilities: Vec<String>,
+    /// Available named tool (repeatable), e.g. `run_tests@1.0.0`.
+    #[arg(long = "tool", value_name = "TOOL")]
+    tools: Vec<String>,
+    /// Working directory the agent operates in (defaults to the current dir).
+    #[arg(long, value_name = "PATH")]
+    cwd: Option<PathBuf>,
+    /// Project identifier, e.g. `repo:github.com/org/project`.
+    #[arg(long = "project-id", value_name = "PROJECT_ID", default_value = "")]
+    project_id: String,
+    /// Maximum concurrent invocations the agent will accept.
+    #[arg(long = "max-invocations", value_name = "N", default_value_t = mx_agent_daemon::DEFAULT_MAX_INVOCATIONS)]
+    max_invocations: u32,
 }
 
 #[derive(Debug, Args)]
@@ -340,6 +368,7 @@ pub fn run() -> ExitCode {
         Command::Daemon(cmd) => handle_daemon(g, cmd),
         Command::Auth(cmd) => handle_auth(g, cmd),
         Command::Workspace(cmd) => handle_workspace(g, cmd),
+        Command::Agent(cmd) => handle_agent(g, cmd),
         _ => unimplemented(g, &path),
     }
 }
@@ -718,6 +747,85 @@ fn workspace_status(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode
 }
 
 /// Handle the `daemon` command group.
+fn handle_agent(global: &GlobalArgs, cmd: &AgentCommand) -> ExitCode {
+    match cmd {
+        AgentCommand::Register(args) => agent_register(global, args),
+        _ => unimplemented(global, "agent"),
+    }
+}
+
+fn agent_register(global: &GlobalArgs, args: &AgentRegisterArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let cwd = match &args.cwd {
+        Some(p) => p.clone(),
+        None => match std::env::current_dir() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("mx-agent: could not resolve current directory: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let options = mx_agent_daemon::RegisterAgentOptions {
+        room: args.room.clone(),
+        agent_id: args.agent_id.clone(),
+        kind: args.kind.clone(),
+        capabilities: args.capabilities.clone(),
+        tools: args.tools.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        project_id: args.project_id.clone(),
+        max_invocations: args.max_invocations,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::register_agent_for_session(&session, &options).await {
+            Ok(state) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("mx-agent: registered agent {}", state.agent_id);
+                    println!("  kind:         {}", state.kind);
+                    println!("  user:         {}", state.matrix_user_id);
+                    println!("  device:       {}", state.device_id);
+                    println!("  cwd:          {}", state.workspace.cwd);
+                    if !state.workspace.project_id.is_empty() {
+                        println!("  project:      {}", state.workspace.project_id);
+                    }
+                    if !state.workspace.git_commit.is_empty() {
+                        println!("  git commit:   {}", state.workspace.git_commit);
+                    }
+                    if !state.capabilities.is_empty() {
+                        println!("  capabilities: {}", state.capabilities.join(", "));
+                    }
+                    if !state.tools.is_empty() {
+                        println!("  tools:        {}", state.tools.join(", "));
+                    }
+                    println!(
+                        "  load:         {}/{} invocations",
+                        state.load.running_invocations, state.load.max_invocations
+                    );
+                    println!("  state_rev:    {}", state.state_rev);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not register agent: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// Handle the `daemon` command group.
 fn handle_daemon(global: &GlobalArgs, cmd: &DaemonCommand) -> ExitCode {
     match cmd {
         DaemonCommand::Start(args) => daemon_start(global, args.foreground),
@@ -882,7 +990,7 @@ fn command_path(command: &Command) -> String {
         Command::Agent(c) => format!(
             "agent {}",
             match c {
-                AgentCommand::Register => "register",
+                AgentCommand::Register(_) => "register",
                 AgentCommand::List => "list",
                 AgentCommand::Show => "show",
                 AgentCommand::Tools => "tools",

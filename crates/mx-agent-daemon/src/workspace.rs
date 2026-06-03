@@ -445,7 +445,7 @@ pub async fn attach_workspace_for_session(
 
 /// Detect git repository metadata for `path`, returning `None` when `path` is
 /// not inside a git work tree.
-fn detect_repo_info(path: &Path) -> Option<RepoInfo> {
+pub(crate) fn detect_repo_info(path: &Path) -> Option<RepoInfo> {
     // A non-zero exit (or missing git) means this is not a git repository.
     let inside = git_output(path, &["rev-parse", "--is-inside-work-tree"]);
     if inside.as_deref() != Some("true") {
@@ -462,7 +462,7 @@ fn detect_repo_info(path: &Path) -> Option<RepoInfo> {
 ///
 /// Returns `None` when git is unavailable, exits non-zero, or produces empty
 /// output, so callers can treat missing metadata uniformly.
-fn git_output(path: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git_output(path: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -481,7 +481,7 @@ fn git_output(path: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// Parse a user-supplied room ID or alias into an owned identifier.
-fn parse_room_or_alias(
+pub(crate) fn parse_room_or_alias(
     target: &str,
 ) -> Result<matrix_sdk::ruma::OwnedRoomOrAliasId, WorkspaceError> {
     RoomOrAliasId::parse(target)
@@ -490,7 +490,7 @@ fn parse_room_or_alias(
 }
 
 /// Resolve an alias to a concrete room ID, or pass through an existing ID.
-async fn resolve_room_id(
+pub(crate) async fn resolve_room_id(
     client: &Client,
     id: &RoomOrAliasId,
 ) -> Result<OwnedRoomId, WorkspaceError> {
