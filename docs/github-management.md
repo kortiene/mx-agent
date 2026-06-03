@@ -131,15 +131,38 @@ The CI workflow is safe before Rust code exists: Rust checks run only when `Carg
 
 ---
 
-## Creating Issues
+## Automated Population
 
-`docs/github-issue-backlog.md` contains a complete phase-by-phase issue backlog. Create issues manually from that file or use `gh` once authenticated.
+`docs/github-issue-backlog.md` is the source of truth for the roadmap. It is parsed by `scripts/populate_github.py`, which creates/updates:
 
-Example:
+- all labels in the label set
+- the six roadmap milestones
+- one GitHub issue per backlog entry (66 total)
+
+The script is idempotent by exact issue title, so reruns update labels/milestones instead of creating duplicates.
+
+### How it runs
+
+The workflow `.github/workflows/populate-github.yml` runs:
+
+- automatically on push to `main` when the backlog, script, or workflow changes
+- manually via the Actions tab using `workflow_dispatch`
+
+It uses the built-in `GITHUB_TOKEN` with `issues: write` permission, so no extra secret is required.
+
+### Local validation
+
+Validate parsing without touching GitHub:
+
+```bash
+python scripts/populate_github.py --dry-run
+```
+
+### Manual alternative with gh
 
 ```bash
 gh issue create \
-  --title "Phase 1: implement Unix socket JSON-RPC IPC" \
+  --title "Phase issue 7: Implement framed JSON-RPC IPC transport" \
   --label "type:feature,area:ipc,priority:p0" \
   --milestone "1. Local Daemon Foundation" \
   --body-file /tmp/issue.md

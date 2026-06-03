@@ -1,0 +1,33 @@
+name: populate-github
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - docs/github-issue-backlog.md
+      - docs/github-management.md
+      - scripts/populate_github.py
+      - .github/workflows/populate-github.yml
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: populate-github
+  cancel-in-progress: false
+
+jobs:
+  populate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Populate labels, milestones, and roadmap issues
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/populate_github.py
