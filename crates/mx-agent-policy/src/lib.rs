@@ -4,8 +4,10 @@
 //! based on the policy file described in `docs/architecture.md`, section 13.3.
 //! For now it exposes the default decision used before any policy is loaded.
 
+mod engine;
 mod file;
 
+pub use engine::{Allowance, CallContext, DenyReason, ExecContext, Outcome};
 pub use file::{
     AgentPolicy, ExecutionPolicy, NetworkPolicy, Policy, PolicyError, RawExecDefault, RoomPolicy,
     Sandbox, ENV_CONFIG_DIR, POLICY_FILE_NAME,
