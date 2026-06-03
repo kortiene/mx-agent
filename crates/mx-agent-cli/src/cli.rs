@@ -1796,14 +1796,14 @@ async fn collect_exec_frames(
             mx_agent_daemon::StreamCaptureConfig::batch(),
             tx,
         )
-        .await;
+        .await
     });
 
     let mut frames = Vec::new();
     while let Some(chunk) = rx.recv().await {
         frames.push(StreamFrame::Chunk(chunk));
     }
-    let _ = capture.await;
+    let summary = capture.await.unwrap_or_default();
 
     frames.push(StreamFrame::Finished(ExecFinished {
         invocation_id: INVOCATION.to_string(),
@@ -1812,7 +1812,7 @@ async fn collect_exec_frames(
         duration_ms: 0,
         stdout_bytes: output.stdout.len() as u64,
         stderr_bytes: output.stderr.len() as u64,
-        truncated: false,
+        truncated: summary.truncated,
         artifact_mxc: None,
         extra: Default::default(),
     }));

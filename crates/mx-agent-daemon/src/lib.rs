@@ -62,7 +62,8 @@ pub use signing::{
     load_or_create_signing_key, DaemonSigningKey, SigningKeyError, KEY_ALG, KEY_ID_PREFIX,
 };
 pub use stream::{
-    capture_child_output, capture_stream, StreamCaptureConfig, DEFAULT_BATCH_FLUSH_INTERVAL,
+    capture_child_output, capture_stream, capture_stream_limited, CaptureLimiter, CaptureSummary,
+    OutputCaps, StreamCaptureConfig, DEFAULT_BATCH_FLUSH_INTERVAL,
     DEFAULT_INTERACTIVE_FLUSH_INTERVAL, DEFAULT_MAX_CHUNK_BYTES,
 };
 pub use sync::{
