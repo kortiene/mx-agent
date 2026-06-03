@@ -16,6 +16,8 @@
 # safely resumable just by re-running it.
 #
 # Options:
+#   --runner <name>    Forward --runner to issue.sh (pi|claude). You can also
+#                      set MX_AGENT_RUNNER in the environment.
 #   --keep-going       Continue to the next issue even if one fails
 #                      (default: stop at the first failure).
 #   --start <number>   Resume at the first occurrence of this issue in the
@@ -60,6 +62,7 @@ ASSUME_YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
+    --runner) shift; PASSTHRU+=(--runner "${1:?--runner needs a value}") ;;
     --keep-going) KEEP_GOING=1 ;;
     --start) shift; START="${1:?--start needs a value}" ;;
     --delay) shift; DELAY="${1:?--delay needs a value}" ;;
