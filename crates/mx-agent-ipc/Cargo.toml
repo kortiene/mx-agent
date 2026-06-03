@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+nix = { workspace = true }
 
 [lints]
 workspace = true
