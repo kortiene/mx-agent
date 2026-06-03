@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 mx-agent-protocol.workspace = true
 mx-agent-telemetry.workspace = true
+mx-agent-daemon.workspace = true
 clap.workspace = true
 tracing.workspace = true
 

@@ -5,6 +5,12 @@
 //! section 10). This is a placeholder that wires the supporting crates
 //! together so the workspace builds end to end.
 
+pub mod lifecycle;
+
+pub use lifecycle::{
+    run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
+};
+
 use mx_agent_ipc::default_socket_name;
 use mx_agent_policy::{default_decision, Decision};
 use mx_agent_protocol::protocol_version;

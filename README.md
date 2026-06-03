@@ -76,5 +76,20 @@ Credentials are wrapped in `mx_agent_telemetry::Secret`, which renders as
 `***redacted***` in `Debug`/`Display`, and `mx_agent_telemetry::redact` blanks
 values for secret-looking keys. Never log raw tokens or keys.
 
-The current build is a scaffold; commands are placeholders pending later roadmap
-phases.
+### Daemon lifecycle
+
+The background daemon is managed through the CLI:
+
+```bash
+mx-agent daemon start              # start detached in the background
+mx-agent daemon start --foreground # run in the current terminal (Ctrl-C to stop)
+mx-agent daemon status             # human-readable status (exit 3 if not running)
+mx-agent daemon status --json      # pid, uptime, socket path, version as JSON
+mx-agent daemon stop               # graceful shutdown (SIGTERM, then SIGKILL)
+```
+
+Runtime state lives under `$XDG_RUNTIME_DIR/mx-agent/` (override with
+`MX_AGENT_RUNTIME_DIR`): a `daemon.json` status file, the intended
+`daemon.sock` path, and a `daemon.log` for background output.
+
+Most other commands are still placeholders pending later roadmap phases.

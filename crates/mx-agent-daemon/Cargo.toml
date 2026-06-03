@@ -14,6 +14,10 @@ mx-agent-ipc.workspace = true
 mx-agent-policy.workspace = true
 mx-agent-sandbox.workspace = true
 tracing.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+nix = { workspace = true }
+signal-hook = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

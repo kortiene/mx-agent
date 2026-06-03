@@ -95,12 +95,19 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    /// Start the background daemon.
-    Start,
+    /// Start the daemon.
+    Start(DaemonStartArgs),
     /// Report daemon status.
     Status,
-    /// Stop the background daemon.
+    /// Stop the daemon.
     Stop,
+}
+
+#[derive(Debug, Args)]
+struct DaemonStartArgs {
+    /// Run in the foreground instead of detaching into the background.
+    #[arg(long)]
+    foreground: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -266,7 +273,123 @@ pub fn run() -> ExitCode {
         socket = ?g.socket,
         "dispatching command"
     );
-    unimplemented(g, &path)
+
+    match &cli.command {
+        Command::Daemon(cmd) => handle_daemon(g, cmd),
+        _ => unimplemented(g, &path),
+    }
+}
+
+/// Handle the `daemon` command group.
+fn handle_daemon(global: &GlobalArgs, cmd: &DaemonCommand) -> ExitCode {
+    match cmd {
+        DaemonCommand::Start(args) => daemon_start(global, args.foreground),
+        DaemonCommand::Status => daemon_status(global),
+        DaemonCommand::Stop => daemon_stop(global),
+    }
+}
+
+fn daemon_start(global: &GlobalArgs, foreground: bool) -> ExitCode {
+    if foreground {
+        return match mx_agent_daemon::run_foreground() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mx-agent: daemon failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    match mx_agent_daemon::status() {
+        Ok(Some(running)) => {
+            if global.json {
+                println!("{}", running.to_json());
+            } else {
+                println!("mx-agent daemon already running (pid {})", running.pid);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => match mx_agent_daemon::start_background() {
+            Ok(running) => {
+                if global.json {
+                    println!("{}", running.to_json());
+                } else {
+                    println!("mx-agent daemon started (pid {})", running.pid);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not start daemon: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("mx-agent: could not read daemon status: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn daemon_status(global: &GlobalArgs) -> ExitCode {
+    match mx_agent_daemon::status() {
+        Ok(Some(running)) => {
+            if global.json {
+                println!("{}", running.to_json());
+            } else {
+                println!("mx-agent daemon: running");
+                println!("  pid:     {}", running.pid);
+                println!("  uptime:  {}s", running.uptime_seconds);
+                println!("  socket:  {}", running.socket_path);
+                println!("  version: {}", running.version);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            if global.json {
+                println!("{{\"running\":false}}");
+            } else {
+                println!("mx-agent daemon: not running");
+            }
+            // Distinct nonzero code so scripts can detect a stopped daemon.
+            ExitCode::from(3)
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not read daemon status: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn daemon_stop(global: &GlobalArgs) -> ExitCode {
+    use mx_agent_daemon::StopOutcome;
+    match mx_agent_daemon::stop(std::time::Duration::from_secs(5)) {
+        Ok(outcome) => {
+            let (msg, json) = match outcome {
+                StopOutcome::NotRunning => (
+                    "mx-agent daemon: not running".to_string(),
+                    "{\"stopped\":false,\"running\":false}".to_string(),
+                ),
+                StopOutcome::Stopped(pid) => (
+                    format!("mx-agent daemon stopped (pid {pid})"),
+                    format!("{{\"stopped\":true,\"pid\":{pid}}}"),
+                ),
+                StopOutcome::Killed(pid) => (
+                    format!("mx-agent daemon force-killed (pid {pid})"),
+                    format!("{{\"stopped\":true,\"killed\":true,\"pid\":{pid}}}"),
+                ),
+            };
+            if global.json {
+                println!("{json}");
+            } else {
+                println!("{msg}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not stop daemon: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Build a dotted path string identifying the invoked command.
@@ -275,7 +398,7 @@ fn command_path(command: &Command) -> String {
         Command::Daemon(c) => format!(
             "daemon {}",
             match c {
-                DaemonCommand::Start => "start",
+                DaemonCommand::Start(_) => "start",
                 DaemonCommand::Status => "status",
                 DaemonCommand::Stop => "stop",
             }
