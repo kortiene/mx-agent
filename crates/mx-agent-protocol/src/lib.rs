@@ -23,6 +23,7 @@
 //!   than literal strings so typos are caught at compile time.
 
 pub mod events;
+pub mod id;
 pub mod schema;
 
 /// Wire-format version for mx-agent Matrix event types (`com.mxagent.*.v1`).
