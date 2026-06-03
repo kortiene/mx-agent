@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod audit;
 pub mod call;
+pub mod exec;
 pub mod heartbeat;
 pub mod lifecycle;
 pub mod matrix;
@@ -30,6 +31,11 @@ pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE
 pub use call::{
     authorize_call_request, build_signed_call_request, emit_call_response, execute_authorized_call,
     rejection_response, send_call_request, success_response, CallRejection,
+};
+pub use exec::{
+    authorize_exec_request, build_signed_exec_request, emit_exec_accepted, emit_exec_rejected,
+    invocation_state_for, publish_invocation_state, send_exec_request, ExecRejection,
+    ExecRequestOptions,
 };
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
