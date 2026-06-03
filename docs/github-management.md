@@ -238,9 +238,13 @@ scripts/issue.sh 15 -- --thinking high -nc     # pass extra flags verbatim to pi
 
 ```bash
 scripts/issue.sh 15 --log-dir ./logs            # tee the transcript to a per-issue log
+scripts/issue.sh 15 --timeout 3600              # abort the run after an hour
+scripts/issue.sh 15 --yes                        # skip the confirmation prompt
 scripts/issue.sh 15 --no-verify                 # skip the post-run CLOSED check
 scripts/issue.sh 15 --force                      # run even if already CLOSED
 ```
+
+By default the script refuses to start on a dirty working tree (`--allow-dirty` to override) and, when run interactively, asks for confirmation before implementing and merging (`--yes`/`MX_AGENT_YES=1` to skip; auto-skipped when stdin is not a terminal). `--timeout` aborts a stuck run.
 
 Notes:
 
@@ -261,7 +265,7 @@ scripts/issues.sh 15-30 --start 21               # resume from #21
 scripts/issues.sh 15 16 18-20 --dry-run          # preview the plan
 ```
 
-It stops at the first failure by default (`--keep-going` to continue), preserves the given order, supports number/range specs, forwards flags after `--` to `issue.sh`, and prints a completed/failed summary (also on Ctrl-C). Because each run verifies closure and already-closed issues are skipped, a batch is safely **resumable just by re-running it**; `--start <n>` and `--log-dir <dir>` (forwarded to each run) are also available. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
+It stops at the first failure by default (`--keep-going` to continue), preserves the given order, supports number/range specs, forwards flags after `--` to `issue.sh`, and prints a completed/failed summary (also on Ctrl-C). It confirms once for the whole batch (`--yes` to skip), holds a lock so only one batch runs at a time, and resumes at a given issue with `--start <n>` (index-based). Because each run verifies closure and already-closed issues are skipped, a batch is also **resumable just by re-running it**; `--log-dir <dir>` is forwarded to each run. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
 
 Requirements: `pi` on `PATH` (or `PI_BIN`), plus the same `gh`/`git`/`cargo` access the interactive workflow uses.
 

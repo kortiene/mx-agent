@@ -23,8 +23,11 @@
 #   --name <name>      Session display name (default: "issue #<number>").
 #   --repo <owner/repo> Repository for issue lookups (default: gh-detected).
 #   --log-dir <dir>    Tee pi output to <dir>/issue-<n>-<timestamp>.log.
+#   --timeout <secs>   Abort the pi run after this many seconds (0 = none).
 #   --no-verify        Do not check that the issue is CLOSED after the run.
 #   --force            Run even if the issue is already CLOSED.
+#   --allow-dirty      Skip the clean-working-tree precondition check.
+#   --yes, -y          Do not prompt for confirmation before running.
 #   --print-prompt     Expand the template and print it; do not run pi.
 #   --dry-run          Print the exact pi command; do not run it.
 #   --                 Everything after is passed verbatim to pi.
@@ -33,6 +36,7 @@
 # Environment:
 #   PI_BIN, GH_BIN     Override the pi / gh executables.
 #   REPO               Default repository (owner/repo).
+#   MX_AGENT_YES=1     Assume "yes" to the confirmation prompt.
 #   PI_MODEL, PI_THINKING, MX_AGENT_LOG_DIR  Defaults for the matching flags.
 #
 # Notes:
@@ -50,8 +54,12 @@ PASSTHRU=()
 SESSION_NAME=""
 REPO="${REPO:-}"
 LOG_DIR="${MX_AGENT_LOG_DIR:-}"
+TIMEOUT=0
 VERIFY=1
 FORCE=0
+ALLOW_DIRTY=0
+ASSUME_YES=0
+[ "${MX_AGENT_YES:-0}" = "1" ] && ASSUME_YES=1
 PRINT_PROMPT=0
 DRY_RUN=0
 ARGS=()
@@ -77,8 +85,11 @@ while [ $# -gt 0 ]; do
     --name) shift; SESSION_NAME="${1:?--name needs a value}" ;;
     --repo) shift; REPO="${1:?--repo needs a value}" ;;
     --log-dir) shift; LOG_DIR="${1:?--log-dir needs a value}" ;;
+    --timeout) shift; TIMEOUT="${1:?--timeout needs a value}" ;;
     --no-verify) VERIFY=0 ;;
     --force) FORCE=1 ;;
+    --allow-dirty) ALLOW_DIRTY=1 ;;
+    -y|--yes) ASSUME_YES=1 ;;
     --print-prompt) PRINT_PROMPT=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --) shift; PASSTHRU+=("$@"); break ;;
@@ -91,6 +102,7 @@ done
 [ "${#ARGS[@]}" -gt 0 ] || { usage; exit 2; }
 ISSUE="${ARGS[0]}"
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || die "issue must be a number, got: $ISSUE"
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 [ -f "$TEMPLATE" ] || die "prompt template not found: $TEMPLATE"
 
 # Resolve the pi binary.
@@ -171,8 +183,18 @@ fi
 
 CMD=("$PI_BIN" -p "${MODE_ARGS[@]}" --name "$SESSION_NAME" "${PASSTHRU[@]}" "$PROMPT")
 
+# Wrap with a timeout if requested and available.
+RUNNER=("${CMD[@]}")
+if [ "$TIMEOUT" -gt 0 ]; then
+  if command -v timeout >/dev/null 2>&1; then
+    RUNNER=(timeout --signal=INT "$TIMEOUT" "${CMD[@]}")
+  else
+    note "--timeout requested but 'timeout' not found; running without it"
+  fi
+fi
+
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '[dry-run]'; printf ' %q' "${CMD[@]}"; echo
+  printf '[dry-run]'; printf ' %q' "${RUNNER[@]}"; echo
   exit 0
 fi
 
@@ -201,6 +223,25 @@ if [ "$VERIFY" -eq 1 ] || [ "$FORCE" -eq 0 ]; then
   fi
 fi
 
+# Precondition: refuse to start on a dirty working tree, which would make the
+# template's branch setup fail mid-run.
+if [ "$ALLOW_DIRTY" -eq 0 ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if [ -n "$(git status --porcelain)" ]; then
+    die "working tree is dirty; commit/stash first or pass --allow-dirty"
+  fi
+fi
+
+# Confirmation gate: this run autonomously implements AND merges the issue.
+# Skip when --yes/MX_AGENT_YES is set or stdin is not a terminal (unattended).
+if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+  printf '>> About to autonomously implement and MERGE issue #%s. Continue? [y/N] ' "$ISSUE" >&2
+  read -r reply
+  case "$reply" in
+    [Yy]|[Yy][Ee][Ss]) ;;
+    *) die "aborted" ;;
+  esac
+fi
+
 # Run pi, optionally teeing the transcript to a per-issue log file.
 LOG_FILE=""
 if [ -n "$LOG_DIR" ]; then
@@ -212,10 +253,10 @@ fi
 note "running /issue $ISSUE headlessly via $PI_BIN (session: $SESSION_NAME)"
 set +e
 if [ -n "$LOG_FILE" ]; then
-  "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+  "${RUNNER[@]}" 2>&1 | tee "$LOG_FILE"
   pi_rc=${PIPESTATUS[0]}
 else
-  "${CMD[@]}"
+  "${RUNNER[@]}"
   pi_rc=$?
 fi
 set -e

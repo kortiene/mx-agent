@@ -18,14 +18,17 @@
 # Options:
 #   --keep-going       Continue to the next issue even if one fails
 #                      (default: stop at the first failure).
-#   --start <number>   Skip ahead: ignore issues before this number in the
-#                      expanded list (resume an interrupted run).
+#   --start <number>   Resume at the first occurrence of this issue in the
+#                      expanded list, skipping everything before it.
 #   --delay <seconds>  Sleep this many seconds between issues (default: 0).
 #   --log-dir <dir>    Forward --log-dir to issue.sh so each run is captured.
+#   --yes, -y          Confirm once for the whole batch (forwarded to issue.sh).
 #   --dry-run          Print what would run; do not invoke issue.sh.
 #   --                 Everything after is forwarded verbatim to issue.sh
 #                      (e.g. --json, --model sonnet:high, --dry-run).
 #   -h, --help         Show this help.
+#
+# Only one batch may run at a time (guarded by a lock file).
 #
 # Examples:
 #   scripts/issues.sh 15 16 17
@@ -51,6 +54,8 @@ note() { echo ">> $*" >&2; }
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
 LOG_DIR=""
+ASSUME_YES=0
+[ "${MX_AGENT_YES:-0}" = "1" ] && ASSUME_YES=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -59,6 +64,7 @@ while [ $# -gt 0 ]; do
     --start) shift; START="${1:?--start needs a value}" ;;
     --delay) shift; DELAY="${1:?--delay needs a value}" ;;
     --log-dir) shift; LOG_DIR="${1:?--log-dir needs a value}" ;;
+    -y|--yes) ASSUME_YES=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --) shift; PASSTHRU+=("$@"); break ;;
     -*) die "unknown option: $1" ;;
@@ -89,19 +95,42 @@ for spec in "${SPECS[@]}"; do
   fi
 done
 
-# Apply --start filter (resume).
+# Apply --start: drop everything before the first occurrence of START so the
+# resume point is honored even for non-monotonic lists.
 if [ "$START" -gt 0 ]; then
   FILTERED=()
+  started=0
   for n in "${ISSUES[@]}"; do
-    [ "$n" -ge "$START" ] && FILTERED+=("$n")
+    [ "$started" -eq 0 ] && [ "$n" -eq "$START" ] && started=1
+    [ "$started" -eq 1 ] && FILTERED+=("$n")
   done
+  [ "$started" -eq 1 ] || die "--start $START is not in the issue list: ${ISSUES[*]}"
   ISSUES=("${FILTERED[@]}")
 fi
 
 [ "${#ISSUES[@]}" -gt 0 ] || die "no issues to process after expansion/filtering"
 
-# Forward --log-dir to each issue.sh run.
+# Forward --log-dir and the batch-level confirmation to each issue.sh run.
 [ -n "$LOG_DIR" ] && PASSTHRU=(--log-dir "$LOG_DIR" "${PASSTHRU[@]}")
+[ "$ASSUME_YES" -eq 1 ] && PASSTHRU=(--yes "${PASSTHRU[@]}")
+
+# Serialize batches: concurrent runs would clobber branches and races on main.
+if [ "$DRY_RUN" -eq 0 ] && command -v flock >/dev/null 2>&1; then
+  LOCK="${TMPDIR:-/tmp}/mx-agent-issues.lock"
+  exec 9>"$LOCK"
+  flock -n 9 || die "another issues.sh run holds $LOCK; wait for it or remove the lock"
+fi
+
+# Confirm once for the whole batch (unless --yes or non-interactive).
+if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+  printf '>> About to autonomously implement and MERGE %d issue(s): %s. Continue? [y/N] ' \
+    "${#ISSUES[@]}" "${ISSUES[*]}" >&2
+  read -r reply
+  case "$reply" in
+    [Yy]|[Yy][Ee][Ss]) ASSUME_YES=1; PASSTHRU=(--yes "${PASSTHRU[@]}") ;;
+    *) die "aborted" ;;
+  esac
+fi
 
 note "processing ${#ISSUES[@]} issue(s) in order: ${ISSUES[*]}"
 
