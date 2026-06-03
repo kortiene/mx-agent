@@ -6,6 +6,7 @@
 //! together so the workspace builds end to end.
 
 pub mod agent;
+pub mod audit;
 pub mod heartbeat;
 pub mod lifecycle;
 pub mod matrix;
@@ -22,6 +23,7 @@ pub use agent::{
     register_agent_for_session, show_agent, show_agent_for_session, AgentTools, ListAgentsOptions,
     RegisterAgentOptions, DEFAULT_AGENT_KIND, DEFAULT_MAX_INVOCATIONS,
 };
+pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE_NAME};
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
     DEFAULT_OFFLINE_AFTER, DEFAULT_STALE_AFTER, DEFAULT_STATE_REFRESH,

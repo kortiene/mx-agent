@@ -13,6 +13,7 @@ mx-agent-protocol.workspace = true
 mx-agent-ipc.workspace = true
 mx-agent-policy.workspace = true
 mx-agent-sandbox.workspace = true
+mx-agent-telemetry.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
