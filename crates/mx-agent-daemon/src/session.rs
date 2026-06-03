@@ -1,0 +1,360 @@
+//! Matrix session persistence in daemon-owned storage.
+//!
+//! The daemon owns the long-lived Matrix session (see `docs/architecture.md`,
+//! sections 10.1 and 13.1). After a successful login the session — including
+//! the access token — is written to a private, `0600` file under the user's
+//! data directory so that authentication survives a daemon restart.
+//!
+//! Access and refresh tokens are wrapped in [`Secret`], whose `Debug`/`Display`
+//! implementations redact the value. The token is therefore never printed by
+//! status output or debug logging; only the user ID, device ID, and homeserver
+//! are ever surfaced (see [`AuthStatus`]).
+
+use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+/// Environment variable overriding the data directory (useful for tests).
+pub const ENV_DATA_DIR: &str = "MX_AGENT_DATA_DIR";
+
+/// Placeholder rendered in place of a secret value.
+pub const REDACTED: &str = "***redacted***";
+
+/// A secret string (e.g. an access token) that never reveals itself through
+/// `Debug` or `Display`.
+///
+/// The inner value is serialized transparently so it can be persisted, but it
+/// is redacted in every formatting path to keep it out of logs and output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wrap a secret value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrow the underlying secret. Callers must not log the result.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Secret({REDACTED})")
+    }
+}
+
+impl fmt::Display for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+/// A persisted Matrix session.
+///
+/// `Debug` is derived; because the token fields are [`Secret`], debug output
+/// (including via `tracing`) redacts them automatically.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub struct StoredSession {
+    /// Homeserver base URL.
+    pub homeserver: String,
+    /// Full Matrix user ID, e.g. `@alice:matrix.org`.
+    pub user_id: String,
+    /// Device ID issued at login.
+    pub device_id: String,
+    /// Access token (redacted in all formatting).
+    pub access_token: Secret,
+    /// Refresh token, if the server issued one (redacted in all formatting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<Secret>,
+}
+
+/// Non-sensitive authentication status, safe to print or serialize.
+///
+/// Deliberately has no token field so it cannot leak credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub struct AuthStatus {
+    /// Whether a persisted session exists.
+    pub logged_in: bool,
+    /// Homeserver base URL, if logged in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub homeserver: Option<String>,
+    /// Matrix user ID, if logged in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Device ID, if logged in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+}
+
+impl AuthStatus {
+    /// The status for "no persisted session".
+    pub fn logged_out() -> Self {
+        Self {
+            logged_in: false,
+            homeserver: None,
+            user_id: None,
+            device_id: None,
+        }
+    }
+
+    /// Build a status snapshot from a stored session (without its tokens).
+    pub fn from_session(session: &StoredSession) -> Self {
+        Self {
+            logged_in: true,
+            homeserver: Some(session.homeserver.clone()),
+            user_id: Some(session.user_id.clone()),
+            device_id: Some(session.device_id.clone()),
+        }
+    }
+
+    /// Render as a single-line JSON object.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{\"logged_in\":false}".to_string())
+    }
+}
+
+/// Resolved filesystem locations for persisted session state.
+#[derive(Debug, Clone)]
+pub struct SessionPaths {
+    /// Directory holding daemon-owned data.
+    pub data_dir: PathBuf,
+    /// JSON file storing the Matrix session.
+    pub session_file: PathBuf,
+}
+
+impl SessionPaths {
+    /// Resolve session paths from the environment.
+    ///
+    /// Precedence: `MX_AGENT_DATA_DIR`, then `$XDG_DATA_HOME/mx-agent`, then
+    /// `$HOME/.local/share/mx-agent`, then a temp-directory fallback.
+    pub fn resolve() -> Self {
+        let data_dir = if let Ok(dir) = std::env::var(ENV_DATA_DIR) {
+            PathBuf::from(dir)
+        } else if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            PathBuf::from(xdg).join("mx-agent")
+        } else if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(".local/share/mx-agent")
+        } else {
+            std::env::temp_dir().join("mx-agent")
+        };
+        Self {
+            session_file: data_dir.join("session.json"),
+            data_dir,
+        }
+    }
+
+    /// Ensure the data directory exists with `0700` permissions.
+    pub fn ensure_data_dir(&self) -> io::Result<()> {
+        if !self.data_dir.exists() {
+            fs::create_dir_all(&self.data_dir)?;
+            fs::set_permissions(&self.data_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+}
+
+/// Persist `session` to daemon-owned storage with `0600` permissions.
+///
+/// The write is atomic (write-to-temp then rename) so a crash cannot leave a
+/// half-written session file.
+pub fn save_session(paths: &SessionPaths, session: &StoredSession) -> io::Result<()> {
+    paths.ensure_data_dir()?;
+    let bytes = serde_json::to_vec_pretty(session)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let tmp = paths.session_file.with_extension("json.tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        f.write_all(&bytes)?;
+        f.flush()?;
+    }
+    fs::rename(&tmp, &paths.session_file)?;
+    Ok(())
+}
+
+/// Load a persisted session, if one exists.
+pub fn load_session(paths: &SessionPaths) -> io::Result<Option<StoredSession>> {
+    match fs::read(&paths.session_file) {
+        Ok(bytes) => {
+            let session = serde_json::from_slice(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(Some(session))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove any persisted session (logout). Missing files are not an error.
+pub fn clear_session(paths: &SessionPaths) -> io::Result<()> {
+    match fs::remove_file(&paths.session_file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Report the current authentication status from persisted storage.
+pub fn auth_status(paths: &SessionPaths) -> io::Result<AuthStatus> {
+    Ok(match load_session(paths)? {
+        Some(session) => AuthStatus::from_session(&session),
+        None => AuthStatus::logged_out(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct TempData {
+        dir: PathBuf,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl TempData {
+        fn new(tag: &str) -> Self {
+            let guard = env_lock();
+            let dir = std::env::temp_dir().join(format!(
+                "mx-agent-session-{}-{}-{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::env::set_var(ENV_DATA_DIR, &dir);
+            Self { dir, _guard: guard }
+        }
+    }
+
+    impl Drop for TempData {
+        fn drop(&mut self) {
+            std::env::remove_var(ENV_DATA_DIR);
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn sample() -> StoredSession {
+        StoredSession {
+            homeserver: "https://matrix.org/".to_string(),
+            user_id: "@alice:matrix.org".to_string(),
+            device_id: "MXAGENTDEVICE01".to_string(),
+            access_token: Secret::new("syt_supersecret_token_value"),
+            refresh_token: Some(Secret::new("refresh_supersecret")),
+        }
+    }
+
+    #[test]
+    fn secret_is_redacted_in_debug_and_display() {
+        let s = Secret::new("syt_supersecret_token_value");
+        assert_eq!(format!("{s}"), REDACTED);
+        assert_eq!(format!("{s:?}"), format!("Secret({REDACTED})"));
+        assert!(!format!("{s:?}").contains("supersecret"));
+        // The value is still accessible for legitimate use.
+        assert_eq!(s.expose(), "syt_supersecret_token_value");
+    }
+
+    #[test]
+    fn session_debug_redacts_tokens() {
+        let session = sample();
+        let debug = format!("{session:?}");
+        assert!(
+            !debug.contains("supersecret"),
+            "debug output leaked a token: {debug}"
+        );
+        assert!(debug.contains("@alice:matrix.org"));
+        assert!(debug.contains("MXAGENTDEVICE01"));
+    }
+
+    #[test]
+    fn session_survives_save_and_reload() {
+        let _data = TempData::new("reload");
+        let paths = SessionPaths::resolve();
+        let session = sample();
+        save_session(&paths, &session).unwrap();
+
+        // Simulate a daemon restart by reloading from disk afresh.
+        let reloaded = load_session(&paths)
+            .unwrap()
+            .expect("session should persist");
+        assert_eq!(reloaded, session);
+        assert_eq!(
+            reloaded.access_token.expose(),
+            "syt_supersecret_token_value"
+        );
+    }
+
+    #[test]
+    fn session_file_is_private() {
+        let _data = TempData::new("perms");
+        let paths = SessionPaths::resolve();
+        save_session(&paths, &sample()).unwrap();
+        let mode = fs::metadata(&paths.session_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "session file must be private");
+    }
+
+    #[test]
+    fn persisted_file_does_not_label_tokens_as_plaintext_status() {
+        // The on-disk file legitimately contains the token, but the status
+        // surface must never expose it.
+        let _data = TempData::new("status");
+        let paths = SessionPaths::resolve();
+        save_session(&paths, &sample()).unwrap();
+
+        let status = auth_status(&paths).unwrap();
+        assert!(status.logged_in);
+        assert_eq!(status.user_id.as_deref(), Some("@alice:matrix.org"));
+        assert_eq!(status.device_id.as_deref(), Some("MXAGENTDEVICE01"));
+
+        let json = status.to_json();
+        assert!(
+            !json.contains("supersecret"),
+            "status json leaked token: {json}"
+        );
+        assert!(
+            !json.contains("access_token"),
+            "status json exposed token field"
+        );
+        assert!(json.contains("@alice:matrix.org"));
+    }
+
+    #[test]
+    fn status_is_logged_out_without_session() {
+        let _data = TempData::new("logout");
+        let paths = SessionPaths::resolve();
+        let status = auth_status(&paths).unwrap();
+        assert!(!status.logged_in);
+        assert_eq!(status.to_json(), "{\"logged_in\":false}");
+    }
+
+    #[test]
+    fn clear_session_is_idempotent() {
+        let _data = TempData::new("clear");
+        let paths = SessionPaths::resolve();
+        clear_session(&paths).unwrap(); // no file yet
+        save_session(&paths, &sample()).unwrap();
+        clear_session(&paths).unwrap();
+        assert!(load_session(&paths).unwrap().is_none());
+    }
+}

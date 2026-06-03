@@ -12,6 +12,8 @@ use matrix_sdk::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::session::{Secret, StoredSession};
+
 /// Daemon Matrix configuration, typically loaded from `config.toml`.
 ///
 /// ```toml
@@ -174,6 +176,81 @@ pub async fn build_client(config: &MatrixConfig) -> Result<Client, ClientError> 
         .build()
         .await
         .map_err(ClientError::Build)
+}
+
+/// Error returned when a Matrix login attempt fails.
+#[derive(Debug)]
+pub enum LoginError {
+    /// The Matrix client could not be constructed.
+    Client(ClientError),
+    /// The homeserver rejected the login or the request failed.
+    Matrix(matrix_sdk::Error),
+    /// Login succeeded but the SDK reported no active session.
+    NoSession,
+}
+
+impl fmt::Display for LoginError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoginError::Client(e) => write!(f, "{e}"),
+            LoginError::Matrix(e) => write!(f, "Matrix login failed: {e}"),
+            LoginError::NoSession => {
+                write!(
+                    f,
+                    "login succeeded but no session was returned by the server"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoginError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LoginError::Client(e) => Some(e),
+            LoginError::Matrix(e) => Some(e),
+            LoginError::NoSession => None,
+        }
+    }
+}
+
+impl From<ClientError> for LoginError {
+    fn from(e: ClientError) -> Self {
+        LoginError::Client(e)
+    }
+}
+
+/// Log in to the configured homeserver with a username and password.
+///
+/// On success a [`StoredSession`] is returned containing the issued tokens; the
+/// caller is responsible for persisting it via
+/// [`crate::session::save_session`]. The password is never logged, and the
+/// returned token fields are redacting [`Secret`]s.
+pub async fn login_password(
+    config: &MatrixConfig,
+    username: &str,
+    password: &str,
+) -> Result<StoredSession, LoginError> {
+    let client = build_client(config).await?;
+    client
+        .matrix_auth()
+        .login_username(username, password)
+        .initial_device_display_name("mx-agent")
+        .send()
+        .await
+        .map_err(LoginError::Matrix)?;
+
+    let session = client
+        .matrix_auth()
+        .session()
+        .ok_or(LoginError::NoSession)?;
+    Ok(StoredSession {
+        homeserver: client.homeserver().to_string(),
+        user_id: session.meta.user_id.to_string(),
+        device_id: session.meta.device_id.to_string(),
+        access_token: Secret::new(session.tokens.access_token),
+        refresh_token: session.tokens.refresh_token.map(Secret::new),
+    })
 }
 
 #[cfg(test)]

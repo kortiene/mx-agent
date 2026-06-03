@@ -7,11 +7,18 @@
 
 pub mod lifecycle;
 pub mod matrix;
+pub mod session;
 
 pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
 };
-pub use matrix::{build_client, ClientError, ConfigError, MatrixConfig};
+pub use matrix::{
+    build_client, login_password, ClientError, ConfigError, LoginError, MatrixConfig,
+};
+pub use session::{
+    auth_status, clear_session, load_session, save_session, AuthStatus, Secret, SessionPaths,
+    StoredSession,
+};
 
 use mx_agent_ipc::default_socket_name;
 use mx_agent_policy::{default_decision, Decision};

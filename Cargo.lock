@@ -1781,6 +1781,7 @@ dependencies = [
  "mx-agent-protocol",
  "mx-agent-telemetry",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 
