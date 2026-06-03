@@ -22,9 +22,11 @@
 //! - **Use the constants.** Always reference the constants in [`events`] rather
 //!   than literal strings so typos are caught at compile time.
 
+pub mod canonical_json;
 pub mod events;
 pub mod id;
 pub mod schema;
+pub mod signing;
 
 /// Wire-format version for mx-agent Matrix event types (`com.mxagent.*.v1`).
 pub const PROTOCOL_VERSION: &str = "v1";
