@@ -7,6 +7,7 @@ members = [
     "crates/mx-agent-ipc",
     "crates/mx-agent-policy",
     "crates/mx-agent-sandbox",
+    "crates/mx-agent-telemetry",
 ]
 
 [workspace.package]
@@ -19,7 +20,10 @@ authors = ["mx-agent contributors"]
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 mx-agent-protocol = { path = "crates/mx-agent-protocol", version = "0.0.1" }
+mx-agent-telemetry = { path = "crates/mx-agent-telemetry", version = "0.0.1" }
 mx-agent-ipc = { path = "crates/mx-agent-ipc", version = "0.0.1" }
 mx-agent-policy = { path = "crates/mx-agent-policy", version = "0.0.1" }
 mx-agent-sandbox = { path = "crates/mx-agent-sandbox", version = "0.0.1" }

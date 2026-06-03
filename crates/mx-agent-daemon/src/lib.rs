@@ -35,6 +35,22 @@ impl DaemonInfo {
     }
 }
 
+impl DaemonInfo {
+    /// Emit a structured startup log describing the daemon configuration.
+    ///
+    /// The subscriber is installed by the hosting process (the CLI today, a
+    /// dedicated daemon binary later); this method only produces the event.
+    pub fn log_summary(&self) {
+        tracing::info!(
+            protocol_version = self.protocol_version,
+            socket_name = self.socket_name,
+            default_decision = ?self.default_decision,
+            sandbox_backend = ?self.sandbox_backend,
+            "daemon configuration"
+        );
+    }
+}
+
 impl Default for DaemonInfo {
     fn default() -> Self {
         Self::new()
@@ -52,5 +68,44 @@ mod tests {
         assert_eq!(info.socket_name, "daemon.sock");
         assert_eq!(info.default_decision, Decision::Deny);
         assert_eq!(info.sandbox_backend, Backend::None);
+    }
+
+    #[test]
+    fn log_summary_emits_a_structured_event() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Buffer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            DaemonInfo::new().log_summary();
+        });
+
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("daemon configuration"), "got: {output}");
+        assert!(output.contains("protocol_version"), "got: {output}");
     }
 }
