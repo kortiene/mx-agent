@@ -1276,8 +1276,20 @@ fn agent_tools(global: &GlobalArgs, args: &AgentToolsArgs) -> ExitCode {
                     if tools.tools.is_empty() {
                         println!("  (no tools advertised)");
                     } else {
-                        for tool in &tools.tools {
-                            println!("  {tool}");
+                        for reference in &tools.tools {
+                            let name = reference.split('@').next().unwrap_or(reference);
+                            match tools.schemas.iter().find(|s| s.name == name) {
+                                Some(schema) => {
+                                    println!(
+                                        "  {} ({})",
+                                        schema.qualified_ref(),
+                                        schema.description
+                                    );
+                                    println!("    input:  {}", schema.input_schema);
+                                    println!("    output: {}", schema.output_schema);
+                                }
+                                None => println!("  {reference}"),
+                            }
                         }
                     }
                 }

@@ -17,10 +17,11 @@ use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::AGENT as AGENT_STATE_TYPE;
-use mx_agent_protocol::schema::{AgentLoad, AgentState, AgentWorkspace};
+use mx_agent_protocol::schema::{AgentLoad, AgentState, AgentWorkspace, ToolSchema};
 
 use crate::matrix::restore_client;
 use crate::session::StoredSession;
+use crate::tools::ToolRegistry;
 use crate::workspace::{git_output, parse_room_or_alias, resolve_room_id, WorkspaceError};
 
 /// Default agent kind used when the caller does not specify one.
@@ -201,12 +202,15 @@ pub struct ListAgentsOptions {
     pub capabilities: Vec<String>,
 }
 
-/// Placeholder view of the tools an agent offers, derived from its registered
+/// View of the tools an agent offers, derived from its registered
 /// [`AgentState`].
 ///
-/// Tools negotiation is a later roadmap phase; for now `agent tools` simply
-/// reports the tools and capabilities the agent advertised at registration so
-/// callers can discover what is on offer.
+/// Reports the tools and capabilities the agent advertised at registration so
+/// callers can discover what is on offer. Each advertised `name@version`
+/// reference is resolved against the known tool registry into a full
+/// [`ToolSchema`] when possible, so `agent tools` can display tool metadata
+/// (name, version, description, and input/output schemas) rather than bare
+/// references.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentTools {
     /// Agent identifier.
@@ -217,19 +221,34 @@ pub struct AgentTools {
     pub status: String,
     /// Declared capabilities.
     pub capabilities: Vec<String>,
-    /// Available named tools.
+    /// Advertised named tool references, e.g. `run_tests@1.0.0`.
     pub tools: Vec<String>,
+    /// Full metadata for advertised tools that resolve against the registry.
+    pub schemas: Vec<ToolSchema>,
 }
 
 impl AgentTools {
-    /// Build a tools view from a registered agent state.
+    /// Build a tools view from a registered agent state, resolving advertised
+    /// tool references against the built-in [`ToolRegistry`].
     pub fn from_state(state: &AgentState) -> Self {
+        Self::from_state_with_registry(state, &ToolRegistry::builtin())
+    }
+
+    /// Build a tools view, resolving advertised tool references against a
+    /// caller-supplied registry.
+    pub fn from_state_with_registry(state: &AgentState, registry: &ToolRegistry) -> Self {
+        let schemas = state
+            .tools
+            .iter()
+            .filter_map(|reference| registry.resolve(reference).cloned())
+            .collect();
         Self {
             agent_id: state.agent_id.clone(),
             kind: state.kind.clone(),
             status: state.status.clone(),
             capabilities: state.capabilities.clone(),
             tools: state.tools.clone(),
+            schemas,
         }
     }
 }
@@ -425,6 +444,21 @@ mod tests {
             tools.tools,
             vec!["run_tests@1.0.0".to_string(), "lint@1.0.0".to_string()]
         );
+        // Both advertised references resolve to built-in tool metadata.
+        assert_eq!(tools.schemas.len(), 2);
+        let names: Vec<&str> = tools.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"run_tests"));
+        assert!(names.contains(&"lint"));
+    }
+
+    #[test]
+    fn agent_tools_view_skips_unknown_tool_references() {
+        let agent = sample_state("dev-pi", &[], &["run_tests@1.0.0", "mystery@2.0.0"]);
+        let tools = AgentTools::from_state(&agent);
+        assert_eq!(tools.tools.len(), 2);
+        // Only the known reference resolves to metadata.
+        assert_eq!(tools.schemas.len(), 1);
+        assert_eq!(tools.schemas[0].name, "run_tests");
     }
 
     #[test]

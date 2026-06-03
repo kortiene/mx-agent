@@ -240,6 +240,39 @@ pub struct ContextShare {
     pub extra: Extra,
 }
 
+/// `com.mxagent.tool.v1` state content (architecture §5.2, §7.1).
+///
+/// Describes a single named tool an agent offers. Tools are the preferred
+/// security boundary over raw `exec`: they declare strict input/output JSON
+/// schemas so callers know exactly what arguments are accepted and what shape
+/// the result takes. The `input_schema` and `output_schema` fields hold JSON
+/// Schema documents as opaque [`Value`]s so the model does not constrain which
+/// subset of JSON Schema a tool uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSchema {
+    /// Tool name, e.g. `run_tests`.
+    pub name: String,
+    /// Tool version, e.g. `1.0.0`.
+    pub version: String,
+    /// Human-readable description of what the tool does.
+    pub description: String,
+    /// JSON Schema document describing accepted input arguments.
+    pub input_schema: Value,
+    /// JSON Schema document describing the result payload.
+    pub output_schema: Value,
+    /// Forward-compatible unknown fields.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl ToolSchema {
+    /// Return the qualified tool reference (`name@version`) used to advertise
+    /// this tool in [`AgentState::tools`].
+    pub fn qualified_ref(&self) -> String {
+        format!("{}@{}", self.name, self.version)
+    }
+}
+
 /// `com.mxagent.call.request.v1` content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallRequest {
@@ -650,6 +683,45 @@ mod tests {
             "approved_by": "local-user",
             "created_at": "2026-06-02T12:00:30Z"
         }));
+    }
+
+    #[test]
+    fn tool_schema_round_trips() {
+        // Matches the documented tool metadata example in architecture.md §5.2.
+        assert_round_trip::<ToolSchema>(json!({
+            "name": "run_tests",
+            "version": "1.0.0",
+            "description": "Run project test suites",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "package": { "type": "string" },
+                    "coverage": { "type": "boolean" }
+                },
+                "required": ["package"]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "exit_code": { "type": "integer" },
+                    "summary": { "type": "string" },
+                    "log_mxc": { "type": "string" }
+                }
+            }
+        }));
+    }
+
+    #[test]
+    fn tool_schema_qualified_ref_is_name_at_version() {
+        let tool = ToolSchema {
+            name: "lint".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Lint the project".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: json!({ "type": "object" }),
+            extra: Default::default(),
+        };
+        assert_eq!(tool.qualified_ref(), "lint@1.0.0");
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod replay;
 pub mod session;
 pub mod signing;
 pub mod sync;
+pub mod tools;
 pub mod trust;
 pub mod trust_state;
 pub mod workspace;
@@ -46,6 +47,7 @@ pub use signing::{
 pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
 };
+pub use tools::{builtin_tools, ToolRegistry};
 pub use trust::{fingerprint_from_key_id, TrustEntry, TrustStatus, TrustStore};
 pub use trust_state::{
     effective_trust, effective_trust_table, list_trust_states, list_trust_states_for_session,
