@@ -32,12 +32,35 @@
 //! Each chunk is emitted as UTF-8 when its bytes form valid UTF-8, and as
 //! base64 otherwise (architecture §7.3). The capture stage never blocks on the
 //! sink failing: if the consumer has gone away, capture stops early.
+//!
+//! ## Rate limiting and output caps
+//!
+//! Per architecture §8.1 and §8.3 the daemon must protect both Matrix and the
+//! local process from a command that produces enormous or rapid output. Two
+//! per-invocation limits, configured through [`OutputCaps`], are enforced here:
+//!
+//! - `max_output_bytes` bounds the *total* number of output bytes forwarded
+//!   across all of an invocation's streams. Once the budget is exhausted the
+//!   remaining output is dropped and the invocation is flagged as **truncated**
+//!   so the terminal `exec.finished` event can say so explicitly.
+//! - `max_events_per_second` bounds how fast chunk events are emitted, using a
+//!   token bucket shared across the invocation's streams. This keeps a noisy
+//!   command from flooding the Matrix timeline (and the homeserver's own rate
+//!   limits).
+//!
+//! Both limits are shared across stdout and stderr through a [`CaptureLimiter`]
+//! so the cap applies per invocation, not per stream. The EOF marker for each
+//! stream is always delivered (it carries no payload and terminates the
+//! stream), so truncation never leaves a consumer waiting for an end-of-stream
+//! that never arrives.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{timeout, Instant};
 
 use mx_agent_protocol::schema::{StreamChunk, StreamKind};
 
@@ -49,6 +72,32 @@ pub const DEFAULT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Default flush interval for interactive streams (§8.1: 50 ms).
 pub const DEFAULT_INTERACTIVE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Per-invocation output caps (architecture §8.1, §8.3).
+///
+/// These limits are shared across all of an invocation's streams and enforced
+/// by a [`CaptureLimiter`]. Both fields default to `None` (unlimited); a daemon
+/// fills them in from policy before capturing a command's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OutputCaps {
+    /// Maximum total output bytes forwarded across all streams. Output beyond
+    /// this is dropped and the invocation flagged truncated. `None` is
+    /// unlimited.
+    pub max_output_bytes: Option<u64>,
+    /// Maximum chunk events emitted per second across all streams, smoothed by
+    /// a token bucket. `None` is unlimited.
+    pub max_events_per_second: Option<u32>,
+}
+
+impl OutputCaps {
+    /// No caps: unlimited output bytes and event rate.
+    pub const fn unlimited() -> Self {
+        Self {
+            max_output_bytes: None,
+            max_events_per_second: None,
+        }
+    }
+}
 
 /// How output is chunked into [`StreamChunk`] events.
 ///
@@ -64,6 +113,8 @@ pub struct StreamCaptureConfig {
     pub flush_interval: Duration,
     /// Flush at newline boundaries (interactive mode).
     pub flush_on_newline: bool,
+    /// Per-invocation output byte cap and event-rate limit.
+    pub caps: OutputCaps,
 }
 
 impl StreamCaptureConfig {
@@ -73,6 +124,7 @@ impl StreamCaptureConfig {
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
             flush_interval: DEFAULT_BATCH_FLUSH_INTERVAL,
             flush_on_newline: false,
+            caps: OutputCaps::unlimited(),
         }
     }
 
@@ -82,7 +134,14 @@ impl StreamCaptureConfig {
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
             flush_interval: DEFAULT_INTERACTIVE_FLUSH_INTERVAL,
             flush_on_newline: true,
+            caps: OutputCaps::unlimited(),
         }
+    }
+
+    /// Return a copy with the given per-invocation output `caps` applied.
+    pub const fn with_caps(mut self, caps: OutputCaps) -> Self {
+        self.caps = caps;
+        self
     }
 }
 
@@ -90,6 +149,170 @@ impl Default for StreamCaptureConfig {
     fn default() -> Self {
         Self::batch()
     }
+}
+
+/// A token bucket that smooths event emission to a sustained rate.
+///
+/// Tokens refill continuously at `refill_per_sec`, capped at `capacity` (one
+/// second's worth of events, allowing a small initial burst). Each event costs
+/// one token; when none are available the caller waits just long enough for the
+/// next token to accrue.
+#[derive(Debug)]
+struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refill_per_sec: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(events_per_second: u32) -> Self {
+        let rate = f64::from(events_per_second.max(1));
+        Self {
+            capacity: rate,
+            tokens: rate,
+            refill_per_sec: rate,
+            last: Instant::now(),
+        }
+    }
+
+    /// Refill tokens for the time elapsed since the last update.
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+            self.last = now;
+        }
+    }
+
+    /// Try to spend one token, returning `None` on success or `Some(wait)` with
+    /// how long to wait for the next token if the bucket is empty.
+    fn try_take(&mut self, now: Instant) -> Option<Duration> {
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            None
+        } else {
+            let deficit = 1.0 - self.tokens;
+            Some(Duration::from_secs_f64(deficit / self.refill_per_sec))
+        }
+    }
+}
+
+/// Shared, per-invocation enforcement of an output byte cap and an event-rate
+/// limit across all of an invocation's streams.
+///
+/// Cloning a [`CaptureLimiter`] shares the same underlying budget and token
+/// bucket, so stdout and stderr draw from one pool. Construct one with
+/// [`CaptureLimiter::new`] (or [`CaptureLimiter::unlimited`]) and hand clones to
+/// each [`capture_stream`].
+#[derive(Clone)]
+pub struct CaptureLimiter {
+    inner: Arc<LimiterInner>,
+}
+
+struct LimiterInner {
+    max_output_bytes: Option<u64>,
+    emitted: AtomicU64,
+    truncated: AtomicBool,
+    rate: Option<Mutex<TokenBucket>>,
+}
+
+impl Default for CaptureLimiter {
+    fn default() -> Self {
+        Self::unlimited()
+    }
+}
+
+impl CaptureLimiter {
+    /// A limiter that enforces nothing: unlimited bytes and event rate.
+    pub fn unlimited() -> Self {
+        Self::new(OutputCaps::unlimited())
+    }
+
+    /// Build a limiter enforcing `caps` across the invocation.
+    pub fn new(caps: OutputCaps) -> Self {
+        Self {
+            inner: Arc::new(LimiterInner {
+                max_output_bytes: caps.max_output_bytes,
+                emitted: AtomicU64::new(0),
+                truncated: AtomicBool::new(false),
+                rate: caps
+                    .max_events_per_second
+                    .map(|eps| Mutex::new(TokenBucket::new(eps))),
+            }),
+        }
+    }
+
+    /// Reserve up to `len` bytes of the shared output budget, returning how many
+    /// bytes may actually be forwarded.
+    ///
+    /// When the budget cannot satisfy the full request the invocation is flagged
+    /// as truncated. With no byte cap, the full `len` is always granted.
+    fn reserve(&self, len: usize) -> usize {
+        let Some(max) = self.inner.max_output_bytes else {
+            return len;
+        };
+        let want = len as u64;
+        let mut current = self.inner.emitted.load(Ordering::Relaxed);
+        loop {
+            let remaining = max.saturating_sub(current);
+            let grant = want.min(remaining);
+            match self.inner.emitted.compare_exchange_weak(
+                current,
+                current + grant,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    if grant < want {
+                        self.inner.truncated.store(true, Ordering::Relaxed);
+                    }
+                    return grant as usize;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Wait for permission to emit one chunk event under the rate limit.
+    ///
+    /// A no-op when no event-rate cap is configured; otherwise blocks until the
+    /// shared token bucket has a token available.
+    async fn acquire_event(&self) {
+        let Some(rate) = &self.inner.rate else {
+            return;
+        };
+        loop {
+            let wait = {
+                let mut bucket = rate.lock().await;
+                bucket.try_take(Instant::now())
+            };
+            match wait {
+                None => return,
+                Some(delay) => tokio::time::sleep(delay).await,
+            }
+        }
+    }
+
+    /// Whether output has been truncated because the byte budget was exhausted.
+    pub fn truncated(&self) -> bool {
+        self.inner.truncated.load(Ordering::Relaxed)
+    }
+
+    /// Total output bytes forwarded so far across all streams.
+    pub fn emitted_bytes(&self) -> u64 {
+        self.inner.emitted.load(Ordering::Relaxed)
+    }
+}
+
+/// Summary of a finished capture, used to populate the `exec.finished` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CaptureSummary {
+    /// Whether output was truncated to honour the per-invocation byte cap.
+    pub truncated: bool,
+    /// Total output bytes forwarded across all streams.
+    pub output_bytes: u64,
 }
 
 /// Capture a child's stdout and stderr **concurrently** into `sink`.
@@ -100,6 +323,10 @@ impl Default for StreamCaptureConfig {
 /// so a consumer observes chunks interleaved across streams but strictly
 /// ordered within each stream. Each stream is terminated by a final EOF chunk.
 ///
+/// Returns a [`CaptureSummary`] describing whether output was truncated to
+/// honour the per-invocation byte cap and how many bytes were forwarded, so the
+/// caller can populate the terminal `exec.finished` event.
+///
 /// Returns once both streams have reached EOF (or the sink was dropped).
 pub async fn capture_child_output<O, E>(
     stdout: O,
@@ -107,21 +334,36 @@ pub async fn capture_child_output<O, E>(
     invocation_id: impl Into<String>,
     config: StreamCaptureConfig,
     sink: mpsc::Sender<StreamChunk>,
-) where
+) -> CaptureSummary
+where
     O: AsyncRead + Unpin + Send,
     E: AsyncRead + Unpin + Send,
 {
     let invocation_id = invocation_id.into();
-    let out = capture_stream(
+    // One limiter shared across both streams so the caps apply per invocation.
+    let limiter = CaptureLimiter::new(config.caps);
+    let out = capture_stream_limited(
         stdout,
         invocation_id.clone(),
         StreamKind::Stdout,
         config,
         sink.clone(),
+        limiter.clone(),
     );
-    let err = capture_stream(stderr, invocation_id, StreamKind::Stderr, config, sink);
+    let err = capture_stream_limited(
+        stderr,
+        invocation_id,
+        StreamKind::Stderr,
+        config,
+        sink,
+        limiter.clone(),
+    );
     // Read both concurrently on the current task; `join` polls both futures.
     tokio::join!(out, err);
+    CaptureSummary {
+        truncated: limiter.truncated(),
+        output_bytes: limiter.emitted_bytes(),
+    }
 }
 
 /// Capture a single stream, chunking it into [`StreamChunk`] events.
@@ -129,6 +371,10 @@ pub async fn capture_child_output<O, E>(
 /// Reads from `reader` until EOF, flushing the buffer into `sink` whenever a
 /// flush condition in [`StreamCaptureConfig`] is met, then sends a final EOF
 /// chunk. Stops early (without error) if the sink is closed by the consumer.
+///
+/// This convenience wrapper enforces no per-invocation caps; use
+/// [`capture_child_output`] (or [`capture_stream_limited`]) to apply an output
+/// byte cap or event-rate limit.
 pub async fn capture_stream<R>(
     reader: R,
     invocation_id: impl Into<String>,
@@ -138,32 +384,90 @@ pub async fn capture_stream<R>(
 ) where
     R: AsyncRead + Unpin,
 {
+    capture_stream_limited(
+        reader,
+        invocation_id,
+        stream,
+        config,
+        sink,
+        CaptureLimiter::unlimited(),
+    )
+    .await;
+}
+
+/// Capture a single stream like [`capture_stream`], enforcing the shared
+/// per-invocation `limiter` (output byte cap and event-rate limit).
+///
+/// Once the shared byte budget is exhausted the remaining payload is dropped and
+/// the limiter is flagged truncated; the stream's EOF marker is still sent so a
+/// consumer never waits for an end-of-stream that never arrives.
+pub async fn capture_stream_limited<R>(
+    reader: R,
+    invocation_id: impl Into<String>,
+    stream: StreamKind,
+    config: StreamCaptureConfig,
+    sink: mpsc::Sender<StreamChunk>,
+    limiter: CaptureLimiter,
+) where
+    R: AsyncRead + Unpin,
+{
     let invocation_id = invocation_id.into();
     let mut reader = reader;
     let mut buf: Vec<u8> = Vec::with_capacity(config.max_chunk_bytes.min(8192));
     let mut read_buf = [0u8; 8192];
     let mut seq: u64 = 0;
 
+    // Send the EOF marker and return; used on every exit path so the stream is
+    // always terminated for the consumer.
+    macro_rules! finish {
+        () => {{
+            let _ = emit_chunk(&sink, &invocation_id, stream, &mut seq, &[], true, &limiter).await;
+            return;
+        }};
+    }
+
     loop {
         match timeout(config.flush_interval, reader.read(&mut read_buf)).await {
             // Flush interval elapsed: flush whatever is buffered.
             Err(_elapsed) => {
-                if !buf.is_empty()
-                    && !emit_chunk(&sink, &invocation_id, stream, &mut seq, &buf, false).await
-                {
-                    return;
+                if !buf.is_empty() {
+                    match emit_chunk(
+                        &sink,
+                        &invocation_id,
+                        stream,
+                        &mut seq,
+                        &buf,
+                        false,
+                        &limiter,
+                    )
+                    .await
+                    {
+                        Emit::Sent => {}
+                        Emit::Closed => return,
+                        Emit::BudgetExhausted => finish!(),
+                    }
                 }
                 buf.clear();
             }
             // EOF: flush any remainder, then send the EOF marker.
             Ok(Ok(0)) => {
-                if !buf.is_empty()
-                    && !emit_chunk(&sink, &invocation_id, stream, &mut seq, &buf, false).await
-                {
-                    return;
+                if !buf.is_empty() {
+                    match emit_chunk(
+                        &sink,
+                        &invocation_id,
+                        stream,
+                        &mut seq,
+                        &buf,
+                        false,
+                        &limiter,
+                    )
+                    .await
+                    {
+                        Emit::Sent | Emit::BudgetExhausted => {}
+                        Emit::Closed => return,
+                    }
                 }
-                let _ = emit_chunk(&sink, &invocation_id, stream, &mut seq, &[], true).await;
-                return;
+                finish!();
             }
             // Data: append and flush on size / newline as configured.
             Ok(Ok(n)) => {
@@ -172,8 +476,20 @@ pub async fn capture_stream<R>(
                 // Flush whole chunks while the buffer is at or over the cap.
                 while buf.len() >= config.max_chunk_bytes {
                     let chunk: Vec<u8> = buf.drain(..config.max_chunk_bytes).collect();
-                    if !emit_chunk(&sink, &invocation_id, stream, &mut seq, &chunk, false).await {
-                        return;
+                    match emit_chunk(
+                        &sink,
+                        &invocation_id,
+                        stream,
+                        &mut seq,
+                        &chunk,
+                        false,
+                        &limiter,
+                    )
+                    .await
+                    {
+                        Emit::Sent => {}
+                        Emit::Closed => return,
+                        Emit::BudgetExhausted => finish!(),
                     }
                 }
 
@@ -181,9 +497,20 @@ pub async fn capture_stream<R>(
                 if config.flush_on_newline {
                     if let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') {
                         let line: Vec<u8> = buf.drain(..=last_nl).collect();
-                        if !emit_chunk(&sink, &invocation_id, stream, &mut seq, &line, false).await
+                        match emit_chunk(
+                            &sink,
+                            &invocation_id,
+                            stream,
+                            &mut seq,
+                            &line,
+                            false,
+                            &limiter,
+                        )
+                        .await
                         {
-                            return;
+                            Emit::Sent => {}
+                            Emit::Closed => return,
+                            Emit::BudgetExhausted => finish!(),
                         }
                     }
                 }
@@ -191,21 +518,80 @@ pub async fn capture_stream<R>(
             Ok(Err(_io_err)) => {
                 // Treat a read error as end-of-stream: flush and mark EOF.
                 if !buf.is_empty() {
-                    let _ = emit_chunk(&sink, &invocation_id, stream, &mut seq, &buf, false).await;
+                    let _ = emit_chunk(
+                        &sink,
+                        &invocation_id,
+                        stream,
+                        &mut seq,
+                        &buf,
+                        false,
+                        &limiter,
+                    )
+                    .await;
                 }
-                let _ = emit_chunk(&sink, &invocation_id, stream, &mut seq, &[], true).await;
-                return;
+                finish!();
             }
         }
     }
 }
 
-/// Build a [`StreamChunk`] for `data` and send it on `sink`.
+/// Outcome of attempting to emit one chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Emit {
+    /// The chunk (or as much of it as the budget allowed) was delivered.
+    Sent,
+    /// The sink is closed (consumer went away); the caller should stop.
+    Closed,
+    /// The shared output byte budget is exhausted; stop forwarding payload.
+    BudgetExhausted,
+}
+
+/// Build a [`StreamChunk`] for `data` and send it on `sink`, enforcing the
+/// shared per-invocation `limiter`.
 ///
-/// Returns `true` if the chunk was delivered and `false` if the sink is closed
-/// (the consumer went away), letting the caller stop early. `seq` is advanced
-/// on every emitted chunk so sequence numbers stay monotonic per stream.
+/// The EOF marker (`eof == true`) bypasses both caps: it carries no payload and
+/// must always terminate the stream. For data chunks the byte budget is
+/// reserved first (truncating the payload when exhausted) and the event-rate
+/// limit is awaited before sending. `seq` is advanced only when a chunk is
+/// actually emitted so sequence numbers stay monotonic per stream.
+///
+/// Returns [`Emit::Closed`] when the sink is closed, [`Emit::BudgetExhausted`]
+/// when the byte budget could not cover the chunk (the caller should stop
+/// forwarding payload), and [`Emit::Sent`] otherwise.
 async fn emit_chunk(
+    sink: &mpsc::Sender<StreamChunk>,
+    invocation_id: &str,
+    stream: StreamKind,
+    seq: &mut u64,
+    data: &[u8],
+    eof: bool,
+    limiter: &CaptureLimiter,
+) -> Emit {
+    if eof {
+        return match send_chunk(sink, invocation_id, stream, seq, &[], true).await {
+            true => Emit::Sent,
+            false => Emit::Closed,
+        };
+    }
+
+    let allowed = limiter.reserve(data.len());
+    let exhausted = allowed < data.len();
+    if allowed > 0 {
+        limiter.acquire_event().await;
+        if !send_chunk(sink, invocation_id, stream, seq, &data[..allowed], false).await {
+            return Emit::Closed;
+        }
+    }
+    if exhausted {
+        Emit::BudgetExhausted
+    } else {
+        Emit::Sent
+    }
+}
+
+/// Build and send a single [`StreamChunk`], advancing `seq`. Returns `false`
+/// when the sink is closed.
+async fn send_chunk(
     sink: &mpsc::Sender<StreamChunk>,
     invocation_id: &str,
     stream: StreamKind,
@@ -435,6 +821,116 @@ mod tests {
         );
         assert!(interactive.flush_on_newline);
         assert_eq!(batch.max_chunk_bytes, DEFAULT_MAX_CHUNK_BYTES);
+    }
+
+    #[tokio::test]
+    async fn output_byte_cap_truncates_and_flags_summary() {
+        // Acceptance: a high-output command does not flood Matrix and truncation
+        // is explicit. A 1 KiB cap stops the stream well short of the input.
+        let (tx, rx) = mpsc::channel(256);
+        let data = vec![b'x'; 64 * 1024];
+        let config = StreamCaptureConfig::batch().with_caps(OutputCaps {
+            max_output_bytes: Some(1024),
+            max_events_per_second: None,
+        });
+        let summary = capture_child_output(&data[..], &[][..], "inv_cap", config, tx).await;
+        let chunks = collect(rx).await;
+        let payload: usize = chunks.iter().map(|c| c.data.len()).sum();
+        assert!(payload <= 1024, "forwarded {payload} bytes, cap was 1024");
+        assert!(summary.truncated, "summary should report truncation");
+        assert_eq!(summary.output_bytes, 1024);
+        // The stream must still be terminated for the consumer.
+        assert!(chunks.iter().any(|c| c.eof));
+    }
+
+    #[tokio::test]
+    async fn output_byte_cap_is_shared_across_streams() {
+        // The cap is per invocation, not per stream: stdout + stderr together
+        // cannot exceed the budget.
+        let (tx, rx) = mpsc::channel(256);
+        let out = vec![b'o'; 8 * 1024];
+        let err = vec![b'e'; 8 * 1024];
+        let config = StreamCaptureConfig::batch().with_caps(OutputCaps {
+            max_output_bytes: Some(4096),
+            max_events_per_second: None,
+        });
+        let summary = capture_child_output(&out[..], &err[..], "inv_cap", config, tx).await;
+        let chunks = collect(rx).await;
+        let payload: usize = chunks.iter().map(|c| c.data.len()).sum();
+        assert!(payload <= 4096, "forwarded {payload} bytes, cap was 4096");
+        assert!(summary.truncated);
+        assert_eq!(summary.output_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn output_within_cap_is_not_truncated() {
+        let (tx, rx) = mpsc::channel(256);
+        let data = b"small output\n".to_vec();
+        let config = StreamCaptureConfig::batch().with_caps(OutputCaps {
+            max_output_bytes: Some(1_000_000),
+            max_events_per_second: None,
+        });
+        let summary = capture_child_output(&data[..], &[][..], "inv_ok", config, tx).await;
+        let chunks = collect(rx).await;
+        assert!(!summary.truncated);
+        assert_eq!(summary.output_bytes, data.len() as u64);
+        let payload: Vec<u8> = chunks
+            .iter()
+            .filter(|c| !c.eof)
+            .flat_map(|c| c.data.clone().into_bytes())
+            .collect();
+        assert_eq!(payload, data);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn event_rate_limit_throttles_chunk_emission() {
+        // Acceptance: limit event rate per invocation. With a 2 events/sec cap
+        // and tiny one-byte chunks, the fourth chunk cannot be emitted until
+        // virtual time advances past the initial burst.
+        let (tx, mut rx) = mpsc::channel(256);
+        let data = [b'a'; 6];
+        let config = StreamCaptureConfig {
+            max_chunk_bytes: 1,
+            ..StreamCaptureConfig::batch()
+        }
+        .with_caps(OutputCaps {
+            max_output_bytes: None,
+            max_events_per_second: Some(2),
+        });
+        let handle = tokio::spawn(async move {
+            capture_child_output(&data[..], &[][..], "inv_rate", config, tx).await
+        });
+        // The token bucket starts full (capacity == rate == 2), so the first two
+        // data chunks emit immediately; the third must wait for a refill.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut received = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            received.push(chunk);
+        }
+        let data_chunks = received.iter().filter(|c| !c.eof).count();
+        assert!(
+            data_chunks <= 2,
+            "rate limit should hold emission to the initial burst, got {data_chunks}"
+        );
+        // Advance virtual time enough to refill the bucket and drain the rest.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        while (rx.recv().await).is_some() {}
+        let summary = handle.await.unwrap();
+        assert!(!summary.truncated);
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new(4);
+        bucket.last = start;
+        bucket.tokens = 0.0;
+        // Empty bucket: must wait for the next token (1/4 s at 4 eps).
+        let wait = bucket.try_take(start).expect("empty bucket waits");
+        assert!(wait > Duration::ZERO);
+        // After a full second, the bucket has refilled to capacity.
+        let later = start + Duration::from_secs(1);
+        assert!(bucket.try_take(later).is_none());
     }
 
     #[test]

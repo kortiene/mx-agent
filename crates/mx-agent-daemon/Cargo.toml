@@ -30,6 +30,7 @@ getrandom = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "test-util"] }
 
 [lints]
 workspace = true
