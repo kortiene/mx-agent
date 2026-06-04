@@ -561,6 +561,30 @@ Cancellation policy:
 3. Send SIGKILL to process group.
 4. Emit `exec.cancelled` and final invocation state.
 
+### 7.6 Terminal Signals and Ctrl-C
+
+Interactive `exec --pty` makes the local terminal transparent to the remote
+program: the requester puts its local terminal into **raw mode** (clearing
+`ISIG`, `ICANON`, and `ECHO`) so keystrokes — including control characters — are
+forwarded byte-for-byte rather than interpreted locally.
+
+- **Ctrl-C (and Ctrl-\\, Ctrl-Z, …)** are sent as their literal bytes (`0x03`,
+  …) over `StreamKind::Stdin` to the remote PTY, whose line discipline raises
+  the corresponding signal (`SIGINT`, `SIGQUIT`, `SIGTSTP`) in the remote
+  foreground process group. The local `mx-agent` is **not** interrupted; Ctrl-C
+  acts on the remote program exactly as it would at a local terminal.
+- A remote process killed by a signal reports `128 + signum` per §5.3, so a
+  Ctrl-C'd remote command exits `130`.
+- The non-interactive `exec` path leaves the terminal in cooked mode, so Ctrl-C
+  raises `SIGINT` locally and terminates `mx-agent` itself with exit code `130`.
+
+**Terminal restoration.** The raw-mode settings are restored on normal exit, on
+error, and on panic. Because a signal can terminate the process without running
+that cleanup, the requester also installs a handler so that a `SIGINT`,
+`SIGTERM`, `SIGHUP`, or `SIGQUIT` first restores the terminal (and then exits
+`128 + signum`). The local terminal is therefore never left stranded in raw mode
+after a failure.
+
 ---
 
 ## 8. Stream Transport Semantics
