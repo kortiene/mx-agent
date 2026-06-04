@@ -335,7 +335,7 @@ enum TaskCommand {
     /// List tasks.
     List(TaskListArgs),
     /// Render the task dependency graph.
-    Graph,
+    Graph(TaskGraphArgs),
     /// Watch task state changes.
     Watch,
 }
@@ -392,6 +392,13 @@ struct TaskUpdateArgs {
     /// Associate this task with an invocation ID.
     #[arg(long = "invocation", value_name = "INVOCATION_ID")]
     invocation: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct TaskGraphArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
 }
 
 #[derive(Debug, Args)]
@@ -1469,7 +1476,7 @@ fn handle_task(global: &GlobalArgs, cmd: &TaskCommand) -> ExitCode {
         TaskCommand::Create(args) => task_create(global, args),
         TaskCommand::Update(args) => task_update(global, args),
         TaskCommand::List(args) => task_list(global, args),
-        TaskCommand::Graph => unimplemented(global, "task graph"),
+        TaskCommand::Graph(args) => task_graph(global, args),
         TaskCommand::Watch => unimplemented(global, "task watch"),
     }
 }
@@ -1606,6 +1613,44 @@ fn task_list(global: &GlobalArgs, args: &TaskListArgs) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("mx-agent: could not list tasks: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn task_graph(global: &GlobalArgs, args: &TaskGraphArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::ListTasksOptions {
+        room: args.room.clone(),
+        state: None,
+        assigned_to: None,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::list_tasks_for_session(&session, &options).await {
+            Ok(tasks) => {
+                let graph = mx_agent_daemon::TaskGraph::from_tasks(&tasks);
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&graph).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else if graph.nodes.is_empty() {
+                    println!("mx-agent: no tasks in {}", args.room);
+                } else {
+                    print!("{}", graph.render_text());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not render task graph: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -1799,7 +1844,7 @@ fn command_path(command: &Command) -> String {
                 TaskCommand::Create(_) => "create",
                 TaskCommand::Update(_) => "update",
                 TaskCommand::List(_) => "list",
-                TaskCommand::Graph => "graph",
+                TaskCommand::Graph(_) => "graph",
                 TaskCommand::Watch => "watch",
             }
         ),
@@ -2644,6 +2689,20 @@ mod tests {
             other => panic!("expected task list, got {other:?}"),
         }
         assert_eq!(command_path(&cli.command), "task list");
+    }
+
+    #[test]
+    fn task_graph_requires_room() {
+        assert!(Cli::try_parse_from(["mx-agent", "task", "graph"]).is_err());
+        let cli = Cli::try_parse_from(["mx-agent", "task", "graph", "--room", "!abc:matrix.org"])
+            .unwrap();
+        match &cli.command {
+            Command::Task(TaskCommand::Graph(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+            }
+            other => panic!("expected task graph, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "task graph");
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod signing;
 pub mod stream;
 pub mod sync;
 pub mod task;
+pub mod task_graph;
 pub mod tool_exec;
 pub mod tools;
 pub mod trust;
@@ -75,6 +76,7 @@ pub use task::{
     update_task_for_session, CreateTaskOptions, ListTasksOptions, UpdateTaskOptions,
     DEFAULT_TASK_STATE,
 };
+pub use task_graph::{GraphEdge, GraphNode, TaskGraph};
 pub use tool_exec::{execute_tool, ToolError, ToolResult, RUN_TESTS};
 pub use tools::{builtin_tools, ToolRegistry};
 pub use trust::{fingerprint_from_key_id, TrustEntry, TrustStatus, TrustStore};
