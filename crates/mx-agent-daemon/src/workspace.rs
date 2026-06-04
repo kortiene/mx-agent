@@ -189,6 +189,8 @@ pub enum WorkspaceError {
     TaskExists(String),
     /// No task with the requested ID exists in the room.
     TaskNotFound(String),
+    /// No invocation with the requested ID exists in the room.
+    InvocationNotFound(String),
     /// Restoring the authenticated Matrix client from the session failed.
     Restore(Box<LoginError>),
     /// An underlying Matrix request failed.
@@ -217,6 +219,9 @@ impl fmt::Display for WorkspaceError {
             }
             WorkspaceError::TaskNotFound(value) => {
                 write!(f, "task {value:?} was not found in the room")
+            }
+            WorkspaceError::InvocationNotFound(value) => {
+                write!(f, "invocation {value:?} was not found in the room")
             }
             WorkspaceError::Restore(e) => write!(f, "{e}"),
             WorkspaceError::Matrix(e) => write!(f, "Matrix request failed: {e}"),

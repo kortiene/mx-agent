@@ -834,6 +834,19 @@ mod tests {
             "exit_code": null,
             "state_rev": 1
         }));
+        // A task-linked invocation that has finished records both its owning
+        // task and a terminal exit code.
+        assert_round_trip::<InvocationState>(json!({
+            "invocation_id": "inv_01HZ",
+            "task_id": "task_abc",
+            "requester": "claude-local",
+            "target": "developer-pi",
+            "state": "succeeded",
+            "created_at": "2026-06-02T12:00:00Z",
+            "updated_at": "2026-06-02T12:01:00Z",
+            "exit_code": 0,
+            "state_rev": 3
+        }));
         assert_round_trip::<CallRequest>(json!({
             "invocation_id": "inv_01HZ",
             "request_id": "req_01HZ",
