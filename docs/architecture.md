@@ -337,6 +337,34 @@ mx-agent share env \
   --include node,npm,os,git
 ```
 
+List recently shared context in a room:
+
+```bash
+mx-agent share list \
+  --room '!abc123:matrix.org' \
+  --limit 50
+```
+
+Small context objects (up to 256 KiB) are inlined directly in the event,
+avoiding a media round-trip. Text payloads are stored verbatim (`encoding:
+"utf-8"`); binary payloads are base64-encoded (`encoding: "base64"`). The
+`sha256` digest always covers the raw bytes:
+
+```json
+{
+  "type": "com.mxagent.context.share",
+  "content": {
+    "context_id": "ctx_01HZ...",
+    "name": "plan.json",
+    "mime_type": "application/json",
+    "size_bytes": 27,
+    "sha256": "base64...",
+    "data": "{\"step\":\"run tests\"}",
+    "encoding": "utf-8"
+  }
+}
+```
+
 Large context objects should be uploaded as Matrix media and referenced by URI:
 
 ```json

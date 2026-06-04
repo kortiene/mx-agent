@@ -221,6 +221,14 @@ pub struct StreamArtifact {
 }
 
 /// `com.mxagent.context.share.v1` content (architecture §6/7.1).
+///
+/// A context object is carried in one of two ways. **Small payloads** are
+/// inlined directly in the event via [`data`](Self::data) (encoded per
+/// [`encoding`](Self::encoding)), avoiding a media round-trip. **Large objects**
+/// are uploaded as Matrix media and referenced by [`mxc_uri`](Self::mxc_uri).
+/// Exactly one of the two is populated for a given share; the other is `None`.
+/// In both cases [`sha256`](Self::sha256) digests the raw bytes so a receiver
+/// can verify integrity regardless of transport encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextShare {
     /// Context identifier.
@@ -229,12 +237,23 @@ pub struct ContextShare {
     pub name: String,
     /// MIME type.
     pub mime_type: String,
-    /// Size in bytes.
+    /// Size in bytes of the raw (decoded) payload.
     pub size_bytes: u64,
-    /// Base64 digest.
+    /// Base64 digest of the raw (decoded) payload.
     pub sha256: String,
-    /// MXC URI of the uploaded object.
-    pub mxc_uri: String,
+    /// Inline payload for a small context, encoded per
+    /// [`encoding`](Self::encoding). `None` when the object is stored as Matrix
+    /// media and referenced by [`mxc_uri`](Self::mxc_uri) instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// Encoding of [`data`](Self::data): `utf-8` for text or `base64` for
+    /// binary. `None` when there is no inline payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// MXC URI of the uploaded object for a large context. `None` for an inline
+    /// (small-payload) share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mxc_uri: Option<String>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -651,7 +670,8 @@ mod tests {
     }
 
     #[test]
-    fn context_share_round_trips() {
+    fn context_share_large_object_round_trips() {
+        // A large object referenced by Matrix media: no inline payload.
         assert_round_trip::<ContextShare>(json!({
             "context_id": "ctx_01HZ",
             "name": "full-test-log.txt",
@@ -659,6 +679,20 @@ mod tests {
             "size_bytes": 2500000u64,
             "sha256": "base64",
             "mxc_uri": "mxc://matrix.org/abcdef"
+        }));
+    }
+
+    #[test]
+    fn context_share_inline_small_payload_round_trips() {
+        // A small payload inlined directly in the event: no `mxc_uri`.
+        assert_round_trip::<ContextShare>(json!({
+            "context_id": "ctx_01HZ",
+            "name": "plan.json",
+            "mime_type": "application/json",
+            "size_bytes": 27u64,
+            "sha256": "base64",
+            "data": "{\"step\":\"run tests\"}",
+            "encoding": "utf-8"
         }));
     }
 
