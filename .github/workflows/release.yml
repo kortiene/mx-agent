@@ -1,9 +1,13 @@
 name: release
 
-# Build release binaries for Linux, macOS, and Windows whenever a version tag
-# is pushed, generate SHA-256 checksums, and publish everything to the matching
-# GitHub Release. Triggered by tags like `v0.1.0`; `workflow_dispatch` allows a
-# manual dry run that builds and uploads artifacts without creating a release.
+# Build release binaries for Linux and macOS whenever a version tag is pushed,
+# generate SHA-256 checksums, and publish everything to the matching GitHub
+# Release. Triggered by tags like `v0.1.0`; `workflow_dispatch` allows a manual
+# dry run that builds and uploads artifacts without creating a release.
+#
+# Windows is intentionally not a target: the daemon's IPC uses Unix domain
+# sockets and the `nix` crate, so the `mx-agent` binary is Unix-only for now
+# (a Windows named-pipe transport is future work; see docs/architecture.md).
 on:
   push:
     tags:
@@ -30,9 +34,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
