@@ -32,12 +32,24 @@
 //! process group so that a later timeout or cancellation can signal the whole
 //! group rather than just the immediate child (architecture §7.4). On other
 //! platforms this is a no-op and the child runs in the daemon's group.
+//!
+//! ## Sandbox abstraction
+//!
+//! The command is launched through the [`mx_agent_sandbox`] abstraction
+//! (architecture §13.5). The runner resolves the selected [`Backend`]
+//! ([`RunSpec::sandbox`]) into a backend implementation and asks it to
+//! [`prepare`][mx_agent_sandbox::Sandbox::prepare] the argv and the centralized
+//! [`Restrictions`] (restricted cwd, sanitized env, timeout, output cap). The
+//! baseline `none` backend returns the argv unchanged and leaves the runner to
+//! enforce those controls; stronger backends rewrite the argv to launch inside
+//! their wrapper. This keeps the control set in one place regardless of backend.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use mx_agent_sandbox::{sandbox_for, Backend, Restrictions};
 use tokio::process::Command;
 
 /// Default grace period between the SIGTERM and the SIGKILL escalation when a
@@ -169,6 +181,13 @@ pub struct RunSpec {
     /// timed-out command is being terminated. Defaults to
     /// [`DEFAULT_GRACE_PERIOD`].
     pub grace_period: Duration,
+    /// Sandbox backend to launch the command under (architecture §13.5).
+    ///
+    /// The baseline [`Backend::None`] adds no isolation beyond the centralized
+    /// cwd/env/timeout/output controls the runner already enforces. Resolved
+    /// from policy (`execution.default_sandbox` / the agent override); defaults
+    /// to [`Backend::None`].
+    pub sandbox: Backend,
 }
 
 impl Default for RunSpec {
@@ -181,6 +200,7 @@ impl Default for RunSpec {
             stdin: None,
             timeout: None,
             grace_period: DEFAULT_GRACE_PERIOD,
+            sandbox: Backend::None,
         }
     }
 }
@@ -254,13 +274,31 @@ impl std::error::Error for RunError {
 /// Kept separate from [`run`] so the command construction is testable without
 /// actually waiting on a child.
 fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
-    let (program, args) = spec.command.split_first().ok_or(RunError::EmptyCommand)?;
+    if spec.command.is_empty() {
+        return Err(RunError::EmptyCommand);
+    }
 
     if !is_existing_dir(&spec.cwd) {
         return Err(RunError::MissingCwd(spec.cwd.clone()));
     }
 
     let env = sanitize_env(std::env::vars(), &spec.env, &spec.env_allowlist);
+
+    // Launch through the selected sandbox backend (architecture §13.5). The
+    // backend receives the requested argv and the centralized [`Restrictions`]
+    // and returns the argv to actually spawn plus the controls to enforce. The
+    // baseline `none` backend returns both unchanged; stronger backends rewrite
+    // the argv to launch the command inside their wrapper.
+    let restrictions = Restrictions {
+        cwd: spec.cwd.clone(),
+        env,
+        timeout: spec.timeout,
+        // Output capping is enforced by the capture stage, not the spawn.
+        max_output_bytes: None,
+    };
+    let prepared = sandbox_for(spec.sandbox).prepare(spec.command.clone(), restrictions);
+    let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
+    let Restrictions { cwd, env, .. } = prepared.restrictions;
 
     let stdin = if spec.stdin.is_some() {
         Stdio::piped()
@@ -271,7 +309,7 @@ fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
     let mut command = Command::new(program);
     command
         .args(args)
-        .current_dir(&spec.cwd)
+        .current_dir(&cwd)
         .env_clear()
         .envs(env)
         .stdin(stdin)
@@ -881,6 +919,21 @@ mod tests {
         let out = run(&spec).await.expect("runs");
         assert!(!out.timed_out);
         assert_eq!(out.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn runs_under_none_sandbox_backend() {
+        // Acceptance (#53): the process runner launches through the sandbox
+        // abstraction. The baseline `none` backend adds no isolation, so the
+        // command still runs normally in the requested cwd.
+        let spec = RunSpec {
+            command: vec!["true".to_string()],
+            cwd: std::env::temp_dir(),
+            sandbox: Backend::None,
+            ..RunSpec::default()
+        };
+        let out = run(&spec).await.expect("runs");
+        assert!(out.is_success());
     }
 
     #[tokio::test]

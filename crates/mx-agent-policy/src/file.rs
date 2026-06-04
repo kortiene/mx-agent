@@ -105,6 +105,22 @@ pub enum Sandbox {
     Chroot,
 }
 
+impl Sandbox {
+    /// The stable, lowercase name of this backend, matching the policy
+    /// configuration vocabulary. Used to record the selected sandbox in the
+    /// audit log (architecture §13.6).
+    pub fn name(self) -> &'static str {
+        match self {
+            Sandbox::None => "none",
+            Sandbox::Bubblewrap => "bubblewrap",
+            Sandbox::Firejail => "firejail",
+            Sandbox::Docker => "docker",
+            Sandbox::Podman => "podman",
+            Sandbox::Chroot => "chroot",
+        }
+    }
+}
+
 /// Workspace-wide execution defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
