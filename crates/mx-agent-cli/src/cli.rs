@@ -417,11 +417,34 @@ struct TaskListArgs {
 #[derive(Debug, Subcommand)]
 enum InvocationCommand {
     /// List invocations.
-    List,
+    List(InvocationListArgs),
     /// Show one invocation.
-    Show,
+    Show(InvocationShowArgs),
     /// Cancel a running invocation.
     Cancel,
+}
+
+#[derive(Debug, Args)]
+struct InvocationListArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Only list invocations in this lifecycle state, e.g. `running`.
+    #[arg(long, value_name = "STATE")]
+    state: Option<String>,
+    /// Only list invocations linked to this task ID.
+    #[arg(long = "task", value_name = "TASK_ID")]
+    task: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct InvocationShowArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Invocation ID (state key) to show.
+    #[arg(value_name = "INVOCATION_ID")]
+    invocation_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -546,6 +569,7 @@ pub fn run() -> ExitCode {
         Command::Agent(cmd) => handle_agent(g, cmd),
         Command::Trust(cmd) => handle_trust(g, cmd),
         Command::Task(cmd) => handle_task(g, cmd),
+        Command::Invocation(cmd) => handle_invocation(g, cmd),
         Command::Call(args) => cmd_call(g, args),
         Command::Exec(args) => cmd_exec(g, args),
         _ => unimplemented(g, &path),
@@ -1493,6 +1517,9 @@ fn print_task(task: &mx_agent_protocol::schema::TaskState) {
     if !task.blocks.is_empty() {
         println!("    blocks:       {}", task.blocks.join(", "));
     }
+    if let Some(invocation_id) = &task.invocation_id {
+        println!("    invocation:   {invocation_id}");
+    }
     println!("    state_rev:    {}", task.state_rev);
 }
 
@@ -1651,6 +1678,113 @@ fn task_graph(global: &GlobalArgs, args: &TaskGraphArgs) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("mx-agent: could not render task graph: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// Handle the `invocation` command group.
+fn handle_invocation(global: &GlobalArgs, cmd: &InvocationCommand) -> ExitCode {
+    match cmd {
+        InvocationCommand::List(args) => invocation_list(global, args),
+        InvocationCommand::Show(args) => invocation_show(global, args),
+        InvocationCommand::Cancel => unimplemented(global, "invocation cancel"),
+    }
+}
+
+/// Render a single invocation as a human-readable block.
+fn print_invocation(invocation: &mx_agent_protocol::schema::InvocationState) {
+    println!(
+        "  {:<28} {:<10} {} -> {}",
+        invocation.invocation_id, invocation.state, invocation.requester, invocation.target
+    );
+    if let Some(task_id) = &invocation.task_id {
+        println!("    task:         {task_id}");
+    }
+    if let Some(exit_code) = invocation.exit_code {
+        println!("    exit_code:    {exit_code}");
+    }
+    println!("    state_rev:    {}", invocation.state_rev);
+}
+
+fn invocation_list(global: &GlobalArgs, args: &InvocationListArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::ListInvocationsOptions {
+        room: args.room.clone(),
+        state: args.state.clone(),
+        task_id: args.task.clone(),
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::list_invocations_for_session(&session, &options).await {
+            Ok(invocations) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&invocations).unwrap_or_else(|_| "[]".to_string())
+                    );
+                } else if invocations.is_empty() {
+                    println!("mx-agent: no invocations in {}", args.room);
+                } else {
+                    println!(
+                        "mx-agent: {} invocation(s) in {}",
+                        invocations.len(),
+                        args.room
+                    );
+                    for invocation in &invocations {
+                        print_invocation(invocation);
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not list invocations: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn invocation_show(global: &GlobalArgs, args: &InvocationShowArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::get_invocation_for_session(&session, &args.room, &args.invocation_id)
+            .await
+        {
+            Ok(Some(invocation)) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&invocation).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    print_invocation(&invocation);
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                eprintln!(
+                    "mx-agent: invocation {:?} was not found in {}",
+                    args.invocation_id, args.room
+                );
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not show invocation: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -1851,8 +1985,8 @@ fn command_path(command: &Command) -> String {
         Command::Invocation(c) => format!(
             "invocation {}",
             match c {
-                InvocationCommand::List => "list",
-                InvocationCommand::Show => "show",
+                InvocationCommand::List(_) => "list",
+                InvocationCommand::Show(_) => "show",
                 InvocationCommand::Cancel => "cancel",
             }
         ),
@@ -2703,6 +2837,61 @@ mod tests {
             other => panic!("expected task graph, got {other:?}"),
         }
         assert_eq!(command_path(&cli.command), "task graph");
+    }
+
+    #[test]
+    fn invocation_list_requires_room_and_accepts_filters() {
+        assert!(Cli::try_parse_from(["mx-agent", "invocation", "list"]).is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "list",
+            "--room",
+            "!abc:matrix.org",
+            "--state",
+            "running",
+            "--task",
+            "task_abc",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Invocation(InvocationCommand::List(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.state.as_deref(), Some("running"));
+                assert_eq!(args.task.as_deref(), Some("task_abc"));
+            }
+            other => panic!("expected invocation list, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "invocation list");
+    }
+
+    #[test]
+    fn invocation_show_requires_room_and_id() {
+        assert!(Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "show",
+            "--room",
+            "!abc:matrix.org"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "show",
+            "--room",
+            "!abc:matrix.org",
+            "inv_01HZ",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Invocation(InvocationCommand::Show(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.invocation_id, "inv_01HZ");
+            }
+            other => panic!("expected invocation show, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "invocation show");
     }
 
     #[test]

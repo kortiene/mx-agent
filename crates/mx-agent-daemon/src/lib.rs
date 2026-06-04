@@ -10,6 +10,7 @@ pub mod audit;
 pub mod call;
 pub mod exec;
 pub mod heartbeat;
+pub mod invocation;
 pub mod lifecycle;
 pub mod matrix;
 pub mod replay;
@@ -44,6 +45,11 @@ pub use exec::{
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
     DEFAULT_OFFLINE_AFTER, DEFAULT_STALE_AFTER, DEFAULT_STATE_REFRESH,
+};
+pub use invocation::{
+    advance_invocation, advance_invocation_for_session, get_invocation, get_invocation_for_session,
+    is_terminal, list_invocations, list_invocations_for_session, terminal_state_for_exit,
+    ListInvocationsOptions,
 };
 pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
