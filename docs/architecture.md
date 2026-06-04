@@ -780,6 +780,44 @@ local policy permits the operation
 no conflicting newer state_rev exists
 ```
 
+Daemon orchestration treats the task's forward-compatible `action` extension as
+structured work while preserving older readers' ability to round-trip unknown
+fields:
+
+```json
+{
+  "action": {
+    "type": "tool",
+    "tool": "run_tests",
+    "args": { "package": "mx-agent-cli" }
+  }
+}
+```
+
+or:
+
+```json
+{
+  "action": {
+    "type": "exec",
+    "command": ["cargo", "test", "--all"],
+    "cwd": "/home/me/code/project",
+    "env": {},
+    "timeout_ms": 600000
+  }
+}
+```
+
+The daemon scheduler first claims a pending task with the observed `state_rev`,
+sets `state = "executing"`, and attaches a generated `invocation_id`. A lost
+claim race is treated as a stale update and must not spawn. After the signed,
+trust-checked, deny-by-default dispatcher returns, the daemon finalizes the task
+as `succeeded` or `failed` with a non-sensitive structured `result` containing
+the invocation link, action kind, exit code/summary, denial reason, or recovery
+metadata. On restart, an assigned `executing` task whose local invocation is no
+longer live is marked failed with a recovery result instead of being spawned a
+second time.
+
 ### 9.3 Workspace State
 
 State event:
