@@ -2982,7 +2982,7 @@ async fn collect_exec_frames(
     stdin: Option<Vec<u8>>,
 ) -> Result<Vec<crate::stream::StreamFrame>, mx_agent_daemon::RunError> {
     use crate::stream::StreamFrame;
-    use mx_agent_protocol::schema::ExecFinished;
+    use mx_agent_protocol::schema::{ExecFinished, StreamKind};
 
     let spec = mx_agent_daemon::RunSpec {
         command: command.to_vec(),
@@ -2994,26 +2994,57 @@ async fn collect_exec_frames(
     let output = mx_agent_daemon::run(&spec).await?;
 
     const INVOCATION: &str = "inv-local";
-    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-    let stdout_bytes = output.stdout.clone();
-    let stderr_bytes = output.stderr.clone();
-    // Capture concurrently so a full channel never deadlocks the drain below.
-    let capture = tokio::spawn(async move {
-        mx_agent_daemon::capture_child_output(
-            &stdout_bytes[..],
-            &stderr_bytes[..],
-            INVOCATION,
-            mx_agent_daemon::StreamCaptureConfig::batch(),
-            tx,
-        )
-        .await
-    });
+
+    // High-output commands switch to artifact mode: rather than streaming every
+    // byte over the timeline, the full log is packaged as a Matrix media
+    // artifact and the terminal shows a tail preview (architecture §8.4). The
+    // local loopback has no homeserver, so the artifact is finalized with an
+    // empty `mxc_uri`; the daemon's streaming path uploads it for real.
+    let artifact_config = mx_agent_daemon::ArtifactConfig::default();
+    let total_output = output.stdout.len() + output.stderr.len();
 
     let mut frames = Vec::new();
-    while let Some(chunk) = rx.recv().await {
-        frames.push(StreamFrame::Chunk(chunk));
-    }
-    let summary = capture.await.unwrap_or_default();
+    let (truncated, artifact_mxc) = if artifact_config.should_switch(total_output) {
+        let mut artifact_mxc = None;
+        for (stream, data) in [
+            (StreamKind::Stdout, &output.stdout),
+            (StreamKind::Stderr, &output.stderr),
+        ] {
+            if data.is_empty() {
+                continue;
+            }
+            let prepared =
+                mx_agent_daemon::prepare_artifact(INVOCATION, stream, data, &artifact_config).await;
+            let event = prepared.into_event(String::new());
+            if stream == StreamKind::Stdout {
+                artifact_mxc = Some(event.mxc_uri.clone());
+            }
+            frames.push(StreamFrame::Artifact(event));
+        }
+        // The full log is preserved in the artifact, so nothing was truncated.
+        (false, artifact_mxc)
+    } else {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let stdout_bytes = output.stdout.clone();
+        let stderr_bytes = output.stderr.clone();
+        // Capture concurrently so a full channel never deadlocks the drain below.
+        let capture = tokio::spawn(async move {
+            mx_agent_daemon::capture_child_output(
+                &stdout_bytes[..],
+                &stderr_bytes[..],
+                INVOCATION,
+                mx_agent_daemon::StreamCaptureConfig::batch(),
+                tx,
+            )
+            .await
+        });
+
+        while let Some(chunk) = rx.recv().await {
+            frames.push(StreamFrame::Chunk(chunk));
+        }
+        let summary = capture.await.unwrap_or_default();
+        (summary.truncated, None)
+    };
 
     frames.push(StreamFrame::Finished(ExecFinished {
         invocation_id: INVOCATION.to_string(),
@@ -3022,8 +3053,8 @@ async fn collect_exec_frames(
         duration_ms: 0,
         stdout_bytes: output.stdout.len() as u64,
         stderr_bytes: output.stderr.len() as u64,
-        truncated: summary.truncated,
-        artifact_mxc: None,
+        truncated,
+        artifact_mxc,
         extra: Default::default(),
     }));
     Ok(frames)
