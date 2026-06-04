@@ -1,26 +1,135 @@
 # mx-agent
 
-`mx-agent` is a proposed Matrix-backed command line interface for decentralized communication and orchestration between autonomous coding agents such as Pi, Claude Code, and other terminal-based LLM runners.
+**Matrix-backed CLI + daemon for decentralized orchestration between autonomous coding agents** — Pi, Claude Code, and other terminal-based LLM runners.
 
-The CLI treats Matrix rooms as federated workspaces where agents can discover peers, share execution context, stream terminal I/O, and coordinate distributed task graphs without requiring central orchestration servers or inbound firewall access.
+[![CI](https://github.com/kortiene/mx-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/kortiene/mx-agent/actions/workflows/ci.yml)
+[![Status: public alpha](https://img.shields.io/badge/status-public%20alpha-orange)](#project-status)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
+[![MSRV: 1.74](https://img.shields.io/badge/rustc-1.74%2B-93450a)](#prerequisites)
+[![Platform: Unix](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-555)](#project-status)
 
-Documentation:
+mx-agent turns Matrix rooms into **federated workspaces** where agents discover peers, share execution context (diffs, plans, env snapshots), invoke named tools, stream terminal I/O, and coordinate a distributed task graph — **without a central orchestration server and without any inbound firewall port**.
 
-- [Alpha user guide](docs/user-guide.md) — install, log in, create a workspace, register agents, and run the two-agent demo
-- [Security hardening guide](docs/security-hardening.md) — safe defaults and unsafe options for tokens, trust, policy, sandboxing, and audit logging
-- [Alpha release checklist](docs/alpha-release-checklist.md) — the alpha gate, known limitations, and rollback/revocation guidance for deciding if a commit is release-ready
-- [Architecture](docs/architecture.md)
-- [Rust implementation roadmap](docs/roadmap-rust.md)
-- [GitHub project management](docs/github-management.md)
-- [GitHub issue backlog](docs/github-issue-backlog.md)
+📖 **[Wiki](https://github.com/kortiene/mx-agent/wiki)** · [Getting Started](https://github.com/kortiene/mx-agent/wiki/Getting-Started) · [AI Agent Orchestration](https://github.com/kortiene/mx-agent/wiki/AI-Agent-Orchestration) · [Architecture](docs/architecture.md)
+
+---
+
+## Why mx-agent?
+
+Traditional remote-execution tooling assumes a box you can reach inbound — an SSH port, an RPC listener, a VPN or bastion. That breaks the moment your agents live behind NAT, corporate firewalls, or a home router, and it tends to hand long-lived secrets to the very LLM you'd rather not trust with them.
+
+mx-agent inverts that:
+
+| Traditional remote execution | mx-agent |
+|---|---|
+| Needs an **inbound port** (SSH/RPC/agent listener) | **Outbound-only** — daemons connect *out* to a homeserver; nothing listens inbound |
+| NAT/firewall traversal needs a **VPN/bastion/tunnel** | Works anywhere an HTTPS connection to a homeserver works |
+| A **central coordinator** is a single point of failure | **Federated** — state lives in Matrix room history; no central mx-agent server |
+| "Can reach the box" ≈ "**can run anything**" | **Room membership ≠ execution rights** — every privileged request is Ed25519-signed and checked against deny-by-default local policy |
+| Long-lived secrets **handed to the agent** | The coding agent **never sees** Matrix tokens or device keys |
+
+If a box can sync with a homeserver, it can participate — even one that accepts no inbound connections at all.
+
+---
+
+## Project status
+
+**Public alpha (v0.1.0).** The architecture, protocol schema, IPC layer, policy engine, Ed25519 signing, and sandbox abstraction are in place. **Most CLI subcommands currently parse their arguments and report "not implemented yet"** while daemon behavior is filled in across the roadmap. Each capability below is tagged so you always know what runs today.
+
+| Area | Status |
+|---|---|
+| Daemon lifecycle (`start` / `status` / `stop`), background + foreground | ✅ Implemented |
+| Local IPC: Unix-socket JSON-RPC 2.0 with `0600` perms + `SO_PEERCRED` peer check | ✅ Implemented |
+| Structured logging, secret redaction, dev Matrix homeserver (Tuwunel) | ✅ Implemented |
+| Protocol event schema, Ed25519 signing, policy parser, `none` sandbox backend | ✅ Implemented |
+| `auth`, `workspace`, `agent`, `exec`, `call`, `task`, `trust`, `approval` commands | 🟡 Argument-parsing placeholders; behavior landing (issue #4) |
+| E2EE in production, `bubblewrap`/container sandboxes, interactive PTY, large artifacts | 🔮 Planned |
+
+**Platform: Unix only** (Linux and macOS). Windows was intentionally dropped — the project relies on Unix-domain-socket IPC and Unix process semantics.
+
+---
+
+## Quickstart
+
+Everything here runs today. (For the full conceptual walkthrough, see the [Getting Started](https://github.com/kortiene/mx-agent/wiki/Getting-Started) wiki page.)
+
+### Prerequisites
+
+- A Unix host (Linux or macOS)
+- Rust stable toolchain, **1.74+** (install via [rustup](https://rustup.rs))
+
+### Build
+
+```bash
+git clone https://github.com/kortiene/mx-agent.git
+cd mx-agent
+cargo build --all --release
+```
+
+### Explore the command surface
+
+```bash
+cargo run -p mx-agent-cli -- --help        # or ./target/release/mx-agent --help
+```
+
+### Run the daemon
+
+```bash
+mx-agent daemon start                 # start detached in the background
+mx-agent daemon status                # human-readable status (exit 3 if not running)
+mx-agent daemon status --json         # pid, uptime, socket path, version as JSON
+mx-agent daemon stop                  # graceful shutdown (SIGTERM, then SIGKILL)
+```
+
+The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The remaining `auth` / `workspace` / `agent` / `exec` commands accept their final argument shape now but report "not implemented yet" — see [Project status](#project-status).
+
+---
+
+## How it works
+
+```text
+ coding agent / shell  ──spawns──▶  mx-agent (CLI, stateless)
+                                          │  JSON-RPC over Unix socket (0600, SO_PEERCRED)
+                                          ▼
+                                   mx-agent daemon  ──signs──▶  com.mxagent.exec.request.v1 (Ed25519)
+                                          │  Matrix Client-Server API (+ E2EE)
+                                          ▼
+                          Matrix homeserver + federation  ◀──▶  remote daemon ──▶ verify → policy → process
+```
+
+A *local* exec follows the **same path** as a remote one: the daemon signs an event, publishes it, and its own `/sync` loop receives it back through the full verify → policy → runner pipeline. See [Core Concepts](https://github.com/kortiene/mx-agent/wiki/Core-Concepts) and [Architecture](docs/architecture.md).
+
+## Security posture
+
+mx-agent is **zero-trust and deny-by-default**: room membership grants nothing on its own.
+
+- Every privileged request is **Ed25519-signed**; the target verifies the signature, nonce, and expiry, then checks **local policy** before running anything.
+- The coding agent **never sees** Matrix tokens or device keys — they stay inside the daemon (`0600`, user-owned).
+- Child processes start from an **environment allowlist** with secret scrubbing (`GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_*`, …).
+- The local IPC socket enforces a **`SO_PEERCRED` UID check** and refuses cross-user or world-accessible runtime dirs.
+- The workspace **forbids `unsafe` Rust** (`unsafe_code = "forbid"`).
+
+Full details and a complete `policy.toml`: [Security & Sandboxing](https://github.com/kortiene/mx-agent/wiki/Security-and-Sandboxing) · [Security hardening guide](docs/security-hardening.md).
+
+---
+
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| **[Wiki](https://github.com/kortiene/mx-agent/wiki)** | Conceptual guides: getting started, core concepts, protocol spec, security, AI-agent orchestration |
+| [Alpha user guide](docs/user-guide.md) | Install, log in, create a workspace, register agents, run the two-agent demo |
+| [Architecture](docs/architecture.md) | Full system design, protocol, state model, security boundaries |
+| [Security hardening guide](docs/security-hardening.md) | Safe defaults and unsafe options for tokens, trust, policy, sandboxing, audit |
+| [Alpha release checklist](docs/alpha-release-checklist.md) | The alpha gate, known limitations, rollback/revocation guidance |
+| [Rust implementation roadmap](docs/roadmap-rust.md) | Implementation phases |
+| [GitHub management](docs/github-management.md) · [Issue backlog](docs/github-issue-backlog.md) | Project process |
+
+---
 
 ## Development
 
 `mx-agent` is a Rust Cargo workspace.
-
-### Prerequisites
-
-- Rust stable toolchain (install via [rustup](https://rustup.rs))
 
 ### Workspace layout
 
@@ -47,13 +156,11 @@ The same checks run in CI (`.github/workflows/ci.yml`) and must pass on every PR
 
 ### Lint and format configuration
 
-- Formatting is pinned by `rustfmt.toml` (stable options only); run `cargo fmt`
-  to apply.
+- Formatting is pinned by `rustfmt.toml` (stable options only); run `cargo fmt` to apply.
 - Clippy honors the MSRV in `clippy.toml`.
-- Shared lints are declared once in `[workspace.lints]` in the root `Cargo.toml`
-  and inherited by each crate via `[lints] workspace = true`. Notably,
-  `unsafe_code` is forbidden and `missing_docs` is a warning (treated as an
-  error in CI via `-D warnings`).
+- Shared lints are declared once in `[workspace.lints]` in the root `Cargo.toml` and
+  inherited by each crate via `[lints] workspace = true`. Notably, `unsafe_code` is
+  forbidden and `missing_docs` is a warning (treated as an error in CI via `-D warnings`).
 - Minimum supported Rust version (MSRV): 1.74.
 
 ### Logging
@@ -67,8 +174,8 @@ command output on stdout is never corrupted). Configure logging with:
 | `RUST_LOG` | `RUST_LOG`-style directive | unset | Log filter fallback |
 | `MX_AGENT_LOG_FORMAT` | `human` \| `json` | `human` | Output format |
 
-The CLI `-v`/`-vv`/`-vvv` flags raise the default level (`warn` → `info` →
-`debug` → `trace`) when no filter env var is set.
+The CLI `-v`/`-vv`/`-vvv` flags raise the default level (`warn` → `info` → `debug` →
+`trace`) when no filter env var is set.
 
 ```bash
 MX_AGENT_LOG_FORMAT=json mx-agent -vv agent list   # JSON logs on stderr
@@ -76,48 +183,54 @@ MX_AGENT_LOG=mx_agent_daemon=debug,info mx-agent daemon status
 ```
 
 Credentials are wrapped in `mx_agent_telemetry::Secret`, which renders as
-`***redacted***` in `Debug`/`Display`, and `mx_agent_telemetry::redact` blanks
-values for secret-looking keys. Never log raw tokens or keys.
+`***redacted***` in `Debug`/`Display`, and `mx_agent_telemetry::redact` blanks values
+for secret-looking keys. Never log raw tokens or keys.
 
 ### Daemon lifecycle
 
-The background daemon is managed through the CLI:
-
-```bash
-mx-agent daemon start              # start detached in the background
-mx-agent daemon start --foreground # run in the current terminal (Ctrl-C to stop)
-mx-agent daemon status             # human-readable status (exit 3 if not running)
-mx-agent daemon status --json      # pid, uptime, socket path, version as JSON
-mx-agent daemon stop               # graceful shutdown (SIGTERM, then SIGKILL)
-```
-
 Runtime state lives under `$XDG_RUNTIME_DIR/mx-agent/` (override with
-`MX_AGENT_RUNTIME_DIR`): a `daemon.json` status file, the `daemon.sock` IPC
-socket, and a `daemon.log` for background output.
+`MX_AGENT_RUNTIME_DIR`): a `daemon.json` status file, the `daemon.sock` IPC socket, and
+a `daemon.log` for background output.
 
-The IPC socket is created with mode `0600` and the daemon refuses to run if its
-runtime directory is group- or world-accessible or owned by another user. Stale
-sockets from a previous run are cleaned up automatically when no daemon is
-listening.
-
-The CLI and daemon communicate over this socket using length-delimited
-(4-byte big-endian prefix) JSON-RPC 2.0 frames. For example, `mx-agent daemon
-status` queries the running daemon with a `daemon.status` request and renders
-the live response. Malformed input yields a controlled JSON-RPC error rather
-than a dropped connection.
-
-Most other commands are still placeholders pending later roadmap phases.
+The IPC socket is created with mode `0600`; the daemon refuses to run if its runtime
+directory is group- or world-accessible or owned by another user, and verifies the peer
+UID via `SO_PEERCRED`. Stale sockets from a previous run are cleaned up automatically
+when no daemon is listening. The CLI and daemon communicate over this socket using
+length-delimited (4-byte big-endian prefix) JSON-RPC 2.0 frames; malformed input yields
+a controlled JSON-RPC error rather than a dropped connection.
 
 ### Local Matrix homeserver (dev / e2e)
 
-A throwaway [Tuwunel](https://github.com/matrix-construct/tuwunel) homeserver in
-Docker is provided for development and the integration/e2e tests:
+A throwaway [Tuwunel](https://github.com/matrix-construct/tuwunel) homeserver in Docker
+is provided for development and the integration/e2e tests:
 
 ```bash
-scripts/matrix_dev.sh up            # start (loopback-only); auto-creates dev/matrix/.env
+scripts/matrix_dev.sh up             # start (loopback-only); auto-creates dev/matrix/.env
 scripts/matrix_dev.sh register alice # register a test user, print an access token
 scripts/matrix_dev.sh reset          # wipe all homeserver data
 ```
 
 Then point the daemon at it (`homeserver_url = "http://127.0.0.1:8008"`). See
 [`dev/matrix/README.md`](dev/matrix/README.md) for details.
+
+### Wiki sync
+
+The `wiki/` folder is mirrored to the GitHub wiki on pushes to `main` via a local
+pre-push hook. Install it once per clone:
+
+```bash
+sh scripts/install-wiki-hook.sh
+```
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a PR, run the CI checks locally
+(`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo test --all`). See [GitHub management](docs/github-management.md) for process and
+the [issue backlog](docs/github-issue-backlog.md) for where help is needed.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
