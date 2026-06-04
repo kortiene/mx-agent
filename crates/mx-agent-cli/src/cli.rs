@@ -318,12 +318,74 @@ struct ExecArgs {
 
 #[derive(Debug, Subcommand)]
 enum ShareCommand {
-    /// Share a git diff.
-    Diff,
-    /// Share environment metadata.
-    Env,
-    /// Share a file or piped content.
-    File,
+    /// Share a typed payload read from stdin.
+    File(ShareFileArgs),
+    /// Capture and share the current git diff.
+    Diff(ShareDiffArgs),
+    /// Collect and share environment metadata.
+    Env(ShareEnvArgs),
+    /// List recently shared context in a room.
+    List(ShareListArgs),
+}
+
+/// Diff output format for `share diff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DiffFormat {
+    /// Full unified diff (git's default).
+    Unified,
+    /// `--stat` summary of changed files.
+    Stat,
+}
+
+#[derive(Debug, Args)]
+struct ShareFileArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// MIME type of the payload, e.g. `application/json`.
+    #[arg(
+        long = "type",
+        value_name = "MIME",
+        default_value = "application/octet-stream"
+    )]
+    mime_type: String,
+    /// Object name to record on the share, e.g. `plan.json`.
+    #[arg(long, value_name = "NAME")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
+struct ShareDiffArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Base revision to diff against (e.g. `main`). Defaults to the unstaged
+    /// working-tree diff.
+    #[arg(long, value_name = "REV")]
+    base: Option<String>,
+    /// Diff output format.
+    #[arg(long, value_enum, default_value_t = DiffFormat::Unified)]
+    format: DiffFormat,
+}
+
+#[derive(Debug, Args)]
+struct ShareEnvArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Comma-separated facts to include (defaults to `node,npm,os,git`).
+    #[arg(long, value_name = "FACTS", value_delimiter = ',')]
+    include: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ShareListArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Maximum number of recent timeline events to scan.
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    limit: u32,
 }
 
 #[derive(Debug, Subcommand)]
@@ -574,6 +636,7 @@ pub fn run() -> ExitCode {
         Command::Trust(cmd) => handle_trust(g, cmd),
         Command::Task(cmd) => handle_task(g, cmd),
         Command::Invocation(cmd) => handle_invocation(g, cmd),
+        Command::Share(cmd) => handle_share(g, cmd),
         Command::Call(args) => cmd_call(g, args),
         Command::Exec(args) => cmd_exec(g, args),
         _ => unimplemented(g, &path),
@@ -1689,6 +1752,189 @@ fn task_graph(global: &GlobalArgs, args: &TaskGraphArgs) -> ExitCode {
     })
 }
 
+/// Handle the `share` command group.
+fn handle_share(global: &GlobalArgs, cmd: &ShareCommand) -> ExitCode {
+    match cmd {
+        ShareCommand::File(args) => share_file(global, args),
+        ShareCommand::Diff(args) => share_diff(global, args),
+        ShareCommand::Env(args) => share_env(global, args),
+        ShareCommand::List(args) => share_list(global, args),
+    }
+}
+
+/// Render a single context share as a human-readable block.
+fn print_context_share(share: &mx_agent_protocol::schema::ContextShare) {
+    println!(
+        "  {:<28} {:<24} {} bytes",
+        share.context_id, share.name, share.size_bytes
+    );
+    println!("    mime_type:    {}", share.mime_type);
+    if let Some(encoding) = &share.encoding {
+        println!("    encoding:     {encoding}");
+    }
+    if let Some(mxc_uri) = &share.mxc_uri {
+        println!("    mxc_uri:      {mxc_uri}");
+    }
+    println!("    sha256:       {}", share.sha256);
+}
+
+/// Emit a shared [`ContextShare`](mx_agent_protocol::schema::ContextShare) as
+/// JSON or a human-readable block.
+fn report_share(global: &GlobalArgs, share: &mx_agent_protocol::schema::ContextShare) {
+    if global.json {
+        println!(
+            "{}",
+            serde_json::to_string(share).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("mx-agent: shared {} ({})", share.name, share.context_id);
+        print_context_share(share);
+    }
+}
+
+fn share_file(global: &GlobalArgs, args: &ShareFileArgs) -> ExitCode {
+    let data = match read_piped_stdin() {
+        Ok(Some(buf)) => buf,
+        Ok(None) => {
+            eprintln!("mx-agent: share file reads the payload from stdin; pipe or redirect input");
+            return ExitCode::from(64);
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not read stdin: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::ShareContextOptions {
+        room: args.room.clone(),
+        name: args.name.clone(),
+        mime_type: args.mime_type.clone(),
+        data,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::share_context_for_session(&session, &options).await {
+            Ok(share) => {
+                report_share(global, &share);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not share context: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn share_diff(global: &GlobalArgs, args: &ShareDiffArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::ShareDiffOptions {
+        room: args.room.clone(),
+        base: args.base.clone(),
+        stat: args.format == DiffFormat::Stat,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::share_diff_for_session(&session, &options).await {
+            Ok(share) => {
+                report_share(global, &share);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not share diff: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn share_env(global: &GlobalArgs, args: &ShareEnvArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    // An empty `--include` falls back to the documented default fact set.
+    let include = if args.include.is_empty() {
+        mx_agent_daemon::DEFAULT_ENV_INCLUDE
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        args.include.clone()
+    };
+    let options = mx_agent_daemon::ShareEnvOptions {
+        room: args.room.clone(),
+        include,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::share_env_for_session(&session, &options).await {
+            Ok(share) => {
+                report_share(global, &share);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not share environment: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn share_list(global: &GlobalArgs, args: &ShareListArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::ListSharesOptions {
+        room: args.room.clone(),
+        limit: args.limit,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::list_context_shares_for_session(&session, &options).await {
+            Ok(shares) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&shares).unwrap_or_else(|_| "[]".to_string())
+                    );
+                } else if shares.is_empty() {
+                    println!("mx-agent: no shared context in {}", args.room);
+                } else {
+                    println!("mx-agent: {} share(s) in {}", shares.len(), args.room);
+                    for share in &shares {
+                        print_context_share(share);
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not list shared context: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
 /// Handle the `invocation` command group.
 fn handle_invocation(global: &GlobalArgs, cmd: &InvocationCommand) -> ExitCode {
     match cmd {
@@ -1972,9 +2218,10 @@ fn command_path(command: &Command) -> String {
         Command::Share(c) => format!(
             "share {}",
             match c {
-                ShareCommand::Diff => "diff",
-                ShareCommand::Env => "env",
-                ShareCommand::File => "file",
+                ShareCommand::File(_) => "file",
+                ShareCommand::Diff(_) => "diff",
+                ShareCommand::Env(_) => "env",
+                ShareCommand::List(_) => "list",
             }
         ),
         Command::Task(c) => format!(

@@ -202,6 +202,16 @@ pub enum WorkspaceError {
     },
     /// No invocation with the requested ID exists in the room.
     InvocationNotFound(String),
+    /// A context payload exceeds the inline-share size limit and must be
+    /// uploaded as Matrix media instead (architecture §6).
+    PayloadTooLarge {
+        /// Size of the rejected payload in bytes.
+        size: usize,
+        /// Maximum inline payload size in bytes.
+        max: usize,
+    },
+    /// Capturing local context (a git diff or environment metadata) failed.
+    ContextCaptureFailed(String),
     /// Restoring the authenticated Matrix client from the session failed.
     Restore(Box<LoginError>),
     /// An underlying Matrix request failed.
@@ -242,6 +252,14 @@ impl fmt::Display for WorkspaceError {
             ),
             WorkspaceError::InvocationNotFound(value) => {
                 write!(f, "invocation {value:?} was not found in the room")
+            }
+            WorkspaceError::PayloadTooLarge { size, max } => write!(
+                f,
+                "context payload is {size} bytes, which exceeds the {max}-byte \
+                 inline-share limit; upload it as Matrix media instead"
+            ),
+            WorkspaceError::ContextCaptureFailed(value) => {
+                write!(f, "could not capture context: {value}")
             }
             WorkspaceError::Restore(e) => write!(f, "{e}"),
             WorkspaceError::Matrix(e) => write!(f, "Matrix request failed: {e}"),
