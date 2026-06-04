@@ -1,0 +1,74 @@
+# cargo-deny configuration — dependency policy for mx-agent.
+#
+# Enforced in CI by the `cargo deny check` job (see .github/workflows/ci.yml).
+# Run locally with:  cargo deny check
+#
+# This policy keeps the dependency tree free of known security advisories and
+# restricts third-party code to a vetted set of permissive (and weak-copyleft)
+# licenses compatible with mx-agent's Apache-2.0 distribution.
+
+[graph]
+# Check dependencies for all target platforms we ship on, plus build/dev.
+all-features = true
+
+# ----------------------------------------------------------------------------
+# Security advisories (RustSec). A reported vulnerability, unsound, or yanked
+# crate in the tree fails the check (and therefore CI).
+# ----------------------------------------------------------------------------
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Fail when a crate version has been yanked from the registry.
+yanked = "deny"
+# Specific advisory IDs to temporarily ignore must be listed here with a
+# justification comment. Keep this empty by default.
+ignore = []
+
+# ----------------------------------------------------------------------------
+# License policy. Only the licenses listed below are permitted. Anything else
+# (e.g. GPL/AGPL strong copyleft, or an unlicensed crate) fails the check.
+# ----------------------------------------------------------------------------
+[licenses]
+version = 2
+# Require a fairly high textual match before accepting a detected license.
+confidence-threshold = 0.9
+# Permissive and weak-copyleft licenses that are compatible with shipping
+# mx-agent under Apache-2.0. Every entry is required by at least one crate in
+# the current dependency tree.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    # MPL-2.0 is file-level (weak) copyleft pulled in transitively by
+    # matrix-sdk (eyeball, imbl, readlock, ...). It imposes no obligations on
+    # mx-agent's own source, so it is permitted.
+    "MPL-2.0",
+]
+# Per-crate license exceptions would go here, e.g.
+#   { allow = ["..."], crate = "some-crate" }
+exceptions = []
+
+# ----------------------------------------------------------------------------
+# Banned crates / duplicate versions. We don't hard-fail on duplicate versions
+# (common and unavoidable in a large tree) but do reject wildcard deps.
+# ----------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Allow the `*` version requirement only between path/workspace crates.
+allow-wildcard-paths = true
+
+# ----------------------------------------------------------------------------
+# Crate sources. Only crates.io is permitted; unknown registries or git
+# sources fail the check so dependencies can't be pulled from untrusted hosts.
+# ----------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
