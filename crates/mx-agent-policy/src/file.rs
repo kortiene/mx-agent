@@ -121,6 +121,17 @@ pub struct ExecutionPolicy {
     /// Paths the sandboxed process may write to.
     #[serde(default)]
     pub writable_paths: Vec<PathBuf>,
+    /// Additional environment variable names a child process may inherit from
+    /// the daemon, on top of the built-in safe defaults.
+    ///
+    /// The child environment is allowlist-based (architecture §13.4): only a
+    /// small set of known-safe variables is passed through by default. This
+    /// list lets an operator explicitly allow further safe variables (e.g.
+    /// `CARGO_HOME`, `RUSTUP_HOME`) without exposing the daemon's secrets. A
+    /// name listed here that nonetheless matches a known token variable is
+    /// still scrubbed, so the allowlist cannot reintroduce a credential.
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
 }
 
 /// Per-agent authorization rules within a room.
@@ -229,6 +240,19 @@ impl Policy {
     pub fn validate(&self) -> Result<(), PolicyError> {
         validate_paths("execution.read_only_paths", &self.execution.read_only_paths)?;
         validate_paths("execution.writable_paths", &self.execution.writable_paths)?;
+
+        if let Some((idx, _)) = self
+            .execution
+            .env_allowlist
+            .iter()
+            .enumerate()
+            .find(|(_, name)| name.trim().is_empty())
+        {
+            return Err(PolicyError::Validation {
+                path: format!("execution.env_allowlist[{idx}]"),
+                message: "environment variable name must not be empty".to_string(),
+            });
+        }
 
         for (room_id, room) in &self.rooms {
             let room_path = format!("rooms.{}", quote(room_id));
@@ -382,6 +406,29 @@ network = "deny"
         assert!(!agent.requires_approval);
         assert_eq!(agent.sandbox, Some(Sandbox::Bubblewrap));
         assert_eq!(agent.network, Some(NetworkPolicy::Deny));
+    }
+
+    #[test]
+    fn execution_env_allowlist_parses() {
+        let policy =
+            Policy::parse("[execution]\nenv_allowlist = [\"CARGO_HOME\", \"RUSTUP_HOME\"]\n")
+                .expect("env allowlist parses");
+        assert_eq!(
+            policy.execution.env_allowlist,
+            ["CARGO_HOME", "RUSTUP_HOME"]
+        );
+    }
+
+    #[test]
+    fn empty_env_allowlist_name_reports_precise_path() {
+        let err = Policy::parse("[execution]\nenv_allowlist = [\"OK\", \"  \"]\n").unwrap_err();
+        match err {
+            PolicyError::Validation { path, message } => {
+                assert_eq!(path, "execution.env_allowlist[1]");
+                assert!(message.contains("must not be empty"), "got {message}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
     }
 
     #[test]
