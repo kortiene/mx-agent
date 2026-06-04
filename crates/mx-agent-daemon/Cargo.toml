@@ -36,7 +36,19 @@ tokio = { workspace = true, features = ["process", "io-util", "test-util"] }
 # Used by the local Matrix integration test (tests/matrix_integration.rs) to
 # create rooms and send events against a live homeserver. The integration test
 # is `#[ignore]`d by default; see scripts/matrix_integration_test.sh.
-matrix-sdk = { workspace = true }
+#
+# `e2e-encryption` is enabled here (test builds only) so the E2EE integration
+# test (issue #61) exercises the daemon's real client through end-to-end
+# encrypted rooms — encrypting sends and decrypting receives. Because this lives
+# under `[dev-dependencies]`, Cargo unifies the feature into the daemon library
+# only when building tests; `cargo build --all` (no dev-deps) leaves production
+# builds free of the crypto stack.
+matrix-sdk = { workspace = true, features = ["e2e-encryption"] }
+# The E2EE integration test feeds decrypted privileged events through the real
+# receive-side authorization pipeline, which needs the policy engine and the
+# protocol event-type constants.
+mx-agent-policy.workspace = true
+mx-agent-protocol.workspace = true
 
 [lints]
 workspace = true
