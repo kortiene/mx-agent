@@ -52,6 +52,17 @@ jobs:
         if: steps.cargo.outputs.present == 'true'
         run: cargo test --all
 
+  cargo-deny:
+    # Enforces the dependency policy in deny.toml: security advisories, the
+    # allowed-license set, and trusted crate sources. Denied licenses or
+    # advisories fail this job (and therefore the PR).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
   matrix-integration:
     # Boots the throwaway local homeserver (issue #59) and runs the daemon's
     # `#[ignore]`d Matrix integration test against it (issue #60). Docker, curl,
