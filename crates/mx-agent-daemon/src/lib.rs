@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod artifact;
 pub mod audit;
 pub mod call;
 pub mod context;
@@ -40,6 +41,10 @@ pub use approval::{
     decision_permits_spawn, disposition_for_exec, emit_approval_decision, emit_approval_request,
     get_pending_approval, list_pending_approvals, ApprovalDecisionRecord, ApprovalQueue,
     ExecDisposition, PendingApproval, DECISION_APPROVED, DECISION_DENIED,
+};
+pub use artifact::{
+    prepare_artifact, upload_artifact, zstd_available, ArtifactConfig, ArtifactError,
+    PreparedArtifact, DEFAULT_MAX_TIMELINE_OUTPUT_BYTES, DEFAULT_TAIL_PREVIEW_BYTES,
 };
 pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE_NAME};
 pub use call::{

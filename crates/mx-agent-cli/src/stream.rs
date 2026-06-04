@@ -42,7 +42,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 
-use mx_agent_protocol::schema::{ExecFinished, StreamChunk, StreamKind};
+use mx_agent_protocol::schema::{ExecFinished, StreamArtifact, StreamChunk, StreamKind};
 
 /// Local exit code used when the stream ends without an `exec.finished` frame
 /// (architecture §5.3: protocol/network failure).
@@ -62,6 +62,9 @@ pub const DEFAULT_REORDER_WINDOW: usize = 64;
 pub enum StreamFrame {
     /// A chunk of stdout/stderr output.
     Chunk(StreamChunk),
+    /// A reference to a large output stream uploaded as a Matrix media artifact
+    /// instead of streamed as chunks (architecture §8.4).
+    Artifact(StreamArtifact),
     /// The terminal frame carrying the remote exit status.
     Finished(ExecFinished),
 }
@@ -107,6 +110,10 @@ pub struct StreamOutcome {
     /// `true` if strict mode detected a stream-integrity violation (a missing
     /// or invalid chunk). Always `false` in best-effort (default) mode.
     pub integrity_failure: bool,
+    /// Large-output artifacts referenced by the stream, in arrival order. Each
+    /// stands in for a stream that was uploaded as Matrix media rather than
+    /// streamed as chunks (architecture §8.4).
+    pub artifacts: Vec<StreamArtifact>,
 }
 
 impl StreamOutcome {
@@ -317,6 +324,40 @@ where
     }
 }
 
+/// Render a large-output artifact reference: announce where the full log lives
+/// on `err`, then write the tail preview to the stream's natural destination so
+/// the terminal still shows useful output (architecture §8.4).
+pub fn render_artifact<O, E>(artifact: &StreamArtifact, out: &mut O, err: &mut E) -> io::Result<()>
+where
+    O: Write,
+    E: Write,
+{
+    let location = if artifact.mxc_uri.is_empty() {
+        "(captured locally; not uploaded)"
+    } else {
+        artifact.mxc_uri.as_str()
+    };
+    writeln!(
+        err,
+        "mx-agent: {} exceeded the timeline budget; full log uploaded as artifact \
+         {:?} ({} bytes, sha256={}) at {}",
+        stream_label(artifact.stream),
+        artifact.name,
+        artifact.size_bytes,
+        artifact.sha256,
+        location,
+    )?;
+    if artifact.tail_preview.is_empty() {
+        return Ok(());
+    }
+    writeln!(err, "mx-agent: tail preview follows:")?;
+    // Preview to the stream's natural destination so it reads like the output.
+    match artifact.stream {
+        StreamKind::Stderr => write!(err, "{}", artifact.tail_preview),
+        _ => write!(out, "{}", artifact.tail_preview),
+    }
+}
+
 /// Validate a chunk's payload integrity, returning a human-readable reason if
 /// the chunk is invalid.
 ///
@@ -469,6 +510,10 @@ where
                 }
                 surface_missing(&detected, &mut outcome, config.strict, err)?;
             }
+            StreamFrame::Artifact(artifact) => {
+                render_artifact(&artifact, out, err)?;
+                outcome.artifacts.push(artifact);
+            }
             StreamFrame::Finished(finished) => {
                 // Flush anything still buffered before reporting the exit code;
                 // remaining gaps are declared lost.
@@ -542,6 +587,68 @@ mod tests {
             artifact_mxc: None,
             extra: Default::default(),
         }
+    }
+
+    fn artifact(stream: StreamKind, mxc: &str, tail: &str) -> StreamArtifact {
+        StreamArtifact {
+            invocation_id: "inv_1".to_string(),
+            stream,
+            name: "stdout.log.zst".to_string(),
+            mime_type: "text/plain+zstd".to_string(),
+            size_bytes: 10_485_760,
+            sha256: "abc123".to_string(),
+            mxc_uri: mxc.to_string(),
+            tail_preview: tail.to_string(),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn artifact_frame_shows_tail_preview_and_reference() {
+        // Acceptance: high-output commands upload the full log as an artifact and
+        // the terminal shows a useful preview.
+        let frames = vec![
+            StreamFrame::Artifact(artifact(
+                StreamKind::Stdout,
+                "mxc://server/abcdef",
+                "...last lines of the build log\n",
+            )),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.artifacts.len(), 1);
+        // The tail preview reaches stdout (the artifact's natural destination).
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "...last lines of the build log\n"
+        );
+        // The notice on stderr points at the uploaded media and its digest.
+        let notice = String::from_utf8(err).unwrap();
+        assert!(notice.contains("mxc://server/abcdef"), "got: {notice}");
+        assert!(notice.contains("sha256="), "got: {notice}");
+        assert!(notice.contains("stdout"), "got: {notice}");
+    }
+
+    #[test]
+    fn local_artifact_without_upload_is_marked() {
+        // The local loopback has no homeserver: an empty mxc renders a clear
+        // "not uploaded" note rather than a bogus reference.
+        let frames = vec![
+            StreamFrame::Artifact(artifact(StreamKind::Stderr, "", "tail of stderr\n")),
+            StreamFrame::Finished(finished(Some(1), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(out.is_empty());
+        // A stderr artifact previews to stderr alongside the notice.
+        let combined = String::from_utf8(err).unwrap();
+        assert!(combined.contains("not uploaded"), "got: {combined}");
+        assert!(combined.contains("tail of stderr\n"), "got: {combined}");
     }
 
     #[test]
