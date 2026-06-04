@@ -26,6 +26,7 @@ pub mod stream;
 pub mod sync;
 pub mod task;
 pub mod task_graph;
+pub mod task_orchestrator;
 pub mod tool_exec;
 pub mod tools;
 pub mod trust;
@@ -113,6 +114,11 @@ pub use task::{
     DEFAULT_TASK_STATE,
 };
 pub use task_graph::{GraphEdge, GraphNode, TaskGraph};
+pub use task_orchestrator::{
+    action_from_task, OrchestrationOutcome, TaskAction, TaskActionError, TaskDispatchError,
+    TaskDispatcher, TaskExecutionResult, TaskOrchestrator, TaskStore, TaskStoreError,
+    STATE_ASSIGNED, STATE_EXECUTING, STATE_FAILED, STATE_PENDING, STATE_SUCCEEDED,
+};
 pub use tool_exec::{execute_tool, ToolError, ToolResult, RUN_TESTS};
 pub use tools::{builtin_tools, ToolRegistry};
 pub use trust::{fingerprint_from_key_id, TrustEntry, TrustStatus, TrustStore};
