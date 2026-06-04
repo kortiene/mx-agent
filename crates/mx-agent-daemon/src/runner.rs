@@ -377,6 +377,36 @@ fn signal_process_group(pid: Option<u32>, signal: TermSignal) {
 #[cfg(not(unix))]
 fn signal_process_group(_pid: Option<u32>, _signal: TermSignal) {}
 
+/// The signal a cancellation delivers to a running command's process group.
+///
+/// Reported as `signal_sent` in the emitted `com.mxagent.exec.cancelled.v1`
+/// (see [`crate::exec::emit_exec_cancelled`]).
+pub const CANCEL_SIGNAL: &str = "SIGTERM";
+
+/// Terminate the process group led by `pid` when cancelling a running command
+/// (architecture §7.5).
+///
+/// Sends [`SIGTERM`][CANCEL_SIGNAL] to the whole process group — whose id equals
+/// the command's pid (see [`build_command`]) — so the command and every
+/// descendant it spawned are torn down together, leaving nothing orphaned. A
+/// caller that must guarantee teardown of a process ignoring `SIGTERM` can
+/// escalate with [`kill_process_group`] after a grace period, mirroring the
+/// timeout path in [`run`]. On platforms without process groups this is a
+/// best-effort no-op.
+pub fn terminate_process_group(pid: u32) {
+    signal_process_group(Some(pid), TermSignal::Term);
+}
+
+/// Forcefully kill the process group led by `pid` with `SIGKILL`.
+///
+/// The uncatchable escalation after [`terminate_process_group`] for a command
+/// that ignores `SIGTERM`. Like its sibling, it signals the whole group so no
+/// descendant is left orphaned, and is a best-effort no-op on platforms without
+/// process groups.
+pub fn kill_process_group(pid: u32) {
+    signal_process_group(Some(pid), TermSignal::Kill);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +671,68 @@ mod tests {
             Ok(()) | Err(nix::errno::Errno::EPERM)
         );
         assert!(!alive, "grandchild {grandchild} was left orphaned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_process_group_tears_down_running_command() {
+        // Acceptance (#48): cancelling a running command terminates it. The
+        // command spawns a long-lived grandchild and prints its pid, then
+        // sleeps. Signalling the whole group must tear the grandchild down too
+        // rather than leave it orphaned.
+        let mut child = build_command(&RunSpec {
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "sleep 60 & echo $! ; wait".to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+            ..RunSpec::default()
+        })
+        .expect("builds")
+        .spawn()
+        .expect("spawns");
+
+        // The child leads its own process group (id == its pid).
+        let pid = child.id().expect("running child has a pid");
+
+        // Read the grandchild pid the command prints before it blocks on sleep.
+        use tokio::io::AsyncReadExt as _;
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut buf = Vec::new();
+        // The first line carries the grandchild pid; reading to EOF would block
+        // until the group dies, so read just enough to see the newline.
+        loop {
+            let mut byte = [0u8; 1];
+            if stdout.read(&mut byte).await.unwrap_or(0) == 0 || byte[0] == b'\n' {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        let grandchild: i32 = String::from_utf8(buf)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("grandchild pid");
+
+        // Cancel: signal the whole group.
+        terminate_process_group(pid);
+        let _ = child.wait().await;
+
+        // Give the kernel a moment to reap the signalled group.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        // ESRCH means the process is gone; anything else means it survived.
+        let alive = matches!(
+            kill(Pid::from_raw(grandchild), None),
+            Ok(()) | Err(nix::errno::Errno::EPERM)
+        );
+        assert!(
+            !alive,
+            "grandchild {grandchild} was left orphaned after cancel"
+        );
     }
 
     #[tokio::test]

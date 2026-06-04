@@ -36,9 +36,11 @@ use serde_json::Value;
 
 use mx_agent_policy::{DenyReason, ExecContext, Policy};
 use mx_agent_protocol::events::state::INVOCATION;
-use mx_agent_protocol::events::timeline::{EXEC_ACCEPTED, EXEC_REJECTED, EXEC_REQUEST};
+use mx_agent_protocol::events::timeline::{
+    EXEC_ACCEPTED, EXEC_CANCEL, EXEC_CANCELLED, EXEC_REJECTED, EXEC_REQUEST,
+};
 use mx_agent_protocol::schema::{
-    ExecAccepted, ExecRejected, ExecRequest, InvocationState, Signature,
+    ExecAccepted, ExecCancel, ExecCancelled, ExecRejected, ExecRequest, InvocationState, Signature,
 };
 use mx_agent_protocol::signing::{self, SignatureError, SIGNATURE_FIELD};
 
@@ -372,6 +374,236 @@ pub async fn publish_invocation_state(
     Ok(())
 }
 
+/// Why an incoming `com.mxagent.exec.cancel.v1` was rejected (architecture §7.5,
+/// §13.1).
+///
+/// Cancellation authorization is narrower than a fresh exec: there is no policy
+/// or routing check, but the requester must prove they own the invocation they
+/// are cancelling. Every variant maps to a stable, machine-readable reason via
+/// [`CancelRejection::reason`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelRejection {
+    /// The cancel content was not a JSON object, so it cannot be verified.
+    Malformed,
+    /// The cancel carried no `signature` field.
+    Unsigned,
+    /// The signature was present but did not verify against the signing key.
+    InvalidSignature,
+    /// The cancel names a different invocation than the one being authorized.
+    InvocationMismatch {
+        /// The `invocation_id` named in the cancel request.
+        requested: String,
+    },
+    /// The signing key is unknown to or revoked in the local trust store.
+    UntrustedKey {
+        /// The signing key identifier that was rejected.
+        key_id: String,
+    },
+    /// The requester does not own the invocation, so may not cancel it.
+    Unauthorized {
+        /// The agent that owns (requested) the invocation.
+        owner: String,
+    },
+}
+
+impl CancelRejection {
+    /// A stable, machine-readable reason string.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Malformed => "malformed_request".to_string(),
+            Self::Unsigned => "unsigned".to_string(),
+            Self::InvalidSignature => "invalid_signature".to_string(),
+            Self::InvocationMismatch { .. } => "invocation_mismatch".to_string(),
+            Self::UntrustedKey { .. } => "untrusted_key".to_string(),
+            Self::Unauthorized { .. } => "unauthorized".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for CancelRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => write!(f, "cancel request content is not a JSON object"),
+            Self::Unsigned => write!(f, "cancel request is unsigned"),
+            Self::InvalidSignature => write!(f, "cancel request signature is invalid"),
+            Self::InvocationMismatch { requested } => {
+                write!(f, "cancel request names invocation {requested:?}")
+            }
+            Self::UntrustedKey { key_id } => {
+                write!(f, "signing key {key_id:?} is not trusted")
+            }
+            Self::Unauthorized { owner } => {
+                write!(f, "only the requester {owner:?} may cancel this invocation")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CancelRejection {}
+
+/// Build and sign a `com.mxagent.exec.cancel.v1` content value.
+///
+/// Constructs an [`ExecCancel`] for `invocation_id` carrying a human-readable
+/// `reason`, then signs the content with `signing_key`, embedding the detached
+/// signature under the `signature` field. The returned JSON value is ready to be
+/// sent as the timeline event's content.
+pub fn build_signed_exec_cancel(
+    signing_key: &SigningKey,
+    key_id: impl Into<String>,
+    invocation_id: impl Into<String>,
+    reason: impl Into<String>,
+    created_at: impl Into<String>,
+    nonce: impl Into<String>,
+) -> Result<Value, SignatureError> {
+    // Build the unsigned content with a placeholder signature, then sign it in
+    // place. `sign_into` excludes the `signature` field from the signed bytes,
+    // so the placeholder does not affect the result.
+    let cancel = ExecCancel {
+        invocation_id: invocation_id.into(),
+        reason: reason.into(),
+        created_at: created_at.into(),
+        nonce: nonce.into(),
+        signature: Signature {
+            alg: signing::ALG_ED25519.to_string(),
+            key_id: key_id.into(),
+            sig: String::new(),
+        },
+        extra: Default::default(),
+    };
+    let mut content =
+        serde_json::to_value(&cancel).expect("ExecCancel serializes to a JSON object");
+    let key_id = cancel.signature.key_id;
+    signing::sign_into(signing_key, key_id, &mut content)?;
+    Ok(content)
+}
+
+/// Send a signed `com.mxagent.exec.cancel.v1` timeline event into `room`.
+///
+/// Builds and signs the cancel with [`build_signed_exec_cancel`], then sends it
+/// as a Matrix timeline event so it federates to the target agent. Returns the
+/// parsed [`ExecCancel`] that was sent (including its embedded signature).
+pub async fn send_exec_cancel(
+    room: &Room,
+    signing_key: &SigningKey,
+    key_id: impl Into<String>,
+    invocation_id: impl Into<String>,
+    reason: impl Into<String>,
+    created_at: impl Into<String>,
+    nonce: impl Into<String>,
+) -> Result<ExecCancel, WorkspaceError> {
+    // Signing only fails when the content is not a JSON object; the content we
+    // build here is always an object, so this cannot fail in practice.
+    let content = build_signed_exec_cancel(
+        signing_key,
+        key_id,
+        invocation_id,
+        reason,
+        created_at,
+        nonce,
+    )
+    .expect("ExecCancel content is always a JSON object");
+    room.send_raw(EXEC_CANCEL, content.clone())
+        .await
+        .map_err(WorkspaceError::from)?;
+    serde_json::from_value::<ExecCancel>(content)
+        .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))
+}
+
+/// Verify and authorize an incoming `com.mxagent.exec.cancel.v1` against the
+/// `invocation` it targets (architecture §7.5, §13.1).
+///
+/// Runs the receive-side pipeline: signature, then invocation match, then trust,
+/// then ownership. On success the parsed [`ExecCancel`] is returned; on failure
+/// the first failing check is reported as a [`CancelRejection`] and **nothing is
+/// terminated** — this routine never signals a process.
+///
+/// `verifying_key` is the public key resolved for the cancel's signing key;
+/// `requesting_agent` is the agent identity the cancel was sent from (resolved
+/// from the Matrix event sender). Authorization requires that this agent owns
+/// the invocation — i.e. it is the invocation's original `requester` — so a peer
+/// cannot cancel another agent's running command.
+pub fn authorize_exec_cancel(
+    content: &Value,
+    verifying_key: &VerifyingKey,
+    trust: &TrustStore,
+    invocation: &InvocationState,
+    requesting_agent: &str,
+) -> Result<ExecCancel, CancelRejection> {
+    // 1. Signature must be present and valid.
+    let signature = read_cancel_signature(content)?.ok_or(CancelRejection::Unsigned)?;
+    signing::verify(verifying_key, content).map_err(|e| match e {
+        SignatureError::MissingSignature => CancelRejection::Unsigned,
+        SignatureError::NotAnObject => CancelRejection::Malformed,
+        _ => CancelRejection::InvalidSignature,
+    })?;
+
+    let cancel: ExecCancel =
+        serde_json::from_value(content.clone()).map_err(|_| CancelRejection::Malformed)?;
+
+    // 2. The cancel must name the invocation being authorized.
+    if cancel.invocation_id != invocation.invocation_id {
+        return Err(CancelRejection::InvocationMismatch {
+            requested: cancel.invocation_id,
+        });
+    }
+
+    // 3. The signing key must be locally trusted.
+    if !trust.is_key_trusted(&signature.key_id) {
+        return Err(CancelRejection::UntrustedKey {
+            key_id: signature.key_id,
+        });
+    }
+
+    // 4. The requester must own the invocation they are cancelling.
+    if requesting_agent != invocation.requester {
+        return Err(CancelRejection::Unauthorized {
+            owner: invocation.requester.clone(),
+        });
+    }
+
+    Ok(cancel)
+}
+
+/// Read the detached [`Signature`] embedded in a cancel `content`, mirroring
+/// [`read_signature`] but mapping failures to [`CancelRejection`].
+fn read_cancel_signature(content: &Value) -> Result<Option<Signature>, CancelRejection> {
+    let obj = content.as_object().ok_or(CancelRejection::Malformed)?;
+    match obj.get(SIGNATURE_FIELD) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value::<Signature>(value.clone())
+            .map(Some)
+            .map_err(|_| CancelRejection::InvalidSignature),
+    }
+}
+
+/// Emit a `com.mxagent.exec.cancelled.v1` timeline event into `room`.
+///
+/// Confirms that a cancellation tore down the invocation's process group:
+/// `signal_sent` names the delivered signal (see [`crate::runner::CANCEL_SIGNAL`])
+/// and `killed_process_group` records whether the whole group was signalled.
+pub async fn emit_exec_cancelled(
+    room: &Room,
+    invocation_id: impl Into<String>,
+    signal_sent: impl Into<String>,
+    killed_process_group: bool,
+    finished_at: impl Into<String>,
+) -> Result<(), WorkspaceError> {
+    let cancelled = ExecCancelled {
+        invocation_id: invocation_id.into(),
+        signal_sent: signal_sent.into(),
+        killed_process_group,
+        finished_at: finished_at.into(),
+        extra: Default::default(),
+    };
+    let content = serde_json::to_value(&cancelled)
+        .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    room.send_raw(EXEC_CANCELLED, content)
+        .await
+        .map_err(WorkspaceError::from)?;
+    Ok(())
+}
+
 // `Outcome` does not expose its deny reason directly; provide a small helper.
 trait OutcomeExt {
     fn deny_reason(&self) -> Option<DenyReason>;
@@ -621,5 +853,178 @@ allow_cwd = ["/home/me/code/project"]
         assert_eq!(state.created_at, "2026-06-02T12:00:01Z");
         assert_eq!(state.updated_at, "2026-06-02T12:00:01Z");
         assert!(state.exit_code.is_none());
+    }
+
+    // --- cancellation (#48) ---
+
+    /// A `running` invocation owned by [`AGENT`], the canonical cancel target.
+    fn running_invocation() -> InvocationState {
+        InvocationState {
+            invocation_id: "inv_01HZ".to_string(),
+            task_id: None,
+            requester: AGENT.to_string(),
+            target: TARGET.to_string(),
+            state: "running".to_string(),
+            created_at: "2026-06-02T12:00:00Z".to_string(),
+            updated_at: "2026-06-02T12:00:01Z".to_string(),
+            exit_code: None,
+            state_rev: 1,
+            extra: Default::default(),
+        }
+    }
+
+    fn signed_cancel(key: &SigningKey, invocation_id: &str) -> Value {
+        build_signed_exec_cancel(
+            key,
+            key_id_for(key),
+            invocation_id,
+            "user requested",
+            "2026-06-02T12:01:00Z",
+            "base64-nonce",
+        )
+        .expect("signs")
+    }
+
+    #[test]
+    fn owner_can_cancel_running_invocation() {
+        // Acceptance: `invocation cancel` is authorized for the running command's
+        // own requester.
+        let key = test_key();
+        let content = signed_cancel(&key, "inv_01HZ");
+        let trust = trust_with(&key_id_for(&key));
+        let cancel = authorize_exec_cancel(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &running_invocation(),
+            AGENT,
+        )
+        .expect("authorized");
+        assert_eq!(cancel.invocation_id, "inv_01HZ");
+        assert_eq!(cancel.reason, "user requested");
+    }
+
+    #[test]
+    fn unsigned_cancel_is_rejected() {
+        let key = test_key();
+        let mut content = signed_cancel(&key, "inv_01HZ");
+        content
+            .as_object_mut()
+            .unwrap()
+            .remove(SIGNATURE_FIELD)
+            .unwrap();
+        let trust = trust_with(&key_id_for(&key));
+        let err = authorize_exec_cancel(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &running_invocation(),
+            AGENT,
+        )
+        .unwrap_err();
+        assert_eq!(err, CancelRejection::Unsigned);
+        assert_eq!(err.reason(), "unsigned");
+    }
+
+    #[test]
+    fn tampered_cancel_fails_signature_check() {
+        let key = test_key();
+        let mut content = signed_cancel(&key, "inv_01HZ");
+        content["reason"] = json!("something else");
+        let trust = trust_with(&key_id_for(&key));
+        let err = authorize_exec_cancel(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &running_invocation(),
+            AGENT,
+        )
+        .unwrap_err();
+        assert_eq!(err, CancelRejection::InvalidSignature);
+    }
+
+    #[test]
+    fn cancel_for_other_invocation_is_rejected() {
+        let key = test_key();
+        let content = signed_cancel(&key, "inv_other");
+        let trust = trust_with(&key_id_for(&key));
+        let err = authorize_exec_cancel(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &running_invocation(),
+            AGENT,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CancelRejection::InvocationMismatch {
+                requested: "inv_other".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_from_untrusted_key_is_rejected() {
+        let key = test_key();
+        let content = signed_cancel(&key, "inv_01HZ");
+        let trust = TrustStore::default();
+        let err = authorize_exec_cancel(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &running_invocation(),
+            AGENT,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CancelRejection::UntrustedKey {
+                key_id: key_id_for(&key)
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_from_non_owner_is_rejected() {
+        // Acceptance: unauthorized cancellation is rejected. A trusted peer that
+        // does not own the invocation may not cancel it.
+        let key = test_key();
+        let content = signed_cancel(&key, "inv_01HZ");
+        let trust = trust_with(&key_id_for(&key));
+        let err = authorize_exec_cancel(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &running_invocation(),
+            "@someone-else:matrix.org",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CancelRejection::Unauthorized {
+                owner: AGENT.to_string()
+            }
+        );
+        assert_eq!(err.reason(), "unauthorized");
+    }
+
+    #[test]
+    fn cancel_pipeline_checks_signature_before_ownership() {
+        // A tampered cancel from a non-owner fails on the signature first, so the
+        // rejection does not leak the ownership relationship.
+        let key = test_key();
+        let mut content = signed_cancel(&key, "inv_01HZ");
+        content["reason"] = json!("tampered");
+        let trust = trust_with(&key_id_for(&key));
+        let err = authorize_exec_cancel(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &running_invocation(),
+            "@someone-else:matrix.org",
+        )
+        .unwrap_err();
+        assert_eq!(err, CancelRejection::InvalidSignature);
     }
 }

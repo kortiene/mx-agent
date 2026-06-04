@@ -505,7 +505,7 @@ enum InvocationCommand {
     /// Show one invocation.
     Show(InvocationShowArgs),
     /// Cancel a running invocation.
-    Cancel,
+    Cancel(InvocationCancelArgs),
 }
 
 #[derive(Debug, Args)]
@@ -529,6 +529,19 @@ struct InvocationShowArgs {
     /// Invocation ID (state key) to show.
     #[arg(value_name = "INVOCATION_ID")]
     invocation_id: String,
+}
+
+#[derive(Debug, Args)]
+struct InvocationCancelArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Invocation ID (state key) to cancel.
+    #[arg(value_name = "INVOCATION_ID")]
+    invocation_id: String,
+    /// Human-readable reason recorded with the cancellation.
+    #[arg(long, value_name = "REASON", default_value = "cancelled by operator")]
+    reason: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2039,7 +2052,7 @@ fn handle_invocation(global: &GlobalArgs, cmd: &InvocationCommand) -> ExitCode {
     match cmd {
         InvocationCommand::List(args) => invocation_list(global, args),
         InvocationCommand::Show(args) => invocation_show(global, args),
-        InvocationCommand::Cancel => unimplemented(global, "invocation cancel"),
+        InvocationCommand::Cancel(args) => invocation_cancel(global, args),
     }
 }
 
@@ -2135,6 +2148,66 @@ fn invocation_show(global: &GlobalArgs, args: &InvocationShowArgs) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("mx-agent: could not show invocation: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn invocation_cancel(global: &GlobalArgs, args: &InvocationCancelArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    // The cancel is signed with the daemon's own key so the target agent can
+    // verify the requester before terminating the command.
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    let key = match mx_agent_daemon::load_or_create_signing_key(&paths) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("mx-agent: could not load signing key: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let key_id = key.key_id();
+    runtime.block_on(async {
+        match mx_agent_daemon::cancel_invocation_for_session(
+            &session,
+            key.signing_key(),
+            &key_id,
+            &args.room,
+            &args.invocation_id,
+            &args.reason,
+        )
+        .await
+        {
+            Ok(invocation) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&invocation).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else if invocation.state == "cancelled" {
+                    println!(
+                        "mx-agent: cancelled invocation {}",
+                        invocation.invocation_id
+                    );
+                    print_invocation(&invocation);
+                } else {
+                    // The invocation had already finished before we could cancel.
+                    println!(
+                        "mx-agent: invocation {} already {}; nothing to cancel",
+                        invocation.invocation_id, invocation.state
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not cancel invocation: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -2339,7 +2412,7 @@ fn command_path(command: &Command) -> String {
             match c {
                 InvocationCommand::List(_) => "list",
                 InvocationCommand::Show(_) => "show",
-                InvocationCommand::Cancel => "cancel",
+                InvocationCommand::Cancel(_) => "cancel",
             }
         ),
         Command::Approval(c) => format!(
@@ -3244,6 +3317,59 @@ mod tests {
             other => panic!("expected invocation show, got {other:?}"),
         }
         assert_eq!(command_path(&cli.command), "invocation show");
+    }
+
+    #[test]
+    fn invocation_cancel_requires_room_and_id_with_default_reason() {
+        // The room flag and the positional invocation id are both required.
+        assert!(Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "cancel",
+            "--room",
+            "!abc:matrix.org"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "cancel",
+            "--room",
+            "!abc:matrix.org",
+            "inv_01HZ",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Invocation(InvocationCommand::Cancel(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.invocation_id, "inv_01HZ");
+                // A reason is recorded even when the operator does not supply one.
+                assert_eq!(args.reason, "cancelled by operator");
+            }
+            other => panic!("expected invocation cancel, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "invocation cancel");
+    }
+
+    #[test]
+    fn invocation_cancel_accepts_explicit_reason() {
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "cancel",
+            "--room",
+            "!abc:matrix.org",
+            "--reason",
+            "superseded",
+            "inv_01HZ",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Invocation(InvocationCommand::Cancel(args)) => {
+                assert_eq!(args.reason, "superseded");
+            }
+            other => panic!("expected invocation cancel, got {other:?}"),
+        }
     }
 
     #[test]
