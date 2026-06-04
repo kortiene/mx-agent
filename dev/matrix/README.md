@@ -52,6 +52,24 @@ Then log in with a registered user, e.g.:
 MX_AGENT_PASSWORD=alice-pass mx-agent auth login --homeserver http://127.0.0.1:8008 --user alice
 ```
 
+## Integration test
+
+The daemon's Matrix integration test
+(`crates/mx-agent-daemon/tests/matrix_integration.rs`) drives the real login,
+session-restore, `/sync`, and event-handling paths against this homeserver. It
+is `#[ignore]`d so the default `cargo test --all` (which has no homeserver)
+stays green. Run it end to end with the harness:
+
+```bash
+scripts/matrix_integration_test.sh            # boots the homeserver, runs the test
+scripts/matrix_integration_test.sh --teardown # also stops the homeserver afterward
+```
+
+The script boots the homeserver, registers two test users, and runs the test
+with the env vars it expects (`MX_AGENT_TEST_HOMESERVER`, `MX_AGENT_TEST_USER*`,
+`MX_AGENT_TEST_PASSWORD*`). The test creates a room as the second user, has the
+daemon user join and sync, and asserts the daemon observes the message.
+
 ## Configuration
 
 - `dev/matrix/docker-compose.yml` — the Tuwunel service (loopback-only port,
@@ -62,8 +80,7 @@ MX_AGENT_PASSWORD=alice-pass mx-agent auth login --homeserver http://127.0.0.1:8
 
 ## CI note
 
-The same `scripts/matrix_dev.sh up` flow runs under Docker in CI, so the planned
-integration-test job (issue #60) can stand up the homeserver, register users,
-and exercise the daemon against it. The Rust integration tests and the CI job
-itself are implemented in their own issues; this directory provides the
-homeserver harness they build on.
+The `matrix-integration` job in `.github/workflows/ci.yml` runs
+`scripts/matrix_integration_test.sh --teardown` on the Docker-enabled GitHub
+runner: it stands up this homeserver, registers users, and exercises the daemon
+against it. The same flow runs locally via the command above.
