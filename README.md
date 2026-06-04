@@ -104,3 +104,17 @@ the live response. Malformed input yields a controlled JSON-RPC error rather
 than a dropped connection.
 
 Most other commands are still placeholders pending later roadmap phases.
+
+### Local Matrix homeserver (dev / e2e)
+
+A throwaway [Tuwunel](https://github.com/matrix-construct/tuwunel) homeserver in
+Docker is provided for development and the integration/e2e tests:
+
+```bash
+scripts/matrix_dev.sh up            # start (loopback-only); auto-creates dev/matrix/.env
+scripts/matrix_dev.sh register alice # register a test user, print an access token
+scripts/matrix_dev.sh reset          # wipe all homeserver data
+```
+
+Then point the daemon at it (`homeserver_url = "http://127.0.0.1:8008"`). See
+[`dev/matrix/README.md`](dev/matrix/README.md) for details.

@@ -1,0 +1,27 @@
+# Tuwunel homeserver config for local mx-agent development and e2e tests.
+#
+# This is a throwaway, localhost-only homeserver (see dev/matrix/README.md).
+# It is NOT hardened for any real deployment: federation is off, it binds only
+# inside the container (the compose file maps it to 127.0.0.1 on the host), and
+# the registration token is injected at runtime from dev/matrix/.env so no
+# secret lives in this committed file.
+
+[global]
+# Local user IDs are @name:localhost. Clients connect to http://127.0.0.1:8008.
+server_name = "localhost"
+
+# Bind on all interfaces *inside the container*; the compose file restricts the
+# published port to 127.0.0.1 on the host.
+address = ["0.0.0.0"]
+port = [8008]
+
+database_path = "/var/lib/tuwunel"
+
+# Token-gated registration. The token itself comes from the environment
+# (TUWUNEL_REGISTRATION_TOKEN), set via dev/matrix/.env, so it is never committed.
+allow_registration = true
+
+# Keep this homeserver isolated: no federation with other servers.
+allow_federation = false
+
+log = "warn"

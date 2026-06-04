@@ -1,0 +1,26 @@
+# Local Matrix homeserver (Tuwunel) for mx-agent development and e2e tests.
+#
+# Bring it up with `scripts/matrix_dev.sh up` (preferred) or, from this
+# directory, `docker compose up -d`. The registration token is read from
+# dev/matrix/.env (gitignored); copy .env.example to .env first.
+name: mx-agent-matrix-dev
+
+services:
+  homeserver:
+    image: ghcr.io/matrix-construct/tuwunel:latest
+    container_name: mx-agent-tuwunel
+    command: ["--config", "/etc/tuwunel/tuwunel.toml"]
+    # Publish only to loopback on the host so the homeserver is never exposed
+    # on the network.
+    ports:
+      - "127.0.0.1:${MATRIX_PORT:-8008}:8008"
+    environment:
+      # Token-gated registration; value comes from dev/matrix/.env.
+      TUWUNEL_REGISTRATION_TOKEN: "${MATRIX_REGISTRATION_TOKEN:?set MATRIX_REGISTRATION_TOKEN in dev/matrix/.env (see .env.example)}"
+    volumes:
+      - ./tuwunel.toml:/etc/tuwunel/tuwunel.toml:ro
+      - tuwunel-data:/var/lib/tuwunel
+    restart: unless-stopped
+
+volumes:
+  tuwunel-data:
