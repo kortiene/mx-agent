@@ -184,6 +184,11 @@ pub enum WorkspaceError {
     RoomNotFound(String),
     /// The attach path does not exist or is not a directory.
     InvalidPath(String),
+    /// A task with the requested ID already exists (refusing to clobber on
+    /// create; use update instead).
+    TaskExists(String),
+    /// No task with the requested ID exists in the room.
+    TaskNotFound(String),
     /// Restoring the authenticated Matrix client from the session failed.
     Restore(Box<LoginError>),
     /// An underlying Matrix request failed.
@@ -203,6 +208,15 @@ impl fmt::Display for WorkspaceError {
             }
             WorkspaceError::InvalidPath(value) => {
                 write!(f, "path {value:?} does not exist or is not a directory")
+            }
+            WorkspaceError::TaskExists(value) => {
+                write!(
+                    f,
+                    "task {value:?} already exists; use `task update` to change it"
+                )
+            }
+            WorkspaceError::TaskNotFound(value) => {
+                write!(f, "task {value:?} was not found in the room")
             }
             WorkspaceError::Restore(e) => write!(f, "{e}"),
             WorkspaceError::Matrix(e) => write!(f, "Matrix request failed: {e}"),
