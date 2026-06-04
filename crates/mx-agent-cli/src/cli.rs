@@ -550,10 +550,10 @@ enum ApprovalCommand {
     List(ApprovalListArgs),
     /// Show one approval request.
     Show(ApprovalShowArgs),
-    /// Approve a request.
-    Approve,
-    /// Deny a request.
-    Deny,
+    /// Approve a request so the held command may run.
+    Approve(ApprovalDecideArgs),
+    /// Deny a request so the held command never runs.
+    Deny(ApprovalDecideArgs),
 }
 
 #[derive(Debug, Args)]
@@ -568,6 +568,16 @@ struct ApprovalShowArgs {
     /// Approval request ID to show.
     #[arg(value_name = "REQUEST_ID")]
     request_id: String,
+}
+
+#[derive(Debug, Args)]
+struct ApprovalDecideArgs {
+    /// Approval request ID to decide.
+    #[arg(value_name = "REQUEST_ID")]
+    request_id: String,
+    /// Identity to record as the decision-maker (defaults to the logged-in user).
+    #[arg(long = "by", value_name = "IDENTITY")]
+    by: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2233,8 +2243,12 @@ fn handle_approval(global: &GlobalArgs, cmd: &ApprovalCommand) -> ExitCode {
     match cmd {
         ApprovalCommand::List(args) => approval_list(global, args),
         ApprovalCommand::Show(args) => approval_show(global, args),
-        ApprovalCommand::Approve => unimplemented(global, "approval approve"),
-        ApprovalCommand::Deny => unimplemented(global, "approval deny"),
+        ApprovalCommand::Approve(args) => {
+            approval_decide(global, args, mx_agent_daemon::DECISION_APPROVED)
+        }
+        ApprovalCommand::Deny(args) => {
+            approval_decide(global, args, mx_agent_daemon::DECISION_DENIED)
+        }
     }
 }
 
@@ -2306,6 +2320,60 @@ fn approval_show(global: &GlobalArgs, args: &ApprovalShowArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Approve or deny a queued request: emit the decision event and dequeue it.
+///
+/// `decision` is [`mx_agent_daemon::DECISION_APPROVED`] or
+/// [`mx_agent_daemon::DECISION_DENIED`]. The decision-maker identity defaults to
+/// the logged-in user unless `--by` overrides it.
+fn approval_decide(global: &GlobalArgs, args: &ApprovalDecideArgs, decision: &str) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let approved_by = args.by.clone().unwrap_or_else(|| session.user_id.clone());
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    runtime.block_on(async {
+        match mx_agent_daemon::decide_approval_for_session(
+            &session,
+            &paths,
+            &args.request_id,
+            decision,
+            &approved_by,
+        )
+        .await
+        {
+            Ok(record) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&record.decision)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    let verb = if record.approved() {
+                        "approved"
+                    } else {
+                        "denied"
+                    };
+                    println!(
+                        "mx-agent: {verb} approval request {} in {}",
+                        record.decision.request_id, record.room_id
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not decide approval: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 /// Handle the `daemon` command group.
@@ -2514,8 +2582,8 @@ fn command_path(command: &Command) -> String {
             match c {
                 ApprovalCommand::List(_) => "list",
                 ApprovalCommand::Show(_) => "show",
-                ApprovalCommand::Approve => "approve",
-                ApprovalCommand::Deny => "deny",
+                ApprovalCommand::Approve(_) => "approve",
+                ApprovalCommand::Deny(_) => "deny",
             }
         ),
         Command::Trust(c) => format!(
@@ -3464,6 +3532,43 @@ mod tests {
             }
             other => panic!("expected invocation cancel, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn approval_approve_requires_request_id() {
+        // The positional request id is required.
+        assert!(Cli::try_parse_from(["mx-agent", "approval", "approve"]).is_err());
+        let cli = Cli::try_parse_from(["mx-agent", "approval", "approve", "req_01HZ"]).unwrap();
+        match &cli.command {
+            Command::Approval(ApprovalCommand::Approve(args)) => {
+                assert_eq!(args.request_id, "req_01HZ");
+                assert!(args.by.is_none(), "decision-maker defaults to the user");
+            }
+            other => panic!("expected approval approve, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "approval approve");
+    }
+
+    #[test]
+    fn approval_deny_requires_request_id_and_accepts_by() {
+        assert!(Cli::try_parse_from(["mx-agent", "approval", "deny"]).is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "approval",
+            "deny",
+            "--by",
+            "@alice:matrix.org",
+            "req_01HZ",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Approval(ApprovalCommand::Deny(args)) => {
+                assert_eq!(args.request_id, "req_01HZ");
+                assert_eq!(args.by.as_deref(), Some("@alice:matrix.org"));
+            }
+            other => panic!("expected approval deny, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "approval deny");
     }
 
     #[test]

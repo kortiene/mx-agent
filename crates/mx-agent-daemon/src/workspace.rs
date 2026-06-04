@@ -202,6 +202,8 @@ pub enum WorkspaceError {
     },
     /// No invocation with the requested ID exists in the room.
     InvocationNotFound(String),
+    /// No approval request with the requested ID exists in the local queue.
+    ApprovalNotFound(String),
     /// No context share with the requested ID exists in the room.
     ContextNotFound(String),
     /// A retrieved context artifact did not match the digest recorded on its
@@ -223,6 +225,9 @@ pub enum WorkspaceError {
     Restore(Box<LoginError>),
     /// An underlying Matrix request failed.
     Matrix(Box<matrix_sdk::Error>),
+    /// A local file operation (e.g. reading or writing the approval queue)
+    /// failed.
+    Io(std::io::Error),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -260,6 +265,12 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::InvocationNotFound(value) => {
                 write!(f, "invocation {value:?} was not found in the room")
             }
+            WorkspaceError::ApprovalNotFound(value) => {
+                write!(
+                    f,
+                    "approval request {value:?} was not found in the local queue"
+                )
+            }
             WorkspaceError::ContextNotFound(value) => {
                 write!(f, "context share {value:?} was not found in the room")
             }
@@ -280,6 +291,7 @@ impl fmt::Display for WorkspaceError {
             }
             WorkspaceError::Restore(e) => write!(f, "{e}"),
             WorkspaceError::Matrix(e) => write!(f, "Matrix request failed: {e}"),
+            WorkspaceError::Io(e) => write!(f, "local file operation failed: {e}"),
         }
     }
 }
@@ -289,6 +301,7 @@ impl std::error::Error for WorkspaceError {
         match self {
             WorkspaceError::Restore(e) => Some(e),
             WorkspaceError::Matrix(e) => Some(e),
+            WorkspaceError::Io(e) => Some(e),
             _ => None,
         }
     }
@@ -303,6 +316,12 @@ impl From<LoginError> for WorkspaceError {
 impl From<matrix_sdk::Error> for WorkspaceError {
     fn from(e: matrix_sdk::Error) -> Self {
         WorkspaceError::Matrix(Box::new(e))
+    }
+}
+
+impl From<std::io::Error> for WorkspaceError {
+    fn from(e: std::io::Error) -> Self {
+        WorkspaceError::Io(e)
     }
 }
 

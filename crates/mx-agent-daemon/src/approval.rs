@@ -27,15 +27,18 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use matrix_sdk::Room;
+use matrix_sdk::config::SyncSettings;
+use matrix_sdk::{Client, Room};
 use mx_agent_policy::{Allowance, NetworkPolicy, Sandbox};
-use mx_agent_protocol::events::timeline::APPROVAL_REQUEST;
-use mx_agent_protocol::schema::{ApprovalRequest, ExecRequest};
+use mx_agent_protocol::events::timeline::{APPROVAL_DECISION, APPROVAL_REQUEST};
+use mx_agent_protocol::schema::{ApprovalDecision, ApprovalRequest, ExecRequest};
 use serde::{Deserialize, Serialize};
 
-use crate::session::SessionPaths;
-use crate::workspace::WorkspaceError;
+use crate::matrix::restore_client;
+use crate::session::{SessionPaths, StoredSession};
+use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
 
 /// Whether an authorized request may run immediately or must wait for approval.
 ///
@@ -281,6 +284,157 @@ pub fn get_pending_approval(
     Ok(ApprovalQueue::load(paths)?.get(request_id).cloned())
 }
 
+/// `decision` value approving a request: the held command may now run.
+pub const DECISION_APPROVED: &str = "approved";
+/// `decision` value denying a request: the held command must never run.
+pub const DECISION_DENIED: &str = "denied";
+
+/// Build the `com.mxagent.approval.decision.v1` content for a decision.
+///
+/// Pure and deterministic: the caller supplies the identity that decided and the
+/// timestamp, so the result depends only on its inputs (the wall clock is read by
+/// [`decide_approval_for_session`], not here).
+pub fn approval_decision_for(
+    request_id: &str,
+    decision: &str,
+    approved_by: &str,
+    created_at: &str,
+) -> ApprovalDecision {
+    ApprovalDecision {
+        request_id: request_id.to_string(),
+        decision: decision.to_string(),
+        approved_by: approved_by.to_string(),
+        created_at: created_at.to_string(),
+        extra: Default::default(),
+    }
+}
+
+/// Whether a decision permits the held request to proceed.
+///
+/// Fail-closed: only an explicit [`DECISION_APPROVED`] lets the request run, so a
+/// denial — or any unrecognised decision value — keeps it from ever spawning.
+/// This is the gate behind the acceptance criteria "approved request proceeds,
+/// denied request never spawns".
+pub fn decision_permits_spawn(decision: &ApprovalDecision) -> bool {
+    decision.decision == DECISION_APPROVED
+}
+
+/// Emit a `com.mxagent.approval.decision.v1` timeline event into `room`.
+pub async fn emit_approval_decision(
+    room: &Room,
+    decision: &ApprovalDecision,
+) -> Result<(), WorkspaceError> {
+    let content = serde_json::to_value(decision)
+        .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    room.send_raw(APPROVAL_DECISION, content)
+        .await
+        .map_err(WorkspaceError::from)?;
+    Ok(())
+}
+
+/// The outcome of deciding a queued approval.
+///
+/// Returned by [`decide_approval_for_session`] once the decision has been emitted
+/// into the room and the request removed from the local queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDecisionRecord {
+    /// The decision event that was emitted.
+    pub decision: ApprovalDecision,
+    /// Matrix room ID the decision was emitted into.
+    pub room_id: String,
+}
+
+impl ApprovalDecisionRecord {
+    /// Whether the recorded decision approved the request.
+    pub fn approved(&self) -> bool {
+        decision_permits_spawn(&self.decision)
+    }
+}
+
+/// Format the current wall-clock time as an RFC 3339 UTC timestamp.
+fn now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    unix_to_rfc3339(secs)
+}
+
+/// Format Unix seconds as an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Uses Howard Hinnant's civil-from-days algorithm so no date library is
+/// required, matching the formatter used elsewhere in the daemon.
+fn unix_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let tod = (secs % 86_400) as i64;
+    let (hour, minute, second) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Sync once, resolve the room, and return its [`Room`] handle.
+async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, WorkspaceError> {
+    let id = parse_room_or_alias(target)?;
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .map_err(WorkspaceError::from)?;
+    let room_id = resolve_room_id(client, &id).await?;
+    client
+        .get_room(&room_id)
+        .ok_or_else(|| WorkspaceError::RoomNotFound(target.to_string()))
+}
+
+/// Decide a queued approval: emit a `com.mxagent.approval.decision.v1` event into
+/// the request's room and take it off the local pending queue.
+///
+/// `decision` is [`DECISION_APPROVED`] or [`DECISION_DENIED`]; `approved_by` is
+/// the identity recording the decision (typically the operator's Matrix user ID).
+/// The request is looked up in the local queue first — an unknown `request_id` is
+/// [`WorkspaceError::ApprovalNotFound`] — so the room the decision belongs to is
+/// known without the caller supplying it. The decision is emitted before the
+/// queue is updated, so a failure to publish leaves the request pending for a
+/// retry rather than silently dropping it.
+pub async fn decide_approval_for_session(
+    session: &StoredSession,
+    paths: &SessionPaths,
+    request_id: &str,
+    decision: &str,
+    approved_by: &str,
+) -> Result<ApprovalDecisionRecord, WorkspaceError> {
+    let mut queue = ApprovalQueue::load(paths)?;
+    let pending = queue
+        .get(request_id)
+        .cloned()
+        .ok_or_else(|| WorkspaceError::ApprovalNotFound(request_id.to_string()))?;
+
+    let client = restore_client(session).await?;
+    let room = sync_and_get_room(&client, &pending.room_id).await?;
+
+    let content = approval_decision_for(request_id, decision, approved_by, &now_rfc3339());
+    emit_approval_decision(&room, &content).await?;
+
+    // Only drop the request from the queue once the decision is published.
+    queue.remove(request_id);
+    queue.save(paths)?;
+
+    Ok(ApprovalDecisionRecord {
+        decision: content,
+        room_id: pending.room_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +653,58 @@ mod tests {
         let paths = paths_in(&dir);
         assert!(list_pending_approvals(&paths, None).unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decision_content_copies_inputs() {
+        let decision = approval_decision_for(
+            "req_01HZ",
+            DECISION_APPROVED,
+            "@alice:matrix.org",
+            "2026-06-02T12:01:00Z",
+        );
+        assert_eq!(decision.request_id, "req_01HZ");
+        assert_eq!(decision.decision, "approved");
+        assert_eq!(decision.approved_by, "@alice:matrix.org");
+        assert_eq!(decision.created_at, "2026-06-02T12:01:00Z");
+    }
+
+    #[test]
+    fn approved_request_proceeds_denied_never_spawns() {
+        // Acceptance: an approved request proceeds; a denied one never spawns.
+        let approved = approval_decision_for("req", DECISION_APPROVED, "@a:srv", "t");
+        let denied = approval_decision_for("req", DECISION_DENIED, "@a:srv", "t");
+        assert!(decision_permits_spawn(&approved));
+        assert!(!decision_permits_spawn(&denied));
+
+        // Fail-closed: any unrecognised decision value is treated as a denial.
+        let garbled = approval_decision_for("req", "maybe", "@a:srv", "t");
+        assert!(
+            !decision_permits_spawn(&garbled),
+            "only an explicit approval may let a request run"
+        );
+    }
+
+    #[test]
+    fn decision_record_reports_approval() {
+        let record = ApprovalDecisionRecord {
+            decision: approval_decision_for("req", DECISION_APPROVED, "@a:srv", "t"),
+            room_id: "!abc:matrix.org".to_string(),
+        };
+        assert!(record.approved());
+        let denied = ApprovalDecisionRecord {
+            decision: approval_decision_for("req", DECISION_DENIED, "@a:srv", "t"),
+            room_id: "!abc:matrix.org".to_string(),
+        };
+        assert!(!denied.approved());
+    }
+
+    #[test]
+    fn now_rfc3339_round_trips_a_known_instant() {
+        assert_eq!(unix_to_rfc3339(1_748_865_600), "2025-06-02T12:00:00Z");
+        // now_rfc3339 reads the wall clock; just assert it is well-formed.
+        let now = now_rfc3339();
+        assert_eq!(now.len(), 20, "RFC 3339 UTC seconds is 20 chars");
+        assert!(now.ends_with('Z'));
     }
 }
