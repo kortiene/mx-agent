@@ -3355,10 +3355,12 @@ fn cmd_exec_pty(command: &[String], cwd: PathBuf) -> ExitCode {
         }
     };
 
-    // Raw mode for the session: input bytes (arrow keys, control characters)
-    // reach the remote PTY unmodified. A no-op when stdin is not a terminal;
-    // restored on drop.
-    let raw = RawModeGuard::activate();
+    // Raw mode for the session: input bytes (arrow keys, control characters,
+    // Ctrl-C) reach the remote PTY unmodified rather than being interpreted
+    // locally (see [`crate::terminal`] for the Ctrl-C/signal semantics). A no-op
+    // when stdin is not a terminal; restored on drop and on signal-triggered
+    // death so the local terminal is never stranded in raw mode.
+    let raw = crate::terminal::RawModeGuard::activate();
 
     // Pump the merged PTY output to the local terminal on a dedicated thread so
     // the child never blocks on a full PTY buffer.
@@ -3498,45 +3500,10 @@ fn exit_code_from_status(status: &std::process::ExitStatus) -> u8 {
         return u8::try_from(code).unwrap_or(1);
     }
     if let Some(sig) = status.signal() {
-        return u8::try_from(128 + sig).unwrap_or(crate::stream::EXIT_PROTOCOL_FAILURE);
+        return u8::try_from(crate::terminal::signal_exit_code(sig))
+            .unwrap_or(crate::stream::EXIT_PROTOCOL_FAILURE);
     }
     crate::stream::EXIT_PROTOCOL_FAILURE
-}
-
-/// Restores the local terminal's original line settings when dropped.
-#[cfg(unix)]
-struct RawModeGuard {
-    original: rustix::termios::Termios,
-}
-
-#[cfg(unix)]
-impl RawModeGuard {
-    /// Put the local terminal (stdin) into raw mode, returning a guard that
-    /// restores it on drop. `None` when stdin is not a terminal or the mode
-    /// could not be changed, in which case input is left as-is.
-    fn activate() -> Option<RawModeGuard> {
-        use rustix::termios::{isatty, tcgetattr, tcsetattr, OptionalActions};
-
-        let stdin = std::io::stdin();
-        if !isatty(&stdin) {
-            return None;
-        }
-        let original = tcgetattr(&stdin).ok()?;
-        let mut raw = original.clone();
-        raw.make_raw();
-        tcsetattr(&stdin, OptionalActions::Flush, &raw).ok()?;
-        Some(RawModeGuard { original })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        use rustix::termios::{tcsetattr, OptionalActions};
-
-        let stdin = std::io::stdin();
-        let _ = tcsetattr(&stdin, OptionalActions::Flush, &self.original);
-    }
 }
 
 #[cfg(test)]

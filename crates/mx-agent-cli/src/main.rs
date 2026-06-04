@@ -6,6 +6,7 @@
 
 mod cli;
 mod stream;
+mod terminal;
 
 use std::process::ExitCode;
 
