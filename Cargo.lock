@@ -1781,8 +1781,10 @@ dependencies = [
  "mx-agent-ipc",
  "mx-agent-protocol",
  "mx-agent-telemetry",
+ "rustix",
  "serde_json",
  "sha2",
+ "signal-hook",
  "tokio",
  "tracing",
 ]
@@ -1802,6 +1804,7 @@ dependencies = [
  "mx-agent-sandbox",
  "mx-agent-telemetry",
  "nix",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
