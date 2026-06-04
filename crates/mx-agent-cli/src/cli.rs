@@ -392,6 +392,10 @@ struct TaskUpdateArgs {
     /// Associate this task with an invocation ID.
     #[arg(long = "invocation", value_name = "INVOCATION_ID")]
     invocation: Option<String>,
+    /// Only apply the update if the task is still at this `state_rev`; otherwise
+    /// reject it as stale rather than overwriting newer state.
+    #[arg(long = "expected-state-rev", value_name = "REV")]
+    expected_state_rev: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -1579,6 +1583,7 @@ fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
         description: args.description.clone(),
         invocation_id: args.invocation.clone(),
         result: None,
+        expected_state_rev: args.expected_state_rev,
     };
     let session = match load_session_or_exit() {
         Ok(s) => s,

@@ -73,6 +73,12 @@ pub struct UpdateTaskOptions {
     pub invocation_id: Option<String>,
     /// Result payload to attach (typically when the task completes).
     pub result: Option<Value>,
+    /// `state_rev` the caller last observed for this task. When `Some`, the
+    /// update is applied only if the task is still at that revision; otherwise
+    /// it is rejected as stale ([`WorkspaceError::StaleTaskUpdate`]) so newer
+    /// state is never overwritten silently (architecture §9.4). `None` skips the
+    /// check and performs an unconditional last-write-wins update.
+    pub expected_state_rev: Option<u64>,
 }
 
 /// Options for [`list_tasks`].
@@ -177,6 +183,29 @@ fn apply_update(
     state.state_rev += 1;
     state.updated_at = now;
     state.previous_event_id = previous_event_id;
+}
+
+/// Reject an update whose `expected_state_rev` no longer matches the task's
+/// current revision.
+///
+/// This is the client-side stale-update guard (architecture §9.4): because
+/// Matrix room state is last-write-wins, a caller working from an outdated view
+/// could clobber a newer revision published by a peer. When the caller supplies
+/// the revision they last saw and it differs from `current_rev`, the task has
+/// moved on and we refuse the write. A `None` expectation opts out of the check.
+fn check_not_stale(
+    task_id: &str,
+    current_rev: u64,
+    expected_rev: Option<u64>,
+) -> Result<(), WorkspaceError> {
+    match expected_rev {
+        Some(expected) if expected != current_rev => Err(WorkspaceError::StaleTaskUpdate {
+            task_id: task_id.to_string(),
+            expected,
+            current: current_rev,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Return `true` when `task` passes the (optional) state and assignee filters.
@@ -314,6 +343,12 @@ pub async fn create_task_for_session(
 /// refreshes `updated_at`, records the prior event ID as `previous_event_id`,
 /// and republishes. Returns [`WorkspaceError::TaskNotFound`] when the task does
 /// not exist.
+///
+/// When `options.expected_state_rev` is set, the update is first checked against
+/// the task's current revision and rejected with
+/// [`WorkspaceError::StaleTaskUpdate`] if the task has already moved on, so a
+/// caller working from a stale view never silently overwrites newer state
+/// (architecture §9.4).
 pub async fn update_task(
     client: &Client,
     options: &UpdateTaskOptions,
@@ -323,6 +358,8 @@ pub async fn update_task(
     let (mut state, event_id) = read_task_state(&room, &options.task_id)
         .await?
         .ok_or_else(|| WorkspaceError::TaskNotFound(options.task_id.clone()))?;
+
+    check_not_stale(&state.task_id, state.state_rev, options.expected_state_rev)?;
 
     apply_update(&mut state, options, now_rfc3339(), event_id);
     publish_task_state(&room, &options.task_id, &state).await?;
@@ -438,6 +475,7 @@ mod tests {
             description: None,
             invocation_id: Some("inv_01HZ".to_string()),
             result: None,
+            expected_state_rev: None,
         };
         apply_update(
             &mut task,
@@ -472,6 +510,68 @@ mod tests {
         apply_update(&mut task, &update, "t2".to_string(), None);
         assert_eq!(task.state, "succeeded");
         assert_eq!(task.result, Some(json!({ "exit_code": 0 })));
+    }
+
+    #[test]
+    fn check_not_stale_passes_when_expectation_omitted_or_matches() {
+        // No expectation: unconditional update is always allowed.
+        assert!(check_not_stale("task_abc", 4, None).is_ok());
+        // Matching expectation: the caller's view is current.
+        assert!(check_not_stale("task_abc", 4, Some(4)).is_ok());
+    }
+
+    #[test]
+    fn stale_update_is_detected_and_reports_both_revisions() {
+        // Caller read the task at rev 1, but a peer has since advanced it to
+        // rev 3. The update must be rejected rather than clobbering rev 3.
+        let err = check_not_stale("task_abc", 3, Some(1))
+            .expect_err("an update based on an older revision must be rejected");
+        match err {
+            WorkspaceError::StaleTaskUpdate {
+                task_id,
+                expected,
+                current,
+            } => {
+                assert_eq!(task_id, "task_abc");
+                assert_eq!(expected, 1);
+                assert_eq!(current, 3);
+            }
+            other => panic!("expected StaleTaskUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn newer_state_is_not_overwritten_silently() {
+        // Two callers both read the task at rev 1. The first update lands,
+        // bumping it to rev 2. The second caller still expects rev 1, so its
+        // update is refused: the newer state survives untouched.
+        let mut task = build_new_task(
+            &create_opts(),
+            "task_abc".to_string(),
+            "claude-local".to_string(),
+            "2026-06-02T12:00:00Z".to_string(),
+        );
+        assert_eq!(task.state_rev, 1);
+
+        // First writer succeeds: rev 1 -> 2.
+        check_not_stale(&task.task_id, task.state_rev, Some(1))
+            .expect("first update from rev 1 should be accepted");
+        let first = UpdateTaskOptions {
+            state: Some("executing".to_string()),
+            expected_state_rev: Some(1),
+            ..Default::default()
+        };
+        apply_update(&mut task, &first, "2026-06-02T12:01:00Z".to_string(), None);
+        assert_eq!(task.state_rev, 2);
+        assert_eq!(task.state, "executing");
+
+        // Second writer is working from the now-stale rev 1 and is rejected;
+        // the executing state from the first writer is preserved.
+        let err = check_not_stale(&task.task_id, task.state_rev, Some(1))
+            .expect_err("second update from the stale rev 1 must be rejected");
+        assert!(matches!(err, WorkspaceError::StaleTaskUpdate { .. }));
+        assert_eq!(task.state, "executing");
+        assert_eq!(task.state_rev, 2);
     }
 
     fn task_with(task_id: &str, state: &str, assigned_to: &str) -> TaskState {
