@@ -189,6 +189,17 @@ pub enum WorkspaceError {
     TaskExists(String),
     /// No task with the requested ID exists in the room.
     TaskNotFound(String),
+    /// The update was rejected because the task has already advanced past the
+    /// revision the caller last observed; applying it would silently overwrite
+    /// newer state (architecture §9.4).
+    StaleTaskUpdate {
+        /// Task ID (state key) the update targeted.
+        task_id: String,
+        /// Revision the caller expected the task to still be at.
+        expected: u64,
+        /// Revision the task is actually at in the room right now.
+        current: u64,
+    },
     /// No invocation with the requested ID exists in the room.
     InvocationNotFound(String),
     /// Restoring the authenticated Matrix client from the session failed.
@@ -220,6 +231,15 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::TaskNotFound(value) => {
                 write!(f, "task {value:?} was not found in the room")
             }
+            WorkspaceError::StaleTaskUpdate {
+                task_id,
+                expected,
+                current,
+            } => write!(
+                f,
+                "task {task_id:?} update is stale: expected state_rev {expected} \
+                 but the task is now at {current}; re-read the task and retry"
+            ),
             WorkspaceError::InvocationNotFound(value) => {
                 write!(f, "invocation {value:?} was not found in the room")
             }
