@@ -7,6 +7,7 @@ The CLI treats Matrix rooms as federated workspaces where agents can discover pe
 Documentation:
 
 - [Alpha user guide](docs/user-guide.md) — install, log in, create a workspace, register agents, and run the two-agent demo
+- [Security hardening guide](docs/security-hardening.md) — safe defaults and unsafe options for tokens, trust, policy, sandboxing, and audit logging
 - [Architecture](docs/architecture.md)
 - [Rust implementation roadmap](docs/roadmap-rust.md)
 - [GitHub project management](docs/github-management.md)
