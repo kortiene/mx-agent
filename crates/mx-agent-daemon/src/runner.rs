@@ -295,6 +295,10 @@ fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
         timeout: spec.timeout,
         // Output capping is enforced by the capture stage, not the spawn.
         max_output_bytes: None,
+        // Network and path isolation are consumed only by isolating backends;
+        // threading them from policy into the runner is a later step, so for now
+        // the baseline path leaves them at their (deny / empty) defaults.
+        ..Default::default()
     };
     let prepared = sandbox_for(spec.sandbox).prepare(spec.command.clone(), restrictions);
     let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
