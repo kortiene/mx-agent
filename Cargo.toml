@@ -25,18 +25,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ulid = "1.2"
-toml = "0.8"
+toml = "1"
 url = "2.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 matrix-sdk = { version = "0.18", default-features = false }
 mime = "0.3"
 ed25519-dalek = { version = "2", features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
-getrandom = "0.2"
-nix = { version = "0.29", features = ["signal", "process", "user"] }
+getrandom = "0.4"
+nix = { version = "0.31", features = ["signal", "process", "user"] }
 rustix = { version = "1", default-features = false, features = ["std", "pty", "termios"] }
-signal-hook = "0.3"
+signal-hook = "0.4"
 mx-agent-protocol = { path = "crates/mx-agent-protocol", version = "0.0.1" }
 mx-agent-telemetry = { path = "crates/mx-agent-telemetry", version = "0.0.1" }
 mx-agent-ipc = { path = "crates/mx-agent-ipc", version = "0.0.1" }

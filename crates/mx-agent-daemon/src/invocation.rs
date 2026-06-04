@@ -238,7 +238,7 @@ pub async fn advance_invocation_for_session(
 fn random_nonce() -> String {
     use base64::Engine as _;
     let mut bytes = [0u8; 16];
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())

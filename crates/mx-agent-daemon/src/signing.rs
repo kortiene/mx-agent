@@ -153,7 +153,7 @@ fn generate_and_store(paths: &SessionPaths) -> Result<DaemonSigningKey, SigningK
     paths.ensure_data_dir()?;
 
     let mut secret = [0u8; SECRET_KEY_LENGTH];
-    getrandom::getrandom(&mut secret).map_err(SigningKeyError::Random)?;
+    getrandom::fill(&mut secret).map_err(SigningKeyError::Random)?;
     let signing_key = SigningKey::from_bytes(&secret);
 
     let file = signing_key_file(paths);
