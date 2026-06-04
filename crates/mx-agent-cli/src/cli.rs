@@ -524,6 +524,31 @@ enum InvocationCommand {
     Show(InvocationShowArgs),
     /// Cancel a running invocation.
     Cancel(InvocationCancelArgs),
+    /// Retrieve and verify an invocation's output artifact.
+    Artifact(InvocationArtifactArgs),
+}
+
+/// Captured output stream selected by `invocation artifact`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StreamChannel {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+    /// Pseudo-terminal output.
+    Pty,
+}
+
+impl StreamChannel {
+    /// Map to the protocol [`StreamKind`](mx_agent_protocol::schema::StreamKind).
+    fn to_stream_kind(self) -> mx_agent_protocol::schema::StreamKind {
+        use mx_agent_protocol::schema::StreamKind;
+        match self {
+            StreamChannel::Stdout => StreamKind::Stdout,
+            StreamChannel::Stderr => StreamKind::Stderr,
+            StreamChannel::Pty => StreamKind::Pty,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -560,6 +585,26 @@ struct InvocationCancelArgs {
     /// Human-readable reason recorded with the cancellation.
     #[arg(long, value_name = "REASON", default_value = "cancelled by operator")]
     reason: String,
+}
+
+#[derive(Debug, Args)]
+struct InvocationArtifactArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Invocation ID whose output artifact to retrieve.
+    #[arg(value_name = "INVOCATION_ID")]
+    invocation_id: String,
+    /// Which captured stream to retrieve.
+    #[arg(long, value_enum, default_value_t = StreamChannel::Stdout)]
+    stream: StreamChannel,
+    /// Write the verified artifact to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Maximum number of recent timeline events to scan when locating the
+    /// artifact.
+    #[arg(long, value_name = "N", default_value_t = 100)]
+    limit: u32,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2304,7 +2349,89 @@ fn handle_invocation(global: &GlobalArgs, cmd: &InvocationCommand) -> ExitCode {
         InvocationCommand::List(args) => invocation_list(global, args),
         InvocationCommand::Show(args) => invocation_show(global, args),
         InvocationCommand::Cancel(args) => invocation_cancel(global, args),
+        InvocationCommand::Artifact(args) => invocation_artifact(global, args),
     }
+}
+
+/// Write a verified artifact to `--output` or stdout.
+///
+/// Mirrors [`emit_fetched_context`]: the artifact bytes are emitted raw
+/// (binary-safe) while metadata goes to stderr (or stdout as JSON under
+/// `--json`) so it never corrupts the payload stream when piped.
+fn emit_retrieved_artifact(
+    global: &GlobalArgs,
+    retrieved: &mx_agent_daemon::RetrievedArtifact,
+    output: Option<&PathBuf>,
+) -> ExitCode {
+    use std::io::Write as _;
+    match output {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &retrieved.data) {
+                eprintln!("mx-agent: could not write {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&retrieved.artifact).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                eprintln!(
+                    "mx-agent: verified {} ({} bytes) -> {}",
+                    retrieved.artifact.invocation_id,
+                    retrieved.data.len(),
+                    path.display()
+                );
+            }
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            if let Err(e) = handle.write_all(&retrieved.data) {
+                eprintln!("mx-agent: could not write artifact to stdout: {e}");
+                return ExitCode::FAILURE;
+            }
+            if global.json {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string(&retrieved.artifact).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                eprintln!(
+                    "mx-agent: verified {} ({} bytes)",
+                    retrieved.artifact.invocation_id,
+                    retrieved.data.len()
+                );
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn invocation_artifact(global: &GlobalArgs, args: &InvocationArtifactArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::RetrieveArtifactOptions {
+        room: args.room.clone(),
+        invocation_id: args.invocation_id.clone(),
+        stream: args.stream.to_stream_kind(),
+        limit: args.limit,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::retrieve_artifact_for_session(&session, &options).await {
+            Ok(retrieved) => emit_retrieved_artifact(global, &retrieved, args.output.as_ref()),
+            Err(e) => {
+                eprintln!("mx-agent: could not retrieve artifact: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 /// Render a single invocation as a human-readable block.
@@ -2802,6 +2929,7 @@ fn command_path(command: &Command) -> String {
                 InvocationCommand::List(_) => "list",
                 InvocationCommand::Show(_) => "show",
                 InvocationCommand::Cancel(_) => "cancel",
+                InvocationCommand::Artifact(_) => "artifact",
             }
         ),
         Command::Approval(c) => format!(
@@ -3777,6 +3905,71 @@ mod tests {
                 assert_eq!(args.reason, "superseded");
             }
             other => panic!("expected invocation cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invocation_artifact_requires_room_and_id_with_stream_default() {
+        // The room flag and the positional invocation id are both required.
+        assert!(Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "artifact",
+            "--room",
+            "!abc:matrix.org"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "artifact",
+            "--room",
+            "!abc:matrix.org",
+            "inv_01HZ",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Invocation(InvocationCommand::Artifact(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.invocation_id, "inv_01HZ");
+                // The stream defaults to stdout, the common retrieval case.
+                assert_eq!(args.stream, StreamChannel::Stdout);
+                assert!(args.output.is_none());
+                assert_eq!(args.limit, 100);
+            }
+            other => panic!("expected invocation artifact, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "invocation artifact");
+    }
+
+    #[test]
+    fn invocation_artifact_accepts_stream_and_output() {
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "invocation",
+            "artifact",
+            "--room",
+            "!abc:matrix.org",
+            "--stream",
+            "stderr",
+            "--output",
+            "/tmp/err.log",
+            "inv_01HZ",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Invocation(InvocationCommand::Artifact(args)) => {
+                assert_eq!(args.stream, StreamChannel::Stderr);
+                assert_eq!(
+                    args.stream.to_stream_kind(),
+                    mx_agent_protocol::schema::StreamKind::Stderr
+                );
+                assert_eq!(
+                    args.output.as_deref(),
+                    Some(std::path::Path::new("/tmp/err.log"))
+                );
+            }
+            other => panic!("expected invocation artifact, got {other:?}"),
         }
     }
 

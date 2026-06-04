@@ -29,12 +29,22 @@ use std::fmt;
 use std::process::Stdio;
 
 use base64::Engine as _;
-use matrix_sdk::Client;
+use matrix_sdk::config::SyncSettings;
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
+use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::OwnedMxcUri;
+use matrix_sdk::{Client, Room};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use mx_agent_protocol::events::timeline::STREAM_ARTIFACT;
 use mx_agent_protocol::schema::{StreamArtifact, StreamKind};
+
+use crate::matrix::restore_client;
+use crate::session::StoredSession;
+use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
 
 /// Default per-stream timeline output budget (architecture §8.4). Output beyond
 /// this is uploaded as an artifact instead of streamed as timeline chunks. Set
@@ -297,6 +307,238 @@ fn sha256_b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
+/// Default number of recent timeline events [`retrieve_artifact`] scans when
+/// locating a stream artifact by invocation ID. Matches the context-share scan
+/// budget ([`crate::context::DEFAULT_FETCH_SCAN_LIMIT`]).
+pub const DEFAULT_ARTIFACT_SCAN_LIMIT: u32 = 100;
+
+/// Options for [`retrieve_artifact`].
+#[derive(Debug, Clone)]
+pub struct RetrieveArtifactOptions {
+    /// Room ID or alias to retrieve the artifact from.
+    pub room: String,
+    /// Invocation whose output artifact to retrieve.
+    pub invocation_id: String,
+    /// Which captured stream to retrieve (defaults to `stdout`).
+    pub stream: StreamKind,
+    /// Maximum number of recent timeline events to scan when locating the
+    /// artifact.
+    pub limit: u32,
+}
+
+impl Default for RetrieveArtifactOptions {
+    fn default() -> Self {
+        Self {
+            room: String::new(),
+            invocation_id: String::new(),
+            stream: StreamKind::Stdout,
+            limit: DEFAULT_ARTIFACT_SCAN_LIMIT,
+        }
+    }
+}
+
+/// A stream artifact retrieved, verified, and decompressed by
+/// [`retrieve_artifact`].
+#[derive(Debug, Clone)]
+pub struct RetrievedArtifact {
+    /// The artifact metadata as published in the room.
+    pub artifact: StreamArtifact,
+    /// The original (decompressed) output bytes, verified against
+    /// [`StreamArtifact::sha256`].
+    pub data: Vec<u8>,
+}
+
+/// Whether an artifact's uploaded media is zstd-compressed.
+///
+/// [`prepare_artifact`] records compression by suffixing the artifact `name`
+/// with `.zst` and tagging its `mime_type` with `+zstd`; either marker is
+/// sufficient to recognise a compressed artifact on the way back in.
+fn is_compressed(artifact: &StreamArtifact) -> bool {
+    artifact.name.ends_with(".zst") || artifact.mime_type.ends_with("+zstd")
+}
+
+/// Verify `media` against the artifact's recorded digest, then decompress it if
+/// the artifact is compressed, returning the original output bytes.
+///
+/// The [`StreamArtifact::sha256`] digest covers the *uploaded* (possibly
+/// compressed) media, so verification happens before decompression: a corrupt
+/// download is rejected with [`WorkspaceError::ArtifactIntegrity`] rather than
+/// fed to the decompressor.
+async fn verify_and_decompress(
+    artifact: &StreamArtifact,
+    media: Vec<u8>,
+) -> Result<Vec<u8>, WorkspaceError> {
+    let actual = sha256_b64(&media);
+    if actual != artifact.sha256 {
+        return Err(WorkspaceError::ArtifactIntegrity {
+            invocation_id: artifact.invocation_id.clone(),
+            stream: stream_stem(artifact.stream).to_string(),
+            expected: artifact.sha256.clone(),
+            actual,
+        });
+    }
+    if is_compressed(artifact) {
+        decompress_zstd(&media).await.ok_or_else(|| {
+            WorkspaceError::ArtifactRetrievalFailed(format!(
+                "could not decompress zstd artifact {:?}; is the `zstd` binary installed?",
+                artifact.name
+            ))
+        })
+    } else {
+        Ok(media)
+    }
+}
+
+/// Select the newest artifact matching `invocation_id` and `stream` from a
+/// timeline scan (artifacts arrive newest-first, so the first match wins).
+fn select_artifact(
+    artifacts: Vec<StreamArtifact>,
+    invocation_id: &str,
+    stream: StreamKind,
+) -> Option<StreamArtifact> {
+    artifacts
+        .into_iter()
+        .find(|a| a.invocation_id == invocation_id && a.stream == stream)
+}
+
+/// Decompress zstd `data` with the `zstd` binary, returning `None` if zstd is
+/// not available or decompression fails. Inverse of [`compress_zstd`].
+async fn decompress_zstd(data: &[u8]) -> Option<Vec<u8>> {
+    let mut child = Command::new("zstd")
+        .arg("-q")
+        .arg("-d")
+        .arg("-c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Feed stdin from a separate task while draining stdout concurrently to
+    // avoid a pipe-buffer deadlock on large artifacts (see `compress_zstd`).
+    let mut stdin = child.stdin.take()?;
+    let input = data.to_vec();
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(&input).await;
+        let _ = stdin.shutdown().await;
+    });
+
+    let output = child.wait_with_output().await.ok();
+    let _ = writer.await;
+
+    let output = output?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// Parse and validate an `mxc://` URI recorded on an artifact.
+fn parse_mxc(uri: &str) -> Result<OwnedMxcUri, WorkspaceError> {
+    let parsed = OwnedMxcUri::from(uri);
+    if parsed.is_valid() {
+        Ok(parsed)
+    } else {
+        Err(WorkspaceError::ArtifactRetrievalFailed(format!(
+            "{uri:?} is not a valid mxc:// URI"
+        )))
+    }
+}
+
+/// Download the raw bytes of an artifact's uploaded media.
+async fn download_media(client: &Client, mxc_uri: &str) -> Result<Vec<u8>, WorkspaceError> {
+    let request = MediaRequestParameters {
+        source: MediaSource::Plain(parse_mxc(mxc_uri)?),
+        format: MediaFormat::File,
+    };
+    client
+        .media()
+        .get_media_content(&request, false)
+        .await
+        .map_err(WorkspaceError::from)
+}
+
+/// Sync once, resolve the room, and return its [`Room`] handle.
+async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, WorkspaceError> {
+    let id = parse_room_or_alias(target)?;
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .map_err(WorkspaceError::from)?;
+    let room_id = resolve_room_id(client, &id).await?;
+    client
+        .get_room(&room_id)
+        .ok_or_else(|| WorkspaceError::RoomNotFound(target.to_string()))
+}
+
+/// List recent stream artifacts in a workspace room, newest first.
+///
+/// Scans up to `limit` recent timeline events and returns the parsed content of
+/// every `com.mxagent.stream.artifact.v1` event among them.
+pub async fn list_stream_artifacts(
+    client: &Client,
+    room: &str,
+    limit: u32,
+) -> Result<Vec<StreamArtifact>, WorkspaceError> {
+    let room = sync_and_get_room(client, room).await?;
+    let mut request = MessagesOptions::backward();
+    request.limit = matrix_sdk::ruma::UInt::from(limit);
+    let messages = room.messages(request).await.map_err(WorkspaceError::from)?;
+
+    let mut artifacts = Vec::new();
+    for event in messages.chunk {
+        let raw = event.raw();
+        let is_artifact =
+            raw.get_field::<String>("type").ok().flatten().as_deref() == Some(STREAM_ARTIFACT);
+        if is_artifact {
+            if let Ok(Some(content)) = raw.get_field::<StreamArtifact>("content") {
+                artifacts.push(content);
+            }
+        }
+    }
+    Ok(artifacts)
+}
+
+/// Retrieve, verify, and decompress a single invocation output artifact.
+///
+/// Locates the artifact for `options.invocation_id` and `options.stream` among
+/// the recent timeline events, downloads its uploaded media, verifies the bytes
+/// against the artifact's [`sha256`](StreamArtifact::sha256), and decompresses
+/// them when the artifact is zstd-compressed. A digest mismatch is reported as
+/// [`WorkspaceError::ArtifactIntegrity`]; an unknown invocation/stream as
+/// [`WorkspaceError::ArtifactNotFound`].
+pub async fn retrieve_artifact(
+    client: &Client,
+    options: &RetrieveArtifactOptions,
+) -> Result<RetrievedArtifact, WorkspaceError> {
+    let artifacts = list_stream_artifacts(client, &options.room, options.limit).await?;
+    let artifact =
+        select_artifact(artifacts, &options.invocation_id, options.stream).ok_or_else(|| {
+            WorkspaceError::ArtifactNotFound(format!(
+                "{} ({})",
+                options.invocation_id,
+                stream_stem(options.stream)
+            ))
+        })?;
+
+    if artifact.mxc_uri.is_empty() {
+        return Err(WorkspaceError::ArtifactRetrievalFailed(format!(
+            "artifact for {:?} has no mxc:// reference to download",
+            options.invocation_id
+        )));
+    }
+    let media = download_media(client, &artifact.mxc_uri).await?;
+    let data = verify_and_decompress(&artifact, media).await?;
+    Ok(RetrievedArtifact { artifact, data })
+}
+
+/// Retrieve and verify an invocation artifact, restoring the authenticated
+/// client from `session`.
+pub async fn retrieve_artifact_for_session(
+    session: &StoredSession,
+    options: &RetrieveArtifactOptions,
+) -> Result<RetrievedArtifact, WorkspaceError> {
+    let client = restore_client(session).await?;
+    retrieve_artifact(&client, options).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +645,130 @@ mod tests {
         }
         // The digest always covers the uploaded bytes.
         assert_eq!(prepared.sha256, sha256_b64(prepared.upload_bytes()));
+    }
+
+    /// Build the artifact event a prepared upload would produce, pairing it with
+    /// the uploaded (possibly-compressed) media for retrieval-side tests.
+    async fn prepared_event_and_media(
+        data: &[u8],
+        config: &ArtifactConfig,
+    ) -> (StreamArtifact, Vec<u8>) {
+        let prepared = prepare_artifact("inv_ret", StreamKind::Stdout, data, config).await;
+        let media = prepared.upload_bytes().to_vec();
+        (prepared.into_event("mxc://server/artifact"), media)
+    }
+
+    #[test]
+    fn is_compressed_recognises_zstd_markers() {
+        let prepared = StreamArtifact {
+            invocation_id: "inv".into(),
+            stream: StreamKind::Stdout,
+            name: "stdout.log.zst".into(),
+            mime_type: "text/plain+zstd".into(),
+            size_bytes: 0,
+            sha256: String::new(),
+            mxc_uri: "mxc://s/a".into(),
+            tail_preview: String::new(),
+            extra: Default::default(),
+        };
+        assert!(is_compressed(&prepared));
+
+        let plain = StreamArtifact {
+            name: "stdout.log".into(),
+            mime_type: "text/plain".into(),
+            ..prepared.clone()
+        };
+        assert!(!is_compressed(&plain));
+    }
+
+    #[test]
+    fn select_artifact_matches_invocation_and_stream() {
+        let mk = |inv: &str, stream| StreamArtifact {
+            invocation_id: inv.into(),
+            stream,
+            name: "x.log".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 0,
+            sha256: String::new(),
+            mxc_uri: "mxc://s/a".into(),
+            tail_preview: String::new(),
+            extra: Default::default(),
+        };
+        let artifacts = vec![
+            mk("inv_1", StreamKind::Stdout),
+            mk("inv_1", StreamKind::Stderr),
+            mk("inv_2", StreamKind::Stdout),
+        ];
+        // stdout/stderr of the same invocation are told apart by stream.
+        let stderr = select_artifact(artifacts.clone(), "inv_1", StreamKind::Stderr)
+            .expect("inv_1 stderr exists");
+        assert_eq!(stderr.invocation_id, "inv_1");
+        assert_eq!(stderr.stream, StreamKind::Stderr);
+
+        assert!(select_artifact(artifacts, "inv_1", StreamKind::Pty).is_none());
+    }
+
+    #[tokio::test]
+    async fn retrieve_round_trips_uncompressed_output() {
+        // Acceptance: a user can retrieve the stdout artifact and get back the
+        // exact original bytes.
+        let data = vec![b'o'; 8 * 1024];
+        let config = ArtifactConfig {
+            compress: false,
+            ..ArtifactConfig::new()
+        };
+        let (artifact, media) = prepared_event_and_media(&data, &config).await;
+        let out = verify_and_decompress(&artifact, media)
+            .await
+            .expect("verification succeeds for untampered media");
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn retrieve_round_trips_compressed_output() {
+        // Acceptance: compression is transparent — a compressed artifact comes
+        // back decompressed and byte-identical to the original output.
+        let data = vec![b'z'; 64 * 1024];
+        let (artifact, media) = prepared_event_and_media(&data, &ArtifactConfig::new()).await;
+        if !is_compressed(&artifact) {
+            // No zstd binary on this host: prepare_artifact fell back to an
+            // uncompressed upload, already covered by the uncompressed test.
+            return;
+        }
+        let out = verify_and_decompress(&artifact, media)
+            .await
+            .expect("compressed artifact decompresses after verification");
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn corrupt_artifact_fails_verification() {
+        // Acceptance: a corrupt/tampered artifact must fail verification rather
+        // than be returned (or fed to the decompressor).
+        let data = b"the original output".to_vec();
+        let config = ArtifactConfig {
+            compress: false,
+            ..ArtifactConfig::new()
+        };
+        let (artifact, mut media) = prepared_event_and_media(&data, &config).await;
+        media[0] ^= 0xff; // flip a byte: the download is now corrupt
+
+        let err = verify_and_decompress(&artifact, media)
+            .await
+            .expect_err("a digest mismatch must be detected");
+        match err {
+            WorkspaceError::ArtifactIntegrity {
+                invocation_id,
+                stream,
+                expected,
+                actual,
+            } => {
+                assert_eq!(invocation_id, "inv_ret");
+                assert_eq!(stream, "stdout");
+                assert_eq!(expected, artifact.sha256);
+                assert_ne!(expected, actual);
+            }
+            other => panic!("expected ArtifactIntegrity, got {other:?}"),
+        }
     }
 }

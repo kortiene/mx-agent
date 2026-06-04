@@ -43,8 +43,10 @@ pub use approval::{
     ExecDisposition, PendingApproval, DECISION_APPROVED, DECISION_DENIED,
 };
 pub use artifact::{
-    prepare_artifact, upload_artifact, zstd_available, ArtifactConfig, ArtifactError,
-    PreparedArtifact, DEFAULT_MAX_TIMELINE_OUTPUT_BYTES, DEFAULT_TAIL_PREVIEW_BYTES,
+    list_stream_artifacts, prepare_artifact, retrieve_artifact, retrieve_artifact_for_session,
+    upload_artifact, zstd_available, ArtifactConfig, ArtifactError, PreparedArtifact,
+    RetrieveArtifactOptions, RetrievedArtifact, DEFAULT_ARTIFACT_SCAN_LIMIT,
+    DEFAULT_MAX_TIMELINE_OUTPUT_BYTES, DEFAULT_TAIL_PREVIEW_BYTES,
 };
 pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE_NAME};
 pub use call::{

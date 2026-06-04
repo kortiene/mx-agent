@@ -646,6 +646,21 @@ Artifact event:
 }
 ```
 
+Retrieve the full artifact by invocation ID:
+
+```bash
+mx-agent invocation artifact \
+  --room '!abc:matrix.org' \
+  --stream stdout \
+  inv_01HZ...
+```
+
+The bytes are downloaded from media, verified against `sha256` (a mismatch is
+rejected as a corrupt/tampered artifact), and decompressed when the artifact is
+zstd-encoded — so the command emits the original output. `--stream` selects
+`stdout` (default), `stderr`, or `pty`; `--output PATH` writes to a file instead
+of stdout.
+
 ---
 
 ## 9. Distributed State Machine and DAG Tracking
