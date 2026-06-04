@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 /target/
 /logs/
+
+# Local secrets / env files (never commit). Examples (*.env.example) are kept.
+.env
+*.env
+!*.env.example
