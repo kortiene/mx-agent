@@ -547,13 +547,27 @@ struct InvocationCancelArgs {
 #[derive(Debug, Subcommand)]
 enum ApprovalCommand {
     /// List pending approval requests.
-    List,
+    List(ApprovalListArgs),
     /// Show one approval request.
-    Show,
+    Show(ApprovalShowArgs),
     /// Approve a request.
     Approve,
     /// Deny a request.
     Deny,
+}
+
+#[derive(Debug, Args)]
+struct ApprovalListArgs {
+    /// Only list approvals queued for this workspace room.
+    #[arg(long, value_name = "ROOM")]
+    room: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ApprovalShowArgs {
+    /// Approval request ID to show.
+    #[arg(value_name = "REQUEST_ID")]
+    request_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -667,10 +681,10 @@ pub fn run() -> ExitCode {
         Command::Trust(cmd) => handle_trust(g, cmd),
         Command::Task(cmd) => handle_task(g, cmd),
         Command::Invocation(cmd) => handle_invocation(g, cmd),
+        Command::Approval(cmd) => handle_approval(g, cmd),
         Command::Share(cmd) => handle_share(g, cmd),
         Command::Call(args) => cmd_call(g, args),
         Command::Exec(args) => cmd_exec(g, args),
-        _ => unimplemented(g, &path),
     }
 }
 
@@ -2214,6 +2228,86 @@ fn invocation_cancel(global: &GlobalArgs, args: &InvocationCancelArgs) -> ExitCo
     })
 }
 
+/// Handle the `approval` command group.
+fn handle_approval(global: &GlobalArgs, cmd: &ApprovalCommand) -> ExitCode {
+    match cmd {
+        ApprovalCommand::List(args) => approval_list(global, args),
+        ApprovalCommand::Show(args) => approval_show(global, args),
+        ApprovalCommand::Approve => unimplemented(global, "approval approve"),
+        ApprovalCommand::Deny => unimplemented(global, "approval deny"),
+    }
+}
+
+/// Render a single pending approval as a human-readable block.
+fn print_approval(pending: &mx_agent_daemon::PendingApproval) {
+    let req = &pending.request;
+    println!(
+        "  {:<28} {:<6} {} -> {}",
+        req.request_id, req.risk, req.requester, req.target
+    );
+    println!("    invocation:   {}", req.invocation_id);
+    println!("    room:         {}", pending.room_id);
+    println!("    summary:      {}", req.summary);
+    println!("    expires_at:   {}", req.expires_at);
+}
+
+fn approval_list(global: &GlobalArgs, args: &ApprovalListArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    match mx_agent_daemon::list_pending_approvals(&paths, args.room.as_deref()) {
+        Ok(pending) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&pending).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else if pending.is_empty() {
+                match &args.room {
+                    Some(room) => println!("mx-agent: no pending approvals in {room}"),
+                    None => println!("mx-agent: no pending approvals"),
+                }
+            } else {
+                println!("mx-agent: {} pending approval(s)", pending.len());
+                for approval in &pending {
+                    print_approval(approval);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not read pending approvals: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn approval_show(global: &GlobalArgs, args: &ApprovalShowArgs) -> ExitCode {
+    let paths = mx_agent_daemon::SessionPaths::resolve();
+    match mx_agent_daemon::get_pending_approval(&paths, &args.request_id) {
+        Ok(Some(pending)) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&pending).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                print_approval(&pending);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!(
+                "mx-agent: approval request {:?} was not found in the local queue",
+                args.request_id
+            );
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("mx-agent: could not read pending approval: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Handle the `daemon` command group.
 fn handle_daemon(global: &GlobalArgs, cmd: &DaemonCommand) -> ExitCode {
     match cmd {
@@ -2418,8 +2512,8 @@ fn command_path(command: &Command) -> String {
         Command::Approval(c) => format!(
             "approval {}",
             match c {
-                ApprovalCommand::List => "list",
-                ApprovalCommand::Show => "show",
+                ApprovalCommand::List(_) => "list",
+                ApprovalCommand::Show(_) => "show",
                 ApprovalCommand::Approve => "approve",
                 ApprovalCommand::Deny => "deny",
             }

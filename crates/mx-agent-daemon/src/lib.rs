@@ -6,6 +6,7 @@
 //! together so the workspace builds end to end.
 
 pub mod agent;
+pub mod approval;
 pub mod audit;
 pub mod call;
 pub mod context;
@@ -33,6 +34,10 @@ pub use agent::{
     register_agent_for_session, show_agent, show_agent_for_session, AgentTools, ListAgentsOptions,
     RegisterAgentOptions, DEFAULT_AGENT_KIND, DEFAULT_MAX_INVOCATIONS,
 };
+pub use approval::{
+    approval_request_for, disposition_for_exec, emit_approval_request, get_pending_approval,
+    list_pending_approvals, ApprovalQueue, ExecDisposition, PendingApproval,
+};
 pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE_NAME};
 pub use call::{
     authorize_call_request, build_signed_call_request, emit_call_response, execute_authorized_call,
@@ -46,10 +51,10 @@ pub use context::{
     DEFAULT_FETCH_SCAN_LIMIT, DIFF_MIME_TYPE, ENV_MIME_TYPE, MAX_INLINE_BYTES,
 };
 pub use exec::{
-    authorize_exec_cancel, authorize_exec_request, build_signed_exec_cancel,
-    build_signed_exec_request, emit_exec_accepted, emit_exec_cancelled, emit_exec_rejected,
-    invocation_state_for, publish_invocation_state, send_exec_cancel, send_exec_request,
-    CancelRejection, ExecRejection, ExecRequestOptions,
+    authorize_exec_cancel, authorize_exec_request, authorize_exec_request_with_allowance,
+    build_signed_exec_cancel, build_signed_exec_request, emit_exec_accepted, emit_exec_cancelled,
+    emit_exec_rejected, invocation_state_for, publish_invocation_state, send_exec_cancel,
+    send_exec_request, CancelRejection, ExecRejection, ExecRequestOptions,
 };
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
