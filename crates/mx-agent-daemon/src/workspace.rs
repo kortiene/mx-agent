@@ -221,6 +221,25 @@ pub enum WorkspaceError {
     ContextRetrievalFailed(String),
     /// Capturing local context (a git diff or environment metadata) failed.
     ContextCaptureFailed(String),
+    /// No stream artifact for the requested invocation (and stream) was found in
+    /// the room timeline.
+    ArtifactNotFound(String),
+    /// A retrieved stream artifact did not match the digest recorded on its
+    /// timeline event, so the bytes are corrupt or tampered with (architecture
+    /// §8.4).
+    ArtifactIntegrity {
+        /// Invocation the artifact belongs to.
+        invocation_id: String,
+        /// Stream the artifact captured (e.g. `stdout`).
+        stream: String,
+        /// Base64 SHA-256 digest the artifact event claimed.
+        expected: String,
+        /// Base64 SHA-256 digest actually computed over the retrieved bytes.
+        actual: String,
+    },
+    /// A stream artifact could not be retrieved or decompressed (invalid
+    /// `mxc://` URI, or zstd decompression failed/unavailable).
+    ArtifactRetrievalFailed(String),
     /// Restoring the authenticated Matrix client from the session failed.
     Restore(Box<LoginError>),
     /// An underlying Matrix request failed.
@@ -288,6 +307,22 @@ impl fmt::Display for WorkspaceError {
             }
             WorkspaceError::ContextCaptureFailed(value) => {
                 write!(f, "could not capture context: {value}")
+            }
+            WorkspaceError::ArtifactNotFound(value) => {
+                write!(f, "no stream artifact for {value:?} was found in the room")
+            }
+            WorkspaceError::ArtifactIntegrity {
+                invocation_id,
+                stream,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "artifact for invocation {invocation_id:?} ({stream}) failed integrity check: \
+                 expected sha256 {expected} but retrieved bytes hash to {actual}"
+            ),
+            WorkspaceError::ArtifactRetrievalFailed(value) => {
+                write!(f, "could not retrieve artifact: {value}")
             }
             WorkspaceError::Restore(e) => write!(f, "{e}"),
             WorkspaceError::Matrix(e) => write!(f, "Matrix request failed: {e}"),
