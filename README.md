@@ -8,6 +8,7 @@ Documentation:
 
 - [Alpha user guide](docs/user-guide.md) — install, log in, create a workspace, register agents, and run the two-agent demo
 - [Security hardening guide](docs/security-hardening.md) — safe defaults and unsafe options for tokens, trust, policy, sandboxing, and audit logging
+- [Alpha release checklist](docs/alpha-release-checklist.md) — the alpha gate, known limitations, and rollback/revocation guidance for deciding if a commit is release-ready
 - [Architecture](docs/architecture.md)
 - [Rust implementation roadmap](docs/roadmap-rust.md)
 - [GitHub project management](docs/github-management.md)
