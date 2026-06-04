@@ -70,6 +70,15 @@ with the env vars it expects (`MX_AGENT_TEST_HOMESERVER`, `MX_AGENT_TEST_USER*`,
 `MX_AGENT_TEST_PASSWORD*`). The test creates a room as the second user, has the
 daemon user join and sync, and asserts the daemon observes the message.
 
+The same harness also runs the E2EE coverage test (issue #61), which exercises
+the daemon against **end-to-end encrypted** rooms: it asserts the daemon
+decrypts signed `exec`/`call` requests and authorizes them, and that a
+privileged event the daemon cannot decrypt (one sent before it joined) stays an
+opaque `m.room.encrypted` event, never reaching authorization — so it is not
+executed. The daemon's `e2e-encryption` support is enabled only for test builds
+(a `[dev-dependencies]` feature in `crates/mx-agent-daemon/Cargo.toml`), so
+`cargo build --all` stays free of the crypto stack.
+
 ## Configuration
 
 - `dev/matrix/docker-compose.yml` — the Tuwunel service (loopback-only port,
