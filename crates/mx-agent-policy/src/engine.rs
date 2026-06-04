@@ -63,6 +63,11 @@ pub struct Allowance {
     pub network: Option<NetworkPolicy>,
     /// Whether the request requires interactive approval before running.
     pub requires_approval: bool,
+    /// Environment variable names the child may inherit from the daemon beyond
+    /// the built-in safe defaults (architecture §13.4). Resolved from
+    /// `execution.env_allowlist`; the runner still scrubs any name matching a
+    /// known token variable.
+    pub env_allowlist: Vec<String>,
 }
 
 /// Machine-readable reason a request was denied.
@@ -239,6 +244,7 @@ impl Policy {
             sandbox: agent.sandbox.or(self.execution.default_sandbox),
             network: agent.network.or(self.execution.network),
             requires_approval: agent.requires_approval,
+            env_allowlist: self.execution.env_allowlist.clone(),
         }
     }
 }
@@ -353,6 +359,41 @@ requires_approval = false
         assert_eq!(a.sandbox, Some(Sandbox::Bubblewrap));
         assert_eq!(a.network, Some(NetworkPolicy::Deny));
         assert!(!a.requires_approval);
+    }
+
+    #[test]
+    fn allowance_carries_execution_env_allowlist() {
+        // policy() defines no env_allowlist, so the resolved allowance is empty.
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let a = p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .allowance()
+            .unwrap()
+            .clone();
+        assert!(a.env_allowlist.is_empty());
+
+        // An explicit execution.env_allowlist flows through to the allowance so
+        // the runner can pass those safe vars to the child.
+        let toml = r#"
+[execution]
+env_allowlist = ["CARGO_HOME", "RUSTUP_HOME"]
+
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        let a = p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .allowance()
+            .unwrap()
+            .clone();
+        assert_eq!(a.env_allowlist, ["CARGO_HOME", "RUSTUP_HOME"]);
     }
 
     #[test]

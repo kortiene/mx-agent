@@ -13,12 +13,18 @@
 //!
 //! ## Environment scrubbing
 //!
-//! Per architecture §13.4, the child must not inherit the daemon's secrets. The
-//! runner builds the child environment from the current process environment
-//! with all known secret variables removed (see [`is_secret_var`]), then layers
-//! the request's explicit `env` overrides on top. This is the security boundary
-//! that keeps credentials such as `MATRIX_ACCESS_TOKEN`, `GITHUB_TOKEN`, or any
-//! `AWS_*` variable out of remotely-triggered commands.
+//! Per architecture §13.4, the child environment is *allowlist-based*: the
+//! child must not inherit the daemon's secrets, so it starts from nothing and
+//! only the variables that are known to be safe are passed through. The runner
+//! builds the child environment from the current process environment by keeping
+//! only the built-in safe defaults ([`DEFAULT_ALLOWED_VARS`]) plus any names the
+//! policy explicitly allows ([`RunSpec::env_allowlist`]), then layers the
+//! request's explicit `env` overrides on top. As defence in depth, any inherited
+//! variable matching a known token name (see [`is_secret_var`]) is scrubbed even
+//! if it was allowlisted, so the allowlist can never reintroduce a credential.
+//! This is the security boundary that keeps credentials such as
+//! `MATRIX_ACCESS_TOKEN`, `GITHUB_TOKEN`, or any `AWS_*` variable out of
+//! remotely-triggered commands.
 //!
 //! ## Process groups
 //!
@@ -27,7 +33,7 @@
 //! group rather than just the immediate child (architecture §7.4). On other
 //! platforms this is a no-op and the child runs in the daemon's group.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -57,6 +63,20 @@ const SECRET_VARS: &[&str] = &[
 /// with one of these is treated as a secret (e.g. `AWS_SECRET_ACCESS_KEY`).
 const SECRET_PREFIXES: &[&str] = &["AWS_", "GOOGLE_", "AZURE_"];
 
+/// Environment variables that are always safe to pass through to a child
+/// process.
+///
+/// These carry no credentials yet are needed for most commands to behave
+/// normally — locating binaries, the home and working directories, locale, and
+/// the terminal. The child environment is allowlist-based (architecture §13.4):
+/// any inherited variable *not* in this set, and not in the policy's explicit
+/// [`RunSpec::env_allowlist`], is dropped so the child inherits a minimal, known
+/// environment by default.
+pub const DEFAULT_ALLOWED_VARS: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ",
+    "TERM", "TMPDIR", "PWD",
+];
+
 /// Whether `name` names a known secret environment variable.
 ///
 /// A name is considered secret if it matches one of [`SECRET_VARS`] exactly or
@@ -68,29 +88,45 @@ pub fn is_secret_var(name: &str) -> bool {
 
 /// Build the sanitized environment for a child process.
 ///
-/// Starts from `inherited` (typically the daemon's own environment), drops every
-/// variable for which [`is_secret_var`] returns true, then applies `overrides`
-/// on top. Overrides are applied unconditionally: an explicitly-provided value
-/// is honoured even if its name would otherwise be scrubbed, because the caller
-/// has made a deliberate choice to pass it.
+/// The child environment is *allowlist-based* (architecture §13.4). Starting
+/// from `inherited` (typically the daemon's own environment), a variable is
+/// passed through only when both:
 ///
-/// Kept as a pure function so the scrubbing rules are unit-testable without
-/// spawning anything.
+/// 1. its name is in [`DEFAULT_ALLOWED_VARS`] or in `extra_allowed` (the
+///    policy's explicit allowlist of further safe variables), and
+/// 2. its name is *not* a known secret per [`is_secret_var`].
+///
+/// The secret check is applied even to allowlisted names as defence in depth, so
+/// an operator who mistakenly allows a token variable still does not leak it.
+/// Finally `overrides` are applied unconditionally: an explicitly-provided value
+/// is honoured even if its name would otherwise be dropped, because the caller
+/// has made a deliberate, per-request choice to pass it.
+///
+/// Kept as a pure function so the rules are unit-testable without spawning
+/// anything.
 pub fn sanitize_env<I>(
     inherited: I,
     overrides: &BTreeMap<String, String>,
+    extra_allowed: &[String],
 ) -> BTreeMap<String, String>
 where
     I: IntoIterator<Item = (String, String)>,
 {
+    let extra: BTreeSet<&str> = extra_allowed.iter().map(String::as_str).collect();
     let mut env: BTreeMap<String, String> = inherited
         .into_iter()
-        .filter(|(name, _)| !is_secret_var(name))
+        .filter(|(name, _)| is_allowed_var(name, &extra) && !is_secret_var(name))
         .collect();
     for (name, value) in overrides {
         env.insert(name.clone(), value.clone());
     }
     env
+}
+
+/// Whether `name` is permitted to be inherited by a child process: it is one of
+/// the built-in [`DEFAULT_ALLOWED_VARS`] or in the policy's `extra_allowed` set.
+fn is_allowed_var(name: &str, extra_allowed: &BTreeSet<&str>) -> bool {
+    DEFAULT_ALLOWED_VARS.contains(&name) || extra_allowed.contains(name)
 }
 
 /// What to run and how (the non-protocol view of an authorized exec request).
@@ -106,6 +142,14 @@ pub struct RunSpec {
     pub cwd: PathBuf,
     /// Explicit environment overrides layered on top of the sanitized env.
     pub env: BTreeMap<String, String>,
+    /// Additional environment variable names this execution may inherit from the
+    /// daemon, on top of the built-in [`DEFAULT_ALLOWED_VARS`] safe set.
+    ///
+    /// Resolved from the policy's `execution.env_allowlist`
+    /// ([`Allowance::env_allowlist`][mx_agent_policy::Allowance::env_allowlist]).
+    /// Names matching a known secret are still scrubbed, so this can widen the
+    /// inherited environment with safe variables but never reintroduce a token.
+    pub env_allowlist: Vec<String>,
     /// Bytes to feed to the child's standard input, if any.
     ///
     /// `None` runs the command with stdin connected to `/dev/null` (the
@@ -133,6 +177,7 @@ impl Default for RunSpec {
             command: Vec::new(),
             cwd: PathBuf::new(),
             env: BTreeMap::new(),
+            env_allowlist: Vec::new(),
             stdin: None,
             timeout: None,
             grace_period: DEFAULT_GRACE_PERIOD,
@@ -215,7 +260,7 @@ fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
         return Err(RunError::MissingCwd(spec.cwd.clone()));
     }
 
-    let env = sanitize_env(std::env::vars(), &spec.env);
+    let env = sanitize_env(std::env::vars(), &spec.env, &spec.env_allowlist);
 
     let stdin = if spec.stdin.is_some() {
         Stdio::piped()
@@ -444,11 +489,57 @@ mod tests {
             ("AWS_SECRET_ACCESS_KEY".to_string(), "aws".to_string()),
             ("HOME".to_string(), "/home/me".to_string()),
         ];
-        let env = sanitize_env(inherited, &BTreeMap::new());
+        let env = sanitize_env(inherited, &BTreeMap::new(), &[]);
         assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home/me"));
         assert!(!env.contains_key("GITHUB_TOKEN"));
         assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn sanitize_env_is_allowlist_based_by_default() {
+        // A perfectly innocuous variable is still dropped unless it is in the
+        // built-in safe set or the policy allowlist: the child gets a minimal,
+        // known environment rather than everything-minus-secrets.
+        let inherited = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("CARGO_HOME".to_string(), "/home/me/.cargo".to_string()),
+            ("MY_RANDOM_VAR".to_string(), "value".to_string()),
+        ];
+        let env = sanitize_env(inherited, &BTreeMap::new(), &[]);
+        assert!(env.contains_key("PATH"));
+        assert!(!env.contains_key("CARGO_HOME"));
+        assert!(!env.contains_key("MY_RANDOM_VAR"));
+    }
+
+    #[test]
+    fn sanitize_env_passes_policy_allowed_vars() {
+        // The policy can explicitly allow further safe variables through.
+        let inherited = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("CARGO_HOME".to_string(), "/home/me/.cargo".to_string()),
+            ("RUSTUP_HOME".to_string(), "/home/me/.rustup".to_string()),
+        ];
+        let allow = vec!["CARGO_HOME".to_string(), "RUSTUP_HOME".to_string()];
+        let env = sanitize_env(inherited, &BTreeMap::new(), &allow);
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/home/me/.cargo")
+        );
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some("/home/me/.rustup")
+        );
+    }
+
+    #[test]
+    fn sanitize_env_scrubs_secret_even_when_allowlisted() {
+        // Defence in depth: allowlisting a token name does not leak it. Only a
+        // deliberate per-request override (next test) can pass such a value.
+        let inherited = vec![("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())];
+        let allow = vec!["GITHUB_TOKEN".to_string()];
+        let env = sanitize_env(inherited, &BTreeMap::new(), &allow);
+        assert!(!env.contains_key("GITHUB_TOKEN"));
     }
 
     #[test]
@@ -457,6 +548,7 @@ mod tests {
         let env = sanitize_env(
             inherited,
             &overrides(&[("MY_FLAG", "1"), ("PATH", "/custom")]),
+            &[],
         );
         assert_eq!(env.get("MY_FLAG").map(String::as_str), Some("1"));
         assert_eq!(env.get("PATH").map(String::as_str), Some("/custom"));
@@ -466,7 +558,7 @@ mod tests {
     fn sanitize_env_honours_explicit_secret_override() {
         // An override wins even over the denylist: the caller chose to pass it.
         let inherited: Vec<(String, String)> = vec![];
-        let env = sanitize_env(inherited, &overrides(&[("GITHUB_TOKEN", "explicit")]));
+        let env = sanitize_env(inherited, &overrides(&[("GITHUB_TOKEN", "explicit")]), &[]);
         assert_eq!(
             env.get("GITHUB_TOKEN").map(String::as_str),
             Some("explicit")
@@ -563,6 +655,49 @@ mod tests {
         );
         std::env::remove_var("GITHUB_TOKEN");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+    }
+
+    #[tokio::test]
+    async fn child_env_excludes_unlisted_vars() {
+        // Acceptance: the child env is allowlist-based, so a non-secret var that
+        // is neither a built-in default nor policy-allowed is not inherited.
+        std::env::set_var("MX_AGENT_UNLISTED_VAR", "should_not_leak");
+        let spec = RunSpec {
+            command: vec!["env".to_string()],
+            cwd: std::env::temp_dir(),
+            env: BTreeMap::new(),
+            stdin: None,
+            ..RunSpec::default()
+        };
+        let out = run(&spec).await.expect("runs");
+        let env_dump = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !env_dump.contains("MX_AGENT_UNLISTED_VAR"),
+            "got: {env_dump}"
+        );
+        std::env::remove_var("MX_AGENT_UNLISTED_VAR");
+    }
+
+    #[tokio::test]
+    async fn child_env_includes_policy_allowed_vars() {
+        // Acceptance: policy can explicitly allow safe vars, which then reach
+        // the child even though they are not built-in defaults.
+        std::env::set_var("MX_AGENT_ALLOWED_VAR", "present");
+        let spec = RunSpec {
+            command: vec!["env".to_string()],
+            cwd: std::env::temp_dir(),
+            env: BTreeMap::new(),
+            env_allowlist: vec!["MX_AGENT_ALLOWED_VAR".to_string()],
+            stdin: None,
+            ..RunSpec::default()
+        };
+        let out = run(&spec).await.expect("runs");
+        let env_dump = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            env_dump.contains("MX_AGENT_ALLOWED_VAR=present"),
+            "got: {env_dump}"
+        );
+        std::env::remove_var("MX_AGENT_ALLOWED_VAR");
     }
 
     #[tokio::test]
