@@ -345,6 +345,16 @@ mx-agent share list \
   --limit 50
 ```
 
+Retrieve and verify a shared artifact by ID (writes the raw bytes to stdout, or
+to `--output`):
+
+```bash
+mx-agent share get \
+  --room '!abc123:matrix.org' \
+  --context-id ctx_01HZ... \
+  --output full-test-log.txt
+```
+
 Small context objects (up to 256 KiB) are inlined directly in the event,
 avoiding a media round-trip. Text payloads are stored verbatim (`encoding:
 "utf-8"`); binary payloads are base64-encoded (`encoding: "base64"`). The
@@ -365,7 +375,8 @@ avoiding a media round-trip. Text payloads are stored verbatim (`encoding:
 }
 ```
 
-Large context objects should be uploaded as Matrix media and referenced by URI:
+Large context objects (over 256 KiB) are uploaded as Matrix media and
+referenced by URI instead of inlining the bytes in the timeline:
 
 ```json
 {
@@ -380,6 +391,11 @@ Large context objects should be uploaded as Matrix media and referenced by URI:
   }
 }
 ```
+
+On retrieval (`share get`), the artifact is fetched from media (or decoded from
+the inline payload) and its SHA-256 is recomputed over the raw bytes and checked
+against `sha256`; a mismatch is rejected as an integrity failure rather than
+returned to the caller.
 
 ---
 

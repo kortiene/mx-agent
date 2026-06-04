@@ -1,24 +1,34 @@
-//! Context sharing for small payloads: `com.mxagent.context.share.v1`.
+//! Context sharing: `com.mxagent.context.share.v1`.
 //!
 //! Agents broadcast working context — a git diff, environment metadata, or an
 //! arbitrary typed blob piped on stdin — into a workspace room so peers can pick
-//! it up (see `docs/architecture.md`, section 6). This module implements the
-//! **small-payload** path: the bytes are inlined directly in the timeline event
-//! rather than uploaded as Matrix media, which keeps a single round-trip for the
-//! common case of diffs, plans, and config snippets.
+//! it up (see `docs/architecture.md`, section 6). A share travels by one of two
+//! transports, chosen by size:
 //!
-//! Inlining is bounded by [`MAX_INLINE_BYTES`]; anything larger is rejected with
-//! [`WorkspaceError::PayloadTooLarge`] and belongs on the media path (a separate
-//! roadmap phase). Text payloads are stored verbatim as UTF-8; binary payloads
-//! are base64-encoded. In both cases the [`ContextShare::sha256`] digest covers
-//! the raw bytes so a receiver can verify integrity independent of encoding.
+//! - **Small payloads** (up to [`MAX_INLINE_BYTES`]) are inlined directly in the
+//!   timeline event via [`ContextShare::data`], keeping a single round-trip for
+//!   the common case of diffs, plans, and config snippets. Text is stored
+//!   verbatim as UTF-8; binary is base64-encoded.
+//! - **Large payloads** are uploaded as Matrix media and referenced by
+//!   [`ContextShare::mxc_uri`], keeping the room timeline and the homeserver's
+//!   event store small.
+//!
+//! In both cases the [`ContextShare::sha256`] digest covers the raw bytes, so a
+//! receiver can verify integrity independent of transport and encoding.
+//! [`fetch_context`] retrieves a share's artifact — downloading the media or
+//! decoding the inline payload — and rejects any byte stream whose digest does
+//! not match with [`WorkspaceError::ContextIntegrity`].
 
 use std::process::Command;
 
 use base64::Engine as _;
 use matrix_sdk::config::SyncSettings;
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
 use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::OwnedMxcUri;
 use matrix_sdk::{Client, Room};
+use mime::Mime;
 use sha2::{Digest, Sha256};
 
 use mx_agent_protocol::events::timeline::CONTEXT_SHARE;
@@ -97,6 +107,41 @@ pub struct ListSharesOptions {
     pub limit: u32,
 }
 
+/// Default number of recent timeline events [`fetch_context`] scans when
+/// locating a share by `context_id`.
+pub const DEFAULT_FETCH_SCAN_LIMIT: u32 = 100;
+
+/// Options for [`fetch_context`].
+#[derive(Debug, Clone)]
+pub struct FetchContextOptions {
+    /// Room ID or alias to fetch the share from.
+    pub room: String,
+    /// Context ID of the share to retrieve.
+    pub context_id: String,
+    /// Maximum number of recent timeline events to scan when locating the
+    /// share.
+    pub limit: u32,
+}
+
+impl Default for FetchContextOptions {
+    fn default() -> Self {
+        Self {
+            room: String::new(),
+            context_id: String::new(),
+            limit: DEFAULT_FETCH_SCAN_LIMIT,
+        }
+    }
+}
+
+/// A context artifact retrieved and verified by [`fetch_context`].
+#[derive(Debug, Clone)]
+pub struct FetchedContext {
+    /// The share metadata as published in the room.
+    pub share: ContextShare,
+    /// The raw artifact bytes, verified against [`ContextShare::sha256`].
+    pub data: Vec<u8>,
+}
+
 /// Encode payload bytes as UTF-8 text when valid, otherwise base64.
 ///
 /// Returns the encoding label (`utf-8` or `base64`) and the encoded string.
@@ -110,6 +155,14 @@ fn encode_payload(data: &[u8]) -> (&'static str, String) {
     }
 }
 
+/// Base64-encode the SHA-256 digest of `data`.
+///
+/// This is the canonical form stored in [`ContextShare::sha256`]: it always
+/// covers the raw (decoded) bytes, independent of the transport encoding.
+fn sha256_b64(data: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data))
+}
+
 /// Build the `com.mxagent.context.share.v1` content for an inlined payload.
 ///
 /// The SHA-256 digest is computed over the raw `data`, independent of the
@@ -120,14 +173,13 @@ fn build_inline_share(
     mime_type: String,
     data: &[u8],
 ) -> ContextShare {
-    let sha256 = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data));
     let (encoding, payload) = encode_payload(data);
     ContextShare {
         context_id,
         name,
         mime_type,
         size_bytes: data.len() as u64,
-        sha256,
+        sha256: sha256_b64(data),
         data: Some(payload),
         encoding: Some(encoding.to_string()),
         mxc_uri: None,
@@ -135,15 +187,128 @@ fn build_inline_share(
     }
 }
 
-/// Reject a payload that is too large to inline (architecture §6).
-fn check_inline_size(len: usize) -> Result<(), WorkspaceError> {
-    if len > MAX_INLINE_BYTES {
-        Err(WorkspaceError::PayloadTooLarge {
-            size: len,
-            max: MAX_INLINE_BYTES,
-        })
+/// Build the `com.mxagent.context.share.v1` content for a media-backed payload.
+///
+/// The raw bytes live in Matrix media at `mxc_uri`; the event carries only the
+/// reference plus the size and digest, with no inline `data`/`encoding`.
+fn build_media_share(
+    context_id: String,
+    name: String,
+    mime_type: String,
+    size_bytes: u64,
+    sha256: String,
+    mxc_uri: String,
+) -> ContextShare {
+    ContextShare {
+        context_id,
+        name,
+        mime_type,
+        size_bytes,
+        sha256,
+        data: None,
+        encoding: None,
+        mxc_uri: Some(mxc_uri),
+        extra: Default::default(),
+    }
+}
+
+/// Parse `mime_type`, falling back to `application/octet-stream` when it is not
+/// a valid MIME string so a share never fails purely on a malformed label.
+fn parse_mime(mime_type: &str) -> Mime {
+    mime_type.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM)
+}
+
+/// Upload `data` as Matrix media and build a media-backed [`ContextShare`].
+async fn upload_media_share(
+    client: &Client,
+    context_id: String,
+    name: String,
+    mime_type: String,
+    data: &[u8],
+) -> Result<ContextShare, WorkspaceError> {
+    let sha256 = sha256_b64(data);
+    let size_bytes = data.len() as u64;
+    let mime = parse_mime(&mime_type);
+    let response = client
+        .media()
+        .upload(&mime, data.to_vec(), None)
+        .await
+        .map_err(WorkspaceError::from)?;
+    Ok(build_media_share(
+        context_id,
+        name,
+        mime_type,
+        size_bytes,
+        sha256,
+        response.content_uri.to_string(),
+    ))
+}
+
+/// Parse and validate an `mxc://` URI recorded on a share.
+fn parse_mxc(uri: &str) -> Result<OwnedMxcUri, WorkspaceError> {
+    let parsed = OwnedMxcUri::from(uri);
+    if parsed.is_valid() {
+        Ok(parsed)
     } else {
+        Err(WorkspaceError::ContextRetrievalFailed(format!(
+            "{uri:?} is not a valid mxc:// URI"
+        )))
+    }
+}
+
+/// Download the raw bytes of a media-backed share from `mxc_uri`.
+async fn download_media(client: &Client, mxc_uri: &str) -> Result<Vec<u8>, WorkspaceError> {
+    let request = MediaRequestParameters {
+        source: MediaSource::Plain(parse_mxc(mxc_uri)?),
+        format: MediaFormat::File,
+    };
+    client
+        .media()
+        .get_media_content(&request, false)
+        .await
+        .map_err(WorkspaceError::from)
+}
+
+/// Decode an inline share's [`data`](ContextShare::data) back into raw bytes,
+/// reversing the [`encoding`](ContextShare::encoding) chosen by
+/// [`encode_payload`].
+fn decode_inline(share: &ContextShare) -> Result<Vec<u8>, WorkspaceError> {
+    let data = share.data.as_deref().ok_or_else(|| {
+        WorkspaceError::ContextRetrievalFailed(format!(
+            "share {:?} has neither inline data nor an mxc:// reference",
+            share.context_id
+        ))
+    })?;
+    match share.encoding.as_deref() {
+        Some("base64") => base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| {
+                WorkspaceError::ContextRetrievalFailed(format!("invalid base64 payload: {e}"))
+            }),
+        // Text payloads are stored verbatim; a missing encoding is treated as
+        // UTF-8 for forward compatibility.
+        Some("utf-8") | None => Ok(data.as_bytes().to_vec()),
+        Some(other) => Err(WorkspaceError::ContextRetrievalFailed(format!(
+            "unknown payload encoding {other:?}"
+        ))),
+    }
+}
+
+/// Verify that `data` hashes to the digest recorded on `share`.
+///
+/// Returns [`WorkspaceError::ContextIntegrity`] on any mismatch so a corrupt or
+/// tampered artifact is rejected rather than silently accepted (architecture
+/// §6).
+fn verify_digest(share: &ContextShare, data: &[u8]) -> Result<(), WorkspaceError> {
+    let actual = sha256_b64(data);
+    if actual == share.sha256 {
         Ok(())
+    } else {
+        Err(WorkspaceError::ContextIntegrity {
+            context_id: share.context_id.clone(),
+            expected: share.sha256.clone(),
+            actual,
+        })
     }
 }
 
@@ -255,22 +420,33 @@ async fn publish_context_share(room: &Room, content: &ContextShare) -> Result<()
 
 /// Share an arbitrary typed payload into a workspace room.
 ///
-/// The payload is inlined in the event; payloads larger than
-/// [`MAX_INLINE_BYTES`] are rejected with [`WorkspaceError::PayloadTooLarge`].
-/// Returns the published [`ContextShare`] (including its generated
-/// `context_id`).
+/// Payloads up to [`MAX_INLINE_BYTES`] are inlined directly in the event; larger
+/// payloads are uploaded as Matrix media and referenced by `mxc_uri` instead of
+/// bloating the timeline (architecture §6). Returns the published
+/// [`ContextShare`] (including its generated `context_id`).
 pub async fn share_context(
     client: &Client,
     options: &ShareContextOptions,
 ) -> Result<ContextShare, WorkspaceError> {
-    check_inline_size(options.data.len())?;
     let room = sync_and_get_room(client, &options.room).await?;
-    let content = build_inline_share(
-        generate_context_id(),
-        options.name.clone(),
-        options.mime_type.clone(),
-        &options.data,
-    );
+    let context_id = generate_context_id();
+    let content = if options.data.len() > MAX_INLINE_BYTES {
+        upload_media_share(
+            client,
+            context_id,
+            options.name.clone(),
+            options.mime_type.clone(),
+            &options.data,
+        )
+        .await?
+    } else {
+        build_inline_share(
+            context_id,
+            options.name.clone(),
+            options.mime_type.clone(),
+            &options.data,
+        )
+    };
     publish_context_share(&room, &content).await?;
     Ok(content)
 }
@@ -339,6 +515,39 @@ pub async fn list_context_shares(
     Ok(shares)
 }
 
+/// Retrieve and verify a single context artifact from a workspace room.
+///
+/// Locates the share with `options.context_id` among the recent timeline events,
+/// retrieves its bytes — downloading the Matrix media for a large share or
+/// decoding the inline payload for a small one — and verifies them against the
+/// share's [`sha256`](ContextShare::sha256). A digest mismatch is reported as
+/// [`WorkspaceError::ContextIntegrity`]; an unknown ID as
+/// [`WorkspaceError::ContextNotFound`].
+pub async fn fetch_context(
+    client: &Client,
+    options: &FetchContextOptions,
+) -> Result<FetchedContext, WorkspaceError> {
+    let shares = list_context_shares(
+        client,
+        &ListSharesOptions {
+            room: options.room.clone(),
+            limit: options.limit,
+        },
+    )
+    .await?;
+    let share = shares
+        .into_iter()
+        .find(|s| s.context_id == options.context_id)
+        .ok_or_else(|| WorkspaceError::ContextNotFound(options.context_id.clone()))?;
+
+    let data = match &share.mxc_uri {
+        Some(mxc_uri) => download_media(client, mxc_uri).await?,
+        None => decode_inline(&share)?,
+    };
+    verify_digest(&share, &data)?;
+    Ok(FetchedContext { share, data })
+}
+
 /// Share a typed payload, restoring the authenticated client from `session`.
 pub async fn share_context_for_session(
     session: &StoredSession,
@@ -375,6 +584,16 @@ pub async fn list_context_shares_for_session(
 ) -> Result<Vec<ContextShare>, WorkspaceError> {
     let client = restore_client(session).await?;
     list_context_shares(&client, options).await
+}
+
+/// Fetch and verify a context artifact, restoring the authenticated client from
+/// `session`.
+pub async fn fetch_context_for_session(
+    session: &StoredSession,
+    options: &FetchContextOptions,
+) -> Result<FetchedContext, WorkspaceError> {
+    let client = restore_client(session).await?;
+    fetch_context(&client, options).await
 }
 
 #[cfg(test)]
@@ -423,17 +642,117 @@ mod tests {
     }
 
     #[test]
-    fn oversize_payload_is_rejected() {
-        // Exactly at the limit is allowed; one byte over is not.
-        assert!(check_inline_size(MAX_INLINE_BYTES).is_ok());
-        let err = check_inline_size(MAX_INLINE_BYTES + 1)
-            .expect_err("a payload over the limit must be rejected");
+    fn media_share_records_reference_size_and_digest() {
+        let data = vec![0u8; MAX_INLINE_BYTES + 1];
+        let share = build_media_share(
+            "ctx_big".to_string(),
+            "full-log.txt".to_string(),
+            "text/plain".to_string(),
+            data.len() as u64,
+            sha256_b64(&data),
+            "mxc://matrix.org/abcdef".to_string(),
+        );
+        assert_eq!(share.context_id, "ctx_big");
+        assert_eq!(share.name, "full-log.txt");
+        assert_eq!(share.size_bytes, data.len() as u64);
+        assert_eq!(share.mxc_uri.as_deref(), Some("mxc://matrix.org/abcdef"));
+        // Media-backed shares carry no inline payload.
+        assert!(share.data.is_none());
+        assert!(share.encoding.is_none());
+        assert_eq!(share.sha256, sha256_b64(&data));
+    }
+
+    #[test]
+    fn parse_mime_falls_back_on_garbage() {
+        assert_eq!(parse_mime("text/plain"), mime::TEXT_PLAIN);
+        assert_eq!(parse_mime("not a mime"), mime::APPLICATION_OCTET_STREAM);
+    }
+
+    #[test]
+    fn parse_mxc_validates_uri() {
+        assert!(parse_mxc("mxc://matrix.org/abcdef").is_ok());
+        let err =
+            parse_mxc("https://example.org/not-mxc").expect_err("a non-mxc URI must be rejected");
+        assert!(matches!(err, WorkspaceError::ContextRetrievalFailed(_)));
+    }
+
+    #[test]
+    fn decode_inline_reverses_both_encodings() {
+        let utf8 = build_inline_share(
+            "c".to_string(),
+            "n".to_string(),
+            "text/plain".to_string(),
+            b"hello",
+        );
+        assert_eq!(decode_inline(&utf8).expect("utf-8 decodes"), b"hello");
+
+        let binary = build_inline_share(
+            "c".to_string(),
+            "n".to_string(),
+            "application/octet-stream".to_string(),
+            &[0xff, 0x00, 0x10],
+        );
+        assert_eq!(
+            decode_inline(&binary).expect("base64 decodes"),
+            vec![0xff, 0x00, 0x10]
+        );
+    }
+
+    #[test]
+    fn decode_inline_rejects_unknown_encoding() {
+        let mut share = build_inline_share(
+            "c".to_string(),
+            "n".to_string(),
+            "text/plain".to_string(),
+            b"hello",
+        );
+        share.encoding = Some("rot13".to_string());
+        assert!(matches!(
+            decode_inline(&share),
+            Err(WorkspaceError::ContextRetrievalFailed(_))
+        ));
+    }
+
+    #[test]
+    fn verify_digest_accepts_matching_bytes() {
+        let data = b"verify me";
+        let share = build_media_share(
+            "ctx".to_string(),
+            "n".to_string(),
+            "text/plain".to_string(),
+            data.len() as u64,
+            sha256_b64(data),
+            "mxc://matrix.org/id".to_string(),
+        );
+        verify_digest(&share, data).expect("matching digest must pass");
+    }
+
+    #[test]
+    fn verify_digest_detects_sha256_mismatch() {
+        // A share that advertises the digest of one payload but is handed a
+        // different (corrupt/tampered) byte stream must be rejected.
+        let share = build_media_share(
+            "ctx_tampered".to_string(),
+            "n".to_string(),
+            "text/plain".to_string(),
+            9,
+            sha256_b64(b"the original"),
+            "mxc://matrix.org/id".to_string(),
+        );
+        let err =
+            verify_digest(&share, b"tampered!").expect_err("a digest mismatch must be detected");
         match err {
-            WorkspaceError::PayloadTooLarge { size, max } => {
-                assert_eq!(size, MAX_INLINE_BYTES + 1);
-                assert_eq!(max, MAX_INLINE_BYTES);
+            WorkspaceError::ContextIntegrity {
+                context_id,
+                expected,
+                actual,
+            } => {
+                assert_eq!(context_id, "ctx_tampered");
+                assert_eq!(expected, sha256_b64(b"the original"));
+                assert_eq!(actual, sha256_b64(b"tampered!"));
+                assert_ne!(expected, actual);
             }
-            other => panic!("expected PayloadTooLarge, got {other:?}"),
+            other => panic!("expected ContextIntegrity, got {other:?}"),
         }
     }
 
