@@ -39,10 +39,11 @@ pub use call::{
     rejection_response, send_call_request, success_response, CallRejection,
 };
 pub use context::{
-    list_context_shares, list_context_shares_for_session, share_context, share_context_for_session,
-    share_diff, share_diff_for_session, share_env, share_env_for_session, ListSharesOptions,
-    ShareContextOptions, ShareDiffOptions, ShareEnvOptions, DEFAULT_ENV_INCLUDE, DIFF_MIME_TYPE,
-    ENV_MIME_TYPE, MAX_INLINE_BYTES,
+    fetch_context, fetch_context_for_session, list_context_shares, list_context_shares_for_session,
+    share_context, share_context_for_session, share_diff, share_diff_for_session, share_env,
+    share_env_for_session, FetchContextOptions, FetchedContext, ListSharesOptions,
+    ShareContextOptions, ShareDiffOptions, ShareEnvOptions, DEFAULT_ENV_INCLUDE,
+    DEFAULT_FETCH_SCAN_LIMIT, DIFF_MIME_TYPE, ENV_MIME_TYPE, MAX_INLINE_BYTES,
 };
 pub use exec::{
     authorize_exec_request, build_signed_exec_request, emit_exec_accepted, emit_exec_rejected,

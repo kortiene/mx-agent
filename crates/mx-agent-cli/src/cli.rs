@@ -326,6 +326,8 @@ enum ShareCommand {
     Env(ShareEnvArgs),
     /// List recently shared context in a room.
     List(ShareListArgs),
+    /// Retrieve and verify a shared context artifact by ID.
+    Get(ShareGetArgs),
 }
 
 /// Diff output format for `share diff`.
@@ -385,6 +387,22 @@ struct ShareListArgs {
     room: String,
     /// Maximum number of recent timeline events to scan.
     #[arg(long, value_name = "N", default_value_t = 50)]
+    limit: u32,
+}
+
+#[derive(Debug, Args)]
+struct ShareGetArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Context ID of the share to retrieve, e.g. `ctx_01HZ...`.
+    #[arg(long = "context-id", value_name = "CONTEXT_ID")]
+    context_id: String,
+    /// Write the verified artifact to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Maximum number of recent timeline events to scan when locating the share.
+    #[arg(long, value_name = "N", default_value_t = 100)]
     limit: u32,
 }
 
@@ -1759,6 +1777,7 @@ fn handle_share(global: &GlobalArgs, cmd: &ShareCommand) -> ExitCode {
         ShareCommand::Diff(args) => share_diff(global, args),
         ShareCommand::Env(args) => share_env(global, args),
         ShareCommand::List(args) => share_list(global, args),
+        ShareCommand::Get(args) => share_get(global, args),
     }
 }
 
@@ -1929,6 +1948,86 @@ fn share_list(global: &GlobalArgs, args: &ShareListArgs) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("mx-agent: could not list shared context: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// Write a verified artifact to `--output` or stdout.
+///
+/// The artifact is emitted raw (binary-safe); the share's metadata goes to
+/// stderr (or stdout as JSON under `--json`) so it never corrupts the payload
+/// stream when piped.
+fn emit_fetched_context(
+    global: &GlobalArgs,
+    fetched: &mx_agent_daemon::FetchedContext,
+    output: Option<&PathBuf>,
+) -> ExitCode {
+    use std::io::Write as _;
+    match output {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &fetched.data) {
+                eprintln!("mx-agent: could not write {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&fetched.share).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                eprintln!(
+                    "mx-agent: verified {} ({} bytes) -> {}",
+                    fetched.share.context_id,
+                    fetched.data.len(),
+                    path.display()
+                );
+            }
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            if let Err(e) = handle.write_all(&fetched.data) {
+                eprintln!("mx-agent: could not write artifact to stdout: {e}");
+                return ExitCode::FAILURE;
+            }
+            if global.json {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string(&fetched.share).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                eprintln!(
+                    "mx-agent: verified {} ({} bytes)",
+                    fetched.share.context_id,
+                    fetched.data.len()
+                );
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn share_get(global: &GlobalArgs, args: &ShareGetArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::FetchContextOptions {
+        room: args.room.clone(),
+        context_id: args.context_id.clone(),
+        limit: args.limit,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::fetch_context_for_session(&session, &options).await {
+            Ok(fetched) => emit_fetched_context(global, &fetched, args.output.as_ref()),
+            Err(e) => {
+                eprintln!("mx-agent: could not get shared context: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -2222,6 +2321,7 @@ fn command_path(command: &Command) -> String {
                 ShareCommand::Diff(_) => "diff",
                 ShareCommand::Env(_) => "env",
                 ShareCommand::List(_) => "list",
+                ShareCommand::Get(_) => "get",
             }
         ),
         Command::Task(c) => format!(

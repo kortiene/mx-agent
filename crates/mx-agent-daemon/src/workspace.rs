@@ -202,14 +202,21 @@ pub enum WorkspaceError {
     },
     /// No invocation with the requested ID exists in the room.
     InvocationNotFound(String),
-    /// A context payload exceeds the inline-share size limit and must be
-    /// uploaded as Matrix media instead (architecture §6).
-    PayloadTooLarge {
-        /// Size of the rejected payload in bytes.
-        size: usize,
-        /// Maximum inline payload size in bytes.
-        max: usize,
+    /// No context share with the requested ID exists in the room.
+    ContextNotFound(String),
+    /// A retrieved context artifact did not match the digest recorded on its
+    /// share, so the bytes are corrupt or tampered with (architecture §6).
+    ContextIntegrity {
+        /// Context ID of the artifact that failed verification.
+        context_id: String,
+        /// Base64 SHA-256 digest the share claimed.
+        expected: String,
+        /// Base64 SHA-256 digest actually computed over the retrieved bytes.
+        actual: String,
     },
+    /// A context share could not be decoded back into its raw bytes (malformed
+    /// inline payload, unknown encoding, or invalid `mxc://` URI).
+    ContextRetrievalFailed(String),
     /// Capturing local context (a git diff or environment metadata) failed.
     ContextCaptureFailed(String),
     /// Restoring the authenticated Matrix client from the session failed.
@@ -253,11 +260,21 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::InvocationNotFound(value) => {
                 write!(f, "invocation {value:?} was not found in the room")
             }
-            WorkspaceError::PayloadTooLarge { size, max } => write!(
+            WorkspaceError::ContextNotFound(value) => {
+                write!(f, "context share {value:?} was not found in the room")
+            }
+            WorkspaceError::ContextIntegrity {
+                context_id,
+                expected,
+                actual,
+            } => write!(
                 f,
-                "context payload is {size} bytes, which exceeds the {max}-byte \
-                 inline-share limit; upload it as Matrix media instead"
+                "context {context_id:?} failed integrity check: expected sha256 \
+                 {expected} but retrieved bytes hash to {actual}"
             ),
+            WorkspaceError::ContextRetrievalFailed(value) => {
+                write!(f, "could not retrieve context: {value}")
+            }
             WorkspaceError::ContextCaptureFailed(value) => {
                 write!(f, "could not capture context: {value}")
             }

@@ -1795,6 +1795,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "matrix-sdk",
+ "mime",
  "mx-agent-ipc",
  "mx-agent-policy",
  "mx-agent-protocol",
