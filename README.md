@@ -226,10 +226,10 @@ sh scripts/install-wiki-hook.sh
 
 ## Contributing
 
-Issues and pull requests are welcome. Before opening a PR, run the CI checks locally
-(`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
-`cargo test --all`). See [GitHub management](docs/github-management.md) for process and
-the [issue backlog](docs/github-issue-backlog.md) for where help is needed.
+Issues and pull requests are welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for
+setup, the required checks (`cargo fmt --check`, `cargo clippy --all-targets
+--all-features -- -D warnings`, `cargo test --all`), and PR guidelines. The
+[issue backlog](docs/github-issue-backlog.md) tracks where help is needed.
 
 ## License
 
