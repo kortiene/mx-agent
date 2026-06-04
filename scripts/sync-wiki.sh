@@ -36,7 +36,10 @@ PUSH_SHA=""
 if [ "${1:-}" = "--force" ]; then
 	PUSH_SHA=$(git rev-parse HEAD)
 else
-	# pre-push stdin lines: <local ref> <local sha> <remote ref> <remote sha>
+	# pre-push stdin lines: <local ref> <local sha> <remote ref> <remote sha>.
+	# All four fields must be named to consume the line; local_ref/remote_sha
+	# are part of git's protocol but unused here.
+	# shellcheck disable=SC2034
 	while read -r local_ref local_sha remote_ref remote_sha; do
 		case "$remote_ref" in
 		refs/heads/main) PUSH_SHA="$local_sha" ;;
