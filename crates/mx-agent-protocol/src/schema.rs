@@ -220,6 +220,32 @@ pub struct StreamArtifact {
     pub extra: Extra,
 }
 
+/// `com.mxagent.pty.resize.v1` content (architecture §7.1, §8.3).
+///
+/// Sent from the requesting side to the executing agent whenever the local
+/// terminal's window size changes, so the remote PTY is resized to match and
+/// full-screen programs (editors, pagers) re-render at the new dimensions. The
+/// pixel dimensions are advisory: they are `0` when the local terminal does not
+/// report them, and most consumers only need `rows`/`cols`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyResize {
+    /// Invocation identifier the resize applies to.
+    pub invocation_id: String,
+    /// New height in character rows.
+    pub rows: u16,
+    /// New width in character columns.
+    pub cols: u16,
+    /// New width in pixels, or `0` when unknown.
+    #[serde(default)]
+    pub pixel_width: u16,
+    /// New height in pixels, or `0` when unknown.
+    #[serde(default)]
+    pub pixel_height: u16,
+    /// Forward-compatible unknown fields.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// `com.mxagent.context.share.v1` content (architecture §6/7.1).
 ///
 /// A context object is carried in one of two ways. **Small payloads** are
@@ -632,6 +658,33 @@ mod tests {
             "truncated": false,
             "artifact_mxc": null
         }));
+    }
+
+    #[test]
+    fn pty_resize_round_trips() {
+        assert_round_trip::<PtyResize>(json!({
+            "invocation_id": "inv_01HZ",
+            "rows": 40,
+            "cols": 120,
+            "pixel_width": 960,
+            "pixel_height": 640
+        }));
+    }
+
+    #[test]
+    fn pty_resize_defaults_pixels_when_absent() {
+        // A minimal producer may omit the advisory pixel dimensions; they
+        // default to zero rather than failing to deserialize.
+        let parsed: PtyResize = serde_json::from_value(json!({
+            "invocation_id": "inv_01HZ",
+            "rows": 24,
+            "cols": 80
+        }))
+        .expect("deserialization failed");
+        assert_eq!(parsed.rows, 24);
+        assert_eq!(parsed.cols, 80);
+        assert_eq!(parsed.pixel_width, 0);
+        assert_eq!(parsed.pixel_height, 0);
     }
 
     #[test]

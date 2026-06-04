@@ -16,6 +16,8 @@ pub mod heartbeat;
 pub mod invocation;
 pub mod lifecycle;
 pub mod matrix;
+#[cfg(unix)]
+pub mod pty;
 pub mod replay;
 pub mod runner;
 pub mod session;
@@ -83,6 +85,8 @@ pub use matrix::{
     build_client, login_password, restore_client, ClientError, ConfigError, LoginError,
     MatrixConfig,
 };
+#[cfg(unix)]
+pub use pty::{PtySession, PtyWinsize};
 pub use replay::{ReplayCache, ReplayError, DEFAULT_CAPACITY};
 pub use runner::{
     is_secret_var, kill_process_group, run, sanitize_env, terminate_process_group, RunError,

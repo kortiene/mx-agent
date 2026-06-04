@@ -3224,6 +3224,15 @@ fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
         },
     };
 
+    // Interactive PTY mode takes a dedicated, synchronous path: it allocates a
+    // pseudo-terminal on the (loopback) remote, mirrors the local terminal's raw
+    // mode and window size, and forwards keystrokes and resize events live
+    // (architecture §7.3, §8.3). The chunk/finished framing used by the
+    // non-interactive path does not apply: a PTY is a single live byte stream.
+    if args.pty {
+        return cmd_exec_pty(&args.command, cwd);
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -3310,6 +3319,226 @@ fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
     }
 }
 
+/// Run a command on the (loopback) remote agent under an interactive
+/// pseudo-terminal, wiring it to the local terminal.
+///
+/// Allocates a remote PTY for the command, puts the local terminal into raw mode
+/// so keystrokes pass straight through, forwards the program's merged output
+/// back to the local terminal, and propagates `SIGWINCH` window-size changes to
+/// the remote PTY. Returns the command's exit code (architecture §5.3, §7.3).
+#[cfg(unix)]
+fn cmd_exec_pty(command: &[String], cwd: PathBuf) -> ExitCode {
+    use mx_agent_daemon::{PtySession, RunError, RunSpec};
+
+    let spec = RunSpec {
+        command: command.to_vec(),
+        cwd,
+        ..Default::default()
+    };
+
+    // Match the remote PTY to the local terminal up front; fall back to the
+    // conventional 24×80 when there is no local terminal (e.g. piped stdin).
+    let initial = local_winsize().unwrap_or_default();
+
+    let mut session = match PtySession::spawn(&spec, initial) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("mx-agent: exec --pty failed: {e}");
+            return match e {
+                RunError::MissingCwd(_) => ExitCode::from(127),
+                RunError::Spawn(ref io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    ExitCode::from(127)
+                }
+                RunError::EmptyCommand => ExitCode::from(64),
+                RunError::Spawn(_) => ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE),
+            };
+        }
+    };
+
+    // Raw mode for the session: input bytes (arrow keys, control characters)
+    // reach the remote PTY unmodified. A no-op when stdin is not a terminal;
+    // restored on drop.
+    let raw = RawModeGuard::activate();
+
+    // Pump the merged PTY output to the local terminal on a dedicated thread so
+    // the child never blocks on a full PTY buffer.
+    let output = match session.try_clone_reader() {
+        Ok(reader) => Some(std::thread::spawn(move || pump_pty_output(reader))),
+        Err(e) => {
+            eprintln!("mx-agent: could not read pty output: {e}");
+            None
+        }
+    };
+
+    // Forward local stdin to the PTY on a detached thread. It blocks reading the
+    // terminal; when the command exits we stop waiting on it and process
+    // teardown reclaims it (a blocking tty read has no clean interruption).
+    if let Ok(writer) = session.try_clone_writer() {
+        std::thread::spawn(move || pump_stdin(writer));
+    }
+
+    // Propagate window-size changes: on each SIGWINCH resize the remote PTY to
+    // the new local size. Detached for the session's lifetime.
+    if let Ok(resize_fd) = session.try_clone_writer() {
+        std::thread::spawn(move || forward_resizes(resize_fd));
+    }
+
+    let status = session.wait();
+
+    // Drain remaining output before restoring the terminal.
+    if let Some(output) = output {
+        let _ = output.join();
+    }
+    drop(raw);
+
+    match status {
+        Ok(status) => ExitCode::from(exit_code_from_status(&status)),
+        Err(e) => {
+            eprintln!("mx-agent: exec --pty failed waiting for command: {e}");
+            ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
+        }
+    }
+}
+
+/// `--pty` is a Unix-only feature; report cleanly elsewhere.
+#[cfg(not(unix))]
+fn cmd_exec_pty(_command: &[String], _cwd: PathBuf) -> ExitCode {
+    eprintln!("mx-agent: --pty is only supported on Unix platforms");
+    ExitCode::from(64)
+}
+
+/// Copy the PTY's merged output to the local stdout until end-of-stream.
+#[cfg(unix)]
+fn pump_pty_output(mut reader: std::fs::File) {
+    use std::io::{Read as _, Write as _};
+
+    let mut buf = [0u8; 8192];
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.write_all(&buf[..n]).is_err() || out.flush().is_err() {
+                    break;
+                }
+            }
+            // A PTY master reports EIO (not EOF) once the slave is gone; treat
+            // any read error as end-of-stream.
+            Err(_) => break,
+        }
+    }
+}
+
+/// Copy local stdin to the PTY until end-of-input.
+#[cfg(unix)]
+fn pump_stdin(mut writer: std::fs::File) {
+    use std::io::{Read as _, Write as _};
+
+    let mut buf = [0u8; 8192];
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    loop {
+        match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if writer.write_all(&buf[..n]).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Resize the remote PTY whenever the local terminal's window size changes.
+#[cfg(unix)]
+fn forward_resizes(resize_fd: std::fs::File) {
+    use signal_hook::consts::SIGWINCH;
+    use signal_hook::iterator::Signals;
+
+    let mut signals = match Signals::new([SIGWINCH]) {
+        Ok(signals) => signals,
+        Err(_) => return,
+    };
+    for _ in signals.forever() {
+        if let Some(size) = local_winsize() {
+            let _ = rustix::termios::tcsetwinsize(&resize_fd, size.into());
+        }
+    }
+}
+
+/// The local terminal's current window size, if stdin or stdout is a terminal.
+#[cfg(unix)]
+fn local_winsize() -> Option<mx_agent_daemon::PtyWinsize> {
+    use rustix::termios::{isatty, tcgetwinsize};
+
+    let stdin = std::io::stdin();
+    if isatty(&stdin) {
+        if let Ok(ws) = tcgetwinsize(&stdin) {
+            return Some(ws.into());
+        }
+    }
+    let stdout = std::io::stdout();
+    if isatty(&stdout) {
+        if let Ok(ws) = tcgetwinsize(&stdout) {
+            return Some(ws.into());
+        }
+    }
+    None
+}
+
+/// Map a finished command's [`ExitStatus`] to a local exit code, reporting
+/// signal death as `128 + signum` (architecture §5.3).
+#[cfg(unix)]
+fn exit_code_from_status(status: &std::process::ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    if let Some(code) = status.code() {
+        return u8::try_from(code).unwrap_or(1);
+    }
+    if let Some(sig) = status.signal() {
+        return u8::try_from(128 + sig).unwrap_or(crate::stream::EXIT_PROTOCOL_FAILURE);
+    }
+    crate::stream::EXIT_PROTOCOL_FAILURE
+}
+
+/// Restores the local terminal's original line settings when dropped.
+#[cfg(unix)]
+struct RawModeGuard {
+    original: rustix::termios::Termios,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    /// Put the local terminal (stdin) into raw mode, returning a guard that
+    /// restores it on drop. `None` when stdin is not a terminal or the mode
+    /// could not be changed, in which case input is left as-is.
+    fn activate() -> Option<RawModeGuard> {
+        use rustix::termios::{isatty, tcgetattr, tcsetattr, OptionalActions};
+
+        let stdin = std::io::stdin();
+        if !isatty(&stdin) {
+            return None;
+        }
+        let original = tcgetattr(&stdin).ok()?;
+        let mut raw = original.clone();
+        raw.make_raw();
+        tcsetattr(&stdin, OptionalActions::Flush, &raw).ok()?;
+        Some(RawModeGuard { original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        use rustix::termios::{tcsetattr, OptionalActions};
+
+        let stdin = std::io::stdin();
+        let _ = tcsetattr(&stdin, OptionalActions::Flush, &self.original);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3381,6 +3610,19 @@ mod tests {
                 assert_eq!(args.args, vec!["package=api".to_string()]);
             }
             other => panic!("expected call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_parses_pty_and_command() {
+        let cli =
+            Cli::try_parse_from(["mx-agent", "exec", "--pty", "--", "bash"]).expect("parse exec");
+        match cli.command {
+            Command::Exec(args) => {
+                assert!(args.pty, "expected --pty to set the pty flag");
+                assert_eq!(args.command, vec!["bash".to_string()]);
+            }
+            other => panic!("expected exec, got {other:?}"),
         }
     }
 
