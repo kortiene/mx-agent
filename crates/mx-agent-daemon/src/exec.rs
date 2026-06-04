@@ -34,7 +34,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use matrix_sdk::Room;
 use serde_json::Value;
 
-use mx_agent_policy::{DenyReason, ExecContext, Policy};
+use mx_agent_policy::{Allowance, DenyReason, ExecContext, Policy};
 use mx_agent_protocol::events::state::INVOCATION;
 use mx_agent_protocol::events::timeline::{
     EXEC_ACCEPTED, EXEC_CANCEL, EXEC_CANCELLED, EXEC_REJECTED, EXEC_REQUEST,
@@ -263,6 +263,34 @@ pub fn authorize_exec_request(
     requesting_agent: &str,
     local_agent: &str,
 ) -> Result<ExecRequest, ExecRejection> {
+    authorize_exec_request_with_allowance(
+        content,
+        verifying_key,
+        trust,
+        policy,
+        room_id,
+        requesting_agent,
+        local_agent,
+    )
+    .map(|(request, _allowance)| request)
+}
+
+/// Like [`authorize_exec_request`] but also returns the resolved [`Allowance`].
+///
+/// The allowance carries the limits the runner must enforce — including the
+/// `requires_approval` flag the caller consults (via
+/// [`crate::approval::disposition_for_exec`]) to decide whether the request may
+/// run immediately or must be queued for approval. Authorizing a request never
+/// spawns a process.
+pub fn authorize_exec_request_with_allowance(
+    content: &Value,
+    verifying_key: &VerifyingKey,
+    trust: &TrustStore,
+    policy: &Policy,
+    room_id: &str,
+    requesting_agent: &str,
+    local_agent: &str,
+) -> Result<(ExecRequest, Allowance), ExecRejection> {
     // 1. Signature must be present and valid.
     let signature = read_signature(content)?.ok_or(ExecRejection::Unsigned)?;
     signing::verify(verifying_key, content).map_err(|e| match e {
@@ -295,11 +323,12 @@ pub fn authorize_exec_request(
         command: &request.command,
         cwd: &request.cwd,
     });
-    if let Some(reason) = outcome.deny_reason() {
-        return Err(ExecRejection::PolicyDenied(reason));
+    match outcome.allowance() {
+        Some(allowance) => Ok((request, allowance.clone())),
+        None => Err(ExecRejection::PolicyDenied(
+            outcome.deny_reason().expect("denied outcome has a reason"),
+        )),
     }
-
-    Ok(request)
 }
 
 /// Build a `com.mxagent.invocation.v1` state record for an authorized request.
