@@ -2,6 +2,8 @@
 
 `mx-agent` is intended to broker remote execution between autonomous agents. Security reports are taken seriously.
 
+For configuring `mx-agent` safely — token isolation, trust bootstrap, policy examples, sandbox configuration, and audit logging, with the safe defaults and unsafe options for each — see the [security hardening guide](docs/security-hardening.md).
+
 ## Reporting a Vulnerability
 
 Please do not open a public issue for suspected vulnerabilities. Use GitHub private vulnerability reporting for this repository:
