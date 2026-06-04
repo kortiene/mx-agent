@@ -46,17 +46,19 @@ pub use context::{
     DEFAULT_FETCH_SCAN_LIMIT, DIFF_MIME_TYPE, ENV_MIME_TYPE, MAX_INLINE_BYTES,
 };
 pub use exec::{
-    authorize_exec_request, build_signed_exec_request, emit_exec_accepted, emit_exec_rejected,
-    invocation_state_for, publish_invocation_state, send_exec_request, ExecRejection,
-    ExecRequestOptions,
+    authorize_exec_cancel, authorize_exec_request, build_signed_exec_cancel,
+    build_signed_exec_request, emit_exec_accepted, emit_exec_cancelled, emit_exec_rejected,
+    invocation_state_for, publish_invocation_state, send_exec_cancel, send_exec_request,
+    CancelRejection, ExecRejection, ExecRequestOptions,
 };
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
     DEFAULT_OFFLINE_AFTER, DEFAULT_STALE_AFTER, DEFAULT_STATE_REFRESH,
 };
 pub use invocation::{
-    advance_invocation, advance_invocation_for_session, get_invocation, get_invocation_for_session,
-    is_terminal, list_invocations, list_invocations_for_session, terminal_state_for_exit,
+    advance_invocation, advance_invocation_for_session, cancel_invocation,
+    cancel_invocation_for_session, get_invocation, get_invocation_for_session, is_terminal,
+    list_invocations, list_invocations_for_session, terminal_state_for_exit,
     ListInvocationsOptions,
 };
 pub use lifecycle::{
@@ -68,7 +70,8 @@ pub use matrix::{
 };
 pub use replay::{ReplayCache, ReplayError, DEFAULT_CAPACITY};
 pub use runner::{
-    is_secret_var, run, sanitize_env, RunError, RunOutput, RunSpec, DEFAULT_GRACE_PERIOD,
+    is_secret_var, kill_process_group, run, sanitize_env, terminate_process_group, RunError,
+    RunOutput, RunSpec, CANCEL_SIGNAL, DEFAULT_GRACE_PERIOD,
 };
 pub use session::{
     auth_status, clear_session, clear_sync_token, load_session, load_sync_token, save_session,

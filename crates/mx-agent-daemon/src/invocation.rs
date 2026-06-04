@@ -19,13 +19,14 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::SigningKey;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::INVOCATION as INVOCATION_STATE_TYPE;
 use mx_agent_protocol::schema::InvocationState;
 
-use crate::exec::publish_invocation_state;
+use crate::exec::{publish_invocation_state, send_exec_cancel};
 use crate::matrix::restore_client;
 use crate::session::StoredSession;
 use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
@@ -228,6 +229,84 @@ pub async fn advance_invocation_for_session(
     advance_invocation(&client, room, invocation_id, state, exit_code).await
 }
 
+/// Generate a random, base64-encoded nonce for a signed cancel request.
+///
+/// A nonce only needs to be unique per request (the signature binds it), so on
+/// the astronomically unlikely event the system RNG is unavailable, a
+/// high-resolution timestamp is used as a unique fallback rather than failing
+/// the cancel.
+fn random_nonce() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        bytes.copy_from_slice(&nanos.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
+}
+
+/// Cancel a running invocation: send a signed `com.mxagent.exec.cancel.v1` into
+/// the room and advance the invocation to the `cancelled` state.
+///
+/// Reads the invocation first: an unknown id is
+/// [`WorkspaceError::InvocationNotFound`], and an already-terminal invocation is
+/// returned unchanged (cancelling a finished command is a no-op). Otherwise the
+/// cancel is signed with the caller's key and sent so it federates to the target
+/// agent that runs the command — which verifies ownership
+/// ([`crate::exec::authorize_exec_cancel`]), terminates the process group, and
+/// confirms with `com.mxagent.exec.cancelled.v1` — and the invocation state is
+/// republished as `cancelled`.
+pub async fn cancel_invocation(
+    client: &Client,
+    signing_key: &SigningKey,
+    key_id: &str,
+    room: &str,
+    invocation_id: &str,
+    reason: &str,
+) -> Result<InvocationState, WorkspaceError> {
+    let room = sync_and_get_room(client, room).await?;
+    let mut invocation = read_invocation_state(&room, invocation_id)
+        .await?
+        .ok_or_else(|| WorkspaceError::InvocationNotFound(invocation_id.to_string()))?;
+
+    // Cancelling an already-finished invocation is a no-op.
+    if is_terminal(&invocation.state) {
+        return Ok(invocation);
+    }
+
+    let now = now_rfc3339();
+    send_exec_cancel(
+        &room,
+        signing_key,
+        key_id,
+        invocation_id,
+        reason,
+        now.clone(),
+        random_nonce(),
+    )
+    .await?;
+
+    apply_transition(&mut invocation, STATE_CANCELLED, None, now);
+    publish_invocation_state(&room, &invocation).await?;
+    Ok(invocation)
+}
+
+/// Cancel an invocation, restoring the authenticated client from `session`.
+pub async fn cancel_invocation_for_session(
+    session: &StoredSession,
+    signing_key: &SigningKey,
+    key_id: &str,
+    room: &str,
+    invocation_id: &str,
+    reason: &str,
+) -> Result<InvocationState, WorkspaceError> {
+    let client = restore_client(session).await?;
+    cancel_invocation(&client, signing_key, key_id, room, invocation_id, reason).await
+}
+
 /// List invocations in a workspace room, optionally filtered by state and task.
 ///
 /// Reads every `com.mxagent.invocation.v1` state event in the room, applies the
@@ -299,6 +378,16 @@ mod tests {
     fn unix_to_rfc3339_formats_known_instants() {
         assert_eq!(unix_to_rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(unix_to_rfc3339(1_748_865_600), "2025-06-02T12:00:00Z");
+    }
+
+    #[test]
+    fn random_nonce_is_nonempty_and_distinct() {
+        let a = random_nonce();
+        let b = random_nonce();
+        assert!(!a.is_empty());
+        // Base64 of 16 bytes (no padding) is 22 chars.
+        assert_eq!(a.len(), 22);
+        assert_ne!(a, b, "nonces must differ between requests");
     }
 
     #[test]
