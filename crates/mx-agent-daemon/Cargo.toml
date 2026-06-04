@@ -33,6 +33,10 @@ getrandom = { workspace = true }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "test-util"] }
+# Used by the local Matrix integration test (tests/matrix_integration.rs) to
+# create rooms and send events against a live homeserver. The integration test
+# is `#[ignore]`d by default; see scripts/matrix_integration_test.sh.
+matrix-sdk = { workspace = true }
 
 [lints]
 workspace = true

@@ -51,3 +51,15 @@ jobs:
       - name: cargo test
         if: steps.cargo.outputs.present == 'true'
         run: cargo test --all
+
+  matrix-integration:
+    # Boots the throwaway local homeserver (issue #59) and runs the daemon's
+    # `#[ignore]`d Matrix integration test against it (issue #60). Docker, curl,
+    # and jq are preinstalled on the GitHub-hosted ubuntu runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Matrix integration test
+        run: scripts/matrix_integration_test.sh --teardown
