@@ -19,7 +19,12 @@
 //! "bubblewrap or firejail"): it can drop the command into a fresh network
 //! namespace ([`Network::Deny`]) and bind the configured read-only and writable
 //! paths into the sandbox, so the command sees only the filesystem it is allowed
-//! to touch. The container backend is described in §13.5 and added later.
+//! to touch.
+//!
+//! The [`ContainerSandbox`] backend runs the command inside a Docker or Podman
+//! container (§13.5 "Docker or Podman"): it launches the configured image with a
+//! read-only root filesystem, mounts the configured read-only and writable paths,
+//! denies the network by default, and forwards only the sanitized environment.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -69,6 +74,31 @@ pub enum Network {
     /// namespace).
     #[default]
     Deny,
+}
+
+/// The container runtime a [`ContainerSandbox`] launches commands through
+/// (architecture §13.5, "Docker or Podman").
+///
+/// Both runtimes accept the same `run` flags this backend uses, so the only
+/// difference is the executable name resolved on `PATH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Runtime {
+    /// Docker (`docker run …`).
+    #[default]
+    Docker,
+    /// Podman (`podman run …`).
+    Podman,
+}
+
+impl Runtime {
+    /// The runtime's executable name, resolved on `PATH`. The runner surfaces a
+    /// spawn error if it is not installed.
+    pub fn program(self) -> &'static str {
+        match self {
+            Runtime::Docker => "docker",
+            Runtime::Podman => "podman",
+        }
+    }
 }
 
 /// The baseline execution controls every sandbox backend enforces around a
@@ -242,25 +272,153 @@ impl Sandbox for BubblewrapSandbox {
     }
 }
 
-/// Render a path as a `bwrap` argument. Paths are passed verbatim; `bwrap`
+/// Render a path as a launcher argument. Paths are passed verbatim; the launcher
 /// resolves them relative to the runner's filesystem when binding.
 fn path_arg(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// The default image [`ContainerSandbox`] runs in until an operator configures
+/// one. A minimal Debian base is a reasonable starting point for running shell
+/// commands; the image is meant to be overridden via [`ContainerSandbox::new`].
+const DEFAULT_IMAGE: &str = "debian:stable-slim";
+
+/// The container backend: runs the command inside a Docker or Podman container
+/// (architecture §13.5, "Docker or Podman").
+///
+/// [`prepare`][ContainerSandbox::prepare] rewrites the argv to
+/// `<runtime> run <isolation flags> <image> <argv>`, deriving the isolation from
+/// the [`Restrictions`]:
+///
+/// - the container starts with a read-only root filesystem (`--read-only`,
+///   §13.5 "read-only root filesystem"); only explicitly mounted writable paths
+///   can be written.
+/// - [`Network::Deny`] adds `--network none`, giving the container an isolated
+///   network namespace with no route to the outside (§13.5 "network disabled by
+///   default"). [`Network::Allow`] keeps the runtime's default networking.
+/// - each [`Restrictions::read_only_paths`] entry is mounted read-only and each
+///   [`Restrictions::writable_paths`] entry writable, at the same path inside the
+///   container, so the command sees only the filesystem it is permitted to touch
+///   (§13.5 "writable workspace and temp only").
+/// - the working directory is set with `--workdir`; it must be reachable through
+///   one of the mounted paths.
+/// - only the sanitized environment ([`Restrictions::env`]) is forwarded, each
+///   variable passed explicitly with `--env KEY=VALUE`. A container does not
+///   inherit the runner's environment, so the variables are injected here rather
+///   than relied on from the spawned process. Secrets are already scrubbed by the
+///   caller (architecture §13.4), so no credential reaches the argv.
+///
+/// `--rm` removes the container when the command exits. The implementation is
+/// pure — it only computes an argv — so the wrapping rules are unit-tested
+/// without launching a container.
+#[derive(Debug, Clone)]
+pub struct ContainerSandbox {
+    /// The container runtime to launch through.
+    runtime: Runtime,
+    /// The image the command runs in.
+    image: String,
+}
+
+impl Default for ContainerSandbox {
+    fn default() -> Self {
+        Self {
+            runtime: Runtime::default(),
+            image: DEFAULT_IMAGE.to_string(),
+        }
+    }
+}
+
+impl ContainerSandbox {
+    /// Construct a container backend that runs commands in `image` via `runtime`.
+    pub fn new(runtime: Runtime, image: impl Into<String>) -> Self {
+        Self {
+            runtime,
+            image: image.into(),
+        }
+    }
+
+    /// The image commands run in.
+    pub fn image(&self) -> &str {
+        &self.image
+    }
+
+    /// The runtime commands are launched through.
+    pub fn runtime(&self) -> Runtime {
+        self.runtime
+    }
+}
+
+impl Sandbox for ContainerSandbox {
+    fn backend(&self) -> Backend {
+        Backend::Container
+    }
+
+    fn prepare(&self, argv: Vec<String>, restrictions: Restrictions) -> Prepared {
+        let mut wrapped: Vec<String> = vec![
+            self.runtime.program().to_string(),
+            "run".to_string(),
+            // Remove the container when the command exits.
+            "--rm".to_string(),
+            // Read-only root filesystem: only explicitly mounted writable paths
+            // can be written (architecture §13.5).
+            "--read-only".to_string(),
+        ];
+
+        // Network deny: an isolated network namespace with no route out
+        // (architecture §13.5, "network disabled by default"). `allow` keeps the
+        // runtime's default networking.
+        if restrictions.network == Network::Deny {
+            wrapped.push("--network".to_string());
+            wrapped.push("none".to_string());
+        }
+
+        // Forward only the sanitized environment (architecture §13.4). A
+        // container does not inherit the runner's environment, so each variable
+        // is passed explicitly. Values are already secret-scrubbed by the caller.
+        for (key, value) in &restrictions.env {
+            wrapped.push("--env".to_string());
+            wrapped.push(format!("{key}={value}"));
+        }
+
+        // Mount the configured filesystem at the same path inside the container:
+        // read-only mounts first, then writable, so a writable path nested under
+        // a read-only one still wins.
+        for path in &restrictions.read_only_paths {
+            let p = path_arg(path);
+            wrapped.push("--volume".to_string());
+            wrapped.push(format!("{p}:{p}:ro"));
+        }
+        for path in &restrictions.writable_paths {
+            let p = path_arg(path);
+            wrapped.push("--volume".to_string());
+            wrapped.push(format!("{p}:{p}"));
+        }
+
+        // Run in the requested working directory (must be reachable through a
+        // mounted path), then the image and the command argv.
+        wrapped.push("--workdir".to_string());
+        wrapped.push(path_arg(&restrictions.cwd));
+        wrapped.push(self.image.clone());
+        wrapped.extend(argv);
+
+        Prepared {
+            backend: Backend::Container,
+            argv: wrapped,
+            restrictions,
+        }
+    }
+}
+
 /// Construct the sandbox implementation for `backend`.
 ///
-/// [`Backend::None`] and [`Backend::Bubblewrap`] are implemented. The container
-/// backend is described in §13.5 and not yet available, so it falls back to the
-/// `none` backend; the returned [`Prepared::backend`] then truthfully reports
-/// `none`, so the audit log never claims isolation that was not applied.
+/// All backends are implemented. The container backend uses its default runtime
+/// and image ([`ContainerSandbox::default`]); a configured image is supplied by
+/// constructing [`ContainerSandbox::new`] directly.
 pub fn sandbox_for(backend: Backend) -> Box<dyn Sandbox> {
     match backend {
         Backend::None => Box::new(NoneSandbox),
         Backend::Bubblewrap => Box::new(BubblewrapSandbox),
-        // Not yet implemented: fall back to `none` rather than failing, and
-        // report `none` honestly.
-        Backend::Container => Box::new(NoneSandbox),
+        Backend::Container => Box::new(ContainerSandbox::default()),
     }
 }
 
@@ -307,13 +465,12 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_backends_fall_back_to_none_honestly() {
-        // Until the container backend lands, selection falls back to `none` and
-        // the prepared command reports `none` so the audit log stays truthful.
+    fn sandbox_for_container_reports_container() {
+        // The container backend is implemented, so selection returns it and the
+        // prepared command honestly reports `container`.
         let prepared =
             sandbox_for(Backend::Container).prepare(argv(&["true"]), Restrictions::default());
-        assert_eq!(prepared.backend, Backend::None);
-        assert_eq!(prepared.argv, argv(&["true"]));
+        assert_eq!(prepared.backend, Backend::Container);
     }
 
     #[test]
@@ -552,6 +709,255 @@ mod tests {
         assert_eq!(
             count, "0",
             "expected no non-loopback interfaces under network deny"
+        );
+    }
+
+    // --- Container backend (Docker/Podman) -----------------------------------
+
+    fn env_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The argv after the image: the image is the first token that is neither a
+    /// flag nor a flag value, found by scanning the `<runtime> run …` prefix.
+    fn container_command<'a>(prepared: &'a Prepared, image: &str) -> &'a [String] {
+        let pos = prepared
+            .argv
+            .iter()
+            .position(|a| a == image)
+            .expect("prepared container argv contains the image");
+        &prepared.argv[pos + 1..]
+    }
+
+    /// The `<runtime> run` flags up to (and excluding) the image.
+    fn container_flags<'a>(prepared: &'a Prepared, image: &str) -> &'a [String] {
+        let pos = prepared.argv.iter().position(|a| a == image).unwrap();
+        &prepared.argv[..pos]
+    }
+
+    #[test]
+    fn runtime_programs_are_stable() {
+        assert_eq!(Runtime::Docker.program(), "docker");
+        assert_eq!(Runtime::Podman.program(), "podman");
+        assert_eq!(Runtime::default(), Runtime::Docker);
+    }
+
+    #[test]
+    fn container_wraps_command_in_configured_image() {
+        let sandbox = ContainerSandbox::new(Runtime::Docker, "myimage:tag");
+        let prepared = sandbox.prepare(argv(&["echo", "hi"]), Restrictions::default());
+        assert_eq!(prepared.backend, Backend::Container);
+        // Launches via `docker run …`.
+        assert_eq!(
+            &prepared.argv[..2],
+            argv(&["docker", "run"]).as_slice(),
+            "argv: {:?}",
+            prepared.argv
+        );
+        // The command runs in the configured image, after all flags.
+        assert_eq!(
+            container_command(&prepared, "myimage:tag"),
+            argv(&["echo", "hi"]).as_slice()
+        );
+        // The centralized controls are carried through unchanged.
+        assert_eq!(prepared.restrictions, Restrictions::default());
+    }
+
+    #[test]
+    fn container_uses_selected_runtime() {
+        let sandbox = ContainerSandbox::new(Runtime::Podman, "img");
+        let prepared = sandbox.prepare(argv(&["true"]), Restrictions::default());
+        assert_eq!(prepared.argv.first().map(String::as_str), Some("podman"));
+    }
+
+    #[test]
+    fn container_default_uses_default_image() {
+        let sandbox = ContainerSandbox::default();
+        assert_eq!(sandbox.runtime(), Runtime::Docker);
+        assert_eq!(sandbox.image(), DEFAULT_IMAGE);
+        let prepared = sandbox.prepare(argv(&["true"]), Restrictions::default());
+        // The default image precedes the command argv.
+        assert_eq!(
+            container_command(&prepared, DEFAULT_IMAGE),
+            argv(&["true"]).as_slice()
+        );
+    }
+
+    #[test]
+    fn container_root_filesystem_is_read_only() {
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img")
+            .prepare(argv(&["true"]), Restrictions::default());
+        assert!(container_flags(&prepared, "img")
+            .iter()
+            .any(|f| f == "--read-only"));
+    }
+
+    #[test]
+    fn container_denies_network_with_network_none() {
+        let denied = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                network: Network::Deny,
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&denied, "img").join(" ");
+        assert!(flags.contains("--network none"), "flags: {flags}");
+
+        let allowed = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                network: Network::Allow,
+                ..Restrictions::default()
+            },
+        );
+        assert!(!container_flags(&allowed, "img")
+            .iter()
+            .any(|f| f == "--network"));
+    }
+
+    #[test]
+    fn container_mounts_paths_according_to_policy() {
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                cwd: PathBuf::from("/work"),
+                read_only_paths: vec![PathBuf::from("/usr"), PathBuf::from("/lib")],
+                writable_paths: vec![PathBuf::from("/work")],
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(flags.contains("--volume /usr:/usr:ro"), "flags: {flags}");
+        assert!(flags.contains("--volume /lib:/lib:ro"), "flags: {flags}");
+        // Writable mount has no :ro suffix.
+        assert!(flags.contains("--volume /work:/work "), "flags: {flags}");
+        // The working directory is entered with --workdir.
+        assert!(flags.contains("--workdir /work"), "flags: {flags}");
+    }
+
+    #[test]
+    fn container_forwards_only_sanitized_env() {
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                env: env_map(&[("PATH", "/usr/bin"), ("LANG", "C")]),
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        // Each sanitized variable is forwarded explicitly as KEY=VALUE.
+        assert!(flags.contains("--env PATH=/usr/bin"), "flags: {flags}");
+        assert!(flags.contains("--env LANG=C"), "flags: {flags}");
+    }
+
+    // --- Integration tests that actually launch a container runtime. ---------
+    //
+    // These validate the acceptance criteria (a command runs in the configured
+    // image, and the workspace is mounted according to policy) against a real
+    // runtime. They skip gracefully when no runtime can run a small image (no
+    // Docker/Podman installed, no network to pull, or a restricted CI sandbox),
+    // so the suite stays green there.
+
+    /// A container runtime and a small image that can run `true`, if one is
+    /// available. Tries each runtime with a few tiny images, using any locally
+    /// present image and otherwise attempting a pull.
+    fn usable_container() -> Option<(Runtime, String)> {
+        use std::process::Command;
+        for runtime in [Runtime::Docker, Runtime::Podman] {
+            for image in ["busybox", "alpine", DEFAULT_IMAGE] {
+                let ran = Command::new(runtime.program())
+                    .args(["run", "--rm", image, "true"])
+                    .output();
+                if let Ok(out) = ran {
+                    if out.status.success() {
+                        return Some((runtime, image.to_string()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn command_runs_in_configured_image() {
+        let Some((runtime, image)) = usable_container() else {
+            eprintln!("skipping: no usable container runtime/image in this environment");
+            return;
+        };
+        let prepared = ContainerSandbox::new(runtime, &image).prepare(
+            argv(&["sh", "-c", "echo inside-container"]),
+            Restrictions {
+                network: Network::Deny,
+                ..Restrictions::default()
+            },
+        );
+        let out = run_prepared(&prepared);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "inside-container"
+        );
+    }
+
+    #[test]
+    fn workspace_writable_mount_allows_writes() {
+        let Some((runtime, image)) = usable_container() else {
+            eprintln!("skipping: no usable container runtime/image in this environment");
+            return;
+        };
+        // A unique workspace dir on the host, mounted writable into the container.
+        let workspace =
+            std::env::temp_dir().join(format!("mx-agent-container-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        let prepared = ContainerSandbox::new(runtime, &image).prepare(
+            argv(&["sh", "-c", "echo ok > probe && cat probe"]),
+            Restrictions {
+                cwd: workspace.clone(),
+                writable_paths: vec![workspace.clone()],
+                network: Network::Deny,
+                ..Restrictions::default()
+            },
+        );
+        let out = run_prepared(&prepared);
+        let success = out.status.success();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        // The file is written through the bind mount, so it is visible on the host.
+        let host_probe = workspace.join("probe");
+        let on_host = std::fs::read_to_string(&host_probe).ok();
+        let _ = std::fs::remove_dir_all(&workspace);
+        assert!(success, "stderr: {stderr}");
+        assert_eq!(stdout, "ok");
+        assert_eq!(on_host.as_deref().map(str::trim), Some("ok"));
+    }
+
+    #[test]
+    fn read_only_root_denies_writes_outside_mounts() {
+        let Some((runtime, image)) = usable_container() else {
+            eprintln!("skipping: no usable container runtime/image in this environment");
+            return;
+        };
+        // With a read-only root and no writable mount covering it, writing to the
+        // container root filesystem must fail.
+        let prepared = ContainerSandbox::new(runtime, &image).prepare(
+            argv(&["sh", "-c", "echo x > /mx-agent-should-fail"]),
+            Restrictions {
+                network: Network::Deny,
+                ..Restrictions::default()
+            },
+        );
+        let out = run_prepared(&prepared);
+        assert!(
+            !out.status.success(),
+            "write to a read-only root filesystem unexpectedly succeeded",
         );
     }
 }
