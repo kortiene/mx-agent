@@ -423,6 +423,15 @@ pub async fn workspace_status(
         .get_room(&room_id)
         .ok_or_else(|| WorkspaceError::RoomNotFound(target.to_string()))?;
 
+    build_workspace_status(&room).await
+}
+
+/// Summarize an already-synced `room` into a [`WorkspaceStatus`].
+///
+/// Unlike [`workspace_status`] this performs no `/sync`; it reads from the room
+/// state already in the client's store. The watch loop ([`crate::watch`]) calls
+/// it once per sync to take a fresh snapshot without re-establishing the room.
+pub(crate) async fn build_workspace_status(room: &Room) -> Result<WorkspaceStatus, WorkspaceError> {
     let mut members = Vec::new();
     for member in room
         .members(RoomMemberships::ACTIVE)
@@ -437,7 +446,7 @@ pub async fn workspace_status(
     }
     members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
 
-    let workspace = read_workspace_state(&room).await?;
+    let workspace = read_workspace_state(room).await?;
 
     Ok(WorkspaceStatus {
         room_id: room.room_id().to_string(),

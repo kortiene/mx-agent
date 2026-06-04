@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
@@ -192,6 +194,9 @@ struct WorkspaceStatusArgs {
     /// Room alias (`#name:server`) or room ID (`!id:server`) to inspect.
     #[arg(long, value_name = "ROOM")]
     room: String,
+    /// Keep running and re-render the status as it changes (Ctrl-C to stop).
+    #[arg(long)]
+    watch: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -416,8 +421,8 @@ enum TaskCommand {
     List(TaskListArgs),
     /// Render the task dependency graph.
     Graph(TaskGraphArgs),
-    /// Watch task state changes.
-    Watch,
+    /// Watch task state changes live (Ctrl-C to stop).
+    Watch(TaskWatchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -494,6 +499,19 @@ struct TaskListArgs {
     #[arg(long, value_name = "STATE")]
     state: Option<String>,
     /// Only list tasks assigned to this agent.
+    #[arg(long = "assigned", value_name = "AGENT")]
+    assigned: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct TaskWatchArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Only watch tasks in this lifecycle state.
+    #[arg(long, value_name = "STATE")]
+    state: Option<String>,
+    /// Only watch tasks assigned to this agent.
     #[arg(long = "assigned", value_name = "AGENT")]
     assigned: Option<String>,
 }
@@ -1305,7 +1323,48 @@ fn workspace_attach(global: &GlobalArgs, args: &WorkspaceAttachArgs) -> ExitCode
     })
 }
 
+/// Render a [`WorkspaceStatus`] as a human-readable block.
+fn print_workspace_status(status: &mx_agent_daemon::WorkspaceStatus) {
+    println!("Workspace: {}", status.room_id);
+    if let Some(alias) = &status.canonical_alias {
+        println!("  alias:     {alias}");
+    }
+    if let Some(name) = &status.name {
+        println!("  name:      {name}");
+    }
+    if let Some(ws) = &status.workspace {
+        println!("  project:   {}", ws.project_id);
+        println!("  path:      {}", ws.path);
+        if let Some(repo) = &ws.repo {
+            if let Some(url) = &repo.remote_url {
+                println!("  remote:    {url}");
+            }
+            if let Some(branch) = &repo.branch {
+                println!("  branch:    {branch}");
+            }
+            if let Some(commit) = &repo.commit {
+                println!("  commit:    {commit}");
+            }
+        }
+    }
+    println!("  encrypted: {}", status.encrypted);
+    println!(
+        "  members:   {} joined, {} invited",
+        status.joined_members, status.invited_members
+    );
+    for member in &status.members {
+        let label = member.display_name.as_deref().unwrap_or(&member.user_id);
+        println!(
+            "    {:<20} {:<8} {}",
+            label, member.membership, member.user_id
+        );
+    }
+}
+
 fn workspace_status(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode {
+    if args.watch {
+        return workspace_status_watch(global, args);
+    }
     let runtime = match build_runtime() {
         Ok(rt) => rt,
         Err(code) => return code,
@@ -1320,46 +1379,79 @@ fn workspace_status(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode
                 if global.json {
                     println!("{}", status.to_json());
                 } else {
-                    println!("Workspace: {}", status.room_id);
-                    if let Some(alias) = &status.canonical_alias {
-                        println!("  alias:     {alias}");
-                    }
-                    if let Some(name) = &status.name {
-                        println!("  name:      {name}");
-                    }
-                    if let Some(ws) = &status.workspace {
-                        println!("  project:   {}", ws.project_id);
-                        println!("  path:      {}", ws.path);
-                        if let Some(repo) = &ws.repo {
-                            if let Some(url) = &repo.remote_url {
-                                println!("  remote:    {url}");
-                            }
-                            if let Some(branch) = &repo.branch {
-                                println!("  branch:    {branch}");
-                            }
-                            if let Some(commit) = &repo.commit {
-                                println!("  commit:    {commit}");
-                            }
-                        }
-                    }
-                    println!("  encrypted: {}", status.encrypted);
-                    println!(
-                        "  members:   {} joined, {} invited",
-                        status.joined_members, status.invited_members
-                    );
-                    for member in &status.members {
-                        let label = member.display_name.as_deref().unwrap_or(&member.user_id);
-                        println!(
-                            "    {:<20} {:<8} {}",
-                            label, member.membership, member.user_id
-                        );
-                    }
+                    print_workspace_status(&status);
                 }
                 ExitCode::SUCCESS
             }
             Err(e) => {
                 eprintln!("mx-agent: could not read workspace status: {e}");
                 ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// Render a single workspace-status watch update to the terminal.
+fn render_status_update(
+    json: bool,
+    update: mx_agent_daemon::WatchUpdate<'_, mx_agent_daemon::WorkspaceStatus>,
+) {
+    use mx_agent_daemon::WatchUpdate;
+    match update {
+        WatchUpdate::Initial(status)
+        | WatchUpdate::Changed {
+            current: status, ..
+        } => {
+            if json {
+                println!("{}", status.to_json());
+            } else {
+                print_workspace_status(status);
+            }
+        }
+        WatchUpdate::Reconnecting { attempt, error } => {
+            eprintln!("mx-agent: reconnecting (attempt {attempt}): {error}");
+        }
+        WatchUpdate::Reconnected => {
+            eprintln!("mx-agent: reconnected");
+        }
+    }
+}
+
+fn workspace_status_watch(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let running = Arc::new(AtomicBool::new(true));
+    let json = global.json;
+    let callback =
+        move |update: mx_agent_daemon::WatchUpdate<'_, mx_agent_daemon::WorkspaceStatus>| {
+            render_status_update(json, update);
+        };
+    runtime.block_on(async {
+        let watch = mx_agent_daemon::watch_workspace_status_for_session(
+            &session,
+            &args.room,
+            mx_agent_daemon::WatchConfig::default(),
+            &running,
+            callback,
+        );
+        tokio::select! {
+            result = watch => match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("mx-agent: could not watch workspace status: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                running.store(false, Ordering::SeqCst);
+                eprintln!("mx-agent: watch stopped");
+                ExitCode::SUCCESS
             }
         }
     })
@@ -1623,7 +1715,7 @@ fn handle_task(global: &GlobalArgs, cmd: &TaskCommand) -> ExitCode {
         TaskCommand::Update(args) => task_update(global, args),
         TaskCommand::List(args) => task_list(global, args),
         TaskCommand::Graph(args) => task_graph(global, args),
-        TaskCommand::Watch => unimplemented(global, "task watch"),
+        TaskCommand::Watch(args) => task_watch(global, args),
     }
 }
 
@@ -1802,6 +1894,141 @@ fn task_graph(global: &GlobalArgs, args: &TaskGraphArgs) -> ExitCode {
             Err(e) => {
                 eprintln!("mx-agent: could not render task graph: {e}");
                 ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// Render a single task change (added/removed/updated) as a one-line entry.
+fn print_task_change(change: &mx_agent_daemon::TaskChange) {
+    use mx_agent_daemon::TaskChange;
+    let none_if_empty = |s: &str| {
+        if s.is_empty() {
+            "(none)".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    match change {
+        TaskChange::Added(task) => {
+            println!("  + {:<26} {:<10} {}", task.task_id, task.state, task.title);
+        }
+        TaskChange::Removed(task) => {
+            println!("  - {:<26} {:<10} {}", task.task_id, task.state, task.title);
+        }
+        TaskChange::Updated { previous, current } => {
+            if previous.state != current.state {
+                // The headline acceptance case: a live state transition.
+                println!(
+                    "  ~ {:<26} {} -> {}",
+                    current.task_id, previous.state, current.state
+                );
+            } else {
+                println!(
+                    "  ~ {:<26} {:<10} {}",
+                    current.task_id, current.state, current.title
+                );
+            }
+            if previous.assigned_to != current.assigned_to {
+                println!(
+                    "      assigned_to: {} -> {}",
+                    none_if_empty(&previous.assigned_to),
+                    none_if_empty(&current.assigned_to)
+                );
+            }
+        }
+    }
+}
+
+/// Render a single task watch update to the terminal.
+fn render_task_update(
+    json: bool,
+    room: &str,
+    update: mx_agent_daemon::WatchUpdate<'_, Vec<mx_agent_protocol::schema::TaskState>>,
+) {
+    use mx_agent_daemon::WatchUpdate;
+    match update {
+        WatchUpdate::Initial(tasks) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "initial", "tasks": tasks })
+                );
+            } else {
+                println!(
+                    "mx-agent: watching {} task(s) in {room} (Ctrl-C to stop)",
+                    tasks.len()
+                );
+                for task in tasks {
+                    print_task(task);
+                }
+            }
+        }
+        WatchUpdate::Changed { previous, current } => {
+            let changes = mx_agent_daemon::diff_tasks(previous, current);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "changed", "changes": changes })
+                );
+            } else {
+                for change in &changes {
+                    print_task_change(change);
+                }
+            }
+        }
+        WatchUpdate::Reconnecting { attempt, error } => {
+            eprintln!("mx-agent: reconnecting (attempt {attempt}): {error}");
+        }
+        WatchUpdate::Reconnected => {
+            eprintln!("mx-agent: reconnected");
+        }
+    }
+}
+
+fn task_watch(global: &GlobalArgs, args: &TaskWatchArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::ListTasksOptions {
+        room: args.room.clone(),
+        state: args.state.clone(),
+        assigned_to: args.assigned.clone(),
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let running = Arc::new(AtomicBool::new(true));
+    let json = global.json;
+    let room = args.room.clone();
+    let callback = move |update: mx_agent_daemon::WatchUpdate<
+        '_,
+        Vec<mx_agent_protocol::schema::TaskState>,
+    >| {
+        render_task_update(json, &room, update);
+    };
+    runtime.block_on(async {
+        let watch = mx_agent_daemon::watch_tasks_for_session(
+            &session,
+            &options,
+            mx_agent_daemon::WatchConfig::default(),
+            &running,
+            callback,
+        );
+        tokio::select! {
+            result = watch => match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("mx-agent: could not watch tasks: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                running.store(false, Ordering::SeqCst);
+                eprintln!("mx-agent: watch stopped");
+                ExitCode::SUCCESS
             }
         }
     })
@@ -2566,7 +2793,7 @@ fn command_path(command: &Command) -> String {
                 TaskCommand::Update(_) => "update",
                 TaskCommand::List(_) => "list",
                 TaskCommand::Graph(_) => "graph",
-                TaskCommand::Watch => "watch",
+                TaskCommand::Watch(_) => "watch",
             }
         ),
         Command::Invocation(c) => format!(
@@ -2922,18 +3149,6 @@ fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Report that a recognized command is not implemented yet.
-fn unimplemented(global: &GlobalArgs, path: &str) -> ExitCode {
-    if global.json {
-        println!("{{\"status\":\"unimplemented\",\"command\":\"{path}\"}}");
-    } else {
-        eprintln!("mx-agent: '{path}' is recognized but not implemented yet");
-    }
-    // Exit code 64 (EX_USAGE-adjacent) signals "recognized but unavailable"
-    // without colliding with clap's usage-error code (2).
-    ExitCode::from(64)
 }
 
 #[cfg(test)]

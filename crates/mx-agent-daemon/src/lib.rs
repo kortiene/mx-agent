@@ -27,6 +27,7 @@ pub mod tool_exec;
 pub mod tools;
 pub mod trust;
 pub mod trust_state;
+pub mod watch;
 pub mod workspace;
 
 pub use agent::{
@@ -108,6 +109,10 @@ pub use trust_state::{
     effective_trust, effective_trust_table, list_trust_states, list_trust_states_for_session,
     publish_trust_state, publish_trust_state_for_session, trust_state_from_entry, trust_state_key,
     EffectiveTrust, TrustSource,
+};
+pub use watch::{
+    diff_tasks, watch_tasks_for_session, watch_workspace_status_for_session, TaskChange,
+    WatchConfig, WatchUpdate, DEFAULT_WATCH_SYNC_TIMEOUT,
 };
 pub use workspace::{
     attach_workspace, attach_workspace_for_session, create_workspace, create_workspace_for_session,

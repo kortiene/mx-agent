@@ -234,7 +234,7 @@ where
 }
 
 /// Sleep for `delay`, waking early if `running` is cleared.
-async fn sleep_interruptible(delay: Duration, running: &AtomicBool) {
+pub(crate) async fn sleep_interruptible(delay: Duration, running: &AtomicBool) {
     let step = Duration::from_millis(50);
     let mut remaining = delay;
     while remaining > Duration::ZERO && running.load(Ordering::SeqCst) {
@@ -280,7 +280,7 @@ pub async fn run_matrix_sync(
 
 /// Classify a Matrix sync error: an unknown/missing access token is fatal
 /// (re-auth required); everything else is treated as transient.
-fn is_fatal_sync_error(error: &matrix_sdk::Error) -> bool {
+pub(crate) fn is_fatal_sync_error(error: &matrix_sdk::Error) -> bool {
     use matrix_sdk::ruma::api::error::ErrorKind;
     matches!(
         error.client_api_error_kind(),

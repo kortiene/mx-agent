@@ -375,6 +375,22 @@ pub async fn update_task_for_session(
     update_task(&client, options).await
 }
 
+/// Read the tasks in an already-synced `room`, applying `options`' filters and
+/// sorting by `task_id` for a stable, deterministic ordering.
+///
+/// Unlike [`list_tasks`] this performs no `/sync`; it reads from the room state
+/// already in the client's store. The watch loop ([`crate::watch`]) calls it
+/// once per sync to take a fresh snapshot without re-establishing the room.
+pub(crate) async fn read_tasks(
+    room: &Room,
+    options: &ListTasksOptions,
+) -> Result<Vec<TaskState>, WorkspaceError> {
+    let mut tasks = read_all_task_states(room).await?;
+    tasks.retain(|task| matches_filters(task, options));
+    tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+    Ok(tasks)
+}
+
 /// List tasks in a workspace room, optionally filtered by state and assignee.
 ///
 /// Reads every `com.mxagent.task.v1` state event in the room, applies the
@@ -384,10 +400,7 @@ pub async fn list_tasks(
     options: &ListTasksOptions,
 ) -> Result<Vec<TaskState>, WorkspaceError> {
     let room = sync_and_get_room(client, &options.room).await?;
-    let mut tasks = read_all_task_states(&room).await?;
-    tasks.retain(|task| matches_filters(task, options));
-    tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
-    Ok(tasks)
+    read_tasks(&room, options).await
 }
 
 /// List tasks in a workspace, restoring the authenticated client from
