@@ -70,7 +70,7 @@ set +e
   MX_AGENT_TEST_PASSWORD="$PASS1" \
   MX_AGENT_TEST_USER2="$USER2" \
   MX_AGENT_TEST_PASSWORD2="$PASS2" \
-    cargo test -p mx-agent-daemon --test matrix_integration -- --ignored --nocapture
+    cargo test -p mx-agent-daemon --test matrix_integration -- --ignored --nocapture --test-threads=1
 )
 status=$?
 set -e

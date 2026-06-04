@@ -107,11 +107,7 @@ async fn daemon_syncs_and_receives_events_from_live_homeserver() {
         .await
         .expect("bob session restore should succeed");
 
-    let mut create = create_room::v3::Request::new();
-    create.name = Some("mx-agent integration test".to_owned());
-    create.visibility = Visibility::Public;
-    create.preset = Some(create_room::v3::RoomPreset::PublicChat);
-    let room = bob.create_room(create).await.expect("bob creates room");
+    let room = create_public_room(&bob, "mx-agent integration test").await;
     let room_id = room.room_id().to_owned();
 
     // The daemon user joins the room so it will receive its timeline on sync.
@@ -247,25 +243,58 @@ fn exec_options() -> ExecRequestOptions {
     }
 }
 
+/// Maximum attempts for transient homeserver operations that can briefly race
+/// with the server's own state resolution.
+const MAX_CREATE_ATTEMPTS: u32 = 5;
+
+/// Create a public chat room, retrying transient homeserver errors.
+///
+/// Conduit-family homeservers (Tuwunel) can briefly return a 403
+/// ("sender's membership `leave` is not `join`") right after `create_room`
+/// while the creator's own join membership is still settling — more likely
+/// under concurrent load. Public + PublicChat lets the daemon user later
+/// `join_room_by_id`, and the default `shared` history visibility lets a late
+/// joiner fetch (but not decrypt) earlier events. Retrying with a short backoff
+/// removes the flake.
+async fn create_public_room(client: &Client, name: &str) -> Room {
+    for attempt in 1..=MAX_CREATE_ATTEMPTS {
+        let mut create = create_room::v3::Request::new();
+        create.name = Some(name.to_owned());
+        create.visibility = Visibility::Public;
+        create.preset = Some(create_room::v3::RoomPreset::PublicChat);
+        match client.create_room(create).await {
+            Ok(room) => return room,
+            Err(e) if attempt < MAX_CREATE_ATTEMPTS => {
+                eprintln!("create_room {name:?} attempt {attempt} failed: {e}; retrying");
+                tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+            }
+            Err(e) => {
+                panic!("create_room {name:?} failed after {MAX_CREATE_ATTEMPTS} attempts: {e}")
+            }
+        }
+    }
+    unreachable!("loop either returns a room or panics")
+}
+
 /// Create a public, end-to-end encrypted room owned by `client`.
 ///
 /// `enable_encryption` sends the `m.room.encryption` state event and waits for
-/// a sync to reflect it, so the caller must already be running a sync loop.
+/// a sync to reflect it, so the caller must already be running a sync loop. Both
+/// the room creation and the encryption enablement retry transient errors.
 async fn create_encrypted_room(client: &Client, name: &str) -> Room {
-    let mut create = create_room::v3::Request::new();
-    create.name = Some(name.to_owned());
-    // Public + PublicChat so the daemon user can `join_room_by_id`, and so the
-    // (default `shared`) history visibility lets a late joiner fetch — but not
-    // decrypt — events sent before it joined.
-    create.visibility = Visibility::Public;
-    create.preset = Some(create_room::v3::RoomPreset::PublicChat);
-    let room = client
-        .create_room(create)
-        .await
-        .expect("create encrypted room");
-    room.enable_encryption()
-        .await
-        .expect("enable end-to-end encryption");
+    let room = create_public_room(client, name).await;
+    for attempt in 1..=MAX_CREATE_ATTEMPTS {
+        match room.enable_encryption().await {
+            Ok(()) => break,
+            Err(e) if attempt < MAX_CREATE_ATTEMPTS => {
+                eprintln!("enable_encryption attempt {attempt} failed: {e}; retrying");
+                tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+            }
+            Err(e) => panic!(
+                "enable end-to-end encryption failed after {MAX_CREATE_ATTEMPTS} attempts: {e}"
+            ),
+        }
+    }
     assert!(
         room.encryption_state().is_encrypted(),
         "room should report encryption enabled"
