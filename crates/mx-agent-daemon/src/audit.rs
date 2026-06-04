@@ -76,6 +76,13 @@ pub struct AuditRecord {
     /// The policy rule (when allowed) or deny reason (when denied) that
     /// produced the decision.
     pub policy_rule: String,
+    /// The sandbox backend selected for an allowed request (architecture
+    /// §13.5), e.g. `"none"` or `"bubblewrap"`. Resolved from the policy
+    /// allowance, defaulting to `"none"` when the allowance selects no explicit
+    /// backend. Omitted for denied requests, where nothing is run and so no
+    /// backend is selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
 }
 
 impl AuditRecord {
@@ -102,6 +109,7 @@ impl AuditRecord {
             tool: None,
             decision: AuditDecision::from_outcome(outcome),
             policy_rule: rule_for(outcome, "allow_commands"),
+            sandbox: sandbox_for_outcome(outcome),
         }
     }
 
@@ -125,6 +133,7 @@ impl AuditRecord {
             tool: Some(tool.to_string()),
             decision: AuditDecision::from_outcome(outcome),
             policy_rule: rule_for(outcome, "allow_tools"),
+            sandbox: sandbox_for_outcome(outcome),
         }
     }
 
@@ -202,6 +211,21 @@ fn rule_for(outcome: &Outcome, allow_rule: &str) -> String {
         Outcome::Allow(_) => allow_rule.to_string(),
         Outcome::Deny(reason) => deny_rule(reason),
     }
+}
+
+/// Resolve the sandbox backend selected for an outcome, for the audit log.
+///
+/// An allowed request records the backend its allowance selected, defaulting to
+/// `"none"` when no explicit backend was configured (architecture §13.5). A
+/// denied request runs nothing, so no backend is selected and the field is
+/// omitted (`None`).
+fn sandbox_for_outcome(outcome: &Outcome) -> Option<String> {
+    outcome.allowance().map(|allowance| {
+        allowance
+            .sandbox
+            .map(|sandbox| sandbox.name().to_string())
+            .unwrap_or_else(|| "none".to_string())
+    })
 }
 
 /// A stable machine-readable identifier for a [`DenyReason`].
@@ -368,6 +392,38 @@ mod tests {
         assert!(json.contains("\"decision\":\"allowed\""), "got {json}");
         // Single line.
         assert!(!json.contains('\n'));
+    }
+
+    #[test]
+    fn allowed_exec_records_default_sandbox_as_none() {
+        // An allowed request with no explicit sandbox records the baseline
+        // `none` backend so the audit log always names what ran.
+        let cmd = argv(&["cargo", "test"]);
+        let record = AuditRecord::for_exec("!r", "@a", "t", None, &cmd, &allow());
+        assert_eq!(record.sandbox.as_deref(), Some("none"));
+        assert!(record.to_json_line().contains("\"sandbox\":\"none\""));
+    }
+
+    #[test]
+    fn allowed_exec_records_selected_sandbox() {
+        // Acceptance (#53): the selected sandbox backend appears in the audit
+        // log.
+        let outcome = Outcome::Allow(Allowance {
+            sandbox: Some(mx_agent_policy::Sandbox::Bubblewrap),
+            ..Allowance::default()
+        });
+        let record = AuditRecord::for_exec("!r", "@a", "t", None, &argv(&["true"]), &outcome);
+        assert_eq!(record.sandbox.as_deref(), Some("bubblewrap"));
+        assert!(record.to_json_line().contains("\"sandbox\":\"bubblewrap\""));
+    }
+
+    #[test]
+    fn denied_request_omits_sandbox() {
+        // A denied request runs nothing, so no backend is selected.
+        let outcome = Outcome::Deny(DenyReason::ExecNotAllowed);
+        let record = AuditRecord::for_exec("!r", "@a", "t", None, &argv(&["true"]), &outcome);
+        assert_eq!(record.sandbox, None);
+        assert!(!record.to_json_line().contains("sandbox"));
     }
 
     #[test]
