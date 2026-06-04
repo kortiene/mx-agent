@@ -750,11 +750,17 @@ mx-agent invocation list --room '!abc:matrix.org' --state running
 Graph output:
 
 ```text
-task-plan       succeeded
+task-plan  succeeded
   └─ task-code  succeeded
       └─ task-test  failed
-          └─ task-review blocked
+          └─ task-review  blocked
 ```
+
+Roots (tasks that depend on nothing present) are drawn at the left margin and
+each dependent is nested beneath the task it depends on, indented four columns
+deeper per level. `mx-agent task graph --json` emits the same graph as a JSON
+object with `nodes`, `edges`, `roots`, and `cycles`. Any dependency cycle is
+reported on its own `cycle detected: a -> b -> a` line rather than expanded.
 
 ---
 
