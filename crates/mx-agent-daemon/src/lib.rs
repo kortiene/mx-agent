@@ -18,6 +18,7 @@ pub mod session;
 pub mod signing;
 pub mod stream;
 pub mod sync;
+pub mod task;
 pub mod tool_exec;
 pub mod tools;
 pub mod trust;
@@ -68,6 +69,11 @@ pub use stream::{
 };
 pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
+};
+pub use task::{
+    create_task, create_task_for_session, list_tasks, list_tasks_for_session, update_task,
+    update_task_for_session, CreateTaskOptions, ListTasksOptions, UpdateTaskOptions,
+    DEFAULT_TASK_STATE,
 };
 pub use tool_exec::{execute_tool, ToolError, ToolResult, RUN_TESTS};
 pub use tools::{builtin_tools, ToolRegistry};

@@ -329,15 +329,82 @@ enum ShareCommand {
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
     /// Create a task.
-    Create,
+    Create(TaskCreateArgs),
     /// Update a task.
-    Update,
+    Update(TaskUpdateArgs),
     /// List tasks.
-    List,
+    List(TaskListArgs),
     /// Render the task dependency graph.
     Graph,
     /// Watch task state changes.
     Watch,
+}
+
+#[derive(Debug, Args)]
+struct TaskCreateArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Explicit task ID (also the state key). A sortable `task_...` ID is
+    /// generated when omitted.
+    #[arg(long, value_name = "TASK_ID")]
+    id: Option<String>,
+    /// Human-readable task title.
+    #[arg(long, value_name = "TITLE")]
+    title: String,
+    /// Longer task description.
+    #[arg(long, value_name = "DESCRIPTION", default_value = "")]
+    description: String,
+    /// Initial lifecycle state (defaults to `pending`).
+    #[arg(long, value_name = "STATE")]
+    state: Option<String>,
+    /// Agent to assign the task to.
+    #[arg(long = "assign", value_name = "AGENT", default_value = "")]
+    assign: String,
+    /// Upstream task this one depends on (repeatable).
+    #[arg(long = "depends-on", value_name = "TASK_ID")]
+    depends_on: Vec<String>,
+    /// Downstream task blocked by this one (repeatable).
+    #[arg(long = "blocks", value_name = "TASK_ID")]
+    blocks: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct TaskUpdateArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Task ID (state key) to update.
+    #[arg(value_name = "TASK_ID")]
+    task_id: String,
+    /// New lifecycle state, e.g. `executing`, `succeeded`, `failed`.
+    #[arg(long, value_name = "STATE")]
+    state: Option<String>,
+    /// Reassign the task to this agent.
+    #[arg(long = "assign", value_name = "AGENT")]
+    assign: Option<String>,
+    /// New title.
+    #[arg(long, value_name = "TITLE")]
+    title: Option<String>,
+    /// New description.
+    #[arg(long, value_name = "DESCRIPTION")]
+    description: Option<String>,
+    /// Associate this task with an invocation ID.
+    #[arg(long = "invocation", value_name = "INVOCATION_ID")]
+    invocation: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct TaskListArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Only list tasks in this lifecycle state.
+    #[arg(long, value_name = "STATE")]
+    state: Option<String>,
+    /// Only list tasks assigned to this agent.
+    #[arg(long = "assigned", value_name = "AGENT")]
+    assigned: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -471,6 +538,7 @@ pub fn run() -> ExitCode {
         Command::Workspace(cmd) => handle_workspace(g, cmd),
         Command::Agent(cmd) => handle_agent(g, cmd),
         Command::Trust(cmd) => handle_trust(g, cmd),
+        Command::Task(cmd) => handle_task(g, cmd),
         Command::Call(args) => cmd_call(g, args),
         Command::Exec(args) => cmd_exec(g, args),
         _ => unimplemented(g, &path),
@@ -1395,6 +1463,155 @@ fn agent_register(global: &GlobalArgs, args: &AgentRegisterArgs) -> ExitCode {
     })
 }
 
+/// Handle the `task` command group.
+fn handle_task(global: &GlobalArgs, cmd: &TaskCommand) -> ExitCode {
+    match cmd {
+        TaskCommand::Create(args) => task_create(global, args),
+        TaskCommand::Update(args) => task_update(global, args),
+        TaskCommand::List(args) => task_list(global, args),
+        TaskCommand::Graph => unimplemented(global, "task graph"),
+        TaskCommand::Watch => unimplemented(global, "task watch"),
+    }
+}
+
+/// Render a single task as a human-readable block.
+fn print_task(task: &mx_agent_protocol::schema::TaskState) {
+    println!("  {:<28} {:<10} {}", task.task_id, task.state, task.title);
+    if !task.assigned_to.is_empty() {
+        println!("    assigned_to:  {}", task.assigned_to);
+    }
+    if !task.depends_on.is_empty() {
+        println!("    depends_on:   {}", task.depends_on.join(", "));
+    }
+    if !task.blocks.is_empty() {
+        println!("    blocks:       {}", task.blocks.join(", "));
+    }
+    println!("    state_rev:    {}", task.state_rev);
+}
+
+fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::CreateTaskOptions {
+        room: args.room.clone(),
+        task_id: args.id.clone(),
+        title: args.title.clone(),
+        description: args.description.clone(),
+        state: args.state.clone(),
+        assigned_to: args.assign.clone(),
+        created_by: None,
+        depends_on: args.depends_on.clone(),
+        blocks: args.blocks.clone(),
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::create_task_for_session(&session, &options).await {
+            Ok(task) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("mx-agent: created task {}", task.task_id);
+                    print_task(&task);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not create task: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::UpdateTaskOptions {
+        room: args.room.clone(),
+        task_id: args.task_id.clone(),
+        state: args.state.clone(),
+        assigned_to: args.assign.clone(),
+        title: args.title.clone(),
+        description: args.description.clone(),
+        invocation_id: args.invocation.clone(),
+        result: None,
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::update_task_for_session(&session, &options).await {
+            Ok(task) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("mx-agent: updated task {}", task.task_id);
+                    print_task(&task);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not update task: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn task_list(global: &GlobalArgs, args: &TaskListArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+    let options = mx_agent_daemon::ListTasksOptions {
+        room: args.room.clone(),
+        state: args.state.clone(),
+        assigned_to: args.assigned.clone(),
+    };
+    let session = match load_session_or_exit() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    runtime.block_on(async {
+        match mx_agent_daemon::list_tasks_for_session(&session, &options).await {
+            Ok(tasks) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string())
+                    );
+                } else if tasks.is_empty() {
+                    println!("mx-agent: no tasks in {}", args.room);
+                } else {
+                    println!("mx-agent: {} task(s) in {}", tasks.len(), args.room);
+                    for task in &tasks {
+                        print_task(task);
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("mx-agent: could not list tasks: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
 /// Handle the `daemon` command group.
 fn handle_daemon(global: &GlobalArgs, cmd: &DaemonCommand) -> ExitCode {
     match cmd {
@@ -1579,9 +1796,9 @@ fn command_path(command: &Command) -> String {
         Command::Task(c) => format!(
             "task {}",
             match c {
-                TaskCommand::Create => "create",
-                TaskCommand::Update => "update",
-                TaskCommand::List => "list",
+                TaskCommand::Create(_) => "create",
+                TaskCommand::Update(_) => "update",
+                TaskCommand::List(_) => "list",
                 TaskCommand::Graph => "graph",
                 TaskCommand::Watch => "watch",
             }
@@ -2333,6 +2550,100 @@ mod tests {
             }
             other => panic!("expected workspace status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn task_create_requires_room_and_title() {
+        assert!(Cli::try_parse_from(["mx-agent", "task", "create"]).is_err());
+        assert!(
+            Cli::try_parse_from(["mx-agent", "task", "create", "--room", "!abc:matrix.org"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "task",
+            "create",
+            "--room",
+            "!abc:matrix.org",
+            "--title",
+            "Run tests",
+            "--assign",
+            "developer-pi",
+            "--depends-on",
+            "task_plan",
+            "--blocks",
+            "task_review",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Task(TaskCommand::Create(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.title, "Run tests");
+                assert_eq!(args.assign, "developer-pi");
+                assert_eq!(args.depends_on, vec!["task_plan"]);
+                assert_eq!(args.blocks, vec!["task_review"]);
+                assert!(args.id.is_none());
+            }
+            other => panic!("expected task create, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "task create");
+    }
+
+    #[test]
+    fn task_update_requires_room_and_task_id() {
+        assert!(
+            Cli::try_parse_from(["mx-agent", "task", "update", "--room", "!abc:matrix.org"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "task",
+            "update",
+            "--room",
+            "!abc:matrix.org",
+            "task_abc",
+            "--state",
+            "executing",
+            "--assign",
+            "developer-pi",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Task(TaskCommand::Update(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.task_id, "task_abc");
+                assert_eq!(args.state.as_deref(), Some("executing"));
+                assert_eq!(args.assign.as_deref(), Some("developer-pi"));
+            }
+            other => panic!("expected task update, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "task update");
+    }
+
+    #[test]
+    fn task_list_requires_room_and_accepts_filters() {
+        assert!(Cli::try_parse_from(["mx-agent", "task", "list"]).is_err());
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "task",
+            "list",
+            "--room",
+            "!abc:matrix.org",
+            "--state",
+            "pending",
+            "--assigned",
+            "developer-pi",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Task(TaskCommand::List(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.state.as_deref(), Some("pending"));
+                assert_eq!(args.assigned.as_deref(), Some("developer-pi"));
+            }
+            other => panic!("expected task list, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "task list");
     }
 
     #[test]
