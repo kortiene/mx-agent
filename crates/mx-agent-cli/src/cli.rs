@@ -1883,6 +1883,12 @@ where
 }
 
 fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
+    if let Some(state) = &args.state {
+        if let Err(e) = validate_task_state_arg(state) {
+            eprintln!("mx-agent: {e}");
+            return ExitCode::from(64);
+        }
+    }
     let action = match build_task_action(TaskActionInput {
         tool: args.tool.as_deref(),
         args: &args.args,
@@ -1930,6 +1936,12 @@ fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
 }
 
 fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
+    if let Some(state) = &args.state {
+        if let Err(e) = validate_task_state_arg(state) {
+            eprintln!("mx-agent: {e}");
+            return ExitCode::from(64);
+        }
+    }
     let action = match build_task_action(TaskActionInput {
         tool: args.tool.as_deref(),
         args: &args.args,
@@ -3142,6 +3154,15 @@ fn read_json_object(path: &std::path::Path) -> Result<serde_json::Value, String>
     }
 }
 
+/// Validate a task lifecycle state supplied on the CLI.
+fn validate_task_state_arg(state: &str) -> Result<(), String> {
+    if mx_agent_daemon::is_known_state(state) {
+        Ok(())
+    } else {
+        Err(format!("task state {state:?} is not recognized"))
+    }
+}
+
 /// Borrowed task action flags used to build a structured task action.
 struct TaskActionInput<'a> {
     /// Optional tool name.
@@ -4215,6 +4236,14 @@ mod tests {
             }
             other => panic!("expected task create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn task_state_arg_validation_rejects_unknown_states() {
+        assert!(validate_task_state_arg("pending").is_ok());
+        assert!(validate_task_state_arg("succeeded").is_ok());
+        assert!(validate_task_state_arg("proposed").is_ok());
+        assert!(validate_task_state_arg("unknown").is_err());
     }
 
     #[test]

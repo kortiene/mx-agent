@@ -110,15 +110,16 @@ pub use sync::{
     run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
 };
 pub use task::{
-    create_task, create_task_for_session, list_tasks, list_tasks_for_session, update_task,
-    update_task_for_session, CreateTaskOptions, ListTasksOptions, UpdateTaskOptions,
-    DEFAULT_TASK_STATE,
+    can_transition, create_task, create_task_for_session, is_known_state, is_runnable, list_tasks,
+    list_tasks_for_session, update_task, update_task_for_session, CreateTaskOptions,
+    ListTasksOptions, UpdateTaskOptions, DEFAULT_TASK_STATE, STATE_ASSIGNED, STATE_BLOCKED,
+    STATE_CANCELLED, STATE_EXECUTING, STATE_FAILED, STATE_PENDING, STATE_PROPOSED, STATE_SUCCEEDED,
+    STATE_SUPERSEDED,
 };
 pub use task_graph::{GraphEdge, GraphNode, TaskGraph};
 pub use task_orchestrator::{
     action_from_task, OrchestrationOutcome, TaskActionError, TaskDispatchError, TaskDispatcher,
-    TaskExecutionResult, TaskOrchestrator, TaskStore, TaskStoreError, STATE_ASSIGNED,
-    STATE_EXECUTING, STATE_FAILED, STATE_PENDING, STATE_SUCCEEDED,
+    TaskExecutionResult, TaskOrchestrator, TaskStore, TaskStoreError,
 };
 pub use tool_exec::{execute_tool, ToolError, ToolResult, RUN_TESTS};
 pub use tools::{builtin_tools, ToolRegistry};

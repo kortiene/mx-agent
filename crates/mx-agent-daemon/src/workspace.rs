@@ -189,6 +189,17 @@ pub enum WorkspaceError {
     TaskExists(String),
     /// No task with the requested ID exists in the room.
     TaskNotFound(String),
+    /// A task lifecycle state is not one of the states mx-agent understands.
+    InvalidTaskState(String),
+    /// A task update attempted a lifecycle transition that is not permitted.
+    InvalidTaskTransition {
+        /// Task ID (state key) the update targeted.
+        task_id: String,
+        /// Current lifecycle state.
+        from: String,
+        /// Requested lifecycle state.
+        to: String,
+    },
     /// The update was rejected because the task has already advanced past the
     /// revision the caller last observed; applying it would silently overwrite
     /// newer state (architecture §9.4).
@@ -272,6 +283,16 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::TaskNotFound(value) => {
                 write!(f, "task {value:?} was not found in the room")
             }
+            WorkspaceError::InvalidTaskState(value) => {
+                write!(
+                    f,
+                    "task state {value:?} is not a recognized lifecycle state"
+                )
+            }
+            WorkspaceError::InvalidTaskTransition { task_id, from, to } => write!(
+                f,
+                "task {task_id:?} cannot transition from {from:?} to {to:?}"
+            ),
             WorkspaceError::StaleTaskUpdate {
                 task_id,
                 expected,

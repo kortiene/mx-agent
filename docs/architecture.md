@@ -761,15 +761,21 @@ state_key: <task_id>
 }
 ```
 
-Task states:
+Task states and common forward transitions:
 
 ```text
 proposed -> pending -> assigned -> executing -> succeeded
-                                      -> failed
-                                      -> cancelled
-        -> blocked
-        -> superseded
+    |           |          |              |--> failed
+    |           |          |              |--> cancelled
+    |           |          |--> blocked -> pending/assigned
+    |           |--> blocked
+    |--> cancelled
+    |--> superseded
 ```
+
+Terminal states (`succeeded`, `failed`, `cancelled`, `superseded`) are not
+reopened by default; invalid daemon-originated state transitions are rejected
+rather than published.
 
 A task is runnable when:
 
