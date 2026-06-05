@@ -891,6 +891,14 @@ tool, and finalizes the task `succeeded` (tool exit 0) or `failed` (nonzero or
 un-invokable) with the tool summary recorded in the task `result`. A
 policy-denied tool action never runs and the task becomes `blocked`.
 
+Exec-backed task actions (`{"type":"exec", ...}`) run through the process runner
+once authorized (and only behind strict policy/trust checks): a denied exec
+never spawns, exit code `0` finalizes the task `succeeded`, and any other
+termination (nonzero exit, signal, or timeout) finalizes it `failed`; output
+artifacts are linked in the task `result` when present. Explicit cancellation is
+handled through the invocation cancel path (`exec.cancelled`), which finalizes
+the owning task `cancelled` via the task↔invocation linkage.
+
 ### 9.3 Workspace State
 
 State event:
