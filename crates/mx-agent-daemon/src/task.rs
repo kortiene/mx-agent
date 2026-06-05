@@ -26,9 +26,92 @@ use crate::matrix::restore_client;
 use crate::session::StoredSession;
 use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
 
+/// Lifecycle state for newly proposed work not yet ready to run.
+pub const STATE_PROPOSED: &str = "proposed";
+/// Lifecycle state for tasks waiting to be assigned or run.
+pub const STATE_PENDING: &str = "pending";
+/// Lifecycle state for tasks assigned and ready to run once dependencies pass.
+pub const STATE_ASSIGNED: &str = "assigned";
+/// Lifecycle state for tasks currently owned by a worker.
+pub const STATE_EXECUTING: &str = "executing";
+/// Lifecycle state for tasks that completed successfully.
+pub const STATE_SUCCEEDED: &str = "succeeded";
+/// Lifecycle state for tasks that completed unsuccessfully or were denied.
+pub const STATE_FAILED: &str = "failed";
+/// Lifecycle state for tasks cancelled before successful completion.
+pub const STATE_CANCELLED: &str = "cancelled";
+/// Lifecycle state for tasks waiting on an external condition.
+pub const STATE_BLOCKED: &str = "blocked";
+/// Lifecycle state for tasks replaced by newer work.
+pub const STATE_SUPERSEDED: &str = "superseded";
+
 /// State assigned to a freshly created task when the caller does not specify
 /// one (architecture §9.2, `proposed -> pending -> ...`).
-pub const DEFAULT_TASK_STATE: &str = "pending";
+pub const DEFAULT_TASK_STATE: &str = STATE_PENDING;
+
+const KNOWN_STATES: &[&str] = &[
+    STATE_PROPOSED,
+    STATE_PENDING,
+    STATE_ASSIGNED,
+    STATE_EXECUTING,
+    STATE_SUCCEEDED,
+    STATE_FAILED,
+    STATE_CANCELLED,
+    STATE_BLOCKED,
+    STATE_SUPERSEDED,
+];
+
+/// Return `true` when `state` is one of the task lifecycle states mx-agent
+/// understands.
+pub fn is_known_state(state: &str) -> bool {
+    KNOWN_STATES.contains(&state)
+}
+
+/// Return `true` when `state` is terminal and must never be auto-executed
+/// again by the scheduler.
+pub fn is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        STATE_SUCCEEDED | STATE_FAILED | STATE_CANCELLED | STATE_SUPERSEDED
+    )
+}
+
+/// Return `true` when a task in `state` may be considered by the scheduler.
+///
+/// This is only a lifecycle check. The scheduler must still require assignment,
+/// satisfied dependencies, a valid action, and local policy/trust approval.
+pub fn is_runnable(state: &str) -> bool {
+    matches!(state, STATE_PENDING | STATE_ASSIGNED)
+}
+
+/// Return `true` when a task may move from `from` to `to`.
+///
+/// Equal states are treated as idempotent republishes. Terminal states do not
+/// transition to any different state, which prevents succeeded/failed/cancelled
+/// or superseded tasks from being reopened and auto-executed accidentally.
+pub fn can_transition(from: &str, to: &str) -> bool {
+    if from == to {
+        return is_known_state(from);
+    }
+    match from {
+        STATE_PROPOSED => matches!(to, STATE_PENDING | STATE_CANCELLED | STATE_SUPERSEDED),
+        STATE_PENDING => matches!(
+            to,
+            STATE_ASSIGNED | STATE_BLOCKED | STATE_CANCELLED | STATE_SUPERSEDED
+        ),
+        STATE_ASSIGNED => matches!(
+            to,
+            STATE_PENDING | STATE_EXECUTING | STATE_BLOCKED | STATE_CANCELLED | STATE_SUPERSEDED
+        ),
+        STATE_BLOCKED => matches!(
+            to,
+            STATE_PENDING | STATE_ASSIGNED | STATE_CANCELLED | STATE_SUPERSEDED
+        ),
+        STATE_EXECUTING => matches!(to, STATE_SUCCEEDED | STATE_FAILED | STATE_CANCELLED),
+        STATE_SUCCEEDED | STATE_FAILED | STATE_CANCELLED | STATE_SUPERSEDED => false,
+        _ => false,
+    }
+}
 
 /// Options for [`create_task`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -219,6 +302,29 @@ fn check_not_stale(
     }
 }
 
+/// Validate that a task state string is recognized.
+fn check_known_state(state: &str) -> Result<(), WorkspaceError> {
+    if is_known_state(state) {
+        Ok(())
+    } else {
+        Err(WorkspaceError::InvalidTaskState(state.to_string()))
+    }
+}
+
+/// Validate a lifecycle transition before publishing it.
+fn check_transition(task_id: &str, from: &str, to: &str) -> Result<(), WorkspaceError> {
+    check_known_state(to)?;
+    if can_transition(from, to) {
+        Ok(())
+    } else {
+        Err(WorkspaceError::InvalidTaskTransition {
+            task_id: task_id.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        })
+    }
+}
+
 /// Return `true` when `task` passes the (optional) state and assignee filters.
 fn matches_filters(task: &TaskState, options: &ListTasksOptions) -> bool {
     options.state.as_deref().map_or(true, |s| task.state == s)
@@ -335,6 +441,7 @@ pub async fn create_task(
         .unwrap_or_else(|| client.user_id().map(|u| u.to_string()).unwrap_or_default());
 
     let state = build_new_task(options, task_id.clone(), created_by, now_rfc3339());
+    check_known_state(&state.state)?;
     publish_task_state(&room, &task_id, &state).await?;
     Ok(state)
 }
@@ -371,6 +478,9 @@ pub async fn update_task(
         .ok_or_else(|| WorkspaceError::TaskNotFound(options.task_id.clone()))?;
 
     check_not_stale(&state.task_id, state.state_rev, options.expected_state_rev)?;
+    if let Some(to) = &options.state {
+        check_transition(&state.task_id, &state.state, to)?;
+    }
 
     apply_update(&mut state, options, now_rfc3339(), event_id);
     publish_task_state(&room, &options.task_id, &state).await?;
@@ -442,6 +552,65 @@ mod tests {
             blocks: vec!["task-review".to_string()],
             action: None,
         }
+    }
+
+    #[test]
+    fn lifecycle_helpers_classify_states() {
+        assert!(is_known_state(STATE_PROPOSED));
+        assert!(is_known_state(STATE_PENDING));
+        assert!(is_known_state(STATE_ASSIGNED));
+        assert!(is_known_state(STATE_EXECUTING));
+        assert!(is_known_state(STATE_SUCCEEDED));
+        assert!(is_known_state(STATE_FAILED));
+        assert!(is_known_state(STATE_CANCELLED));
+        assert!(is_known_state(STATE_BLOCKED));
+        assert!(is_known_state(STATE_SUPERSEDED));
+        assert!(!is_known_state("unknown"));
+
+        assert!(is_runnable(STATE_PENDING));
+        assert!(is_runnable(STATE_ASSIGNED));
+        assert!(!is_runnable(STATE_EXECUTING));
+        assert!(!is_runnable(STATE_SUCCEEDED));
+
+        assert!(!is_terminal(STATE_PROPOSED));
+        assert!(!is_terminal(STATE_PENDING));
+        assert!(is_terminal(STATE_SUCCEEDED));
+        assert!(is_terminal(STATE_FAILED));
+        assert!(is_terminal(STATE_CANCELLED));
+        assert!(is_terminal(STATE_SUPERSEDED));
+    }
+
+    #[test]
+    fn lifecycle_transitions_match_architecture_state_machine() {
+        assert!(can_transition(STATE_PROPOSED, STATE_PENDING));
+        assert!(can_transition(STATE_PENDING, STATE_ASSIGNED));
+        assert!(can_transition(STATE_ASSIGNED, STATE_EXECUTING));
+        assert!(can_transition(STATE_EXECUTING, STATE_SUCCEEDED));
+        assert!(can_transition(STATE_EXECUTING, STATE_FAILED));
+        assert!(can_transition(STATE_EXECUTING, STATE_CANCELLED));
+        assert!(can_transition(STATE_BLOCKED, STATE_PENDING));
+        assert!(can_transition(STATE_PENDING, STATE_PENDING));
+
+        assert!(!can_transition(STATE_PENDING, STATE_SUCCEEDED));
+        assert!(!can_transition(STATE_SUCCEEDED, STATE_PENDING));
+        assert!(!can_transition(STATE_FAILED, STATE_EXECUTING));
+        assert!(!can_transition("unknown", STATE_PENDING));
+        assert!(!can_transition(STATE_PENDING, "unknown"));
+    }
+
+    #[test]
+    fn transition_validation_reports_unknown_and_invalid_states() {
+        let unknown =
+            check_known_state("unknown").expect_err("unknown lifecycle states should be rejected");
+        assert!(matches!(unknown, WorkspaceError::InvalidTaskState(state) if state == "unknown"));
+
+        let invalid = check_transition("task_abc", STATE_SUCCEEDED, STATE_PENDING)
+            .expect_err("terminal tasks must not be reopened");
+        assert!(matches!(
+            invalid,
+            WorkspaceError::InvalidTaskTransition { task_id, from, to }
+                if task_id == "task_abc" && from == STATE_SUCCEEDED && to == STATE_PENDING
+        ));
     }
 
     #[test]

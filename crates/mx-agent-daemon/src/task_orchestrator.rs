@@ -15,18 +15,9 @@ use mx_agent_protocol::id::generate_invocation_id;
 use mx_agent_protocol::schema::{TaskAction, TaskState};
 use serde_json::{json, Map, Value};
 
-use crate::task::UpdateTaskOptions;
-
-/// Lifecycle state for tasks waiting to be assigned or run.
-pub const STATE_PENDING: &str = "pending";
-/// Lifecycle state for tasks assigned and ready to run once dependencies pass.
-pub const STATE_ASSIGNED: &str = "assigned";
-/// Lifecycle state for tasks currently owned by a worker.
-pub const STATE_EXECUTING: &str = "executing";
-/// Lifecycle state for tasks that completed successfully.
-pub const STATE_SUCCEEDED: &str = "succeeded";
-/// Lifecycle state for tasks that completed unsuccessfully or were denied.
-pub const STATE_FAILED: &str = "failed";
+use crate::task::{is_runnable, UpdateTaskOptions, STATE_EXECUTING, STATE_FAILED, STATE_SUCCEEDED};
+#[cfg(test)]
+use crate::task::{STATE_ASSIGNED, STATE_PENDING};
 
 const ACTION_FIELD: &str = "action";
 
@@ -248,7 +239,7 @@ impl TaskOrchestrator {
         tasks
             .iter()
             .filter(|task| self.is_assigned(task))
-            .filter(|task| is_schedulable_state(&task.state))
+            .filter(|task| is_runnable(&task.state))
             .filter(|task| unmet_dependencies(task, &succeeded).is_empty())
             .collect()
     }
@@ -270,7 +261,7 @@ impl TaskOrchestrator {
                 task_id: task.task_id.clone(),
             };
         }
-        if !is_schedulable_state(&task.state) {
+        if !is_runnable(&task.state) {
             return OrchestrationOutcome::NotRunnableState {
                 task_id: task.task_id.clone(),
                 state: task.state.clone(),
@@ -438,10 +429,6 @@ impl TaskOrchestrator {
     fn is_assigned(&self, task: &TaskState) -> bool {
         task.assigned_to == self.agent_id
     }
-}
-
-fn is_schedulable_state(state: &str) -> bool {
-    matches!(state, STATE_PENDING | STATE_ASSIGNED)
 }
 
 fn succeeded_ids(tasks: &[TaskState]) -> BTreeSet<String> {
@@ -686,7 +673,9 @@ mod tests {
         );
         let other_agent = task("task-other", STATE_PENDING, "agent-b");
         let executing = task("task-running", STATE_EXECUTING, "agent-a");
-        let tasks = vec![pending, assigned, other_agent, executing];
+        let succeeded = task("task-done", STATE_SUCCEEDED, "agent-a");
+        let failed = task("task-failed", STATE_FAILED, "agent-a");
+        let tasks = vec![pending, assigned, other_agent, executing, succeeded, failed];
         let ids: Vec<&str> = TaskOrchestrator::new("agent-a")
             .runnable_tasks(&tasks)
             .into_iter()
