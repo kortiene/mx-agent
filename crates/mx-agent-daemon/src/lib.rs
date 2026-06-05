@@ -26,6 +26,7 @@ pub mod signing;
 pub mod stream;
 pub mod sync;
 pub mod task;
+pub mod task_diagnostics;
 pub mod task_dispatch;
 pub mod task_graph;
 pub mod task_orchestrator;
@@ -119,6 +120,7 @@ pub use task::{
     STATE_CANCELLED, STATE_EXECUTING, STATE_FAILED, STATE_PENDING, STATE_PROPOSED, STATE_SUCCEEDED,
     STATE_SUPERSEDED,
 };
+pub use task_diagnostics::{diagnose_tasks, Severity, TaskDiagnostic};
 pub use task_dispatch::{
     exec_result_from_output, ExecRunRequest, ExecTaskDispatcher, ToolTaskDispatcher,
 };

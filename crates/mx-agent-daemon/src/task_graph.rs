@@ -18,6 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use mx_agent_protocol::schema::TaskState;
 use serde::{Deserialize, Serialize};
 
+use crate::task_diagnostics::TaskDiagnostic;
+
 /// One task in the dependency graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphNode {
@@ -54,6 +56,11 @@ pub struct TaskGraph {
     /// loop with the entry point repeated at the end, e.g.
     /// `["task-a", "task-b", "task-a"]`.
     pub cycles: Vec<Vec<String>>,
+    /// Non-blocking diagnostics about the DAG (issue #170): duplicate titles,
+    /// cycles, dangling dependencies, agent/tool problems, etc. Empty unless
+    /// populated by [`TaskGraph::with_diagnostics`].
+    #[serde(default)]
+    pub warnings: Vec<TaskDiagnostic>,
 }
 
 impl TaskGraph {
@@ -102,7 +109,14 @@ impl TaskGraph {
             edges: edges.into_iter().collect(),
             roots,
             cycles,
+            warnings: Vec::new(),
         }
+    }
+
+    /// Attach precomputed [`TaskDiagnostic`] warnings to the graph.
+    pub fn with_diagnostics(mut self, warnings: Vec<TaskDiagnostic>) -> Self {
+        self.warnings = warnings;
+        self
     }
 
     /// Render the graph as the indented text tree from architecture §9.5,

@@ -973,8 +973,19 @@ task-plan  succeeded
 Roots (tasks that depend on nothing present) are drawn at the left margin and
 each dependent is nested beneath the task it depends on, indented four columns
 deeper per level. `mx-agent task graph --json` emits the same graph as a JSON
-object with `nodes`, `edges`, `roots`, and `cycles`. Any dependency cycle is
-reported on its own `cycle detected: a -> b -> a` line rather than expanded.
+object with `nodes`, `edges`, `roots`, `cycles`, and `warnings`. Any dependency
+cycle is reported on its own `cycle detected: a -> b -> a` line rather than
+expanded.
+
+`task graph` also surfaces non-blocking **diagnostics** about the DAG (issue
+#170): duplicate task titles, dependency cycles, missing dependency IDs, tasks
+assigned to unknown or inactive agents, schedulable-but-actionless tasks, and
+tool actions the assigned agent does not offer. These are warnings only — they
+never reject or mutate task state, so advanced workflows are never blocked. Each
+warning has a stable machine-readable `kind` plus a human message; the
+human-readable graph prints a `warnings (...)` section and `--json` includes a
+`warnings` array. Agent-dependent checks are skipped when no agent snapshot is
+available, so a missing agent list never produces misleading warnings.
 
 ---
 

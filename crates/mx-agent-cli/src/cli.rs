@@ -2059,6 +2059,17 @@ fn task_graph(global: &GlobalArgs, args: &TaskGraphArgs) -> ExitCode {
                 println!("mx-agent: no tasks in {}", args.room);
             } else {
                 print!("{}", graph.render_text());
+                if !graph.warnings.is_empty() {
+                    println!("\nwarnings ({}):", graph.warnings.len());
+                    for warning in &graph.warnings {
+                        match &warning.task_id {
+                            Some(task_id) => {
+                                println!("  ! [{}] {}: {}", warning.kind, task_id, warning.message)
+                            }
+                            None => println!("  ! [{}] {}", warning.kind, warning.message),
+                        }
+                    }
+                }
             }
             ExitCode::SUCCESS
         }
