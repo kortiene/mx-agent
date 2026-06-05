@@ -9,22 +9,30 @@
 //! stale, dependency-blocked, or policy-denied work without spawning a process
 //! and without exposing Matrix credentials to the CLI/coding agent.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::VerifyingKey;
 use mx_agent_policy::{CallContext, ExecContext, Outcome, Policy};
+use mx_agent_protocol::canonical_json;
 use mx_agent_protocol::id::generate_invocation_id;
-use mx_agent_protocol::schema::{TaskAction, TaskResult, TaskState};
+use mx_agent_protocol::schema::{
+    Signature, TaskAction, TaskActionAuthorization, TaskResult, TaskState,
+};
+use mx_agent_protocol::signing::{self, SignatureError};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
 
 use crate::audit::{AuditLog, AuditRecord};
+use crate::replay::{ReplayCache, ReplayError};
 use crate::task::{
     is_runnable, UpdateTaskOptions, STATE_BLOCKED, STATE_EXECUTING, STATE_FAILED, STATE_SUCCEEDED,
 };
 #[cfg(test)]
 use crate::task::{STATE_ASSIGNED, STATE_PENDING};
+use crate::trust::TrustStore;
 
 const ACTION_FIELD: &str = "action";
 
@@ -233,6 +241,9 @@ pub struct TaskOrchestrator {
     room_id: Option<String>,
     policy: Option<Policy>,
     audit_log: Option<AuditLog>,
+    trust_store: Option<TrustStore>,
+    verifying_keys: BTreeMap<String, VerifyingKey>,
+    replay_cache: Option<RefCell<ReplayCache>>,
 }
 
 impl TaskOrchestrator {
@@ -243,6 +254,9 @@ impl TaskOrchestrator {
             room_id: None,
             policy: None,
             audit_log: None,
+            trust_store: None,
+            verifying_keys: BTreeMap::new(),
+            replay_cache: None,
         }
     }
 
@@ -262,6 +276,24 @@ impl TaskOrchestrator {
     /// Attach an audit log that records task action policy decisions.
     pub fn with_audit_log(mut self, audit_log: AuditLog) -> Self {
         self.audit_log = Some(audit_log);
+        self
+    }
+
+    /// Attach the local trust store used to authorize signed task actions.
+    pub fn with_trust_store(mut self, trust_store: TrustStore) -> Self {
+        self.trust_store = Some(trust_store);
+        self
+    }
+
+    /// Add a verifying key resolved for a task action signing key id.
+    pub fn with_verifying_key(mut self, key_id: impl Into<String>, key: VerifyingKey) -> Self {
+        self.verifying_keys.insert(key_id.into(), key);
+        self
+    }
+
+    /// Attach replay protection for signed task action authorizations.
+    pub fn with_replay_cache(mut self, replay_cache: ReplayCache) -> Self {
+        self.replay_cache = Some(RefCell::new(replay_cache));
         self
     }
 
@@ -317,6 +349,11 @@ impl TaskOrchestrator {
         };
 
         let invocation_id = generate_invocation_id();
+        if let Err(outcome) =
+            self.verify_task_action_authorization(task, &action, &invocation_id, store)
+        {
+            return outcome;
+        }
         if let Err(outcome) = self.authorize_task_action(task, &action, &invocation_id, store) {
             return outcome;
         }
@@ -474,6 +511,127 @@ impl TaskOrchestrator {
         }
     }
 
+    /// Require a trusted, signed, non-replayed authorization before a task
+    /// action may execute.
+    ///
+    /// Task state is advisory: when trust or replay enforcement is configured,
+    /// an action must carry a valid [`TaskActionAuthorization`] from a locally
+    /// trusted signing key, addressed to this agent, within its expiry, and
+    /// with a fresh nonce. Any failure blocks the task without dispatching. When
+    /// neither a trust store nor a replay cache is configured, this check is a
+    /// no-op (the deterministic scheduler core used in tests and by callers that
+    /// supply authorization elsewhere).
+    fn verify_task_action_authorization<S>(
+        &self,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        store: &mut S,
+    ) -> Result<(), OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        if self.trust_store.is_none() && self.replay_cache.is_none() {
+            return Ok(());
+        }
+
+        let Some(auth) = action.authorization() else {
+            return self.block_unauthorized(task, action, invocation_id, "unsigned", store);
+        };
+
+        // The authorization must be addressed to this agent.
+        if auth.target_agent != self.agent_id {
+            return self.block_unauthorized(task, action, invocation_id, "wrong_target", store);
+        }
+
+        // Trust + signature verification (local trust store is final authority).
+        if let Some(trust) = &self.trust_store {
+            if !trust.is_key_trusted(&auth.signature.key_id) {
+                return self.block_unauthorized(
+                    task,
+                    action,
+                    invocation_id,
+                    "untrusted_key",
+                    store,
+                );
+            }
+            let Some(verifying_key) = self.verifying_keys.get(&auth.signature.key_id) else {
+                return self.block_unauthorized(
+                    task,
+                    action,
+                    invocation_id,
+                    "unresolved_key",
+                    store,
+                );
+            };
+            match verify_task_action_signature(verifying_key, &task.task_id, action, auth) {
+                Ok(()) => {}
+                Err(_) => {
+                    return self.block_unauthorized(
+                        task,
+                        action,
+                        invocation_id,
+                        "invalid_signature",
+                        store,
+                    );
+                }
+            }
+        }
+
+        // Replay/expiry protection. Denials are side-effect free in the cache.
+        if let Some(cache) = &self.replay_cache {
+            let admit = cache.borrow_mut().admit(&auth.nonce, &auth.expires_at);
+            if let Err(err) = admit {
+                let reason = match err {
+                    ReplayError::Expired => "expired",
+                    ReplayError::Replayed => "replayed",
+                    ReplayError::MalformedTimestamp => "malformed_expiry",
+                    ReplayError::Io(_) => "replay_cache_unavailable",
+                };
+                return self.block_unauthorized(task, action, invocation_id, reason, store);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn block_unauthorized<S>(
+        &self,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        reason: &str,
+        store: &mut S,
+    ) -> Result<(), OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        let result = failure_result(
+            &self.agent_id,
+            Some(invocation_id),
+            Some(action.kind()),
+            "unauthorized",
+            Some(format!("task action authorization rejected: {reason}")),
+        );
+        match store.finalize(UpdateTaskOptions {
+            room: String::new(),
+            task_id: task.task_id.clone(),
+            state: Some(STATE_BLOCKED.to_string()),
+            result: Some(result),
+            expected_state_rev: Some(task.state_rev),
+            ..UpdateTaskOptions::default()
+        }) {
+            Ok(finalized) => Err(OrchestrationOutcome::Denied {
+                task_id: finalized.task_id,
+                invocation_id: invocation_id.to_string(),
+            }),
+            Err(err) => Err(OrchestrationOutcome::StoreError {
+                task_id: task.task_id.clone(),
+                reason: format_store_error(&err),
+            }),
+        }
+    }
+
     fn authorize_task_action<S>(
         &self,
         task: &TaskState,
@@ -584,6 +742,82 @@ impl TaskOrchestrator {
     fn is_assigned(&self, task: &TaskState) -> bool {
         task.assigned_to == self.agent_id
     }
+}
+
+/// Build the canonical bytes a task-action authorization signs.
+///
+/// The signature binds the approval to a specific task id and to the action
+/// payload with its embedded authorization removed, plus the authorization
+/// metadata with its own signature removed. Both sides compute the same
+/// canonical JSON so the `signature` field is excluded consistently.
+fn task_action_signing_value(
+    task_id: &str,
+    action: &TaskAction,
+    auth: &TaskActionAuthorization,
+) -> Value {
+    let action_value = serde_json::to_value(action.without_authorization())
+        .expect("task action serializes to JSON");
+    let auth_meta = serde_json::json!({
+        "requesting_agent": auth.requesting_agent,
+        "target_agent": auth.target_agent,
+        "created_at": auth.created_at,
+        "expires_at": auth.expires_at,
+        "nonce": auth.nonce,
+    });
+    serde_json::json!({
+        "task_id": task_id,
+        "action": action_value,
+        "authorization": auth_meta,
+    })
+}
+
+/// Verify a task-action authorization signature against `verifying_key`.
+fn verify_task_action_signature(
+    verifying_key: &VerifyingKey,
+    task_id: &str,
+    action: &TaskAction,
+    auth: &TaskActionAuthorization,
+) -> Result<(), SignatureError> {
+    let value = task_action_signing_value(task_id, action, auth);
+    let bytes = canonical_json::to_canonical_bytes(&value);
+    signing::verify_signature(verifying_key, &auth.signature, &bytes)
+}
+
+/// Build a detached task-action signature with `signing_key`.
+///
+/// This is the producer side of [`verify_task_action_signature`]: it signs the
+/// canonical bytes binding `task_id`, the action (without authorization), and
+/// the authorization metadata (without signature).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_task_action(
+    signing_key: &ed25519_dalek::SigningKey,
+    key_id: impl Into<String>,
+    task_id: &str,
+    action: &TaskAction,
+    requesting_agent: impl Into<String>,
+    target_agent: impl Into<String>,
+    created_at: impl Into<String>,
+    expires_at: impl Into<String>,
+    nonce: impl Into<String>,
+) -> Result<TaskActionAuthorization, SignatureError> {
+    let mut auth = TaskActionAuthorization {
+        requesting_agent: requesting_agent.into(),
+        target_agent: target_agent.into(),
+        created_at: created_at.into(),
+        expires_at: expires_at.into(),
+        nonce: nonce.into(),
+        signature: Signature {
+            alg: signing::ALG_ED25519.to_string(),
+            key_id: key_id.into(),
+            sig: String::new(),
+        },
+        extra: Default::default(),
+    };
+    let value = task_action_signing_value(task_id, action, &auth);
+    let key_id = auth.signature.key_id.clone();
+    let signature = signing::sign(signing_key, key_id, &value)?;
+    auth.signature = signature;
+    Ok(auth)
 }
 
 fn evaluate_task_action(
@@ -864,7 +1098,8 @@ allow_cwd = ["/repo"]
             action_from_task(&t).unwrap(),
             TaskAction::Tool {
                 tool: "run_tests".to_string(),
-                args: json!({"package":"cli"})
+                args: json!({"package":"cli"}),
+                authorization: None,
             }
         );
     }
@@ -878,12 +1113,14 @@ allow_cwd = ["/repo"]
         t.action = Some(TaskAction::Tool {
             tool: "typed".to_string(),
             args: json!({ "package": "cli" }),
+            authorization: None,
         });
         assert_eq!(
             action_from_task(&t).unwrap(),
             TaskAction::Tool {
                 tool: "typed".to_string(),
-                args: json!({ "package": "cli" })
+                args: json!({ "package": "cli" }),
+                authorization: None,
             }
         );
     }
@@ -1232,5 +1469,267 @@ allow_cwd = ["/repo"]
             result.get("invocation_id").and_then(Value::as_str),
             Some("inv-lost")
         );
+    }
+
+    // --- Signed task action authorization (issue #166) -----------------------
+
+    use crate::session::SessionPaths;
+    use ed25519_dalek::SigningKey;
+
+    fn signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    const TEST_KEY_ID: &str = "mxagent-ed25519:test-task-key";
+
+    fn trust_store_with_key(status_trusted: bool) -> TrustStore {
+        let mut store = TrustStore::default();
+        store.approve(
+            "@planner:server",
+            TEST_KEY_ID,
+            Some("SHA256:test".to_string()),
+            None,
+            None,
+        );
+        if !status_trusted {
+            store.revoke("@planner:server", TEST_KEY_ID);
+        }
+        store
+    }
+
+    fn replay_cache(name: &str) -> (ReplayCache, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "mx-agent-task-auth-{name}-{}-{}",
+            std::process::id(),
+            now_rfc3339().replace([':', '-'], "")
+        ));
+        std::fs::create_dir_all(&dir).expect("create replay dir");
+        let paths = SessionPaths {
+            session_file: dir.join("session.json"),
+            sync_token_file: dir.join("sync_token"),
+            data_dir: dir.clone(),
+        };
+        let cache = ReplayCache::load_with_capacity(&paths, 64).expect("replay cache loads");
+        (cache, dir)
+    }
+
+    fn future_rfc3339() -> String {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default()
+            + 3600;
+        unix_to_rfc3339(secs)
+    }
+
+    fn signed_tool_action(expires_at: &str, nonce: &str) -> (TaskState, TaskAction) {
+        let action = TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: None,
+        };
+        let auth = sign_task_action(
+            &signing_key(),
+            TEST_KEY_ID,
+            "task-a",
+            &action,
+            "@planner:server",
+            "agent-a",
+            "2026-06-04T18:00:00Z",
+            expires_at,
+            nonce,
+        )
+        .expect("sign task action");
+        let signed = TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: Some(auth),
+        };
+        let mut t = task("task-a", STATE_PENDING, "agent-a");
+        t.created_by = "@planner:server".to_string();
+        t.action = Some(signed.clone());
+        (t, signed)
+    }
+
+    #[test]
+    fn trusted_signed_action_runs_through_policy_and_dispatch() {
+        let (t, _action) = signed_tool_action(&future_rfc3339(), "nonce-ok");
+        let (cache, dir) = replay_cache("ok");
+        let mut store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .with_replay_cache(cache)
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED
+        ));
+    }
+
+    #[test]
+    fn unsigned_action_does_not_execute_when_trust_required() {
+        let mut t = task("task-a", STATE_PENDING, "agent-a");
+        t.created_by = "@planner:server".to_string();
+        t.action = Some(TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: None,
+        });
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        assert_eq!(store.finalized_state.as_deref(), Some(STATE_BLOCKED));
+        let result = finalized_result(&store);
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("unauthorized")
+        );
+    }
+
+    #[test]
+    fn untrusted_key_signed_action_does_not_execute() {
+        let (t, _action) = signed_tool_action(&future_rfc3339(), "nonce-untrusted");
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(TrustStore::default())
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        let result = finalized_result(&store);
+        assert!(result
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("untrusted_key")));
+    }
+
+    #[test]
+    fn revoked_key_signed_action_does_not_execute() {
+        let (t, _action) = signed_tool_action(&future_rfc3339(), "nonce-revoked");
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust_store_with_key(false))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        let result = finalized_result(&store);
+        assert!(result
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("untrusted_key")));
+    }
+
+    #[test]
+    fn tampered_signed_action_fails_verification() {
+        let (mut t, _action) = signed_tool_action(&future_rfc3339(), "nonce-tamper");
+        // Tamper with the action after signing: change the tool name.
+        if let Some(TaskAction::Tool {
+            tool,
+            authorization,
+            ..
+        }) = t.action.clone()
+        {
+            t.action = Some(TaskAction::Tool {
+                tool: format!("{tool}-tampered"),
+                args: json!({}),
+                authorization,
+            });
+        }
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        let result = finalized_result(&store);
+        assert!(result
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("invalid_signature")));
+    }
+
+    #[test]
+    fn expired_signed_action_does_not_execute() {
+        let (t, _action) = signed_tool_action("2000-01-01T00:00:00Z", "nonce-expired");
+        let (cache, dir) = replay_cache("expired");
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .with_replay_cache(cache)
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        let result = finalized_result(&store);
+        assert!(result
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("expired")));
+    }
+
+    #[test]
+    fn replayed_signed_action_does_not_execute_twice() {
+        let expires = future_rfc3339();
+        let (cache, dir) = replay_cache("replay");
+        let mut store = MemoryStore::default();
+        let orchestrator = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .with_replay_cache(cache);
+
+        let (t, _action) = signed_tool_action(&expires, "nonce-replay");
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let first =
+            orchestrator.process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(first, OrchestrationOutcome::Completed { .. }));
+
+        // Re-presenting the same signed authorization (same nonce) must not run.
+        let mut replay_store = MemoryStore::default();
+        let mut panic_dispatcher = PanicDispatcher;
+        let second = orchestrator.process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut replay_store,
+            &mut panic_dispatcher,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(second, OrchestrationOutcome::Denied { .. }));
+        let result = finalized_result(&replay_store);
+        assert!(result
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("replayed")));
     }
 }

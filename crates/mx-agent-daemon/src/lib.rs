@@ -86,7 +86,7 @@ pub use matrix::{
     build_client, login_password, restore_client, ClientError, ConfigError, LoginError,
     MatrixConfig,
 };
-pub use mx_agent_protocol::schema::{TaskAction, TaskResult};
+pub use mx_agent_protocol::schema::{TaskAction, TaskActionAuthorization, TaskResult};
 #[cfg(unix)]
 pub use pty::{PtySession, PtyWinsize};
 pub use replay::{ReplayCache, ReplayError, DEFAULT_CAPACITY};
@@ -118,8 +118,8 @@ pub use task::{
 };
 pub use task_graph::{GraphEdge, GraphNode, TaskGraph};
 pub use task_orchestrator::{
-    action_from_task, OrchestrationOutcome, TaskActionError, TaskDispatchError, TaskDispatcher,
-    TaskExecutionResult, TaskOrchestrator, TaskStore, TaskStoreError,
+    action_from_task, sign_task_action, OrchestrationOutcome, TaskActionError, TaskDispatchError,
+    TaskDispatcher, TaskExecutionResult, TaskOrchestrator, TaskStore, TaskStoreError,
 };
 pub use tool_exec::{execute_tool, ToolError, ToolResult, RUN_TESTS};
 pub use tools::{builtin_tools, ToolRegistry};

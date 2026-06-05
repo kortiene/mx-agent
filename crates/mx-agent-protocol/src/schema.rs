@@ -501,6 +501,30 @@ pub struct Heartbeat {
     pub extra: Extra,
 }
 
+/// Signed authorization attached to a privileged task action.
+///
+/// The signature is produced by the requesting agent's mx-agent signing key and
+/// authorizes one specific task action until `expires_at`. Daemons still verify
+/// local trust, replay protection, and policy before executing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskActionAuthorization {
+    /// Agent requesting the action.
+    pub requesting_agent: String,
+    /// Agent expected to execute the action.
+    pub target_agent: String,
+    /// Creation timestamp (RFC 3339).
+    pub created_at: String,
+    /// Expiry timestamp (RFC 3339).
+    pub expires_at: String,
+    /// Random nonce for replay protection.
+    pub nonce: String,
+    /// Detached signature over the task id, action, and authorization metadata.
+    pub signature: Signature,
+    /// Forward-compatible unknown fields.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// Structured work attached to a [`TaskState`] (architecture §9.2).
 ///
 /// A task without an action is a manual/planning task: it can be listed,
@@ -518,6 +542,9 @@ pub enum TaskAction {
         /// Tool arguments as a JSON object or value understood by the tool.
         #[serde(default)]
         args: Value,
+        /// Signed authorization making this advisory action executable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorization: Option<TaskActionAuthorization>,
     },
     /// Invoke an exec-style command through the daemon's execution path.
     Exec {
@@ -534,6 +561,9 @@ pub enum TaskAction {
         /// Whether output should be streamed.
         #[serde(default)]
         stream: bool,
+        /// Signed authorization making this advisory action executable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorization: Option<TaskActionAuthorization>,
     },
 }
 
@@ -543,6 +573,43 @@ impl TaskAction {
         match self {
             Self::Tool { .. } => "tool",
             Self::Exec { .. } => "exec",
+        }
+    }
+
+    /// Borrow the signed authorization attached to this action, if any.
+    pub fn authorization(&self) -> Option<&TaskActionAuthorization> {
+        match self {
+            Self::Tool { authorization, .. } | Self::Exec { authorization, .. } => {
+                authorization.as_ref()
+            }
+        }
+    }
+
+    /// Return a clone of this action with any embedded authorization removed.
+    ///
+    /// This is the action representation covered by a task-action signature.
+    pub fn without_authorization(&self) -> Self {
+        match self {
+            Self::Tool { tool, args, .. } => Self::Tool {
+                tool: tool.clone(),
+                args: args.clone(),
+                authorization: None,
+            },
+            Self::Exec {
+                command,
+                cwd,
+                env,
+                timeout_ms,
+                stream,
+                ..
+            } => Self::Exec {
+                command: command.clone(),
+                cwd: cwd.clone(),
+                env: env.clone(),
+                timeout_ms: *timeout_ms,
+                stream: *stream,
+                authorization: None,
+            },
         }
     }
 }
@@ -1061,6 +1128,43 @@ mod tests {
                 "env": {},
                 "timeout_ms": 600000,
                 "stream": true
+            }
+        }));
+    }
+
+    #[test]
+    fn task_action_with_authorization_round_trips() {
+        assert_round_trip::<TaskState>(json!({
+            "task_id": "task-test-api",
+            "title": "Run API tests",
+            "description": "",
+            "state": "assigned",
+            "assigned_to": "developer-pi",
+            "created_by": "@planner:server",
+            "depends_on": [],
+            "blocks": [],
+            "invocation_id": null,
+            "created_at": "2026-06-02T12:00:00Z",
+            "updated_at": "2026-06-02T12:00:00Z",
+            "state_rev": 2,
+            "previous_event_id": null,
+            "result": null,
+            "action": {
+                "type": "tool",
+                "tool": "run_tests",
+                "args": {},
+                "authorization": {
+                    "requesting_agent": "@planner:server",
+                    "target_agent": "developer-pi",
+                    "created_at": "2026-06-02T12:00:00Z",
+                    "expires_at": "2026-06-02T12:05:00Z",
+                    "nonce": "base64-random",
+                    "signature": {
+                        "alg": "ed25519",
+                        "key_id": "mxagent-ed25519:abc123",
+                        "sig": "base64"
+                    }
+                }
             }
         }));
     }

@@ -817,9 +817,18 @@ or:
 }
 ```
 
-The daemon scheduler first parses the task action and checks local
-Deny-by-default policy against the task creator and requested tool/exec before
-claiming or dispatching. A policy denial is audited locally, does not spawn, and
+Task state is **advisory**: room membership does not grant execution. A task
+action only becomes executable when it carries a signed `authorization` from a
+locally trusted mx-agent signing key, addressed to the executing agent, within
+its expiry, and with a fresh nonce. The daemon verifies the Ed25519 signature
+(binding the task id and action), checks the local trust store (the final
+authority; revoked keys are rejected), and applies replay/expiry protection
+*before* any policy or dispatch step. An unsigned, untrusted, revoked, expired,
+or replayed task action is blocked and never executes.
+
+After authorization, the daemon scheduler parses the task action and checks
+local deny-by-default policy against the task creator and requested tool/exec
+before claiming or dispatching. A policy denial is audited locally, does not spawn, and
 moves the task to a safe non-runnable state with `reason = "policy_denied"`.
 When policy permits execution, the daemon claims the pending task with the
 observed `state_rev`, sets `state = "executing"`, and attaches a generated

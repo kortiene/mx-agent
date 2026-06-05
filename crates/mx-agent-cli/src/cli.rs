@@ -3241,6 +3241,7 @@ fn build_task_action(
         return Ok(Some(TaskAction::Tool {
             tool: tool.to_string(),
             args,
+            authorization: None,
         }));
     }
 
@@ -3258,6 +3259,7 @@ fn build_task_action(
             env: Default::default(),
             timeout_ms: input.timeout_ms,
             stream: input.stream,
+            authorization: None,
         }));
     }
 
@@ -4325,7 +4327,8 @@ mod tests {
             tool,
             Some(TaskAction::Tool {
                 tool: "run_tests".to_string(),
-                args: serde_json::json!({ "package": "api" })
+                args: serde_json::json!({ "package": "api" }),
+                authorization: None,
             })
         );
 
@@ -4350,6 +4353,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: Some(1000),
                 stream: true,
+                authorization: None,
             })
         );
     }
