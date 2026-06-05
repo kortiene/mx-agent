@@ -14,6 +14,7 @@ pub mod call_ipc;
 pub mod context;
 pub mod event_router;
 pub mod exec;
+pub mod exec_ipc;
 pub mod heartbeat;
 pub mod invocation;
 pub mod lifecycle;
@@ -80,6 +81,9 @@ pub use exec::{
     build_signed_exec_cancel, build_signed_exec_request, emit_exec_accepted, emit_exec_cancelled,
     emit_exec_rejected, invocation_state_for, publish_invocation_state, send_exec_cancel,
     send_exec_request, CancelRejection, ExecRejection, ExecRequestOptions,
+};
+pub use exec_ipc::{
+    start_exec_loopback, ExecErrorKind, ExecFrame, ExecOutcome, ExecStartParams, ExecStartResult,
 };
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
