@@ -457,7 +457,20 @@ fn dispatch(
         "task.graph" => match parse_params::<crate::ListTasksOptions>(req) {
             Ok(options) => block_on_task_response(req, |session| async move {
                 let tasks = crate::list_tasks_for_session(&session, &options).await?;
-                Ok(crate::TaskGraph::from_tasks(&tasks))
+                // Best-effort agent snapshot for agent-dependent diagnostics;
+                // when it cannot be read, agent checks are skipped rather than
+                // failing the graph query.
+                let agents = crate::list_agents_for_session(
+                    &session,
+                    &crate::ListAgentsOptions {
+                        room: options.room.clone(),
+                        capabilities: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap_or_default();
+                let warnings = crate::diagnose_tasks(&tasks, &agents);
+                Ok(crate::TaskGraph::from_tasks(&tasks).with_diagnostics(warnings))
             }),
             Err(response) => *response,
         },
