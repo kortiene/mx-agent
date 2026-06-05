@@ -358,10 +358,16 @@ impl TaskOrchestrator {
             return outcome;
         }
 
+        // Optimistic claim: transition pending/assigned -> executing only if the
+        // task is still at the observed `state_rev`. The claim also records this
+        // agent as the owner via `assigned_to`, so a successful claim publishes
+        // both the executing state and ownership atomically. If another daemon
+        // claimed first, the conditional update is stale and we must not run.
         let claimed = match store.claim(UpdateTaskOptions {
             room: String::new(),
             task_id: task.task_id.clone(),
             state: Some(STATE_EXECUTING.to_string()),
+            assigned_to: Some(self.agent_id.clone()),
             invocation_id: Some(invocation_id.clone()),
             expected_state_rev: Some(task.state_rev),
             ..UpdateTaskOptions::default()
@@ -980,6 +986,8 @@ mod tests {
         stale: bool,
         finalized_result: Option<Value>,
         finalized_state: Option<String>,
+        claimed_assigned_to: Option<String>,
+        claimed_invocation_id: Option<String>,
     }
 
     impl TaskStore for MemoryStore {
@@ -992,12 +1000,15 @@ mod tests {
                 });
             }
             self.current_rev = options.expected_state_rev.unwrap_or(1) + 1;
+            self.claimed_assigned_to = options.assigned_to.clone();
+            self.claimed_invocation_id = options.invocation_id.clone();
+            let assigned_to = options.assigned_to.clone().unwrap_or_default();
             Ok(TaskState {
                 task_id: options.task_id,
                 title: String::new(),
                 description: String::new(),
                 state: options.state.unwrap(),
-                assigned_to: "agent-a".to_string(),
+                assigned_to,
                 created_by: String::new(),
                 depends_on: Vec::new(),
                 blocks: Vec::new(),
@@ -1412,6 +1423,61 @@ allow_cwd = ["/repo"]
             OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED
         ));
         assert_eq!(store.current_rev, 3);
+    }
+
+    #[test]
+    fn claim_records_owner_and_invocation() {
+        let t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"run_tests", "args":{}}),
+        );
+        let mut store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "ok".to_string(),
+            artifact_mxc: None,
+        }));
+        let outcome = TaskOrchestrator::new("agent-a").process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut store,
+            &mut dispatcher,
+        );
+        assert!(matches!(outcome, OrchestrationOutcome::Completed { .. }));
+        // The claim recorded this agent as the owner and linked an invocation.
+        assert_eq!(store.claimed_assigned_to.as_deref(), Some("agent-a"));
+        assert!(store.claimed_invocation_id.is_some());
+    }
+
+    #[test]
+    fn competing_daemon_cannot_double_claim() {
+        // A second daemon observing the same task at the now-stale revision must
+        // lose the claim race and must not dispatch anything.
+        let t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"run_tests", "args":{}}),
+        );
+        let mut store = MemoryStore {
+            current_rev: 2,
+            stale: true,
+            ..MemoryStore::default()
+        };
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a").process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut store,
+            &mut dispatcher,
+        );
+        assert_eq!(
+            outcome,
+            OrchestrationOutcome::StaleClaim {
+                task_id: "task-a".to_string()
+            }
+        );
+        // No claim was recorded and no finalize happened.
+        assert!(store.claimed_assigned_to.is_none());
+        assert!(store.finalized_state.is_none());
     }
 
     #[test]

@@ -836,7 +836,11 @@ or replayed task action is blocked and never executes.
 
 After authorization, the daemon scheduler parses the task action and checks
 local deny-by-default policy against the task creator and requested tool/exec
-before claiming or dispatching. A policy denial is audited locally, does not spawn, and
+before claiming or dispatching. The claim is an optimistic, conditional update
+guarded by the observed `state_rev`: it transitions `pending`/`assigned` ->
+`executing`, records this agent as the owner (`assigned_to`), and attaches a
+generated `invocation_id` atomically. If another daemon claimed first, the
+conditional update is stale and this daemon does not execute. A policy denial is audited locally, does not spawn, and
 moves the task to a safe non-runnable state with `reason = "policy_denied"`.
 When policy permits execution, the daemon claims the pending task with the
 observed `state_rev`, sets `state = "executing"`, and attaches a generated
