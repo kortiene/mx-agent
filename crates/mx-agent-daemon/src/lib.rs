@@ -76,9 +76,9 @@ pub use heartbeat::{
 };
 pub use invocation::{
     advance_invocation, advance_invocation_for_session, cancel_invocation,
-    cancel_invocation_for_session, get_invocation, get_invocation_for_session, is_terminal,
-    list_invocations, list_invocations_for_session, terminal_state_for_exit,
-    ListInvocationsOptions,
+    cancel_invocation_for_session, get_invocation, get_invocation_for_session, invocation_for_task,
+    is_terminal, list_invocations, list_invocations_for_session, task_result_from_invocation,
+    task_state_for_invocation, terminal_state_for_exit, ListInvocationsOptions,
 };
 pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
