@@ -22,6 +22,7 @@ other, then running a tool call and a remote-style `exec`.
 - [Register agents](#register-agents)
 - [Run a tool call](#run-a-tool-call)
 - [Run exec](#run-exec)
+- [Track work with tasks](#track-work-with-tasks)
 - [Two-agent demo (end to end)](#two-agent-demo-end-to-end)
 - [Security warnings](#security-warnings)
 
@@ -194,6 +195,136 @@ missing or corrupt chunk as a hard error), `--pty` (allocate a pseudo-terminal),
 > In this alpha, `call` and `exec` run the command on your **local** machine.
 > The `--room`/`--agent` targeting flags are accepted for forward compatibility
 > but do not yet dispatch to a remote agent over Matrix.
+
+## Track work with tasks
+
+Tasks are durable DAG nodes stored as `com.mxagent.task.v1` room state. The
+`task` commands are mediated by the daemon over local IPC, so start it first and
+keep it running:
+
+```bash
+mx-agent daemon start
+mx-agent daemon status
+```
+
+The CLI stays stateless; the daemon owns the Matrix session and signing key and
+reads/writes task state on the homeserver.
+
+### Create tasks
+
+A planning/manual task (no action) just records intent:
+
+```bash
+mx-agent task create --room '#demo:localhost' --title "Plan the release"
+```
+
+A **tool-backed** task carries a structured action naming a tool and its
+arguments:
+
+```bash
+mx-agent task create --room '#demo:localhost' \
+  --title "Run protocol tests" --assign alice-agent \
+  --tool run_tests --arg package=mx-agent-protocol
+```
+
+An **exec-backed** task carries a command (after `--`):
+
+```bash
+mx-agent task create --room '#demo:localhost' \
+  --title "Build the workspace" --assign alice-agent \
+  --exec --cwd "$PWD" --timeout-ms 600000 \
+  -- cargo build --all
+```
+
+Express dependencies with `--depends-on` (repeatable). A dependent task is not
+runnable until every dependency has succeeded:
+
+```bash
+PLAN=$(mx-agent task create --room '#demo:localhost' --title Plan --json | jq -r .task_id)
+mx-agent task create --room '#demo:localhost' --title Test \
+  --assign alice-agent --tool run_tests --arg package=mx-agent-protocol \
+  --depends-on "$PLAN"
+```
+
+### Inspect tasks
+
+`task list` shows tasks (human by default, `--json` for automation):
+
+```bash
+mx-agent task list --room '#demo:localhost'
+mx-agent task list --room '#demo:localhost' --state pending --json
+```
+
+`task graph` renders the dependency tree and surfaces non-blocking
+**diagnostics** — duplicate titles, dependency cycles, dangling dependency IDs,
+unknown/inactive assignees, schedulable tasks with no action, and tool actions
+the assigned agent does not offer:
+
+```bash
+mx-agent task graph --room '#demo:localhost'
+```
+
+```text
+task-plan  pending
+  └─ task-test  pending
+
+warnings (1):
+  ! [missing_dependency] task-test: task "task-test" depends on missing task "task-deploy"
+```
+
+`mx-agent task graph --room '#demo:localhost' --json` emits the same graph as a
+JSON object with `nodes`, `edges`, `roots`, `cycles`, and a machine-readable
+`warnings` array. Diagnostics never reject or change task state, so valid
+advanced workflows are never blocked.
+
+`task watch` streams live task changes until you press Ctrl-C:
+
+```bash
+mx-agent task watch --room '#demo:localhost'
+```
+
+### Update task state
+
+Transition a task or attach an action/result. Lifecycle transitions are
+validated, so terminal states are not reopened and unknown states are rejected.
+Use `--expected-state-rev` for safe optimistic updates that refuse to clobber a
+newer revision:
+
+```bash
+mx-agent task update --room '#demo:localhost' task_01H... --state assigned --assign alice-agent
+mx-agent task update --room '#demo:localhost' task_01H... --state cancelled
+```
+
+### What the daemon enforces (orchestration engine)
+
+mx-agent ships a daemon **task-orchestration engine** that decides what is
+runnable, claims a task with optimistic `state_rev` concurrency, runs its
+action, and writes a stable result. It enforces the security model *before*
+anything runs:
+
+- **Room membership is not execution permission.** A task action runs only when
+  it is authorized: local deny-by-default **policy** must allow the requested
+  tool/command for the task's creator, and a privileged action must additionally
+  carry a valid **Ed25519 signature** from a key your **local trust store**
+  trusts (the local store is the final authority; a revoked key never runs).
+  Unsigned, untrusted, expired, replayed, malformed, or policy-denied actions
+  never spawn — they are blocked with a recorded, non-sensitive reason.
+- **Approvals** hold a task whose policy sets `requires_approval`; it does not
+  run until you approve it (`mx-agent approval list` / `approve` / `deny`), and a
+  denied approval never spawns.
+- **Lifecycle:** a claimed task moves `pending`/`assigned` → `executing` →
+  `succeeded`/`failed`; the result records the linked `invocation_id`, exit code,
+  and a non-sensitive summary. Exit `0` succeeds; anything else fails.
+- **Restart recovery:** on restart the daemon reconciles `executing` tasks
+  against its live invocations — an orphaned local task is marked failed (never
+  double-run), and a remote-owned task is left unchanged with a stale warning.
+
+> **Alpha limitation.** This orchestration engine is implemented and covered by
+> unit and integration tests, but it is **not yet auto-driven by a live `/sync`
+> loop**: a running daemon does not yet poll the room and execute tasks on its
+> own. Today you create, inspect, transition, and graph task state over Matrix;
+> automatic end-to-end scheduling/execution — and the signed Matrix transport
+> that carries an action to a *remote* agent's daemon (#155) — are still landing.
 
 ## Two-agent demo (end to end)
 

@@ -34,7 +34,7 @@ If a box can sync with a homeserver, it can participate — even one that accept
 
 ## Project status
 
-**Public alpha (v0.1.0).** The architecture, protocol schema, IPC layer, policy engine, Ed25519 signing, and sandbox abstraction are in place. **Most CLI subcommands currently parse their arguments and report "not implemented yet"** while daemon behavior is filled in across the roadmap. Each capability below is tagged so you always know what runs today.
+**Public alpha (v0.1.0).** The architecture, protocol schema, IPC layer, policy engine, Ed25519 signing, and sandbox abstraction are in place, and most command groups now run against a real Matrix homeserver through the daemon. The main gaps are the **signed Matrix transport for remote `call`/`exec`** (which run locally today) and the **live daemon scheduler loop** that would auto-drive tasks over `/sync`. Each capability below is tagged so you always know what runs today.
 
 | Area | Status |
 |---|---|
@@ -42,8 +42,12 @@ If a box can sync with a homeserver, it can participate — even one that accept
 | Local IPC: Unix-socket JSON-RPC 2.0 with `0600` perms + `SO_PEERCRED` peer check | ✅ Implemented |
 | Structured logging, secret redaction, dev Matrix homeserver (Tuwunel) | ✅ Implemented |
 | Protocol event schema, Ed25519 signing, policy parser, `none` sandbox backend | ✅ Implemented |
-| `auth`, `workspace`, `agent`, `exec`, `call`, `task`, `trust`, `approval` commands | 🟡 Argument-parsing placeholders; behavior landing (issue #4) |
-| E2EE in production, `bubblewrap`/container sandboxes, interactive PTY, large artifacts | 🔮 Planned |
+| `auth`, `workspace`, `agent`, `trust`, `approval`, `share` commands (over Matrix, daemon-mediated) | ✅ Implemented |
+| Task state: `task create` / `update` / `list` / `graph` / `watch` (daemon-IPC, over Matrix) | ✅ Implemented |
+| Structured task actions (`tool` / `exec`), lifecycle-transition validation, stable task result schema | ✅ Implemented |
+| Daemon task-orchestration engine: scheduler, optimistic `state_rev` claiming, tool/exec dispatch, policy + trust/signature + approval enforcement, restart recovery, DAG diagnostics | ✅ Implemented (engine + tests); not yet auto-driven by a live `/sync` loop — see limitations |
+| `call` / `exec` runners | 🟡 Local-loopback only; signed Matrix transport to a *remote* daemon still landing (#155) |
+| Live daemon scheduler loop auto-claiming/executing tasks over `/sync`; remote Matrix-backed `exec`; E2EE in production; `bubblewrap`/container sandboxes; interactive PTY; large artifacts | 🔮 Planned |
 
 **Platform: Unix only** (Linux and macOS). Windows was intentionally dropped — the project relies on Unix-domain-socket IPC and Unix process semantics.
 
@@ -81,7 +85,7 @@ mx-agent daemon status --json         # pid, uptime, socket path, version as JSO
 mx-agent daemon stop                  # graceful shutdown (SIGTERM, then SIGKILL)
 ```
 
-The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The remaining `auth` / `workspace` / `agent` / `exec` commands accept their final argument shape now but report "not implemented yet" — see [Project status](#project-status).
+The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and `task` command groups run against a real Matrix homeserver through the daemon today; `call` / `exec` currently run on the **local** machine over a daemon loopback (the signed Matrix transport to a *remote* daemon is still landing). See [Project status](#project-status) for the full breakdown.
 
 ---
 

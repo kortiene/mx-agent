@@ -4,7 +4,7 @@ This guide takes you from nothing to your first remote-style command with mx-age
 
 We define every new term the first time it appears, explain *why* each step exists before giving the command, and end with a "Common errors & fixes" table.
 
-> **What's real in v0.1.0?** mx-agent is a public alpha. The daemon's lifecycle (`start` / `status` / `stop`) and the local IPC are functional. **Most other subcommands currently parse your arguments and print "not implemented yet."** Steps below are tagged ✅ (works today), 🟡 (designed, wiring in progress), or 🔮 (planned). You can run every command to see its shape, but expect the 🟡/🔮 ones to be stubs for now.
+> **What's real in v0.1.0?** mx-agent is a public alpha. The daemon's lifecycle (`start` / `status` / `stop`), local IPC, and the `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and `task` command groups are functional and run against a real Matrix homeserver through the daemon. The remaining gaps: `call` / `exec` run **local-loopback** (remote Matrix transport is landing, #155), and the daemon task-orchestration engine — implemented and tested — is **not yet auto-driven by a live `/sync` loop**. Steps below are tagged ✅ (works today), 🟡 (designed, wiring in progress), or 🔮 (planned).
 
 ---
 

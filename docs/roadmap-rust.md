@@ -371,6 +371,16 @@ Acceptance criteria:
 
 Goal: implement distributed workflow tracking.
 
+> **Status: implemented.** Task state CRUD/graph/watch run over Matrix through
+> the daemon (`task create`/`update`/`list`/`graph`/`watch`), with structured
+> task actions, lifecycle-transition validation, a stable task result schema,
+> invocation/task linkage, `state_rev` revisions, and stale-update detection. A
+> daemon **task-orchestration engine** (scheduler, optimistic claiming, tool/exec
+> dispatch, policy + trust/signature + approval enforcement, restart recovery,
+> and DAG diagnostics) is implemented and tested. Remaining work: wiring that
+> engine into a live `/sync` scheduler loop so a running daemon auto-executes
+> tasks, plus the signed Matrix transport for remote `exec` (tracked by #155).
+
 Commands:
 
 ```bash
