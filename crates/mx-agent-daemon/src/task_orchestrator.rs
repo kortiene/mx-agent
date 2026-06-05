@@ -12,13 +12,17 @@
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use mx_agent_policy::{CallContext, ExecContext, Outcome, Policy};
 use mx_agent_protocol::id::generate_invocation_id;
 use mx_agent_protocol::schema::{TaskAction, TaskResult, TaskState};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
 
-use crate::task::{is_runnable, UpdateTaskOptions, STATE_EXECUTING, STATE_FAILED, STATE_SUCCEEDED};
+use crate::audit::{AuditLog, AuditRecord};
+use crate::task::{
+    is_runnable, UpdateTaskOptions, STATE_BLOCKED, STATE_EXECUTING, STATE_FAILED, STATE_SUCCEEDED,
+};
 #[cfg(test)]
 use crate::task::{STATE_ASSIGNED, STATE_PENDING};
 
@@ -226,6 +230,9 @@ pub enum OrchestrationOutcome {
 /// Daemon task orchestrator for a single local agent.
 pub struct TaskOrchestrator {
     agent_id: String,
+    room_id: Option<String>,
+    policy: Option<Policy>,
+    audit_log: Option<AuditLog>,
 }
 
 impl TaskOrchestrator {
@@ -233,7 +240,29 @@ impl TaskOrchestrator {
     pub fn new(agent_id: impl Into<String>) -> Self {
         Self {
             agent_id: agent_id.into(),
+            room_id: None,
+            policy: None,
+            audit_log: None,
         }
+    }
+
+    /// Attach the Matrix room ID used for local policy evaluation.
+    pub fn with_room_id(mut self, room_id: impl Into<String>) -> Self {
+        self.room_id = Some(room_id.into());
+        self
+    }
+
+    /// Attach the local deny-by-default policy used to authorize task actions
+    /// before the scheduler claims or dispatches them.
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Attach an audit log that records task action policy decisions.
+    pub fn with_audit_log(mut self, audit_log: AuditLog) -> Self {
+        self.audit_log = Some(audit_log);
+        self
     }
 
     /// Return pending tasks assigned to this agent and not dependency-blocked.
@@ -288,6 +317,10 @@ impl TaskOrchestrator {
         };
 
         let invocation_id = generate_invocation_id();
+        if let Err(outcome) = self.authorize_task_action(task, &action, &invocation_id, store) {
+            return outcome;
+        }
+
         let claimed = match store.claim(UpdateTaskOptions {
             room: String::new(),
             task_id: task.task_id.clone(),
@@ -441,8 +474,136 @@ impl TaskOrchestrator {
         }
     }
 
+    fn authorize_task_action<S>(
+        &self,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        store: &mut S,
+    ) -> Result<(), OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        let Some(policy) = &self.policy else {
+            return Ok(());
+        };
+        let Some(room_id) = &self.room_id else {
+            return self.block_policy_denied(
+                task,
+                action,
+                invocation_id,
+                "policy_not_configured_for_room".to_string(),
+                store,
+            );
+        };
+        let outcome = evaluate_task_action(policy, room_id, task, action);
+        if let Err(err) = self.audit_policy_decision(room_id, task, action, invocation_id, &outcome)
+        {
+            return Err(OrchestrationOutcome::StoreError {
+                task_id: task.task_id.clone(),
+                reason: format!("could not write task policy audit record: {err}"),
+            });
+        }
+        match outcome {
+            Outcome::Allow(_) => Ok(()),
+            Outcome::Deny(reason) => {
+                self.block_policy_denied(task, action, invocation_id, reason.to_string(), store)
+            }
+        }
+    }
+
+    fn block_policy_denied<S>(
+        &self,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        reason: String,
+        store: &mut S,
+    ) -> Result<(), OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        let result = failure_result(
+            &self.agent_id,
+            Some(invocation_id),
+            Some(action.kind()),
+            "policy_denied",
+            Some(reason),
+        );
+        match store.finalize(UpdateTaskOptions {
+            room: String::new(),
+            task_id: task.task_id.clone(),
+            state: Some(STATE_BLOCKED.to_string()),
+            result: Some(result),
+            expected_state_rev: Some(task.state_rev),
+            ..UpdateTaskOptions::default()
+        }) {
+            Ok(finalized) => Err(OrchestrationOutcome::Denied {
+                task_id: finalized.task_id,
+                invocation_id: invocation_id.to_string(),
+            }),
+            Err(err) => Err(OrchestrationOutcome::StoreError {
+                task_id: task.task_id.clone(),
+                reason: format_store_error(&err),
+            }),
+        }
+    }
+
+    fn audit_policy_decision(
+        &self,
+        room_id: &str,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        outcome: &Outcome,
+    ) -> std::io::Result<()> {
+        let Some(log) = &self.audit_log else {
+            return Ok(());
+        };
+        let record = match action {
+            TaskAction::Tool { tool, .. } => AuditRecord::for_call(
+                room_id,
+                &task.created_by,
+                &self.agent_id,
+                Some(invocation_id),
+                tool,
+                outcome,
+            ),
+            TaskAction::Exec { command, .. } => AuditRecord::for_exec(
+                room_id,
+                &task.created_by,
+                &self.agent_id,
+                Some(invocation_id),
+                command,
+                outcome,
+            ),
+        };
+        log.append(&record)
+    }
+
     fn is_assigned(&self, task: &TaskState) -> bool {
         task.assigned_to == self.agent_id
+    }
+}
+
+fn evaluate_task_action(
+    policy: &Policy,
+    room_id: &str,
+    task: &TaskState,
+    action: &TaskAction,
+) -> Outcome {
+    match action {
+        TaskAction::Tool { tool, .. } => policy.evaluate_call(&CallContext {
+            room_id,
+            requesting_agent: &task.created_by,
+            tool,
+        }),
+        TaskAction::Exec { command, cwd, .. } => policy.evaluate_exec(&ExecContext {
+            room_id,
+            requesting_agent: &task.created_by,
+            command,
+            cwd,
+        }),
     }
 }
 
@@ -560,7 +721,7 @@ mod tests {
             description: String::new(),
             state: state.to_string(),
             assigned_to: assigned_to.to_string(),
-            created_by: "planner".to_string(),
+            created_by: "@planner:server".to_string(),
             depends_on: Vec::new(),
             blocks: Vec::new(),
             invocation_id: None,
@@ -584,6 +745,7 @@ mod tests {
         current_rev: u64,
         stale: bool,
         finalized_result: Option<Value>,
+        finalized_state: Option<String>,
     }
 
     impl TaskStore for MemoryStore {
@@ -619,6 +781,7 @@ mod tests {
         fn finalize(&mut self, options: UpdateTaskOptions) -> Result<TaskState, TaskStoreError> {
             self.current_rev = options.expected_state_rev.unwrap_or(self.current_rev) + 1;
             self.finalized_result = options.result.clone();
+            self.finalized_state = options.state.clone();
             Ok(TaskState {
                 task_id: options.task_id,
                 title: String::new(),
@@ -651,6 +814,44 @@ mod tests {
         ) -> Result<TaskExecutionResult, TaskDispatchError> {
             self.0.clone()
         }
+    }
+
+    struct PanicDispatcher;
+
+    impl TaskDispatcher for PanicDispatcher {
+        fn dispatch(
+            &mut self,
+            _task: &TaskState,
+            _action: &TaskAction,
+            _invocation_id: &str,
+        ) -> Result<TaskExecutionResult, TaskDispatchError> {
+            panic!("policy-denied task must not dispatch")
+        }
+    }
+
+    fn policy() -> Policy {
+        Policy::parse(
+            r#"
+[rooms."!room:server"]
+trusted = true
+raw_exec_default = "deny"
+
+[rooms."!room:server".agents."@planner:server"]
+allow_exec = true
+allow_tools = ["run_tests"]
+allow_commands = ["cargo"]
+allow_cwd = ["/repo"]
+"#,
+        )
+        .expect("test policy parses")
+    }
+
+    fn audit_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mx-agent-task-policy-{name}-{}-{}.log",
+            std::process::id(),
+            now_rfc3339().replace([':', '-'], "")
+        ))
     }
 
     #[test]
@@ -879,6 +1080,101 @@ mod tests {
             result.get("summary").and_then(Value::as_str),
             Some("no matching allow rule")
         );
+    }
+
+    #[test]
+    fn policy_denies_malicious_tool_before_claim_and_audits() {
+        let t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"delete_everything", "args":{}}),
+        );
+        let audit_path = audit_path("tool-deny");
+        let audit_log = AuditLog::new(audit_path.clone());
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_audit_log(audit_log)
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Denied { task_id, .. } if task_id == "task-a"
+        ));
+        // No claim happened; only the denial update advanced the observed rev.
+        assert_eq!(store.current_rev, 2);
+        assert_eq!(store.finalized_state.as_deref(), Some(STATE_BLOCKED));
+        let result = finalized_result(&store);
+        assert_eq!(result.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("policy_denied")
+        );
+        assert!(result
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("not allowlisted")));
+
+        let audit = std::fs::read_to_string(&audit_path).expect("audit log written");
+        let _ = std::fs::remove_file(&audit_path);
+        assert!(audit.contains("\"decision\":\"denied\""), "{audit}");
+        assert!(audit.contains("delete_everything"), "{audit}");
+        assert!(
+            audit.contains("ToolNotAllowed") || audit.contains("tool"),
+            "{audit}"
+        );
+    }
+
+    #[test]
+    fn policy_denies_disallowed_exec_before_claim() {
+        let t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"exec", "command":["sh", "-c", "rm -rf /"], "cwd":"/repo"}),
+        );
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        assert_eq!(store.current_rev, 2);
+        assert_eq!(store.finalized_state.as_deref(), Some(STATE_BLOCKED));
+        let result = finalized_result(&store);
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("policy_denied")
+        );
+        assert!(result
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("not allowlisted")));
+    }
+
+    #[test]
+    fn policy_allows_known_task_action_to_dispatch() {
+        let t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"run_tests", "args":{}}),
+        );
+        let mut store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED
+        ));
+        assert_eq!(store.current_rev, 3);
     }
 
     #[test]
