@@ -2227,6 +2227,7 @@ dependencies = [
  "mx-agent-protocol",
  "mx-agent-telemetry",
  "rustix",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "signal-hook",

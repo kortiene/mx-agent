@@ -16,10 +16,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mx_agent_protocol::schema::TaskState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One task in the dependency graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphNode {
     /// Task identifier (the Matrix state key).
     pub task_id: String,
@@ -33,7 +33,7 @@ pub struct GraphNode {
 /// A dependency edge. `to` depends on `from`; equivalently, work flows from the
 /// dependency (`from`) to the dependent (`to`), which is the direction the text
 /// tree is drawn.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GraphEdge {
     /// The dependency (drawn as the parent in the tree).
     pub from: String,
@@ -42,7 +42,7 @@ pub struct GraphEdge {
 }
 
 /// A fully analyzed task dependency graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskGraph {
     /// Every task, sorted by `task_id`.
     pub nodes: Vec<GraphNode>,

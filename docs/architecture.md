@@ -970,6 +970,24 @@ Response:
 }
 ```
 
+Task commands are daemon-mediated over the same local IPC channel so the CLI
+never reads Matrix session files or tokens. The daemon owns Matrix restoration
+and calls the task state helpers internally:
+
+| Method | Params | Result |
+|---|---|---|
+| `task.create` | `CreateTaskOptions` | `TaskState` |
+| `task.update` | `UpdateTaskOptions` | `TaskState` |
+| `task.list` | `ListTasksOptions` | `TaskState[]` |
+| `task.graph` | `ListTasksOptions` | `TaskGraph` |
+| `task.watch` | `ListTasksOptions` | stream of watch event envelopes |
+
+`task.watch` keeps the Unix-socket connection open and sends one JSON-RPC
+response frame per event using the original request id. Event envelopes carry
+`event = "initial"`, `"changed"`, `"reconnecting"`, or `"reconnected"` plus
+the task snapshots/diff metadata needed by the CLI to preserve human and
+`--json` output compatibility.
+
 Stream from daemon to CLI:
 
 ```json

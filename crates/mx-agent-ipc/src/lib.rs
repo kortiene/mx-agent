@@ -15,7 +15,7 @@ pub use client::Client;
 pub use frame::{read_frame, write_frame, MAX_FRAME_LEN};
 pub use peercred::{verify_peer, PeerCredCheck};
 pub use rpc::{Request, Response, RpcError};
-pub use server::{handle_message, serve};
+pub use server::{handle_message, serve, serve_streaming};
 pub use socket::{bind, ensure_safe_parent_dir, BindError, SocketGuard, SOCKET_MODE};
 
 /// Default Unix domain socket file name, created under the runtime directory.
