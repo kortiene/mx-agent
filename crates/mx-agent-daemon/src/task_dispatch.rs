@@ -9,15 +9,23 @@
 //! - [`ToolTaskDispatcher`] runs tool-backed task actions through the named-tool
 //!   execution path (architecture §5.2). Named tools are the preferred,
 //!   safer-by-default execution boundary over raw `exec`.
+//! - [`ExecTaskDispatcher`] runs raw `exec` task actions through the process
+//!   runner (architecture §7.7, §13.5), mapping the exit status onto the task
+//!   result and linking any output artifact.
 //!
 //! Because authorization happens before dispatch, a dispatcher never needs to
 //! re-check policy; it only executes the already-authorized action and maps the
 //! outcome onto a [`TaskExecutionResult`] (success/exit code/summary) or a
 //! [`TaskDispatchError`].
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
 use mx_agent_protocol::schema::{TaskAction, TaskState};
 use serde_json::Value;
 
+use crate::runner::{RunError, RunOutput, RunSpec, DEFAULT_GRACE_PERIOD};
 use crate::task_orchestrator::{TaskDispatchError, TaskDispatcher, TaskExecutionResult};
 use crate::tool_exec::{execute_tool, ToolError, ToolResult};
 
@@ -88,6 +96,159 @@ where
             },
             TaskAction::Exec { .. } => Err(TaskDispatchError::Failed(
                 "exec action cannot run through the tool dispatcher".to_string(),
+            )),
+        }
+    }
+}
+
+/// A request to run one exec-backed task action, passed to the command runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecRunRequest {
+    /// Command argv: program followed by arguments.
+    pub command: Vec<String>,
+    /// Working directory for the command.
+    pub cwd: PathBuf,
+    /// Explicit environment overrides (layered on the sanitized env).
+    pub env: BTreeMap<String, String>,
+    /// Maximum wall-clock runtime, if any.
+    pub timeout: Option<Duration>,
+}
+
+/// A function that runs an exec request and returns the captured outcome.
+type CommandRunner = fn(&ExecRunRequest) -> Result<RunOutput, RunError>;
+
+/// Default command runner: bridges to the async process runner.
+///
+/// Must be called from a blocking (non-async) context, consistent with the
+/// synchronous orchestrator core. It builds a [`RunSpec`] (sanitized env,
+/// restricted cwd, timeout, baseline sandbox) and runs the command to
+/// completion on a temporary current-thread runtime.
+fn default_command_runner(request: &ExecRunRequest) -> Result<RunOutput, RunError> {
+    let spec = RunSpec {
+        command: request.command.clone(),
+        cwd: request.cwd.clone(),
+        env: request.env.clone(),
+        env_allowlist: Vec::new(),
+        stdin: None,
+        timeout: request.timeout,
+        grace_period: DEFAULT_GRACE_PERIOD,
+        sandbox: mx_agent_sandbox::Backend::None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(RunError::Spawn)?;
+    runtime.block_on(crate::runner::run(&spec))
+}
+
+/// Map a finished [`RunOutput`] onto a [`TaskExecutionResult`].
+///
+/// Exit code `0` is success; a nonzero code, or a process killed by a signal or
+/// a timeout (no exit code), is a failure. `artifact_mxc`, when present, links
+/// an uploaded output artifact into the task result. The summary is
+/// non-sensitive (it never carries raw process output).
+pub fn exec_result_from_output(
+    output: &RunOutput,
+    artifact_mxc: Option<String>,
+) -> TaskExecutionResult {
+    let summary = if output.timed_out {
+        "exec command timed out".to_string()
+    } else if let Some(code) = output.exit_code {
+        format!("exec command exited with code {code}")
+    } else if let Some(signal) = output.signal {
+        format!("exec command terminated by signal {signal}")
+    } else {
+        "exec command finished".to_string()
+    };
+    // A process killed by a signal or a timeout has no successful exit code; map
+    // it to a conventional failure code (128 + signal where known) so the task
+    // is finalized `failed` rather than `succeeded`.
+    let exit_code = match output.exit_code {
+        Some(code) => Some(code),
+        None => Some(128 + output.signal.unwrap_or(0)),
+    };
+    TaskExecutionResult {
+        exit_code,
+        summary,
+        artifact_mxc,
+    }
+}
+
+/// Dispatches raw `exec` task actions by running the command through the
+/// process runner.
+///
+/// The exec action is already authorized (policy/trust/signature) before the
+/// orchestrator calls this dispatcher, so it only runs the command and maps the
+/// outcome: exit `0` finalizes the task `succeeded`, any other termination
+/// finalizes it `failed`. A command that could not be run at all yields a
+/// [`TaskDispatchError::Failed`]. Explicit cancellation is handled separately
+/// through the invocation cancel path (`exec.cancelled`), which finalizes the
+/// owning task `cancelled` via the invocation linkage helpers.
+///
+/// The command runner is injectable for deterministic testing; by default it
+/// bridges to the async [`crate::runner::run`].
+pub struct ExecTaskDispatcher<F = CommandRunner> {
+    run_command: F,
+}
+
+impl Default for ExecTaskDispatcher<CommandRunner> {
+    fn default() -> Self {
+        Self {
+            run_command: default_command_runner,
+        }
+    }
+}
+
+impl ExecTaskDispatcher<CommandRunner> {
+    /// Build a dispatcher that runs commands via the process runner.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<F> ExecTaskDispatcher<F>
+where
+    F: FnMut(&ExecRunRequest) -> Result<RunOutput, RunError>,
+{
+    /// Build a dispatcher with a custom command runner (used by tests).
+    pub fn with_runner(run_command: F) -> Self {
+        Self { run_command }
+    }
+}
+
+impl<F> TaskDispatcher for ExecTaskDispatcher<F>
+where
+    F: FnMut(&ExecRunRequest) -> Result<RunOutput, RunError>,
+{
+    fn dispatch(
+        &mut self,
+        _task: &TaskState,
+        action: &TaskAction,
+        _invocation_id: &str,
+    ) -> Result<TaskExecutionResult, TaskDispatchError> {
+        match action {
+            TaskAction::Exec {
+                command,
+                cwd,
+                env,
+                timeout_ms,
+                ..
+            } => {
+                let request = ExecRunRequest {
+                    command: command.clone(),
+                    cwd: PathBuf::from(cwd),
+                    env: env.clone(),
+                    timeout: timeout_ms.map(Duration::from_millis),
+                };
+                match (self.run_command)(&request) {
+                    Ok(output) => Ok(exec_result_from_output(&output, None)),
+                    Err(err) => Err(TaskDispatchError::Failed(format!(
+                        "exec command could not be run: {err}"
+                    ))),
+                }
+            }
+            TaskAction::Tool { .. } => Err(TaskDispatchError::Failed(
+                "tool action cannot run through the exec dispatcher".to_string(),
             )),
         }
     }
@@ -187,12 +348,59 @@ allow_tools = ["run_tests"]
         task: &TaskState,
         dispatcher: &mut impl TaskDispatcher,
     ) -> (OrchestrationOutcome, MemoryStore) {
+        run_with(task, policy(), dispatcher)
+    }
+
+    fn run_with(
+        task: &TaskState,
+        policy: Policy,
+        dispatcher: &mut impl TaskDispatcher,
+    ) -> (OrchestrationOutcome, MemoryStore) {
         let mut store = MemoryStore::default();
         let outcome = TaskOrchestrator::new("agent-a")
             .with_room_id("!room:server")
-            .with_policy(policy())
+            .with_policy(policy)
             .process_one(task, std::slice::from_ref(task), &mut store, dispatcher);
         (outcome, store)
+    }
+
+    fn exec_policy() -> Policy {
+        Policy::parse(
+            r#"
+[rooms."!room:server"]
+trusted = true
+raw_exec_default = "deny"
+
+[rooms."!room:server".agents."@planner:server"]
+allow_exec = true
+allow_commands = ["true"]
+allow_cwd = ["/repo"]
+"#,
+        )
+        .expect("exec policy parses")
+    }
+
+    fn exec_task(program: &str) -> TaskState {
+        let mut t = tool_task("unused");
+        t.action = Some(TaskAction::Exec {
+            command: vec![program.to_string()],
+            cwd: "/repo".to_string(),
+            env: Default::default(),
+            timeout_ms: Some(600_000),
+            stream: false,
+            authorization: None,
+        });
+        t
+    }
+
+    fn run_output(exit_code: Option<i32>, signal: Option<i32>, timed_out: bool) -> RunOutput {
+        RunOutput {
+            exit_code,
+            signal,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out,
+        }
     }
 
     #[test]
@@ -294,5 +502,124 @@ allow_tools = ["run_tests"]
         let (outcome, store) = run(&t, &mut dispatcher);
         assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
         assert_eq!(store.finalized_state.as_deref(), Some("blocked"));
+    }
+
+    // --- exec dispatcher (issue #163) ---------------------------------------
+
+    #[test]
+    fn exec_zero_exit_marks_task_succeeded() {
+        let t = exec_task("true");
+        let mut dispatcher = ExecTaskDispatcher::with_runner(|req| {
+            assert_eq!(req.command, vec!["true".to_string()]);
+            Ok(run_output(Some(0), None, false))
+        });
+        let (outcome, store) = run_with(&t, exec_policy(), &mut dispatcher);
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Completed { state, .. } if state == "succeeded"
+        ));
+        let result = store.finalized_result.unwrap();
+        assert_eq!(
+            result.get("status").and_then(Value::as_str),
+            Some("succeeded")
+        );
+        assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(0));
+    }
+
+    #[test]
+    fn exec_nonzero_exit_marks_task_failed() {
+        let t = exec_task("true");
+        let mut dispatcher =
+            ExecTaskDispatcher::with_runner(|_req| Ok(run_output(Some(2), None, false)));
+        let (outcome, store) = run_with(&t, exec_policy(), &mut dispatcher);
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Completed { state, .. } if state == "failed"
+        ));
+        let result = store.finalized_result.unwrap();
+        assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("process_exit")
+        );
+    }
+
+    #[test]
+    fn exec_signalled_run_marks_task_failed() {
+        let t = exec_task("true");
+        // Killed by SIGKILL (9): no exit code, mapped to 128 + 9.
+        let mut dispatcher =
+            ExecTaskDispatcher::with_runner(|_req| Ok(run_output(None, Some(9), false)));
+        let (outcome, store) = run_with(&t, exec_policy(), &mut dispatcher);
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Completed { state, .. } if state == "failed"
+        ));
+        let result = store.finalized_result.unwrap();
+        assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(137));
+    }
+
+    #[test]
+    fn exec_run_failure_fails_the_task() {
+        let t = exec_task("true");
+        let mut dispatcher = ExecTaskDispatcher::with_runner(|_req| {
+            Err(RunError::MissingCwd(PathBuf::from("/repo")))
+        });
+        let (outcome, store) = run_with(&t, exec_policy(), &mut dispatcher);
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Completed { state, .. } if state == "failed"
+        ));
+        let result = store.finalized_result.unwrap();
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("dispatch_failed")
+        );
+    }
+
+    #[test]
+    fn policy_denied_exec_is_not_dispatched() {
+        // `rm` is not in allow_commands, so the orchestrator denies before
+        // dispatch and the runner must never be called.
+        let t = exec_task("rm");
+        let mut dispatcher = ExecTaskDispatcher::with_runner(|_req| {
+            panic!("policy-denied exec must not be dispatched")
+        });
+        let (outcome, store) = run_with(&t, exec_policy(), &mut dispatcher);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        assert_eq!(store.finalized_state.as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn exec_dispatcher_rejects_tool_actions() {
+        let mut dispatcher = ExecTaskDispatcher::new();
+        let tool = TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: None,
+        };
+        let task = exec_task("true");
+        let err = dispatcher
+            .dispatch(&task, &tool, "inv-1")
+            .expect_err("tool action is not exec");
+        assert!(matches!(err, TaskDispatchError::Failed(_)));
+    }
+
+    #[test]
+    fn exec_result_links_artifact_and_maps_timeout() {
+        let with_artifact = exec_result_from_output(
+            &run_output(Some(0), None, false),
+            Some("mxc://matrix.org/log".to_string()),
+        );
+        assert_eq!(
+            with_artifact.artifact_mxc.as_deref(),
+            Some("mxc://matrix.org/log")
+        );
+        assert_eq!(with_artifact.exit_code, Some(0));
+
+        let timed_out = exec_result_from_output(&run_output(None, None, true), None);
+        // A timeout has no successful exit code, so the task is finalized failed.
+        assert!(timed_out.exit_code != Some(0));
+        assert!(timed_out.summary.contains("timed out"));
     }
 }

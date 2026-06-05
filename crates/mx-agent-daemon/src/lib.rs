@@ -119,7 +119,9 @@ pub use task::{
     STATE_CANCELLED, STATE_EXECUTING, STATE_FAILED, STATE_PENDING, STATE_PROPOSED, STATE_SUCCEEDED,
     STATE_SUPERSEDED,
 };
-pub use task_dispatch::ToolTaskDispatcher;
+pub use task_dispatch::{
+    exec_result_from_output, ExecRunRequest, ExecTaskDispatcher, ToolTaskDispatcher,
+};
 pub use task_graph::{GraphEdge, GraphNode, TaskGraph};
 pub use task_orchestrator::{
     action_from_task, sign_task_action, OrchestrationOutcome, TaskActionError, TaskDispatchError,
