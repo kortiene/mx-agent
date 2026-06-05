@@ -26,6 +26,7 @@ pub mod signing;
 pub mod stream;
 pub mod sync;
 pub mod task;
+pub mod task_dispatch;
 pub mod task_graph;
 pub mod task_orchestrator;
 pub mod tool_exec;
@@ -118,6 +119,7 @@ pub use task::{
     STATE_CANCELLED, STATE_EXECUTING, STATE_FAILED, STATE_PENDING, STATE_PROPOSED, STATE_SUCCEEDED,
     STATE_SUPERSEDED,
 };
+pub use task_dispatch::ToolTaskDispatcher;
 pub use task_graph::{GraphEdge, GraphNode, TaskGraph};
 pub use task_orchestrator::{
     action_from_task, sign_task_action, OrchestrationOutcome, TaskActionError, TaskDispatchError,
