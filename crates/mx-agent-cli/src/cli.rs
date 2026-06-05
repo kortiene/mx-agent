@@ -1873,7 +1873,13 @@ fn daemon_socket_path(global: &GlobalArgs) -> PathBuf {
         .unwrap_or_else(|| mx_agent_daemon::Paths::resolve().socket_path)
 }
 
-fn task_ipc_call<T, R>(global: &GlobalArgs, method: &str, params: &T) -> Result<R, ExitCode>
+/// Make a single-response JSON-RPC call to the running daemon over the local
+/// IPC socket, returning the typed result or an [`ExitCode`].
+///
+/// Used by the daemon-mediated commands (`task.*`, `call.start`, …) so the
+/// stateless CLI never reads Matrix session, signing, or policy state itself.
+/// A daemon that cannot be contacted maps to exit code 3.
+fn daemon_ipc_call<T, R>(global: &GlobalArgs, method: &str, params: &T) -> Result<R, ExitCode>
 where
     T: serde::Serialize,
     R: serde::de::DeserializeOwned,
@@ -1940,8 +1946,11 @@ fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
         blocks: args.blocks.clone(),
         action,
     };
-    match task_ipc_call::<_, mx_agent_protocol::schema::TaskState>(global, "task.create", &options)
-    {
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::TaskState>(
+        global,
+        "task.create",
+        &options,
+    ) {
         Ok(task) => {
             if global.json {
                 println!(
@@ -1993,8 +2002,11 @@ fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
         action,
         expected_state_rev: args.expected_state_rev,
     };
-    match task_ipc_call::<_, mx_agent_protocol::schema::TaskState>(global, "task.update", &options)
-    {
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::TaskState>(
+        global,
+        "task.update",
+        &options,
+    ) {
         Ok(task) => {
             if global.json {
                 println!(
@@ -2017,7 +2029,7 @@ fn task_list(global: &GlobalArgs, args: &TaskListArgs) -> ExitCode {
         state: args.state.clone(),
         assigned_to: args.assigned.clone(),
     };
-    match task_ipc_call::<_, Vec<mx_agent_protocol::schema::TaskState>>(
+    match daemon_ipc_call::<_, Vec<mx_agent_protocol::schema::TaskState>>(
         global,
         "task.list",
         &options,
@@ -2048,7 +2060,7 @@ fn task_graph(global: &GlobalArgs, args: &TaskGraphArgs) -> ExitCode {
         state: None,
         assigned_to: None,
     };
-    match task_ipc_call::<_, mx_agent_daemon::TaskGraph>(global, "task.graph", &options) {
+    match daemon_ipc_call::<_, mx_agent_daemon::TaskGraph>(global, "task.graph", &options) {
         Ok(graph) => {
             if global.json {
                 println!(
@@ -3315,37 +3327,46 @@ fn cmd_call(global: &GlobalArgs, args: &CallArgs) -> ExitCode {
         },
     };
 
-    match mx_agent_daemon::execute_tool(&tool, &input) {
-        Ok(result) => {
+    // Tool execution happens in the daemon, never in the CLI: the daemon owns
+    // the Matrix client, signing key, policy, and trust context (architecture
+    // §10.1, issue #193). The CLI only renders the structured outcome.
+    let params = mx_agent_daemon::CallStartParams {
+        room: args.room.clone(),
+        agent: args.agent.clone(),
+        tool,
+        input,
+    };
+    let result: mx_agent_daemon::CallStartResult =
+        match daemon_ipc_call(global, "call.start", &params) {
+            Ok(result) => result,
+            Err(code) => return code,
+        };
+
+    match result.outcome {
+        mx_agent_daemon::CallOutcome::Ok { exit_code, summary } => {
             if global.json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string())
-                );
-            } else {
-                println!("mx-agent: {}", result.summary);
-            }
-            // Propagate the tool's exit code so the shell sees failures.
-            let code = u8::try_from(result.exit_code).unwrap_or(1);
-            ExitCode::from(code)
-        }
-        Err(e) => {
-            if global.json {
-                let body = serde_json::json!({ "ok": false, "error": e.to_string() });
+                let body = serde_json::json!({ "exit_code": exit_code, "summary": summary });
                 println!("{body}");
             } else {
-                eprintln!("mx-agent: {e}");
+                println!("mx-agent: {summary}");
+            }
+            // Propagate the tool's exit code so the shell sees failures.
+            let code = u8::try_from(exit_code).unwrap_or(1);
+            ExitCode::from(code)
+        }
+        mx_agent_daemon::CallOutcome::Error { kind, message } => {
+            if global.json {
+                let body = serde_json::json!({ "ok": false, "error": message });
+                println!("{body}");
+            } else {
+                eprintln!("mx-agent: {message}");
             }
             // Map invocation failures to the exit codes in architecture §5.3.
-            match e {
-                mx_agent_daemon::ToolError::UnknownTool(_) => ExitCode::from(127),
-                mx_agent_daemon::ToolError::InvalidArgs(_) => ExitCode::from(64),
-                mx_agent_daemon::ToolError::Spawn(ref io)
-                    if io.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    ExitCode::from(127)
-                }
-                mx_agent_daemon::ToolError::Spawn(_) => ExitCode::from(128),
+            match kind {
+                mx_agent_daemon::CallErrorKind::UnknownTool
+                | mx_agent_daemon::CallErrorKind::NotFound => ExitCode::from(127),
+                mx_agent_daemon::CallErrorKind::InvalidArgs => ExitCode::from(64),
+                mx_agent_daemon::CallErrorKind::Spawn => ExitCode::from(128),
             }
         }
     }

@@ -436,6 +436,16 @@ fn dispatch(
                 Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
             }
         }
+        "call.start" => match parse_params::<crate::CallStartParams>(req) {
+            Ok(params) => {
+                let result = crate::start_call_loopback(&params);
+                match serde_json::to_value(&result) {
+                    Ok(value) => Response::result(req.id.clone(), value),
+                    Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+                }
+            }
+            Err(response) => *response,
+        },
         "task.create" => match parse_params::<crate::CreateTaskOptions>(req) {
             Ok(options) => block_on_task_response(req, |session| async move {
                 crate::create_task_for_session(&session, &options).await

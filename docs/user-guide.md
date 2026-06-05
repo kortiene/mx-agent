@@ -161,8 +161,10 @@ The default `--kind` is `generic` and the default `--max-invocations` is `1`.
 ## Run a tool call
 
 `mx-agent call` invokes a named tool and exits with the tool's own exit code, so
-failures propagate to your shell. The built-in `run_tests` tool shells out to
-`cargo test`:
+failures propagate to your shell. Tool execution happens in the **daemon**, not
+the CLI, so a daemon must be running (`mx-agent daemon start`); without one,
+`call` exits `3` with a clear message. The built-in `run_tests` tool shells out
+to `cargo test`:
 
 ```bash
 mx-agent call --tool run_tests --arg package=mx-agent-protocol
