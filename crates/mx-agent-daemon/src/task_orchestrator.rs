@@ -226,6 +226,14 @@ pub enum OrchestrationOutcome {
         /// Task ID.
         task_id: String,
     },
+    /// An `executing` task is owned by another (remote) agent; it is left
+    /// unchanged during recovery and surfaced as a stale warning.
+    StaleRemoteExecuting {
+        /// Task ID.
+        task_id: String,
+        /// Agent that owns the executing task.
+        owner: String,
+    },
     /// Store failed in a way the caller must surface.
     StoreError {
         /// Task ID.
@@ -515,6 +523,79 @@ impl TaskOrchestrator {
                 reason: format_store_error(&err),
             },
         }
+    }
+
+    /// Reconcile every `executing` task against the set of live invocations on
+    /// daemon startup/reconnect, returning one outcome per executing task.
+    ///
+    /// This is the restart-recovery entry point (architecture §11.3). For each
+    /// `executing` task:
+    ///
+    /// - **owned by this agent, with a live invocation** — left running
+    ///   ([`OrchestrationOutcome::NotRunnableState`]); the local process is still
+    ///   alive, so nothing is changed and nothing is re-spawned.
+    /// - **owned by this agent, with no live invocation** — recovered: marked
+    ///   `failed` with a recovery result via [`Self::recover_stale_executing`]
+    ///   so the orphaned task is resolved safely and never double-run.
+    /// - **owned by another (remote) agent** — left unchanged and surfaced as a
+    ///   stale warning ([`OrchestrationOutcome::StaleRemoteExecuting`]); only the
+    ///   owning daemon may resolve it.
+    ///
+    /// Every recovery decision is logged (non-sensitive: task id, owner, and
+    /// decision), and a recovered task's durable `result` records why it was
+    /// recovered, so the decision is auditable.
+    pub fn recover_executing_tasks<S>(
+        &self,
+        tasks: &[TaskState],
+        live_invocations: &BTreeSet<String>,
+        store: &mut S,
+    ) -> Vec<OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        let mut outcomes = Vec::new();
+        for task in tasks.iter().filter(|t| t.state == STATE_EXECUTING) {
+            if !self.is_assigned(task) {
+                tracing::warn!(
+                    task_id = %task.task_id,
+                    owner = %task.assigned_to,
+                    decision = "stale_remote_executing",
+                    "restart recovery left a remote-owned executing task unchanged"
+                );
+                outcomes.push(OrchestrationOutcome::StaleRemoteExecuting {
+                    task_id: task.task_id.clone(),
+                    owner: task.assigned_to.clone(),
+                });
+                continue;
+            }
+            let live = task
+                .invocation_id
+                .as_ref()
+                .is_some_and(|id| live_invocations.contains(id));
+            if live {
+                tracing::debug!(
+                    task_id = %task.task_id,
+                    decision = "executing_still_live",
+                    "restart recovery left a live local executing task unchanged"
+                );
+                outcomes.push(OrchestrationOutcome::NotRunnableState {
+                    task_id: task.task_id.clone(),
+                    state: task.state.clone(),
+                });
+                continue;
+            }
+            let outcome = self.recover_stale_executing(task, live_invocations, store);
+            if let OrchestrationOutcome::RecoveredStale { task_id } = &outcome {
+                tracing::warn!(
+                    task_id = %task_id,
+                    invocation_id = task.invocation_id.as_deref().unwrap_or(""),
+                    decision = "recovered_stale_invocation",
+                    "restart recovery marked an orphaned local executing task failed"
+                );
+            }
+            outcomes.push(outcome);
+        }
+        outcomes
     }
 
     /// Require a trusted, signed, non-replayed authorization before a task
@@ -1534,6 +1615,58 @@ allow_cwd = ["/repo"]
         assert_eq!(
             result.get("invocation_id").and_then(Value::as_str),
             Some("inv-lost")
+        );
+    }
+
+    #[test]
+    fn recover_executing_tasks_reconciles_local_and_remote() {
+        // A live local task (still running), an orphaned local task (process
+        // gone), and a remote-owned task. Recovery must resolve only the
+        // orphaned local one, leave the live and the remote ones unchanged, and
+        // never re-spawn anything.
+        let mut live_local = task("task-live", STATE_EXECUTING, "agent-a");
+        live_local.invocation_id = Some("inv-live".to_string());
+        let mut orphaned_local = task("task-orphan", STATE_EXECUTING, "agent-a");
+        orphaned_local.invocation_id = Some("inv-gone".to_string());
+        let mut remote = task("task-remote", STATE_EXECUTING, "agent-b");
+        remote.invocation_id = Some("inv-remote".to_string());
+        let pending = with_action(
+            task("task-pending", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"run_tests", "args":{}}),
+        );
+        let tasks = vec![live_local, orphaned_local, remote, pending];
+
+        let mut live = BTreeSet::new();
+        live.insert("inv-live".to_string());
+
+        let mut store = MemoryStore::default();
+        let outcomes =
+            TaskOrchestrator::new("agent-a").recover_executing_tasks(&tasks, &live, &mut store);
+
+        // Only the three executing tasks produce outcomes; the pending one is
+        // not part of recovery.
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().any(|o| matches!(
+            o,
+            OrchestrationOutcome::NotRunnableState { task_id, .. } if task_id == "task-live"
+        )));
+        assert!(outcomes.iter().any(|o| matches!(
+            o,
+            OrchestrationOutcome::RecoveredStale { task_id } if task_id == "task-orphan"
+        )));
+        assert!(outcomes.iter().any(|o| matches!(
+            o,
+            OrchestrationOutcome::StaleRemoteExecuting { task_id, owner }
+                if task_id == "task-remote" && owner == "agent-b"
+        )));
+        // The only finalize was the orphaned local task being recovered failed;
+        // the live and remote tasks were never written, so nothing was
+        // double-run.
+        assert_eq!(store.finalized_state.as_deref(), Some(STATE_FAILED));
+        let result = store.finalized_result.as_ref().expect("recovery result");
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("recovered_stale_invocation")
         );
     }
 

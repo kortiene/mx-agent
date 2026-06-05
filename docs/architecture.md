@@ -881,9 +881,14 @@ Failure, denial, and recovery results use the same object shape with
 }
 ```
 
-On restart, an assigned `executing` task whose local invocation is no longer
-live is marked failed with a recovery result instead of being spawned a second
-time.
+On restart, the daemon reconciles every `executing` task against its live local
+invocations (architecture §11.3): a task it owns whose invocation is still live
+is left running; a task it owns whose local invocation is gone is marked failed
+with a recovery result instead of being spawned a second time; and a task owned
+by another (remote) agent is left unchanged and surfaced as a non-sensitive
+stale warning, since only the owning daemon may resolve it. Recovery decisions
+are logged and the recovered task's durable `result` records why it was
+recovered, so the outcome is auditable.
 
 Tool-backed task actions (`{"type":"tool", ...}`) run through the named-tool
 execution path once authorized: the daemon links an invocation, runs the named
