@@ -453,6 +453,30 @@ struct TaskCreateArgs {
     /// Downstream task blocked by this one (repeatable).
     #[arg(long = "blocks", value_name = "TASK_ID")]
     blocks: Vec<String>,
+    /// Attach a tool action to the task.
+    #[arg(long = "tool", value_name = "TOOL")]
+    tool: Option<String>,
+    /// Tool argument as `key=value` (repeatable). Used with `--tool`.
+    #[arg(long = "arg", value_name = "KEY=VALUE")]
+    args: Vec<String>,
+    /// JSON object file for tool input, or `-` for stdin. Used with `--tool`.
+    #[arg(long = "input-json", value_name = "FILE")]
+    input_json: Option<PathBuf>,
+    /// Attach an exec action to the task.
+    #[arg(long = "exec")]
+    exec: bool,
+    /// Working directory for an exec action.
+    #[arg(long = "cwd", value_name = "PATH")]
+    cwd: Option<PathBuf>,
+    /// Timeout in milliseconds for an exec action.
+    #[arg(long = "timeout-ms", value_name = "MS")]
+    timeout_ms: Option<u64>,
+    /// Request streamed output for an exec action.
+    #[arg(long = "stream")]
+    stream: bool,
+    /// Exec command and arguments (after `--`).
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -482,6 +506,30 @@ struct TaskUpdateArgs {
     /// reject it as stale rather than overwriting newer state.
     #[arg(long = "expected-state-rev", value_name = "REV")]
     expected_state_rev: Option<u64>,
+    /// Replace the task action with a tool action.
+    #[arg(long = "tool", value_name = "TOOL")]
+    tool: Option<String>,
+    /// Tool argument as `key=value` (repeatable). Used with `--tool`.
+    #[arg(long = "arg", value_name = "KEY=VALUE")]
+    args: Vec<String>,
+    /// JSON object file for tool input, or `-` for stdin. Used with `--tool`.
+    #[arg(long = "input-json", value_name = "FILE")]
+    input_json: Option<PathBuf>,
+    /// Replace the task action with an exec action.
+    #[arg(long = "exec")]
+    exec: bool,
+    /// Working directory for an exec action.
+    #[arg(long = "cwd", value_name = "PATH")]
+    cwd: Option<PathBuf>,
+    /// Timeout in milliseconds for an exec action.
+    #[arg(long = "timeout-ms", value_name = "MS")]
+    timeout_ms: Option<u64>,
+    /// Request streamed output for an exec action.
+    #[arg(long = "stream")]
+    stream: bool,
+    /// Exec command and arguments (after `--`).
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1780,6 +1828,18 @@ fn print_task(task: &mx_agent_protocol::schema::TaskState) {
     if let Some(invocation_id) = &task.invocation_id {
         println!("    invocation:   {invocation_id}");
     }
+    if let Some(action) = &task.action {
+        match action {
+            mx_agent_protocol::schema::TaskAction::Tool { tool, .. } => {
+                println!("    action:       tool {tool}");
+            }
+            mx_agent_protocol::schema::TaskAction::Exec { command, cwd, .. } => {
+                println!("    action:       exec {} (cwd {cwd})", command.join(" "));
+            }
+        }
+    } else {
+        println!("    action:       manual/planning");
+    }
     println!("    state_rev:    {}", task.state_rev);
 }
 
@@ -1823,6 +1883,22 @@ where
 }
 
 fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
+    let action = match build_task_action(TaskActionInput {
+        tool: args.tool.as_deref(),
+        args: &args.args,
+        input_json: args.input_json.as_ref(),
+        exec: args.exec,
+        cwd: args.cwd.as_ref(),
+        timeout_ms: args.timeout_ms,
+        stream: args.stream,
+        command: &args.command,
+    }) {
+        Ok(action) => action,
+        Err(e) => {
+            eprintln!("mx-agent: {e}");
+            return ExitCode::from(64);
+        }
+    };
     let options = mx_agent_daemon::CreateTaskOptions {
         room: args.room.clone(),
         task_id: args.id.clone(),
@@ -1833,6 +1909,7 @@ fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
         created_by: None,
         depends_on: args.depends_on.clone(),
         blocks: args.blocks.clone(),
+        action,
     };
     match task_ipc_call::<_, mx_agent_protocol::schema::TaskState>(global, "task.create", &options)
     {
@@ -1853,6 +1930,22 @@ fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
 }
 
 fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
+    let action = match build_task_action(TaskActionInput {
+        tool: args.tool.as_deref(),
+        args: &args.args,
+        input_json: args.input_json.as_ref(),
+        exec: args.exec,
+        cwd: args.cwd.as_ref(),
+        timeout_ms: args.timeout_ms,
+        stream: args.stream,
+        command: &args.command,
+    }) {
+        Ok(action) => action,
+        Err(e) => {
+            eprintln!("mx-agent: {e}");
+            return ExitCode::from(64);
+        }
+    };
     let options = mx_agent_daemon::UpdateTaskOptions {
         room: args.room.clone(),
         task_id: args.task_id.clone(),
@@ -1862,6 +1955,7 @@ fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
         description: args.description.clone(),
         invocation_id: args.invocation.clone(),
         result: None,
+        action,
         expected_state_rev: args.expected_state_rev,
     };
     match task_ipc_call::<_, mx_agent_protocol::schema::TaskState>(global, "task.update", &options)
@@ -3028,6 +3122,104 @@ fn parse_tool_args(pairs: &[String]) -> Result<serde_json::Value, String> {
     Ok(serde_json::Value::Object(map))
 }
 
+/// Read a JSON object from `path`, or stdin when `path` is `-`.
+fn read_json_object(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    let raw = if path.as_os_str() == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("could not read stdin: {e}"))?;
+        buf
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("could not read {}: {e}", path.display()))?
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err("--input-json must contain a JSON object".to_string()),
+        Err(e) => Err(format!("invalid --input-json: {e}")),
+    }
+}
+
+/// Borrowed task action flags used to build a structured task action.
+struct TaskActionInput<'a> {
+    /// Optional tool name.
+    tool: Option<&'a str>,
+    /// Repeated `--arg key=value` pairs.
+    args: &'a [String],
+    /// Optional `--input-json` path.
+    input_json: Option<&'a PathBuf>,
+    /// Whether `--exec` was set.
+    exec: bool,
+    /// Optional exec working directory.
+    cwd: Option<&'a PathBuf>,
+    /// Optional exec timeout.
+    timeout_ms: Option<u64>,
+    /// Whether streaming was requested for exec.
+    stream: bool,
+    /// Exec argv after `--`.
+    command: &'a [String],
+}
+
+/// Build an optional structured task action from task create/update flags.
+fn build_task_action(
+    input: TaskActionInput<'_>,
+) -> Result<Option<mx_agent_protocol::schema::TaskAction>, String> {
+    use mx_agent_protocol::schema::TaskAction;
+
+    if input.tool.is_some() && input.exec {
+        return Err("--tool and --exec are mutually exclusive".to_string());
+    }
+    if input.input_json.is_some() && !input.args.is_empty() {
+        return Err("--input-json and --arg are mutually exclusive".to_string());
+    }
+    if input.tool.is_none() && !input.args.is_empty() {
+        return Err("--arg requires --tool".to_string());
+    }
+    if input.tool.is_none() && input.input_json.is_some() {
+        return Err("--input-json requires --tool".to_string());
+    }
+    if !input.exec
+        && (!input.command.is_empty()
+            || input.cwd.is_some()
+            || input.timeout_ms.is_some()
+            || input.stream)
+    {
+        return Err("exec action flags require --exec".to_string());
+    }
+
+    if let Some(tool) = input.tool {
+        let args = match input.input_json {
+            Some(path) => read_json_object(path)?,
+            None => parse_tool_args(input.args)?,
+        };
+        return Ok(Some(TaskAction::Tool {
+            tool: tool.to_string(),
+            args,
+        }));
+    }
+
+    if input.exec {
+        if input.command.is_empty() {
+            return Err("--exec requires a command after --".to_string());
+        }
+        let cwd = input
+            .cwd
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        return Ok(Some(TaskAction::Exec {
+            command: input.command.to_vec(),
+            cwd,
+            env: Default::default(),
+            timeout_ms: input.timeout_ms,
+            stream: input.stream,
+        }));
+    }
+
+    Ok(None)
+}
+
 /// Handle `mx-agent call`: invoke a named built-in tool.
 ///
 /// The CLI runs the tool locally and exits with the tool's own exit code, so
@@ -3045,37 +3237,18 @@ fn cmd_call(global: &GlobalArgs, args: &CallArgs) -> ExitCode {
 
     // Build the tool input: a JSON object from --input-json, otherwise from
     // the repeated --arg key=value pairs.
+    if args.input_json.is_some() && !args.args.is_empty() {
+        eprintln!("mx-agent: --input-json and --arg are mutually exclusive");
+        return ExitCode::from(64);
+    }
     let input = match &args.input_json {
-        Some(path) => {
-            let raw = if path.as_os_str() == "-" {
-                use std::io::Read;
-                let mut buf = String::new();
-                if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-                    eprintln!("mx-agent: could not read stdin: {e}");
-                    return ExitCode::from(64);
-                }
-                buf
-            } else {
-                match std::fs::read_to_string(path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("mx-agent: could not read {}: {e}", path.display());
-                        return ExitCode::from(64);
-                    }
-                }
-            };
-            match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(v) if v.is_object() => v,
-                Ok(_) => {
-                    eprintln!("mx-agent: --input-json must contain a JSON object");
-                    return ExitCode::from(64);
-                }
-                Err(e) => {
-                    eprintln!("mx-agent: invalid --input-json: {e}");
-                    return ExitCode::from(64);
-                }
+        Some(path) => match read_json_object(path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("mx-agent: {e}");
+                return ExitCode::from(64);
             }
-        }
+        },
         None => match parse_tool_args(&args.args) {
             Ok(v) => v,
             Err(e) => {
@@ -3977,10 +4150,142 @@ mod tests {
                 assert_eq!(args.depends_on, vec!["task_plan"]);
                 assert_eq!(args.blocks, vec!["task_review"]);
                 assert!(args.id.is_none());
+                assert!(args.tool.is_none());
+                assert!(!args.exec);
             }
             other => panic!("expected task create, got {other:?}"),
         }
         assert_eq!(command_path(&cli.command), "task create");
+    }
+
+    #[test]
+    fn task_create_accepts_tool_action_flags() {
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "task",
+            "create",
+            "--room",
+            "!abc:matrix.org",
+            "--title",
+            "Run tests",
+            "--tool",
+            "run_tests",
+            "--arg",
+            "package=api",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Task(TaskCommand::Create(args)) => {
+                assert_eq!(args.tool.as_deref(), Some("run_tests"));
+                assert_eq!(args.args, vec!["package=api".to_string()]);
+                assert!(!args.exec);
+            }
+            other => panic!("expected task create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_create_accepts_exec_action_after_separator() {
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "task",
+            "create",
+            "--room",
+            "!abc:matrix.org",
+            "--title",
+            "Run tests",
+            "--exec",
+            "--cwd",
+            "/repo",
+            "--timeout-ms",
+            "600000",
+            "--stream",
+            "--",
+            "cargo",
+            "test",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Task(TaskCommand::Create(args)) => {
+                assert!(args.exec);
+                assert_eq!(args.cwd.as_deref(), Some(std::path::Path::new("/repo")));
+                assert_eq!(args.timeout_ms, Some(600_000));
+                assert!(args.stream);
+                assert_eq!(args.command, vec!["cargo".to_string(), "test".to_string()]);
+            }
+            other => panic!("expected task create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_task_action_rejects_conflicts_and_builds_actions() {
+        use mx_agent_protocol::schema::TaskAction;
+        let arg_pairs = vec!["package=api".to_string()];
+        assert!(build_task_action(TaskActionInput {
+            tool: Some("run_tests"),
+            args: &[],
+            input_json: None,
+            exec: true,
+            cwd: None,
+            timeout_ms: None,
+            stream: false,
+            command: &[],
+        })
+        .is_err());
+        assert!(build_task_action(TaskActionInput {
+            tool: None,
+            args: &arg_pairs,
+            input_json: None,
+            exec: false,
+            cwd: None,
+            timeout_ms: None,
+            stream: false,
+            command: &[],
+        })
+        .is_err());
+
+        let tool = build_task_action(TaskActionInput {
+            tool: Some("run_tests"),
+            args: &arg_pairs,
+            input_json: None,
+            exec: false,
+            cwd: None,
+            timeout_ms: None,
+            stream: false,
+            command: &[],
+        })
+        .unwrap();
+        assert_eq!(
+            tool,
+            Some(TaskAction::Tool {
+                tool: "run_tests".to_string(),
+                args: serde_json::json!({ "package": "api" })
+            })
+        );
+
+        let cwd = PathBuf::from("/repo");
+        let command = vec!["cargo".to_string(), "test".to_string()];
+        let exec = build_task_action(TaskActionInput {
+            tool: None,
+            args: &[],
+            input_json: None,
+            exec: true,
+            cwd: Some(&cwd),
+            timeout_ms: Some(1000),
+            stream: true,
+            command: &command,
+        })
+        .unwrap();
+        assert_eq!(
+            exec,
+            Some(TaskAction::Exec {
+                command: vec!["cargo".to_string(), "test".to_string()],
+                cwd: "/repo".to_string(),
+                env: Default::default(),
+                timeout_ms: Some(1000),
+                stream: true,
+            })
+        );
     }
 
     #[test]
@@ -4008,6 +4313,8 @@ mod tests {
                 assert_eq!(args.task_id, "task_abc");
                 assert_eq!(args.state.as_deref(), Some("executing"));
                 assert_eq!(args.assign.as_deref(), Some("developer-pi"));
+                assert!(args.tool.is_none());
+                assert!(!args.exec);
             }
             other => panic!("expected task update, got {other:?}"),
         }
