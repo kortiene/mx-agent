@@ -817,11 +817,16 @@ or:
 }
 ```
 
-The daemon scheduler first claims a pending task with the observed `state_rev`,
-sets `state = "executing"`, and attaches a generated `invocation_id`. A lost
-claim race is treated as a stale update and must not spawn. After the signed,
-trust-checked, deny-by-default dispatcher returns, the daemon finalizes the task
-as `succeeded` or `failed` with a stable, non-sensitive structured `result`.
+The daemon scheduler first parses the task action and checks local
+Deny-by-default policy against the task creator and requested tool/exec before
+claiming or dispatching. A policy denial is audited locally, does not spawn, and
+moves the task to a safe non-runnable state with `reason = "policy_denied"`.
+When policy permits execution, the daemon claims the pending task with the
+observed `state_rev`, sets `state = "executing"`, and attaches a generated
+`invocation_id`. A lost claim race is treated as a stale update and must not
+spawn. After the signed, trust-checked dispatcher returns, the daemon finalizes
+the task as `succeeded` or `failed` with a stable, non-sensitive structured
+`result`.
 
 Successful result example:
 
