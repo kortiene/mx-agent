@@ -86,7 +86,7 @@ pub use matrix::{
     build_client, login_password, restore_client, ClientError, ConfigError, LoginError,
     MatrixConfig,
 };
-pub use mx_agent_protocol::schema::TaskAction;
+pub use mx_agent_protocol::schema::{TaskAction, TaskResult};
 #[cfg(unix)]
 pub use pty::{PtySession, PtyWinsize};
 pub use replay::{ReplayCache, ReplayError, DEFAULT_CAPACITY};

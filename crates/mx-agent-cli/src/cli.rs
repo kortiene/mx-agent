@@ -1840,7 +1840,30 @@ fn print_task(task: &mx_agent_protocol::schema::TaskState) {
     } else {
         println!("    action:       manual/planning");
     }
+    if let Some(result) = &task.result {
+        println!("    result:       {}", task_result_summary(result));
+    }
     println!("    state_rev:    {}", task.state_rev);
+}
+
+fn task_result_summary(result: &Value) -> String {
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut parts = vec![status.to_string()];
+    if let Some(reason) = result.get("reason").and_then(Value::as_str) {
+        parts.push(format!("reason={reason}"));
+    }
+    if let Some(exit_code) = result.get("exit_code").and_then(Value::as_i64) {
+        parts.push(format!("exit_code={exit_code}"));
+    }
+    if let Some(summary) = result.get("summary").and_then(Value::as_str) {
+        if !summary.is_empty() {
+            parts.push(summary.to_string());
+        }
+    }
+    parts.join("; ")
 }
 
 fn daemon_socket_path(global: &GlobalArgs) -> PathBuf {
@@ -4236,6 +4259,20 @@ mod tests {
             }
             other => panic!("expected task create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn task_result_summary_uses_stable_fields() {
+        let result = serde_json::json!({
+            "status": "failed",
+            "reason": "process_exit",
+            "exit_code": 1,
+            "summary": "tests failed"
+        });
+        assert_eq!(
+            task_result_summary(&result),
+            "failed; reason=process_exit; exit_code=1; tests failed"
+        );
     }
 
     #[test]

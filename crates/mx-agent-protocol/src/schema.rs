@@ -547,6 +547,49 @@ impl TaskAction {
     }
 }
 
+/// Stable result object stored in [`TaskState::result`] (architecture §9.2).
+///
+/// `TaskState::result` remains an optional JSON value for wire compatibility,
+/// but daemon-written results use this documented shape so automation can rely
+/// on stable fields. The summary should be non-sensitive: large or secret-prone
+/// output belongs in stream/artifact events, not in the task result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskResult {
+    /// Terminal status, normally `succeeded` or `failed`.
+    pub status: String,
+    /// Agent that completed/finalized the task.
+    pub completed_by: String,
+    /// Completion timestamp (RFC 3339).
+    pub completed_at: String,
+    /// Invocation associated with the result, if any.
+    pub invocation_id: Option<String>,
+    /// Action kind, e.g. `tool` or `exec`, when known.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Machine-readable failure/recovery reason, if any.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Process/tool exit code, if applicable.
+    pub exit_code: Option<i32>,
+    /// Non-sensitive human summary, if available.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Optional Matrix artifact link for full output.
+    #[serde(default)]
+    pub artifact_mxc: Option<String>,
+    /// Forward-compatible unknown fields.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl TaskResult {
+    /// Convert this stable result into the JSON value stored in
+    /// [`TaskState::result`].
+    pub fn into_value(self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
 /// `com.mxagent.task.v1` state content (architecture §9.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskState {
@@ -940,6 +983,32 @@ mod tests {
             "state_rev": 4,
             "previous_event_id": "$eventid",
             "result": null
+        }));
+    }
+
+    #[test]
+    fn task_result_round_trips_success_and_failure_examples() {
+        assert_round_trip::<TaskResult>(json!({
+            "status": "succeeded",
+            "completed_by": "pi-builder",
+            "completed_at": "2026-06-04T18:00:00Z",
+            "invocation_id": "inv_01HZ",
+            "action": "tool",
+            "reason": null,
+            "exit_code": 0,
+            "summary": "tests passed",
+            "artifact_mxc": "mxc://matrix.org/log"
+        }));
+        assert_round_trip::<TaskResult>(json!({
+            "status": "failed",
+            "completed_by": "pi-builder",
+            "completed_at": "2026-06-04T18:00:00Z",
+            "invocation_id": "inv_01HZ",
+            "action": "exec",
+            "reason": "process_exit",
+            "exit_code": 1,
+            "summary": "tests failed",
+            "artifact_mxc": null
         }));
     }
 

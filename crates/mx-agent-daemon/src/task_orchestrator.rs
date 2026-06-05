@@ -10,10 +10,13 @@
 //! and without exposing Matrix credentials to the CLI/coding agent.
 
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mx_agent_protocol::id::generate_invocation_id;
-use mx_agent_protocol::schema::{TaskAction, TaskState};
-use serde_json::{json, Map, Value};
+use mx_agent_protocol::schema::{TaskAction, TaskResult, TaskState};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 
 use crate::task::{is_runnable, UpdateTaskOptions, STATE_EXECUTING, STATE_FAILED, STATE_SUCCEEDED};
 #[cfg(test)]
@@ -316,25 +319,35 @@ impl TaskOrchestrator {
                 };
                 (
                     state,
-                    success_result(&invocation_id, action.kind(), &output),
+                    dispatch_result(
+                        state,
+                        &self.agent_id,
+                        &invocation_id,
+                        action.kind(),
+                        (state == STATE_FAILED).then(|| "process_exit".to_string()),
+                        &output,
+                    ),
                 )
             }
             Err(TaskDispatchError::PolicyDenied(reason)) => (
                 STATE_FAILED,
-                json!({
-                    "invocation_id": invocation_id,
-                    "action": action.kind(),
-                    "denied": true,
-                    "reason": reason,
-                }),
+                failure_result(
+                    &self.agent_id,
+                    Some(&invocation_id),
+                    Some(action.kind()),
+                    "policy_denied",
+                    Some(reason),
+                ),
             ),
             Err(TaskDispatchError::Failed(reason)) => (
                 STATE_FAILED,
-                json!({
-                    "invocation_id": invocation_id,
-                    "action": action.kind(),
-                    "error": reason,
-                }),
+                failure_result(
+                    &self.agent_id,
+                    Some(&invocation_id),
+                    Some(action.kind()),
+                    "dispatch_failed",
+                    Some(reason),
+                ),
             ),
         };
 
@@ -351,9 +364,9 @@ impl TaskOrchestrator {
                     && finalized
                         .result
                         .as_ref()
-                        .and_then(|v| v.get("denied"))
-                        .and_then(Value::as_bool)
-                        == Some(true)
+                        .and_then(|v| v.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some("policy_denied")
                 {
                     OrchestrationOutcome::Denied {
                         task_id: finalized.task_id,
@@ -403,11 +416,13 @@ impl TaskOrchestrator {
                 state: task.state.clone(),
             };
         }
-        let result = json!({
-            "recovered": true,
-            "reason": "daemon restart found executing task without live local invocation",
-            "invocation_id": task.invocation_id,
-        });
+        let result = failure_result(
+            &self.agent_id,
+            task.invocation_id.as_deref(),
+            None,
+            "recovered_stale_invocation",
+            Some("daemon restart found executing task without live local invocation".to_string()),
+        );
         match store.finalize(UpdateTaskOptions {
             room: String::new(),
             task_id: task.task_id.clone(),
@@ -447,16 +462,76 @@ fn unmet_dependencies(task: &TaskState, succeeded: &BTreeSet<String>) -> Vec<Str
         .collect()
 }
 
-fn success_result(invocation_id: &str, action: &str, output: &TaskExecutionResult) -> Value {
-    let mut object = Map::new();
-    object.insert("invocation_id".to_string(), json!(invocation_id));
-    object.insert("action".to_string(), json!(action));
-    object.insert("exit_code".to_string(), json!(output.exit_code));
-    object.insert("summary".to_string(), json!(output.summary));
-    if let Some(mxc) = &output.artifact_mxc {
-        object.insert("artifact_mxc".to_string(), json!(mxc));
+fn dispatch_result(
+    status: &str,
+    completed_by: &str,
+    invocation_id: &str,
+    action: &str,
+    reason: Option<String>,
+    output: &TaskExecutionResult,
+) -> Value {
+    TaskResult {
+        status: status.to_string(),
+        completed_by: completed_by.to_string(),
+        completed_at: now_rfc3339(),
+        invocation_id: Some(invocation_id.to_string()),
+        action: Some(action.to_string()),
+        reason,
+        exit_code: output.exit_code,
+        summary: Some(output.summary.clone()),
+        artifact_mxc: output.artifact_mxc.clone(),
+        extra: Default::default(),
     }
-    Value::Object(object)
+    .into_value()
+}
+
+fn failure_result(
+    completed_by: &str,
+    invocation_id: Option<&str>,
+    action: Option<&str>,
+    reason: &str,
+    summary: Option<String>,
+) -> Value {
+    TaskResult {
+        status: STATE_FAILED.to_string(),
+        completed_by: completed_by.to_string(),
+        completed_at: now_rfc3339(),
+        invocation_id: invocation_id.map(ToString::to_string),
+        action: action.map(ToString::to_string),
+        reason: Some(reason.to_string()),
+        exit_code: None,
+        summary,
+        artifact_mxc: None,
+        extra: Default::default(),
+    }
+    .into_value()
+}
+
+fn now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    unix_to_rfc3339(secs)
+}
+
+fn unix_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let tod = (secs % 86_400) as i64;
+    let (hour, minute, second) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn format_store_error(err: &TaskStoreError) -> String {
@@ -508,6 +583,7 @@ mod tests {
     struct MemoryStore {
         current_rev: u64,
         stale: bool,
+        finalized_result: Option<Value>,
     }
 
     impl TaskStore for MemoryStore {
@@ -542,6 +618,7 @@ mod tests {
 
         fn finalize(&mut self, options: UpdateTaskOptions) -> Result<TaskState, TaskStoreError> {
             self.current_rev = options.expected_state_rev.unwrap_or(self.current_rev) + 1;
+            self.finalized_result = options.result.clone();
             Ok(TaskState {
                 task_id: options.task_id,
                 title: String::new(),
@@ -684,6 +761,13 @@ mod tests {
         assert_eq!(ids, vec!["task-pending", "task-assigned"]);
     }
 
+    fn finalized_result(store: &MemoryStore) -> &Value {
+        store
+            .finalized_result
+            .as_ref()
+            .expect("task should be finalized with a result")
+    }
+
     #[test]
     fn successful_dispatch_claims_and_finalizes_task() {
         let t = with_action(
@@ -711,6 +795,57 @@ mod tests {
             } if task_id == "task-a" && state == STATE_SUCCEEDED
         ));
         assert_eq!(store.current_rev, 3);
+        let result = finalized_result(&store);
+        assert_eq!(
+            result.get("status").and_then(Value::as_str),
+            Some("succeeded")
+        );
+        assert_eq!(
+            result.get("completed_by").and_then(Value::as_str),
+            Some("agent-a")
+        );
+        assert_eq!(result.get("action").and_then(Value::as_str), Some("tool"));
+        assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(0));
+        assert_eq!(
+            result.get("summary").and_then(Value::as_str),
+            Some("tests passed")
+        );
+        assert!(result.get("completed_at").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn failed_exit_uses_stable_process_exit_result() {
+        let t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"exec", "command":["cargo", "test"], "cwd":"/repo"}),
+        );
+        let mut store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(1),
+            summary: "tests failed".to_string(),
+            artifact_mxc: Some("mxc://matrix.org/log".to_string()),
+        }));
+        let outcome = TaskOrchestrator::new("agent-a").process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut store,
+            &mut dispatcher,
+        );
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Completed { state, .. } if state == STATE_FAILED
+        ));
+        let result = finalized_result(&store);
+        assert_eq!(result.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("process_exit")
+        );
+        assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            result.get("artifact_mxc").and_then(Value::as_str),
+            Some("mxc://matrix.org/log")
+        );
     }
 
     #[test]
@@ -734,6 +869,16 @@ mod tests {
             OrchestrationOutcome::Denied { task_id, .. } if task_id == "task-a"
         ));
         assert_eq!(store.current_rev, 3);
+        let result = finalized_result(&store);
+        assert_eq!(result.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("policy_denied")
+        );
+        assert_eq!(
+            result.get("summary").and_then(Value::as_str),
+            Some("no matching allow rule")
+        );
     }
 
     #[test]
@@ -745,6 +890,7 @@ mod tests {
         let mut store = MemoryStore {
             current_rev: 2,
             stale: true,
+            ..MemoryStore::default()
         };
         let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
             exit_code: Some(0),
@@ -780,5 +926,15 @@ mod tests {
             }
         );
         assert_eq!(store.current_rev, 2);
+        let result = finalized_result(&store);
+        assert_eq!(result.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("recovered_stale_invocation")
+        );
+        assert_eq!(
+            result.get("invocation_id").and_then(Value::as_str),
+            Some("inv-lost")
+        );
     }
 }
