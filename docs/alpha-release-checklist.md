@@ -135,10 +135,19 @@ it here before release.
 - **Acceptance validated by unit tests, not live Matrix transport.** Exec
   acceptance criteria are exercised through unit tests over the loopback runner
   rather than a real remote Matrix round-trip.
-- **Most CLI surface is still placeholder.** Beyond auth, workspace, agent
-  registry, task, trust, context-sharing, and the daemon lifecycle, many
-  commands are placeholders pending later roadmap phases (see
-  [`docs/roadmap-rust.md`](roadmap-rust.md)).
+- **Task orchestration engine is not yet auto-driven by a live `/sync` loop.**
+  Task state CRUD/graph/watch/diagnostics run over Matrix through the daemon, and
+  the daemon **task-orchestration engine** (scheduler, optimistic `state_rev`
+  claiming, tool/exec dispatch, policy + trust/signature + approval enforcement,
+  restart recovery) is implemented and covered by unit and integration tests.
+  What is *not* wired yet is a running daemon that polls a room and executes
+  runnable tasks on its own; today tasks are created, inspected, transitioned,
+  and graphed but do not auto-progress to `executing`/`succeeded` from a live
+  daemon loop.
+- **Some CLI surface is still placeholder.** Beyond the daemon lifecycle, auth,
+  workspace, agent registry, task state, trust, approval, and context-sharing
+  command groups (which run against Matrix), a few commands remain placeholders
+  pending later roadmap phases (see [`docs/roadmap-rust.md`](roadmap-rust.md)).
 - **PTY signal semantics are partial.** Controlling-tty and full Ctrl-C
   semantics for `exec --pty` are intentionally limited; the workspace forbids
   `unsafe`, so PTY/termios use the safe `rustix` path.

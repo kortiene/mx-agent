@@ -16,7 +16,7 @@ mx-agent is two cooperating processes plus a transport you already trust:
 
 The result: one coding agent can ask another — on a different machine, network, or continent — to run a command, and watch its output stream back, with every privileged request cryptographically signed and checked against local policy on the machine that would execute it.
 
-> **Project status (v0.1.0, public alpha).** The architecture, protocol schema, IPC layer (with peer-credential checks), policy engine, Ed25519 signing, and the `none` sandbox backend are implemented. **Most CLI subcommands currently parse arguments and return "not implemented yet"** while the daemon behavior is filled in. Throughout this wiki, each feature is tagged **✅ Implemented**, **🟡 Designed / in progress**, or **🔮 Planned** so you always know what runs today.
+> **Project status (v0.1.0, public alpha).** The architecture, protocol schema, IPC layer (with peer-credential checks), policy engine, Ed25519 signing, and the `none` sandbox backend are implemented, and most command groups now run against a real Matrix homeserver through the daemon: `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and the `task` state commands (create/update/list/graph/watch) plus DAG diagnostics. The daemon task-orchestration engine (scheduler, claiming, tool/exec dispatch, policy + trust/signature + approval enforcement, restart recovery) is implemented and tested but **not yet auto-driven by a live `/sync` loop**, and `call` / `exec` still run **local-loopback** (remote Matrix transport is landing, #155). Throughout this wiki, each feature is tagged **✅ Implemented**, **🟡 Designed / in progress**, or **🔮 Planned** so you always know what runs today.
 
 ---
 
