@@ -20,6 +20,7 @@ pub mod matrix;
 pub mod pty;
 pub mod replay;
 pub mod runner;
+pub mod scheduler;
 pub mod session;
 pub mod signing;
 pub mod stream;
@@ -94,6 +95,7 @@ pub use runner::{
     is_secret_var, kill_process_group, run, sanitize_env, terminate_process_group, RunError,
     RunOutput, RunSpec, CANCEL_SIGNAL, DEFAULT_GRACE_PERIOD,
 };
+pub use scheduler::{ScheduleDecision, TaskScheduler};
 pub use session::{
     auth_status, clear_session, clear_sync_token, load_session, load_sync_token, save_session,
     save_sync_token, AuthStatus, Secret, SessionPaths, StoredSession,
