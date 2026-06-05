@@ -24,7 +24,7 @@ use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::INVOCATION as INVOCATION_STATE_TYPE;
-use mx_agent_protocol::schema::InvocationState;
+use mx_agent_protocol::schema::{InvocationState, TaskResult};
 
 use crate::exec::{publish_invocation_state, send_exec_cancel};
 use crate::matrix::restore_client;
@@ -55,6 +55,90 @@ pub fn terminal_state_for_exit(exit_code: i32) -> &'static str {
         STATE_SUCCEEDED
     } else {
         STATE_FAILED
+    }
+}
+
+/// Build the initial `com.mxagent.invocation.v1` record linked to a task this
+/// daemon's agent has claimed (architecture §9.2).
+///
+/// The record carries the owning `task_id` so peers and `mx-agent invocation
+/// list --task` can link work back to the task DAG, and starts in the
+/// [`STATE_ACCEPTED`] lifecycle state at `state_rev` 0. The owning task's
+/// `invocation_id` is set separately when the task is claimed, so the link is
+/// bidirectional and survives a daemon restart (the task state retains the
+/// invocation id, and the invocation state retains the task id).
+pub fn invocation_for_task(
+    task_id: &str,
+    invocation_id: &str,
+    requester: &str,
+    target: &str,
+    now: impl Into<String>,
+) -> InvocationState {
+    let now = now.into();
+    InvocationState {
+        invocation_id: invocation_id.to_string(),
+        task_id: Some(task_id.to_string()),
+        requester: requester.to_string(),
+        target: target.to_string(),
+        state: STATE_ACCEPTED.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        exit_code: None,
+        state_rev: 0,
+        extra: Default::default(),
+    }
+}
+
+/// Map an invocation's terminal lifecycle state to the owning task's terminal
+/// lifecycle state.
+///
+/// Invocations and tasks share the terminal vocabulary (`succeeded`/`failed`/
+/// `cancelled`), so the mapping is identity for terminal states. A non-terminal
+/// invocation state returns `None`: the task is still executing and must not be
+/// finalized yet.
+pub fn task_state_for_invocation(invocation_state: &str) -> Option<&'static str> {
+    match invocation_state {
+        STATE_SUCCEEDED => Some(STATE_SUCCEEDED),
+        STATE_FAILED => Some(STATE_FAILED),
+        STATE_CANCELLED => Some(STATE_CANCELLED),
+        _ => None,
+    }
+}
+
+/// Derive a stable task [`TaskResult`] from a finished invocation (architecture
+/// §9.2, the result schema from issue #164).
+///
+/// The task result is derived from the invocation's completion: its terminal
+/// status, exit code, and a machine-readable failure/cancellation `reason`. The
+/// summary is intentionally non-sensitive (it never carries raw process output).
+/// `completed_by` is the local agent finalizing the task.
+pub fn task_result_from_invocation(
+    invocation: &InvocationState,
+    completed_by: &str,
+    now: impl Into<String>,
+) -> TaskResult {
+    let reason = match invocation.state.as_str() {
+        STATE_FAILED => Some("process_exit".to_string()),
+        STATE_CANCELLED => Some("cancelled".to_string()),
+        _ => None,
+    };
+    let summary = match invocation.state.as_str() {
+        STATE_SUCCEEDED => Some("invocation succeeded".to_string()),
+        STATE_FAILED => Some("invocation failed".to_string()),
+        STATE_CANCELLED => Some("invocation cancelled".to_string()),
+        other => Some(format!("invocation {other}")),
+    };
+    TaskResult {
+        status: invocation.state.clone(),
+        completed_by: completed_by.to_string(),
+        completed_at: now.into(),
+        invocation_id: Some(invocation.invocation_id.clone()),
+        action: None,
+        reason,
+        exit_code: invocation.exit_code,
+        summary,
+        artifact_mxc: None,
+        extra: Default::default(),
     }
 }
 
@@ -404,6 +488,63 @@ mod tests {
         assert_eq!(terminal_state_for_exit(0), STATE_SUCCEEDED);
         assert_eq!(terminal_state_for_exit(1), STATE_FAILED);
         assert_eq!(terminal_state_for_exit(137), STATE_FAILED);
+    }
+
+    #[test]
+    fn invocation_for_task_links_back_to_task() {
+        let inv = invocation_for_task(
+            "task_abc",
+            "inv_01HZ",
+            "@planner:server",
+            "developer-pi",
+            "2026-06-04T18:00:00Z",
+        );
+        assert_eq!(inv.invocation_id, "inv_01HZ");
+        assert_eq!(inv.task_id.as_deref(), Some("task_abc"));
+        assert_eq!(inv.target, "developer-pi");
+        assert_eq!(inv.state, STATE_ACCEPTED);
+        assert_eq!(inv.state_rev, 0);
+        assert!(inv.exit_code.is_none());
+    }
+
+    #[test]
+    fn task_state_for_invocation_maps_terminal_states_only() {
+        assert_eq!(
+            task_state_for_invocation(STATE_SUCCEEDED),
+            Some("succeeded")
+        );
+        assert_eq!(task_state_for_invocation(STATE_FAILED), Some("failed"));
+        assert_eq!(
+            task_state_for_invocation(STATE_CANCELLED),
+            Some("cancelled")
+        );
+        assert_eq!(task_state_for_invocation(STATE_RUNNING), None);
+        assert_eq!(task_state_for_invocation(STATE_ACCEPTED), None);
+    }
+
+    #[test]
+    fn task_result_from_invocation_is_derived_from_completion() {
+        let mut inv = sample("inv_01HZ", STATE_SUCCEEDED, Some("task_abc"));
+        inv.exit_code = Some(0);
+        let ok = task_result_from_invocation(&inv, "developer-pi", "2026-06-04T18:00:00Z");
+        assert_eq!(ok.status, "succeeded");
+        assert_eq!(ok.completed_by, "developer-pi");
+        assert_eq!(ok.invocation_id.as_deref(), Some("inv_01HZ"));
+        assert_eq!(ok.exit_code, Some(0));
+        assert!(ok.reason.is_none());
+
+        let mut failed = sample("inv_01HZ", STATE_FAILED, Some("task_abc"));
+        failed.exit_code = Some(2);
+        let fail = task_result_from_invocation(&failed, "developer-pi", "2026-06-04T18:00:00Z");
+        assert_eq!(fail.status, "failed");
+        assert_eq!(fail.exit_code, Some(2));
+        assert_eq!(fail.reason.as_deref(), Some("process_exit"));
+
+        let cancelled = sample("inv_01HZ", STATE_CANCELLED, Some("task_abc"));
+        let cancel =
+            task_result_from_invocation(&cancelled, "developer-pi", "2026-06-04T18:00:00Z");
+        assert_eq!(cancel.status, "cancelled");
+        assert_eq!(cancel.reason.as_deref(), Some("cancelled"));
     }
 
     #[test]
