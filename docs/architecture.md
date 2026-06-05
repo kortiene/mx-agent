@@ -821,11 +821,43 @@ The daemon scheduler first claims a pending task with the observed `state_rev`,
 sets `state = "executing"`, and attaches a generated `invocation_id`. A lost
 claim race is treated as a stale update and must not spawn. After the signed,
 trust-checked, deny-by-default dispatcher returns, the daemon finalizes the task
-as `succeeded` or `failed` with a non-sensitive structured `result` containing
-the invocation link, action kind, exit code/summary, denial reason, or recovery
-metadata. On restart, an assigned `executing` task whose local invocation is no
-longer live is marked failed with a recovery result instead of being spawned a
-second time.
+as `succeeded` or `failed` with a stable, non-sensitive structured `result`.
+
+Successful result example:
+
+```json
+{
+  "status": "succeeded",
+  "completed_by": "pi-builder",
+  "completed_at": "2026-06-04T18:00:00Z",
+  "invocation_id": "inv_01HZ...",
+  "action": "tool",
+  "exit_code": 0,
+  "summary": "tests passed",
+  "artifact_mxc": null
+}
+```
+
+Failure, denial, and recovery results use the same object shape with
+`status = "failed"` and a machine-readable `reason`, e.g. `process_exit`,
+`policy_denied`, `dispatch_failed`, or `recovered_stale_invocation`:
+
+```json
+{
+  "status": "failed",
+  "completed_by": "pi-builder",
+  "completed_at": "2026-06-04T18:00:00Z",
+  "invocation_id": "inv_01HZ...",
+  "action": "exec",
+  "reason": "process_exit",
+  "exit_code": 1,
+  "summary": "tests failed"
+}
+```
+
+On restart, an assigned `executing` task whose local invocation is no longer
+live is marked failed with a recovery result instead of being spawned a second
+time.
 
 ### 9.3 Workspace State
 
