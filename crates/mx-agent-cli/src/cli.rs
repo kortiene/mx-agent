@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use serde_json::Value;
 
 /// Top-level parser for the `mx-agent` binary.
 #[derive(Debug, Parser)]
@@ -1782,11 +1783,46 @@ fn print_task(task: &mx_agent_protocol::schema::TaskState) {
     println!("    state_rev:    {}", task.state_rev);
 }
 
+fn daemon_socket_path(global: &GlobalArgs) -> PathBuf {
+    global
+        .socket
+        .clone()
+        .unwrap_or_else(|| mx_agent_daemon::Paths::resolve().socket_path)
+}
+
+fn task_ipc_call<T, R>(global: &GlobalArgs, method: &str, params: &T) -> Result<R, ExitCode>
+where
+    T: serde::Serialize,
+    R: serde::de::DeserializeOwned,
+{
+    let params = serde_json::to_value(params).map_err(|e| {
+        eprintln!("mx-agent: could not encode {method} request: {e}");
+        ExitCode::FAILURE
+    })?;
+    let socket = daemon_socket_path(global);
+    let mut client = mx_agent_ipc::Client::connect(&socket).map_err(|e| {
+        eprintln!(
+            "mx-agent: could not contact daemon at {}: {e}; run `mx-agent daemon start`",
+            socket.display()
+        );
+        ExitCode::from(3)
+    })?;
+    let response = client.call(method, params).map_err(|e| {
+        eprintln!("mx-agent: daemon IPC request {method} failed: {e}");
+        ExitCode::FAILURE
+    })?;
+    if let Some(error) = response.error {
+        eprintln!("mx-agent: daemon rejected {method}: {}", error.message);
+        return Err(ExitCode::FAILURE);
+    }
+    let result = response.result.unwrap_or(Value::Null);
+    serde_json::from_value(result).map_err(|e| {
+        eprintln!("mx-agent: daemon returned invalid {method} response: {e}");
+        ExitCode::FAILURE
+    })
+}
+
 fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::CreateTaskOptions {
         room: args.room.clone(),
         task_id: args.id.clone(),
@@ -1798,37 +1834,25 @@ fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
         depends_on: args.depends_on.clone(),
         blocks: args.blocks.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::create_task_for_session(&session, &options).await {
-            Ok(task) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    println!("mx-agent: created task {}", task.task_id);
-                    print_task(&task);
-                }
-                ExitCode::SUCCESS
+    match task_ipc_call::<_, mx_agent_protocol::schema::TaskState>(global, "task.create", &options)
+    {
+        Ok(task) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: created task {}", task.task_id);
+                print_task(&task);
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not create task: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::UpdateTaskOptions {
         room: args.room.clone(),
         task_id: args.task_id.clone(),
@@ -1840,108 +1864,77 @@ fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
         result: None,
         expected_state_rev: args.expected_state_rev,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::update_task_for_session(&session, &options).await {
-            Ok(task) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    println!("mx-agent: updated task {}", task.task_id);
-                    print_task(&task);
-                }
-                ExitCode::SUCCESS
+    match task_ipc_call::<_, mx_agent_protocol::schema::TaskState>(global, "task.update", &options)
+    {
+        Ok(task) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: updated task {}", task.task_id);
+                print_task(&task);
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not update task: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn task_list(global: &GlobalArgs, args: &TaskListArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::ListTasksOptions {
         room: args.room.clone(),
         state: args.state.clone(),
         assigned_to: args.assigned.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::list_tasks_for_session(&session, &options).await {
-            Ok(tasks) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string())
-                    );
-                } else if tasks.is_empty() {
-                    println!("mx-agent: no tasks in {}", args.room);
-                } else {
-                    println!("mx-agent: {} task(s) in {}", tasks.len(), args.room);
-                    for task in &tasks {
-                        print_task(task);
-                    }
+    match task_ipc_call::<_, Vec<mx_agent_protocol::schema::TaskState>>(
+        global,
+        "task.list",
+        &options,
+    ) {
+        Ok(tasks) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else if tasks.is_empty() {
+                println!("mx-agent: no tasks in {}", args.room);
+            } else {
+                println!("mx-agent: {} task(s) in {}", tasks.len(), args.room);
+                for task in &tasks {
+                    print_task(task);
                 }
-                ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not list tasks: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn task_graph(global: &GlobalArgs, args: &TaskGraphArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::ListTasksOptions {
         room: args.room.clone(),
         state: None,
         assigned_to: None,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::list_tasks_for_session(&session, &options).await {
-            Ok(tasks) => {
-                let graph = mx_agent_daemon::TaskGraph::from_tasks(&tasks);
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&graph).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else if graph.nodes.is_empty() {
-                    println!("mx-agent: no tasks in {}", args.room);
-                } else {
-                    print!("{}", graph.render_text());
-                }
-                ExitCode::SUCCESS
+    match task_ipc_call::<_, mx_agent_daemon::TaskGraph>(global, "task.graph", &options) {
+        Ok(graph) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&graph).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else if graph.nodes.is_empty() {
+                println!("mx-agent: no tasks in {}", args.room);
+            } else {
+                print!("{}", graph.render_text());
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not render task graph: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 /// Render a single task change (added/removed/updated) as a one-line entry.
@@ -2031,52 +2024,104 @@ fn render_task_update(
     }
 }
 
+fn render_task_watch_ipc_payload(json: bool, room: &str, payload: Value) -> Result<(), String> {
+    let event = payload
+        .get("event")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing watch event kind".to_string())?;
+    match event {
+        "initial" => {
+            let tasks: Vec<mx_agent_protocol::schema::TaskState> =
+                serde_json::from_value(payload.get("tasks").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| format!("invalid initial task payload: {e}"))?;
+            render_task_update(json, room, mx_agent_daemon::WatchUpdate::Initial(&tasks));
+        }
+        "changed" => {
+            if json {
+                let changes = payload.get("changes").cloned().unwrap_or(Value::Null);
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "changed", "changes": changes })
+                );
+            } else {
+                let previous: Vec<mx_agent_protocol::schema::TaskState> =
+                    serde_json::from_value(payload.get("previous").cloned().unwrap_or(Value::Null))
+                        .map_err(|e| format!("invalid previous task payload: {e}"))?;
+                let current: Vec<mx_agent_protocol::schema::TaskState> =
+                    serde_json::from_value(payload.get("current").cloned().unwrap_or(Value::Null))
+                        .map_err(|e| format!("invalid current task payload: {e}"))?;
+                render_task_update(
+                    json,
+                    room,
+                    mx_agent_daemon::WatchUpdate::Changed {
+                        previous: &previous,
+                        current: &current,
+                    },
+                );
+            }
+        }
+        "reconnecting" => {
+            let attempt = payload.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+            let error = payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            eprintln!("mx-agent: reconnecting (attempt {attempt}): {error}");
+        }
+        "reconnected" => eprintln!("mx-agent: reconnected"),
+        other => return Err(format!("unknown watch event kind {other:?}")),
+    }
+    Ok(())
+}
+
 fn task_watch(global: &GlobalArgs, args: &TaskWatchArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::ListTasksOptions {
         room: args.room.clone(),
         state: args.state.clone(),
         assigned_to: args.assigned.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let running = Arc::new(AtomicBool::new(true));
-    let json = global.json;
-    let room = args.room.clone();
-    let callback = move |update: mx_agent_daemon::WatchUpdate<
-        '_,
-        Vec<mx_agent_protocol::schema::TaskState>,
-    >| {
-        render_task_update(json, &room, update);
-    };
-    runtime.block_on(async {
-        let watch = mx_agent_daemon::watch_tasks_for_session(
-            &session,
-            &options,
-            mx_agent_daemon::WatchConfig::default(),
-            &running,
-            callback,
-        );
-        tokio::select! {
-            result = watch => match result {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("mx-agent: could not watch tasks: {e}");
-                    ExitCode::FAILURE
-                }
-            },
-            _ = tokio::signal::ctrl_c() => {
-                running.store(false, Ordering::SeqCst);
-                eprintln!("mx-agent: watch stopped");
-                ExitCode::SUCCESS
-            }
+    let params = match serde_json::to_value(&options) {
+        Ok(params) => params,
+        Err(e) => {
+            eprintln!("mx-agent: could not encode task.watch request: {e}");
+            return ExitCode::FAILURE;
         }
-    })
+    };
+    let socket = daemon_socket_path(global);
+    let mut client = match mx_agent_ipc::Client::connect(&socket) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!(
+                "mx-agent: could not contact daemon at {}: {e}; run `mx-agent daemon start`",
+                socket.display()
+            );
+            return ExitCode::from(3);
+        }
+    };
+    let request = mx_agent_ipc::Request::new(Value::from(1_u64), "task.watch", params);
+    if let Err(e) = client.send(&request) {
+        eprintln!("mx-agent: daemon IPC request task.watch failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    loop {
+        let response = match client.recv() {
+            Ok(response) => response,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mx-agent: daemon IPC request task.watch failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Some(error) = response.error {
+            eprintln!("mx-agent: daemon rejected task.watch: {}", error.message);
+            return ExitCode::FAILURE;
+        }
+        let payload = response.result.unwrap_or(Value::Null);
+        if let Err(e) = render_task_watch_ipc_payload(global.json, &args.room, payload) {
+            eprintln!("mx-agent: daemon returned invalid task.watch response: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 }
 
 /// Handle the `share` command group.
@@ -4007,6 +4052,81 @@ mod tests {
             other => panic!("expected task graph, got {other:?}"),
         }
         assert_eq!(command_path(&cli.command), "task graph");
+    }
+
+    #[test]
+    fn task_commands_fail_cleanly_when_daemon_unavailable() {
+        let socket = std::env::temp_dir().join(format!(
+            "mx-agent-missing-task-ipc-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let socket = socket.to_string_lossy().into_owned();
+        let commands: &[&[&str]] = &[
+            &[
+                "mx-agent",
+                "--socket",
+                &socket,
+                "task",
+                "create",
+                "--room",
+                "!abc:matrix.org",
+                "--title",
+                "Run tests",
+            ],
+            &[
+                "mx-agent",
+                "--socket",
+                &socket,
+                "task",
+                "update",
+                "--room",
+                "!abc:matrix.org",
+                "task_abc",
+                "--state",
+                "succeeded",
+            ],
+            &[
+                "mx-agent",
+                "--socket",
+                &socket,
+                "task",
+                "list",
+                "--room",
+                "!abc:matrix.org",
+            ],
+            &[
+                "mx-agent",
+                "--socket",
+                &socket,
+                "task",
+                "graph",
+                "--room",
+                "!abc:matrix.org",
+            ],
+            &[
+                "mx-agent",
+                "--socket",
+                &socket,
+                "task",
+                "watch",
+                "--room",
+                "!abc:matrix.org",
+            ],
+        ];
+
+        for argv in commands {
+            let cli = Cli::try_parse_from(*argv).unwrap();
+            match &cli.command {
+                Command::Task(cmd) => {
+                    assert_eq!(handle_task(&cli.global, cmd), ExitCode::from(3));
+                }
+                other => panic!("expected task command, got {other:?}"),
+            }
+        }
     }
 
     #[test]

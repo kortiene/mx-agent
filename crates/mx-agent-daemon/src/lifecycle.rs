@@ -13,14 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mx_agent_ipc::rpc::{Request, Response, INTERNAL_ERROR, METHOD_NOT_FOUND};
+use mx_agent_ipc::rpc::{Request, Response, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use crate::session::{load_session, SessionPaths};
+use crate::session::{load_session, SessionPaths, StoredSession};
 use crate::sync::{BackoffConfig, SyncHealth};
 use crate::DaemonInfo;
 
@@ -238,9 +239,17 @@ pub fn run_foreground() -> io::Result<()> {
     let handler_socket = socket_path.clone();
     let handler_health = health.clone();
     let _server = std::thread::spawn(move || {
-        let handler =
-            move |req: &Request| dispatch(req, pid, started_at, &handler_socket, &handler_health);
-        if let Err(e) = mx_agent_ipc::serve(&listener, handler) {
+        let handler = move |req: &Request, stream: &mut std::os::unix::net::UnixStream| {
+            dispatch_streaming(
+                req,
+                stream,
+                pid,
+                started_at,
+                &handler_socket,
+                &handler_health,
+            )
+        };
+        if let Err(e) = mx_agent_ipc::serve_streaming(&listener, handler) {
             tracing::warn!(error = %e, "ipc server stopped");
         }
     });
@@ -328,7 +337,79 @@ fn spawn_sync_loop(
     (Some(handle), Some(health))
 }
 
-/// Dispatch a single IPC request against the running daemon.
+fn write_ipc_response(
+    stream: &mut std::os::unix::net::UnixStream,
+    response: &Response,
+) -> io::Result<()> {
+    let encoded = serde_json::to_vec(response).unwrap_or_else(|_| {
+        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"encode failure"}}"#
+            .to_vec()
+    });
+    mx_agent_ipc::write_frame(stream, &encoded)
+}
+
+fn parse_params<T>(req: &Request) -> Result<T, Box<Response>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(req.params.clone()).map_err(|e| {
+        Box::new(Response::error(
+            req.id.clone(),
+            INVALID_PARAMS,
+            format!("invalid params for {}: {e}", req.method),
+        ))
+    })
+}
+
+fn load_daemon_session_response(req: &Request) -> Result<StoredSession, Box<Response>> {
+    match load_session(&SessionPaths::resolve()) {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err(Box::new(Response::error(
+            req.id.clone(),
+            INTERNAL_ERROR,
+            "not logged in; run `mx-agent auth login` first",
+        ))),
+        Err(e) => Err(Box::new(Response::error(
+            req.id.clone(),
+            INTERNAL_ERROR,
+            format!("could not read daemon session: {e}"),
+        ))),
+    }
+}
+
+fn block_on_task_response<F, Fut, T>(req: &Request, f: F) -> Response
+where
+    F: FnOnce(StoredSession) -> Fut,
+    Fut: std::future::Future<Output = Result<T, crate::WorkspaceError>>,
+    T: serde::Serialize,
+{
+    let session = match load_daemon_session_response(req) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return Response::error(
+                req.id.clone(),
+                INTERNAL_ERROR,
+                format!("could not start async runtime: {e}"),
+            )
+        }
+    };
+    match runtime.block_on(f(session)) {
+        Ok(value) => match serde_json::to_value(value) {
+            Ok(value) => Response::result(req.id.clone(), value),
+            Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+        },
+        Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+    }
+}
+
+/// Dispatch a single-response IPC request against the running daemon.
 fn dispatch(
     req: &Request,
     pid: u32,
@@ -337,7 +418,7 @@ fn dispatch(
     health: &SharedHealth,
 ) -> Response {
     match req.method.as_str() {
-        "daemon.ping" => Response::result(req.id.clone(), serde_json::json!({"pong": true})),
+        "daemon.ping" => Response::result(req.id.clone(), json!({"pong": true})),
         "daemon.status" => {
             let sync = health
                 .as_ref()
@@ -355,11 +436,134 @@ fn dispatch(
                 Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
             }
         }
+        "task.create" => match parse_params::<crate::CreateTaskOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::create_task_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "task.update" => match parse_params::<crate::UpdateTaskOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::update_task_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "task.list" => match parse_params::<crate::ListTasksOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::list_tasks_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "task.graph" => match parse_params::<crate::ListTasksOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                let tasks = crate::list_tasks_for_session(&session, &options).await?;
+                Ok(crate::TaskGraph::from_tasks(&tasks))
+            }),
+            Err(response) => *response,
+        },
+        "task.watch" => Response::error(
+            req.id.clone(),
+            METHOD_NOT_FOUND,
+            "task.watch requires a streaming IPC connection",
+        ),
         other => Response::error(
             req.id.clone(),
             METHOD_NOT_FOUND,
             format!("unknown method: {other}"),
         ),
+    }
+}
+
+fn dispatch_task_watch(
+    req: &Request,
+    stream: &mut std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    let options = match parse_params::<crate::ListTasksOptions>(req) {
+        Ok(options) => options,
+        Err(response) => return write_ipc_response(stream, &response),
+    };
+    let session = match load_daemon_session_response(req) {
+        Ok(session) => session,
+        Err(response) => return write_ipc_response(stream, &response),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return write_ipc_response(
+                stream,
+                &Response::error(
+                    req.id.clone(),
+                    INTERNAL_ERROR,
+                    format!("could not start async runtime: {e}"),
+                ),
+            )
+        }
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
+    let write_failed = Arc::new(AtomicBool::new(false));
+    let stream_cell = std::cell::RefCell::new(stream);
+    let request_id = req.id.clone();
+    let running_for_callback = running.clone();
+    let write_failed_for_callback = write_failed.clone();
+    let callback = |update: crate::WatchUpdate<'_, Vec<mx_agent_protocol::schema::TaskState>>| {
+        let payload: Value = match update {
+            crate::WatchUpdate::Initial(tasks) => json!({ "event": "initial", "tasks": tasks }),
+            crate::WatchUpdate::Changed { previous, current } => json!({
+                "event": "changed",
+                "previous": previous,
+                "current": current,
+                "changes": crate::diff_tasks(previous, current),
+            }),
+            crate::WatchUpdate::Reconnecting { attempt, error } => json!({
+                "event": "reconnecting",
+                "attempt": attempt,
+                "error": error,
+            }),
+            crate::WatchUpdate::Reconnected => json!({ "event": "reconnected" }),
+        };
+        let response = Response::result(request_id.clone(), payload);
+        if write_ipc_response(&mut stream_cell.borrow_mut(), &response).is_err() {
+            write_failed_for_callback.store(true, Ordering::SeqCst);
+            running_for_callback.store(false, Ordering::SeqCst);
+        }
+    };
+
+    let result = runtime.block_on(crate::watch_tasks_for_session(
+        &session,
+        &options,
+        crate::WatchConfig::default(),
+        &running,
+        callback,
+    ));
+    if write_failed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => write_ipc_response(
+            &mut stream_cell.borrow_mut(),
+            &Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+        ),
+    }
+}
+
+fn dispatch_streaming(
+    req: &Request,
+    stream: &mut std::os::unix::net::UnixStream,
+    pid: u32,
+    started_at: u64,
+    socket_path: &str,
+    health: &SharedHealth,
+) -> io::Result<()> {
+    if req.method == "task.watch" {
+        dispatch_task_watch(req, stream)
+    } else {
+        let response = dispatch(req, pid, started_at, socket_path, health);
+        write_ipc_response(stream, &response)
     }
 }
 
@@ -460,6 +664,7 @@ mod tests {
                 now_unix()
             ));
             std::env::set_var(ENV_RUNTIME_DIR, &dir);
+            std::env::set_var(crate::session::ENV_DATA_DIR, dir.join("data"));
             Self { dir, _guard: guard }
         }
     }
@@ -467,6 +672,7 @@ mod tests {
     impl Drop for TempRuntime {
         fn drop(&mut self) {
             std::env::remove_var(ENV_RUNTIME_DIR);
+            std::env::remove_var(crate::session::ENV_DATA_DIR);
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
@@ -510,6 +716,32 @@ mod tests {
         assert!(running.uptime_seconds >= 2);
         assert_eq!(running.version, DAEMON_VERSION);
         assert!(running.to_json().contains("\"running\":true"));
+    }
+
+    #[test]
+    fn task_ipc_methods_validate_params_before_loading_session() {
+        for method in ["task.create", "task.update", "task.list", "task.graph"] {
+            let req = Request::new(json!(1), method, Value::Null);
+            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None);
+            let error = response.error.expect("invalid params should be rejected");
+            assert_eq!(error.code, INVALID_PARAMS);
+            assert!(error.message.contains("invalid params"));
+            assert!(error.message.contains(method));
+        }
+    }
+
+    #[test]
+    fn task_ipc_methods_report_missing_daemon_session() {
+        let _rt = TempRuntime::new("task-session");
+        let req = Request::new(
+            json!(1),
+            "task.list",
+            json!({"room":"!abc:matrix.org","state":null,"assigned_to":null}),
+        );
+        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        let error = response.error.expect("missing session should be rejected");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(error.message.contains("not logged in"));
     }
 
     #[test]

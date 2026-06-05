@@ -19,6 +19,7 @@ mx-agent-daemon.workspace = true
 mx-agent-ipc.workspace = true
 clap.workspace = true
 tracing.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 base64 = { workspace = true }

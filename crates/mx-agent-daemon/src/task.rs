@@ -19,6 +19,7 @@ use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::TASK as TASK_STATE_TYPE;
 use mx_agent_protocol::id::generate_task_id;
 use mx_agent_protocol::schema::TaskState;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::matrix::restore_client;
@@ -30,7 +31,7 @@ use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
 pub const DEFAULT_TASK_STATE: &str = "pending";
 
 /// Options for [`create_task`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateTaskOptions {
     /// Room ID or alias to create the task in.
     pub room: String,
@@ -55,7 +56,7 @@ pub struct CreateTaskOptions {
 
 /// Options for [`update_task`]. Every mutable field is optional; `None` leaves
 /// the existing value unchanged.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateTaskOptions {
     /// Room ID or alias the task lives in.
     pub room: String,
@@ -82,7 +83,7 @@ pub struct UpdateTaskOptions {
 }
 
 /// Options for [`list_tasks`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListTasksOptions {
     /// Room ID or alias to list tasks in.
     pub room: String,

@@ -24,21 +24,32 @@ where
     }
 }
 
-/// Serve a single connection until the peer closes it.
-fn serve_connection<F>(mut stream: UnixStream, handler: &F) -> io::Result<()>
+fn write_response(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
+    let encoded = serde_json::to_vec(response).unwrap_or_else(|_| {
+        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"encode failure"}}"#
+            .to_vec()
+    });
+    write_frame(stream, &encoded)
+}
+
+/// Serve a single connection with a handler that may write one or more response
+/// frames for each request.
+fn serve_streaming_connection<F>(stream: &mut UnixStream, handler: &F) -> io::Result<()>
 where
-    F: Fn(&Request) -> Response,
+    F: Fn(&Request, &mut UnixStream) -> io::Result<()>,
 {
     loop {
-        let Some(bytes) = read_frame(&mut stream)? else {
+        let Some(bytes) = read_frame(stream)? else {
             return Ok(());
         };
-        let response = handle_message(&bytes, handler);
-        let encoded = serde_json::to_vec(&response).unwrap_or_else(|_| {
-            br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"encode failure"}}"#
-                .to_vec()
-        });
-        write_frame(&mut stream, &encoded)?;
+        match serde_json::from_slice::<Request>(&bytes) {
+            Ok(request) => handler(&request, stream)?,
+            Err(e) => {
+                let response =
+                    Response::error(Value::Null, PARSE_ERROR, format!("invalid request: {e}"));
+                write_response(stream, &response)?;
+            }
+        }
     }
 }
 
@@ -50,10 +61,26 @@ pub fn serve<F>(listener: &UnixListener, handler: F) -> io::Result<()>
 where
     F: Fn(&Request) -> Response,
 {
+    serve_streaming(listener, move |request, stream| {
+        let response = handler(request);
+        write_response(stream, &response)
+    })
+}
+
+/// Accept connections on `listener` and dispatch each request through a handler
+/// that may write multiple JSON-RPC response frames.
+///
+/// This preserves the normal request/one-response behavior for most methods and
+/// allows long-lived streaming methods such as `task.watch` to send an initial
+/// response followed by change responses on the same Unix-socket connection.
+pub fn serve_streaming<F>(listener: &UnixListener, handler: F) -> io::Result<()>
+where
+    F: Fn(&Request, &mut UnixStream) -> io::Result<()>,
+{
     let mut warned_unsupported = false;
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
                 match verify_peer(&stream) {
                     PeerCredCheck::Allowed { .. } => {}
                     PeerCredCheck::Denied {
@@ -80,7 +107,7 @@ where
                         }
                     }
                 }
-                if let Err(e) = serve_connection(stream, &handler) {
+                if let Err(e) = serve_streaming_connection(&mut stream, &handler) {
                     tracing::debug!(error = %e, "ipc connection ended with error");
                 }
             }
