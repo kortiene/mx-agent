@@ -10,6 +10,7 @@ pub mod approval;
 pub mod artifact;
 pub mod audit;
 pub mod call;
+pub mod call_ipc;
 pub mod context;
 pub mod event_router;
 pub mod exec;
@@ -59,6 +60,9 @@ pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE
 pub use call::{
     authorize_call_request, build_signed_call_request, emit_call_response, execute_authorized_call,
     rejection_response, send_call_request, success_response, CallRejection,
+};
+pub use call_ipc::{
+    start_call_loopback, CallErrorKind, CallOutcome, CallStartParams, CallStartResult,
 };
 pub use context::{
     fetch_context, fetch_context_for_session, list_context_shares, list_context_shares_for_session,

@@ -83,3 +83,62 @@ fn daemon_start_status_stop_cycle() {
 
     let _ = std::fs::remove_dir_all(&runtime_dir);
 }
+
+/// `mx-agent call` runs through the daemon IPC path (issue #193): it fails
+/// clearly when no daemon is running, and otherwise the daemon — not the CLI —
+/// executes the tool and returns a structured outcome.
+#[test]
+fn call_uses_daemon_ipc_path() {
+    let runtime_dir = unique_runtime_dir();
+
+    // No daemon yet: `call` fails clearly with exit code 3.
+    let out = run(
+        &runtime_dir,
+        &["call", "--tool", "run_tests", "--arg", "package=x"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "call without a daemon should exit 3: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("daemon"),
+        "error should mention the daemon: {out:?}"
+    );
+
+    // Start the daemon (no Matrix session needed for loopback).
+    let out = run(&runtime_dir, &["daemon", "start"]);
+    assert!(out.status.success(), "start should succeed: {out:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = run(&runtime_dir, &["daemon", "status", "--json"]);
+        if out.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // An unknown tool exercises the full IPC round-trip without spawning a
+    // heavy build: the daemon executes loopback, returns a structured error,
+    // and the CLI maps it to exit 127 with the preserved `--json` error shape.
+    let out = run(
+        &runtime_dir,
+        &["call", "--tool", "definitely_not_a_tool", "--json"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "unknown tool should exit 127: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"ok\":false"),
+        "expected JSON error envelope, got: {stdout}"
+    );
+
+    let out = run(&runtime_dir, &["daemon", "stop"]);
+    assert!(out.status.success(), "stop should succeed: {out:?}");
+
+    let _ = std::fs::remove_dir_all(&runtime_dir);
+}
