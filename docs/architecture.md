@@ -836,7 +836,14 @@ or replayed task action is blocked and never executes.
 
 After authorization, the daemon scheduler parses the task action and checks
 local deny-by-default policy against the task creator and requested tool/exec
-before claiming or dispatching. The claim is an optimistic, conditional update
+before claiming or dispatching. When local policy marks the action
+`requires_approval`, the task does **not** execute immediately: the daemon
+consults an approval gate that records a `com.mxagent.approval.request.v1` in the
+local approval queue (inspectable via `mx-agent approval list`) and holds the
+task. An approved decision lets the task proceed to claim/dispatch; a denied
+decision blocks the task (`reason = "approval_denied"`) and never spawns; an
+undecided action keeps waiting. With no approval gate configured the daemon
+fails closed and does not run the action. The claim is an optimistic, conditional update
 guarded by the observed `state_rev`: it transitions `pending`/`assigned` ->
 `executing`, records this agent as the owner (`assigned_to`), and attaches a
 generated `invocation_id` atomically. If another daemon claimed first, the

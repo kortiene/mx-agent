@@ -124,7 +124,8 @@ pub use task_dispatch::{
 };
 pub use task_graph::{GraphEdge, GraphNode, TaskGraph};
 pub use task_orchestrator::{
-    action_from_task, sign_task_action, OrchestrationOutcome, TaskActionError, TaskDispatchError,
+    action_from_task, sign_task_action, task_approval_request, ApprovalDisposition,
+    OrchestrationOutcome, QueueApprovalGate, TaskActionError, TaskApprovalGate, TaskDispatchError,
     TaskDispatcher, TaskExecutionResult, TaskOrchestrator, TaskStore, TaskStoreError,
 };
 pub use tool_exec::{execute_tool, ToolError, ToolResult, RUN_TESTS};

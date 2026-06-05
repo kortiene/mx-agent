@@ -18,9 +18,11 @@ use mx_agent_policy::{CallContext, ExecContext, Outcome, Policy};
 use mx_agent_protocol::canonical_json;
 use mx_agent_protocol::id::generate_invocation_id;
 use mx_agent_protocol::schema::{
-    Signature, TaskAction, TaskActionAuthorization, TaskResult, TaskState,
+    ApprovalRequest, Signature, TaskAction, TaskActionAuthorization, TaskResult, TaskState,
 };
 use mx_agent_protocol::signing::{self, SignatureError};
+
+use crate::approval::{ApprovalQueue, PendingApproval};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
@@ -153,6 +155,34 @@ pub trait TaskStore {
     fn finalize(&mut self, options: UpdateTaskOptions) -> Result<TaskState, TaskStoreError>;
 }
 
+/// The disposition of a task action that local policy marked
+/// `requires_approval` (architecture §12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDisposition {
+    /// An approval decision permits the action to run now.
+    Approved,
+    /// An approval decision denied the action; it must never spawn.
+    Denied(String),
+    /// No decision yet: the action waits. The string is the request id the
+    /// operator can inspect/decide.
+    Pending(String),
+}
+
+/// Gate consulted before running a task action that requires human approval.
+///
+/// When local policy returns `requires_approval` for an authorized task action,
+/// the orchestrator asks the gate whether a decision exists. Implementations
+/// must be **idempotent**: the first time an action is seen with no decision
+/// they should record/emit exactly one approval request (so the operator can
+/// inspect it via `mx-agent approval list`) and return
+/// [`ApprovalDisposition::Pending`]; subsequent calls for the same undecided
+/// action must not duplicate the request. A gate must never permit a denied or
+/// undecided action to run.
+pub trait TaskApprovalGate {
+    /// Resolve the approval disposition for `task`'s `action`.
+    fn evaluate(&mut self, task: &TaskState, action: &TaskAction) -> ApprovalDisposition;
+}
+
 /// Store-level failures surfaced by orchestration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStoreError {
@@ -234,6 +264,15 @@ pub enum OrchestrationOutcome {
         /// Agent that owns the executing task.
         owner: String,
     },
+    /// The action is authorized but local policy requires human approval, which
+    /// has not been granted yet; the task is not claimed or dispatched.
+    AwaitingApproval {
+        /// Task ID.
+        task_id: String,
+        /// Pending approval request id the operator can inspect, if the gate
+        /// produced one.
+        request_id: Option<String>,
+    },
     /// Store failed in a way the caller must surface.
     StoreError {
         /// Task ID.
@@ -252,6 +291,7 @@ pub struct TaskOrchestrator {
     trust_store: Option<TrustStore>,
     verifying_keys: BTreeMap<String, VerifyingKey>,
     replay_cache: Option<RefCell<ReplayCache>>,
+    approval_gate: Option<RefCell<Box<dyn TaskApprovalGate>>>,
 }
 
 impl TaskOrchestrator {
@@ -265,6 +305,7 @@ impl TaskOrchestrator {
             trust_store: None,
             verifying_keys: BTreeMap::new(),
             replay_cache: None,
+            approval_gate: None,
         }
     }
 
@@ -302,6 +343,16 @@ impl TaskOrchestrator {
     /// Attach replay protection for signed task action authorizations.
     pub fn with_replay_cache(mut self, replay_cache: ReplayCache) -> Self {
         self.replay_cache = Some(RefCell::new(replay_cache));
+        self
+    }
+
+    /// Attach the approval gate consulted when local policy requires approval.
+    ///
+    /// Without a gate, an action that requires approval cannot run: the
+    /// orchestrator fails closed and reports [`OrchestrationOutcome::AwaitingApproval`]
+    /// without claiming or dispatching.
+    pub fn with_approval_gate(mut self, gate: Box<dyn TaskApprovalGate>) -> Self {
+        self.approval_gate = Some(RefCell::new(gate));
         self
     }
 
@@ -362,8 +413,15 @@ impl TaskOrchestrator {
         {
             return outcome;
         }
-        if let Err(outcome) = self.authorize_task_action(task, &action, &invocation_id, store) {
-            return outcome;
+        let requires_approval =
+            match self.authorize_task_action(task, &action, &invocation_id, store) {
+                Ok(req) => req,
+                Err(outcome) => return outcome,
+            };
+        if requires_approval {
+            if let Err(outcome) = self.resolve_approval(task, &action, &invocation_id, store) {
+                return outcome;
+            }
         }
 
         // Optimistic claim: transition pending/assigned -> executing only if the
@@ -719,27 +777,32 @@ impl TaskOrchestrator {
         }
     }
 
+    /// Authorize the action against local policy. Returns `Ok(requires_approval)`
+    /// when permitted (the bool is the policy allowance's `requires_approval`
+    /// flag), or `Err(outcome)` when denied (the task is finalized blocked).
     fn authorize_task_action<S>(
         &self,
         task: &TaskState,
         action: &TaskAction,
         invocation_id: &str,
         store: &mut S,
-    ) -> Result<(), OrchestrationOutcome>
+    ) -> Result<bool, OrchestrationOutcome>
     where
         S: TaskStore,
     {
         let Some(policy) = &self.policy else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(room_id) = &self.room_id else {
-            return self.block_policy_denied(
-                task,
-                action,
-                invocation_id,
-                "policy_not_configured_for_room".to_string(),
-                store,
-            );
+            return self
+                .block_policy_denied(
+                    task,
+                    action,
+                    invocation_id,
+                    "policy_not_configured_for_room".to_string(),
+                    store,
+                )
+                .map(|_| false);
         };
         let outcome = evaluate_task_action(policy, room_id, task, action);
         if let Err(err) = self.audit_policy_decision(room_id, task, action, invocation_id, &outcome)
@@ -750,10 +813,94 @@ impl TaskOrchestrator {
             });
         }
         match outcome {
-            Outcome::Allow(_) => Ok(()),
-            Outcome::Deny(reason) => {
-                self.block_policy_denied(task, action, invocation_id, reason.to_string(), store)
+            Outcome::Allow(allowance) => Ok(allowance.requires_approval),
+            Outcome::Deny(reason) => self
+                .block_policy_denied(task, action, invocation_id, reason.to_string(), store)
+                .map(|_| false),
+        }
+    }
+
+    /// Consult the approval gate for an action local policy marked
+    /// `requires_approval`. `Ok(())` proceeds to claim/dispatch; `Err(outcome)`
+    /// holds or blocks the task without spawning.
+    fn resolve_approval<S>(
+        &self,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        store: &mut S,
+    ) -> Result<(), OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        let Some(gate) = &self.approval_gate else {
+            // Fail closed: approval is required but no gate can grant it, so the
+            // action must not run.
+            tracing::info!(
+                task_id = %task.task_id,
+                decision = "awaiting_approval",
+                "task requires approval but no approval gate is configured; not running"
+            );
+            return Err(OrchestrationOutcome::AwaitingApproval {
+                task_id: task.task_id.clone(),
+                request_id: None,
+            });
+        };
+        match gate.borrow_mut().evaluate(task, action) {
+            ApprovalDisposition::Approved => Ok(()),
+            ApprovalDisposition::Denied(reason) => {
+                self.block_approval_denied(task, action, invocation_id, reason, store)
             }
+            ApprovalDisposition::Pending(request_id) => {
+                tracing::info!(
+                    task_id = %task.task_id,
+                    request_id = %request_id,
+                    decision = "awaiting_approval",
+                    "task is held pending an approval decision"
+                );
+                Err(OrchestrationOutcome::AwaitingApproval {
+                    task_id: task.task_id.clone(),
+                    request_id: Some(request_id),
+                })
+            }
+        }
+    }
+
+    /// Finalize a task blocked because its approval was denied. Never spawns.
+    fn block_approval_denied<S>(
+        &self,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        reason: String,
+        store: &mut S,
+    ) -> Result<(), OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        let result = failure_result(
+            &self.agent_id,
+            Some(invocation_id),
+            Some(action.kind()),
+            "approval_denied",
+            Some(format!("task action approval denied: {reason}")),
+        );
+        match store.finalize(UpdateTaskOptions {
+            room: String::new(),
+            task_id: task.task_id.clone(),
+            state: Some(STATE_BLOCKED.to_string()),
+            result: Some(result),
+            expected_state_rev: Some(task.state_rev),
+            ..UpdateTaskOptions::default()
+        }) {
+            Ok(finalized) => Err(OrchestrationOutcome::Denied {
+                task_id: finalized.task_id,
+                invocation_id: invocation_id.to_string(),
+            }),
+            Err(err) => Err(OrchestrationOutcome::StoreError {
+                task_id: task.task_id.clone(),
+                reason: format_store_error(&err),
+            }),
         }
     }
 
@@ -905,6 +1052,106 @@ pub fn sign_task_action(
     let signature = signing::sign(signing_key, key_id, &value)?;
     auth.signature = signature;
     Ok(auth)
+}
+
+/// Build the `com.mxagent.approval.request.v1` content for a task action that
+/// requires approval (architecture §12).
+///
+/// The request is non-sensitive: it references the task and action kind, not raw
+/// command output. Its `request_id` is derived deterministically from the task
+/// id, so a redelivered/recomputed request is idempotent in the approval queue.
+pub fn task_approval_request(
+    task: &TaskState,
+    action: &TaskAction,
+    target_agent: &str,
+    expires_at: &str,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        request_id: format!("approval:{}", task.task_id),
+        invocation_id: String::new(),
+        requester: task.created_by.clone(),
+        target: target_agent.to_string(),
+        summary: format!("Run {} action for task {}", action.kind(), task.task_id),
+        risk: "medium".to_string(),
+        expires_at: expires_at.to_string(),
+        extra: Default::default(),
+    }
+}
+
+/// A [`TaskApprovalGate`] backed by the local [`ApprovalQueue`].
+///
+/// On the first undecided encounter it enqueues a [`PendingApproval`] (so the
+/// operator can inspect it via `mx-agent approval list`) and returns
+/// [`ApprovalDisposition::Pending`]. A decision is resolved through the supplied
+/// closure, which the daemon wires to recorded approval decisions: `Some(true)`
+/// approves, `Some(false)` denies, and `None` keeps the action pending. After a
+/// run the caller can persist the gate's [`queue`](Self::queue) so pending
+/// approvals survive a restart.
+pub struct QueueApprovalGate<R> {
+    room_id: String,
+    target_agent: String,
+    expires_at: String,
+    queue: ApprovalQueue,
+    resolve_decision: R,
+}
+
+impl<R> QueueApprovalGate<R>
+where
+    R: FnMut(&str) -> Option<bool>,
+{
+    /// Build a queue-backed approval gate for `room_id`/`target_agent`.
+    ///
+    /// `expires_at` is stamped onto emitted approval requests; `resolve_decision`
+    /// maps a request id to a recorded decision (`Some(true)`/`Some(false)`) or
+    /// `None` when still undecided. `queue` seeds the gate with any approvals
+    /// already persisted (so a restart does not re-emit them).
+    pub fn new(
+        room_id: impl Into<String>,
+        target_agent: impl Into<String>,
+        expires_at: impl Into<String>,
+        queue: ApprovalQueue,
+        resolve_decision: R,
+    ) -> Self {
+        Self {
+            room_id: room_id.into(),
+            target_agent: target_agent.into(),
+            expires_at: expires_at.into(),
+            queue,
+            resolve_decision,
+        }
+    }
+
+    /// Borrow the gate's approval queue (for inspection or persistence).
+    pub fn queue(&self) -> &ApprovalQueue {
+        &self.queue
+    }
+}
+
+impl<R> TaskApprovalGate for QueueApprovalGate<R>
+where
+    R: FnMut(&str) -> Option<bool>,
+{
+    fn evaluate(&mut self, task: &TaskState, action: &TaskAction) -> ApprovalDisposition {
+        let request = task_approval_request(task, action, &self.target_agent, &self.expires_at);
+        let request_id = request.request_id.clone();
+        match (self.resolve_decision)(&request_id) {
+            Some(true) => {
+                self.queue.remove(&request_id);
+                ApprovalDisposition::Approved
+            }
+            Some(false) => {
+                self.queue.remove(&request_id);
+                ApprovalDisposition::Denied("approval denied by operator".to_string())
+            }
+            None => {
+                self.queue.enqueue(PendingApproval {
+                    room_id: self.room_id.clone(),
+                    request,
+                });
+                ApprovalDisposition::Pending(request_id)
+            }
+        }
+    }
 }
 
 fn evaluate_task_action(
@@ -1178,6 +1425,160 @@ allow_cwd = ["/repo"]
             std::process::id(),
             now_rfc3339().replace([':', '-'], "")
         ))
+    }
+
+    /// A policy that allows `run_tests` but requires approval before running.
+    fn policy_requires_approval() -> Policy {
+        Policy::parse(
+            r#"
+[rooms."!room:server"]
+trusted = true
+
+[rooms."!room:server".agents."@planner:server"]
+allow_tools = ["run_tests"]
+requires_approval = true
+"#,
+        )
+        .expect("approval policy parses")
+    }
+
+    /// A gate returning a fixed disposition (for orchestrator integration).
+    struct FixedGate(ApprovalDisposition);
+    impl TaskApprovalGate for FixedGate {
+        fn evaluate(&mut self, _task: &TaskState, _action: &TaskAction) -> ApprovalDisposition {
+            self.0.clone()
+        }
+    }
+
+    fn approval_tool_task() -> TaskState {
+        with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"run_tests", "args":{}}),
+        )
+    }
+
+    #[test]
+    fn approval_required_task_does_not_execute_while_pending() {
+        let t = approval_tool_task();
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy_requires_approval())
+            .with_approval_gate(Box::new(FixedGate(ApprovalDisposition::Pending(
+                "approval:task-a".to_string(),
+            ))))
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::AwaitingApproval { task_id, request_id }
+                if task_id == "task-a" && request_id.as_deref() == Some("approval:task-a")
+        ));
+        // The task was neither claimed nor finalized: it stays re-schedulable.
+        assert!(store.finalized_state.is_none());
+    }
+
+    #[test]
+    fn approval_required_task_fails_closed_without_gate() {
+        let t = approval_tool_task();
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy_requires_approval())
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::AwaitingApproval {
+                request_id: None,
+                ..
+            }
+        ));
+        assert!(store.finalized_state.is_none());
+    }
+
+    #[test]
+    fn denied_approval_blocks_task_without_spawning() {
+        let t = approval_tool_task();
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy_requires_approval())
+            .with_approval_gate(Box::new(FixedGate(ApprovalDisposition::Denied(
+                "operator said no".to_string(),
+            ))))
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        assert_eq!(store.finalized_state.as_deref(), Some(STATE_BLOCKED));
+        let result = store.finalized_result.as_ref().expect("blocked result");
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("approval_denied")
+        );
+    }
+
+    #[test]
+    fn approved_task_runs_through_dispatch() {
+        let t = approval_tool_task();
+        let mut store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy_requires_approval())
+            .with_approval_gate(Box::new(FixedGate(ApprovalDisposition::Approved)))
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(
+            outcome,
+            OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED
+        ));
+    }
+
+    #[test]
+    fn queue_gate_enqueues_inspectable_pending_then_resolves() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        // Decision source: pending first, then approved.
+        let approved = Rc::new(Cell::new(false));
+        let flag = approved.clone();
+        let gate = QueueApprovalGate::new(
+            "!room:server",
+            "agent-a",
+            "2026-06-05T00:00:00Z",
+            ApprovalQueue::default(),
+            move |_request_id: &str| if flag.get() { Some(true) } else { None },
+        );
+        let gate = std::cell::RefCell::new(gate);
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+
+        // First evaluation: undecided -> Pending, and the request is queued and
+        // inspectable (as `mx-agent approval list` would read it).
+        let first = gate.borrow_mut().evaluate(&t, &action);
+        assert_eq!(
+            first,
+            ApprovalDisposition::Pending("approval:task-a".to_string())
+        );
+        let queued = gate
+            .borrow()
+            .queue()
+            .get("approval:task-a")
+            .expect("pending approval is inspectable")
+            .clone();
+        assert_eq!(queued.room_id, "!room:server");
+        assert_eq!(queued.request.target, "agent-a");
+        assert!(queued.request.summary.contains("task-a"));
+
+        // After the operator approves, the gate resolves to Approved.
+        approved.set(true);
+        assert_eq!(
+            gate.borrow_mut().evaluate(&t, &action),
+            ApprovalDisposition::Approved
+        );
     }
 
     #[test]
