@@ -3372,116 +3372,26 @@ fn cmd_call(global: &GlobalArgs, args: &CallArgs) -> ExitCode {
     }
 }
 
-/// Map a Unix signal number to its name, for reporting signal death.
-fn signal_name(n: i32) -> Option<String> {
-    Some(
-        match n {
-            1 => "SIGHUP",
-            2 => "SIGINT",
-            3 => "SIGQUIT",
-            6 => "SIGABRT",
-            8 => "SIGFPE",
-            9 => "SIGKILL",
-            11 => "SIGSEGV",
-            13 => "SIGPIPE",
-            14 => "SIGALRM",
-            15 => "SIGTERM",
-            _ => return None,
-        }
-        .to_string(),
-    )
-}
-
-/// Run `command` in `cwd` and collect its output as a sequence of exec stream
-/// frames (chunks followed by a terminal finished frame).
+/// Convert the daemon's serializable [`mx_agent_daemon::ExecFrame`]s (received
+/// over IPC) into the CLI renderer's [`crate::stream::StreamFrame`]s.
 ///
-/// This is the CLI's frame source for `exec` today: a local loopback over the
-/// daemon's process runner and stream-capture stages. The Matrix transport that
-/// carries frames from a remote agent's daemon plugs in here later; the
-/// rendering/exit-code layer ([`crate::stream`]) consumes frames the same way
-/// regardless of source.
-async fn collect_exec_frames(
-    command: &[String],
-    cwd: &std::path::Path,
-    stdin: Option<Vec<u8>>,
-) -> Result<Vec<crate::stream::StreamFrame>, mx_agent_daemon::RunError> {
+/// The two carry the same protocol schema payloads; this only re-tags them for
+/// the renderer, which consumes frames the same way regardless of whether they
+/// came from the daemon's local loopback or (later) a remote agent over Matrix.
+fn stream_frames_from_exec(
+    frames: Vec<mx_agent_daemon::ExecFrame>,
+) -> Vec<crate::stream::StreamFrame> {
     use crate::stream::StreamFrame;
-    use mx_agent_protocol::schema::{ExecFinished, StreamKind};
+    use mx_agent_daemon::ExecFrame;
 
-    let spec = mx_agent_daemon::RunSpec {
-        command: command.to_vec(),
-        cwd: cwd.to_path_buf(),
-        env: Default::default(),
-        stdin,
-        ..Default::default()
-    };
-    let output = mx_agent_daemon::run(&spec).await?;
-
-    const INVOCATION: &str = "inv-local";
-
-    // High-output commands switch to artifact mode: rather than streaming every
-    // byte over the timeline, the full log is packaged as a Matrix media
-    // artifact and the terminal shows a tail preview (architecture §8.4). The
-    // local loopback has no homeserver, so the artifact is finalized with an
-    // empty `mxc_uri`; the daemon's streaming path uploads it for real.
-    let artifact_config = mx_agent_daemon::ArtifactConfig::default();
-    let total_output = output.stdout.len() + output.stderr.len();
-
-    let mut frames = Vec::new();
-    let (truncated, artifact_mxc) = if artifact_config.should_switch(total_output) {
-        let mut artifact_mxc = None;
-        for (stream, data) in [
-            (StreamKind::Stdout, &output.stdout),
-            (StreamKind::Stderr, &output.stderr),
-        ] {
-            if data.is_empty() {
-                continue;
-            }
-            let prepared =
-                mx_agent_daemon::prepare_artifact(INVOCATION, stream, data, &artifact_config).await;
-            let event = prepared.into_event(String::new());
-            if stream == StreamKind::Stdout {
-                artifact_mxc = Some(event.mxc_uri.clone());
-            }
-            frames.push(StreamFrame::Artifact(event));
-        }
-        // The full log is preserved in the artifact, so nothing was truncated.
-        (false, artifact_mxc)
-    } else {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-        let stdout_bytes = output.stdout.clone();
-        let stderr_bytes = output.stderr.clone();
-        // Capture concurrently so a full channel never deadlocks the drain below.
-        let capture = tokio::spawn(async move {
-            mx_agent_daemon::capture_child_output(
-                &stdout_bytes[..],
-                &stderr_bytes[..],
-                INVOCATION,
-                mx_agent_daemon::StreamCaptureConfig::batch(),
-                tx,
-            )
-            .await
-        });
-
-        while let Some(chunk) = rx.recv().await {
-            frames.push(StreamFrame::Chunk(chunk));
-        }
-        let summary = capture.await.unwrap_or_default();
-        (summary.truncated, None)
-    };
-
-    frames.push(StreamFrame::Finished(ExecFinished {
-        invocation_id: INVOCATION.to_string(),
-        exit_code: output.exit_code,
-        signal: output.signal.and_then(signal_name),
-        duration_ms: 0,
-        stdout_bytes: output.stdout.len() as u64,
-        stderr_bytes: output.stderr.len() as u64,
-        truncated,
-        artifact_mxc,
-        extra: Default::default(),
-    }));
-    Ok(frames)
+    frames
+        .into_iter()
+        .map(|frame| match frame {
+            ExecFrame::Chunk(chunk) => StreamFrame::Chunk(chunk),
+            ExecFrame::Artifact(artifact) => StreamFrame::Artifact(artifact),
+            ExecFrame::Finished(finished) => StreamFrame::Finished(finished),
+        })
+        .collect()
 }
 
 /// Run a command and render its forwarded output stream locally, exiting with
@@ -3504,7 +3414,7 @@ fn read_piped_stdin() -> std::io::Result<Option<Vec<u8>>> {
     Ok(Some(buf))
 }
 
-fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
+fn cmd_exec(global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
     if args.command.is_empty() {
         eprintln!("mx-agent: exec requires a command after `--`");
         return ExitCode::from(64);
@@ -3525,20 +3435,10 @@ fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
     // mode and window size, and forwards keystrokes and resize events live
     // (architecture §7.3, §8.3). The chunk/finished framing used by the
     // non-interactive path does not apply: a PTY is a single live byte stream.
+    // PTY does not yet run over IPC; that is tracked as follow-up to #155.
     if args.pty {
         return cmd_exec_pty(&args.command, cwd);
     }
-
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("mx-agent: could not start async runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
 
     // Detect piped stdin: when our standard input is not a terminal it has been
     // redirected (a pipe, file, or here-string), so forward those bytes to the
@@ -3552,20 +3452,36 @@ fn cmd_exec(_global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
         }
     };
 
-    let frames = match runtime.block_on(collect_exec_frames(&args.command, &cwd, stdin)) {
-        Ok(frames) => frames,
-        Err(e) => {
-            eprintln!("mx-agent: exec failed: {e}");
-            return match e {
-                // Command/cwd not found maps to "not found" (architecture §5.3).
-                mx_agent_daemon::RunError::MissingCwd(_) => ExitCode::from(127),
-                mx_agent_daemon::RunError::Spawn(ref io)
-                    if io.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    ExitCode::from(127)
-                }
-                mx_agent_daemon::RunError::EmptyCommand => ExitCode::from(64),
-                mx_agent_daemon::RunError::Spawn(_) => {
+    // Execution happens in the daemon, never in the CLI: the daemon owns process
+    // supervision and (for the live flow) the Matrix client, signing key, policy,
+    // and trust context (architecture §10.1, issue #155). The CLI only forwards
+    // the request and renders the structured frame stream it gets back.
+    let params = mx_agent_daemon::ExecStartParams {
+        room: args.room.clone(),
+        agent: args.agent.clone(),
+        command: args.command.clone(),
+        cwd: Some(cwd),
+        stdin,
+        stream: args.stream,
+        pty: false,
+        task: args.task.clone(),
+        strict_stream: args.strict_stream,
+    };
+    let result: mx_agent_daemon::ExecStartResult =
+        match daemon_ipc_call(global, "exec.start", &params) {
+            Ok(result) => result,
+            Err(code) => return code,
+        };
+
+    let frames = match result.outcome {
+        mx_agent_daemon::ExecOutcome::Ok { frames } => stream_frames_from_exec(frames),
+        mx_agent_daemon::ExecOutcome::Error { kind, message } => {
+            eprintln!("mx-agent: exec failed: {message}");
+            // Map invocation failures to the exit codes in architecture §5.3.
+            return match kind {
+                mx_agent_daemon::ExecErrorKind::NotFound => ExitCode::from(127),
+                mx_agent_daemon::ExecErrorKind::EmptyCommand => ExitCode::from(64),
+                mx_agent_daemon::ExecErrorKind::Spawn => {
                     ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
                 }
             };

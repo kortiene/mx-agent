@@ -142,3 +142,69 @@ fn call_uses_daemon_ipc_path() {
 
     let _ = std::fs::remove_dir_all(&runtime_dir);
 }
+
+/// `mx-agent exec` runs through the daemon IPC path (issue #155): it fails
+/// clearly when no daemon is running, and otherwise the daemon — not the CLI —
+/// runs the command and returns the output frames the CLI renders.
+#[test]
+fn exec_uses_daemon_ipc_path() {
+    let runtime_dir = unique_runtime_dir();
+
+    // No daemon yet: `exec` fails clearly with exit code 3.
+    let out = run(&runtime_dir, &["exec", "--", "echo", "hi"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "exec without a daemon should exit 3: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("daemon"),
+        "error should mention the daemon: {out:?}"
+    );
+
+    // Start the daemon (no Matrix session needed for loopback).
+    let out = run(&runtime_dir, &["daemon", "start"]);
+    assert!(out.status.success(), "start should succeed: {out:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = run(&runtime_dir, &["daemon", "status", "--json"]);
+        if out.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A successful command round-trips through IPC: the daemon runs it and the
+    // CLI renders stdout and exits with the remote exit code (0 here).
+    let out = run(&runtime_dir, &["exec", "--", "echo", "hi"]);
+    assert!(out.status.success(), "echo should exit 0: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hi"),
+        "stdout should carry the command output: {out:?}"
+    );
+
+    // A nonzero exit is propagated as the CLI's exit code.
+    let out = run(&runtime_dir, &["exec", "--", "false"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "false should exit 1 through IPC: {out:?}"
+    );
+
+    // A command that cannot be invoked maps to "not found" (exit 127).
+    let out = run(
+        &runtime_dir,
+        &["exec", "--", "definitely-not-a-real-binary-xyz"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "unknown command should exit 127: {out:?}"
+    );
+
+    let out = run(&runtime_dir, &["daemon", "stop"]);
+    assert!(out.status.success(), "stop should succeed: {out:?}");
+
+    let _ = std::fs::remove_dir_all(&runtime_dir);
+}

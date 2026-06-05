@@ -446,6 +446,10 @@ fn dispatch(
             }
             Err(response) => *response,
         },
+        "exec.start" => match parse_params::<crate::ExecStartParams>(req) {
+            Ok(params) => dispatch_exec_start(req, &params),
+            Err(response) => *response,
+        },
         "task.create" => match parse_params::<crate::CreateTaskOptions>(req) {
             Ok(options) => block_on_task_response(req, |session| async move {
                 crate::create_task_for_session(&session, &options).await
@@ -494,6 +498,31 @@ fn dispatch(
             METHOD_NOT_FOUND,
             format!("unknown method: {other}"),
         ),
+    }
+}
+
+/// Run an `exec.start` loopback request on a dedicated async runtime.
+///
+/// The loopback needs no Matrix session (it runs the command on the local
+/// host), so — unlike the task methods — this does not load the daemon session.
+fn dispatch_exec_start(req: &Request, params: &crate::ExecStartParams) -> Response {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return Response::error(
+                req.id.clone(),
+                INTERNAL_ERROR,
+                format!("could not start async runtime: {e}"),
+            )
+        }
+    };
+    let result = runtime.block_on(crate::start_exec_loopback(params));
+    match serde_json::to_value(&result) {
+        Ok(value) => Response::result(req.id.clone(), value),
+        Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
     }
 }
 
@@ -765,6 +794,40 @@ mod tests {
         let error = response.error.expect("missing session should be rejected");
         assert_eq!(error.code, INTERNAL_ERROR);
         assert!(error.message.contains("not logged in"));
+    }
+
+    #[test]
+    fn exec_start_rejects_invalid_params() {
+        // Missing the required `command` field.
+        let req = Request::new(json!(1), "exec.start", json!({"cwd":"/tmp"}));
+        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        let error = response.error.expect("invalid params should be rejected");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("exec.start"));
+    }
+
+    #[test]
+    fn exec_start_runs_loopback_through_dispatch() {
+        // A valid request runs the command in the daemon and returns frames
+        // with the exit code — no Matrix session required.
+        let req = Request::new(
+            json!(1),
+            "exec.start",
+            json!({"command":["true"],"cwd":std::env::temp_dir()}),
+        );
+        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        assert!(response.error.is_none(), "unexpected error: {response:?}");
+        let result = response.result.expect("exec.start should return a result");
+        let parsed: crate::ExecStartResult = serde_json::from_value(result).unwrap();
+        match parsed.outcome {
+            crate::ExecOutcome::Ok { frames } => {
+                assert!(matches!(
+                    frames.last(),
+                    Some(crate::ExecFrame::Finished(f)) if f.exit_code == Some(0)
+                ));
+            }
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
     }
 
     #[test]

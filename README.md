@@ -46,7 +46,7 @@ If a box can sync with a homeserver, it can participate — even one that accept
 | Task state: `task create` / `update` / `list` / `graph` / `watch` (daemon-IPC, over Matrix) | ✅ Implemented |
 | Structured task actions (`tool` / `exec`), lifecycle-transition validation, stable task result schema | ✅ Implemented |
 | Daemon task-orchestration engine: scheduler, optimistic `state_rev` claiming, tool/exec dispatch, policy + trust/signature + approval enforcement, restart recovery, DAG diagnostics | ✅ Implemented (engine + tests); not yet auto-driven by a live `/sync` loop — see limitations |
-| `call` / `exec` runners | 🟡 Local-loopback only; signed Matrix transport to a *remote* daemon still landing (#155) |
+| `call` / `exec` runners | 🟡 Daemon-mediated over local IPC, local-loopback execution only; signed Matrix transport to a *remote* daemon still landing (#155) |
 | Live daemon scheduler loop auto-claiming/executing tasks over `/sync`; remote Matrix-backed `exec`; E2EE in production; `bubblewrap`/container sandboxes; interactive PTY; large artifacts | 🔮 Planned |
 
 **Platform: Unix only** (Linux and macOS). Windows was intentionally dropped — the project relies on Unix-domain-socket IPC and Unix process semantics.
@@ -85,7 +85,7 @@ mx-agent daemon status --json         # pid, uptime, socket path, version as JSO
 mx-agent daemon stop                  # graceful shutdown (SIGTERM, then SIGKILL)
 ```
 
-The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and `task` command groups run against a real Matrix homeserver through the daemon today; `call` / `exec` currently run on the **local** machine over a daemon loopback (the signed Matrix transport to a *remote* daemon is still landing). See [Project status](#project-status) for the full breakdown.
+The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and `task` command groups run against a real Matrix homeserver through the daemon today; `call` / `exec` are mediated by the daemon over local IPC (the CLI no longer runs the command itself) but still execute on the **local** machine as a loopback (the signed Matrix transport to a *remote* daemon is still landing). See [Project status](#project-status) for the full breakdown.
 
 ---
 

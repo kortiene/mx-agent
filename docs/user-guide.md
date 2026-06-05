@@ -6,12 +6,13 @@ other, then running a tool call and a remote-style `exec`.
 
 > **Alpha status.** `mx-agent` is pre-release software. The workspace,
 > authentication, agent-registry, task, trust, and context-sharing commands run
-> against a real Matrix homeserver. The `call` and `exec` runners currently
-> execute **locally** (a loopback over the daemon's process runner); the signed
-> Matrix transport that carries an invocation to a *remote* agent's daemon is
-> still landing. Treat every command in this guide as running on your own
-> machine and read [Security warnings](#security-warnings) before pointing it at
-> anything you do not control.
+> against a real Matrix homeserver. The `call` and `exec` runners are mediated
+> by the daemon over local IPC (the CLI no longer runs the command itself), but
+> they still execute **locally** as a loopback over the daemon's process runner;
+> the signed Matrix transport that carries an invocation to a *remote* agent's
+> daemon is still landing. Treat every command in this guide as running on your
+> own machine and read [Security warnings](#security-warnings) before pointing
+> it at anything you do not control.
 
 ## Contents
 
@@ -194,9 +195,13 @@ Useful flags: `--stream` (live stdout/stderr), `--strict-stream` (treat a
 missing or corrupt chunk as a hard error), `--pty` (allocate a pseudo-terminal),
 `--stdin` (forward local stdin), and `--cwd <dir>`.
 
-> In this alpha, `call` and `exec` run the command on your **local** machine.
-> The `--room`/`--agent` targeting flags are accepted for forward compatibility
-> but do not yet dispatch to a remote agent over Matrix.
+> In this alpha, `exec` is mediated by the daemon over local IPC, so a daemon
+> must be running (`mx-agent daemon start`); otherwise `exec` exits `3`. The
+> daemon — not the CLI — runs the command, but it still runs on your **local**
+> machine as a loopback. The `--room`/`--agent` targeting flags are accepted for
+> forward compatibility but do not yet dispatch to a remote agent over Matrix.
+> `--pty` still runs in the CLI for now; moving it onto the IPC path is
+> follow-up work.
 
 ## Track work with tasks
 
@@ -365,7 +370,9 @@ mx-agent agent list --room '#demo:localhost'
 #     alice-agent  generic  online  shell,test
 #     bob-agent    generic  online  shell
 
-# 5. Run a tool call and an exec.
+# 5. Run a tool call and an exec. Both are daemon-mediated over local IPC, so a
+#    daemon must be running (start it once; it stays up in the background).
+mx-agent daemon start
 mx-agent call --tool run_tests --arg package=mx-agent-protocol
 mx-agent exec -- echo "hello from the demo"
 ```
