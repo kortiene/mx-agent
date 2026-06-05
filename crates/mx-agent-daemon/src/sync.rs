@@ -21,6 +21,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::event_router::{
+    events_from_sync_response, EventMeta, EventRouter, RouteOutcome, RoutedEvent,
+};
+use crate::replay::ReplayCache;
 use crate::session::{load_sync_token, save_sync_token, SessionPaths};
 
 fn now_unix() -> u64 {
@@ -259,23 +263,90 @@ pub async fn run_matrix_sync(
 ) -> std::io::Result<()> {
     use matrix_sdk::config::SyncSettings;
 
-    run_sync_loop(paths, health, backoff_config, running, |token| async move {
-        let mut settings = SyncSettings::default().timeout(Duration::from_secs(30));
-        if let Some(token) = token {
-            settings = settings.token(token);
+    // The event router observes mx-agent events on each sync (architecture
+    // §10.1, issue #192). Replay protection for privileged requests is
+    // essential, so if the replay cache cannot be loaded we log and route
+    // nothing rather than dispatching unchecked requests; syncing still
+    // continues so token/health tracking is unaffected.
+    let router = match ReplayCache::load(paths) {
+        Ok(cache) => Some(Arc::new(Mutex::new(EventRouter::new(cache)))),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not load replay cache; mx-agent sync events will not be routed"
+            );
+            None
         }
-        match client.sync_once(settings).await {
-            Ok(response) => Ok(response.next_batch),
-            Err(e) => {
-                if is_fatal_sync_error(&e) {
-                    Err(StepError::Fatal(e.to_string()))
-                } else {
-                    Err(StepError::Transient(e.to_string()))
+    };
+
+    run_sync_loop(paths, health, backoff_config, running, move |token| {
+        let router = router.clone();
+        async move {
+            let mut settings = SyncSettings::default().timeout(Duration::from_secs(30));
+            if let Some(token) = token {
+                settings = settings.token(token);
+            }
+            match client.sync_once(settings).await {
+                Ok(response) => {
+                    if let Some(router) = &router {
+                        let mut router = router.lock().unwrap_or_else(|e| e.into_inner());
+                        route_sync_response(&mut router, &response);
+                    }
+                    Ok(response.next_batch)
+                }
+                Err(e) => {
+                    if is_fatal_sync_error(&e) {
+                        Err(StepError::Fatal(e.to_string()))
+                    } else {
+                        Err(StepError::Transient(e.to_string()))
+                    }
                 }
             }
         }
     })
     .await
+}
+
+/// Route every mx-agent event in a sync response through `router`, logging only
+/// non-sensitive metadata (event type, room, sender, category, reason) — never
+/// event content (architecture §13.6, issue #192).
+///
+/// Dispatched events are handed to a stub handler today; follow-up work routes
+/// them to the signed, trust-checked, policy-gated execution paths.
+fn route_sync_response(router: &mut EventRouter, response: &matrix_sdk::sync::SyncResponse) {
+    for event in events_from_sync_response(response) {
+        let mut sink = |meta: &EventMeta, routed: RoutedEvent| {
+            tracing::debug!(
+                category = routed.category().as_str(),
+                event_type = %meta.event_type,
+                room = %meta.room_id,
+                sender = %meta.sender,
+                "dispatched mx-agent event to handler (stub)"
+            );
+        };
+        match router.route(&event, &mut sink) {
+            RouteOutcome::Dispatched(_) | RouteOutcome::Ignored => {}
+            RouteOutcome::SkippedEncrypted => tracing::debug!(
+                event_type = %event.event_type,
+                room = %event.room_id,
+                "skipped undecryptable encrypted event"
+            ),
+            RouteOutcome::Malformed(cat) => tracing::warn!(
+                category = cat.as_str(),
+                event_type = %event.event_type,
+                room = %event.room_id,
+                sender = %event.sender,
+                "rejected malformed mx-agent event"
+            ),
+            RouteOutcome::ReplayRejected(cat) => tracing::warn!(
+                category = cat.as_str(),
+                event_type = %event.event_type,
+                room = %event.room_id,
+                sender = %event.sender,
+                "rejected replayed or expired privileged request"
+            ),
+        }
+    }
 }
 
 /// Classify a Matrix sync error: an unknown/missing access token is fatal
