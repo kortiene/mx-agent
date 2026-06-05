@@ -330,6 +330,7 @@ mod tests {
             state_rev: rev,
             previous_event_id: None,
             result: None,
+            action: None,
             extra: Default::default(),
         }
     }

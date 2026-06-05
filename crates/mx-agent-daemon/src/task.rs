@@ -18,7 +18,7 @@ use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::TASK as TASK_STATE_TYPE;
 use mx_agent_protocol::id::generate_task_id;
-use mx_agent_protocol::schema::TaskState;
+use mx_agent_protocol::schema::{TaskAction, TaskState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -52,6 +52,9 @@ pub struct CreateTaskOptions {
     pub depends_on: Vec<String>,
     /// Downstream task IDs blocked by this one.
     pub blocks: Vec<String>,
+    /// Optional structured action. When absent, this is a manual/planning task
+    /// and must not be auto-executed by inferring intent from text fields.
+    pub action: Option<TaskAction>,
 }
 
 /// Options for [`update_task`]. Every mutable field is optional; `None` leaves
@@ -74,6 +77,9 @@ pub struct UpdateTaskOptions {
     pub invocation_id: Option<String>,
     /// Result payload to attach (typically when the task completes).
     pub result: Option<Value>,
+    /// Optional structured action to replace the task's current action.
+    /// `None` leaves the existing action unchanged.
+    pub action: Option<TaskAction>,
     /// `state_rev` the caller last observed for this task. When `Some`, the
     /// update is applied only if the task is still at that revision; otherwise
     /// it is rejected as stale ([`WorkspaceError::StaleTaskUpdate`]) so newer
@@ -151,6 +157,7 @@ fn build_new_task(
         state_rev: 1,
         previous_event_id: None,
         result: None,
+        action: options.action.clone(),
         extra: Default::default(),
     }
 }
@@ -180,6 +187,9 @@ fn apply_update(
     }
     if let Some(result) = &options.result {
         state.result = Some(result.clone());
+    }
+    if let Some(action) = &options.action {
+        state.action = Some(action.clone());
     }
     state.state_rev += 1;
     state.updated_at = now;
@@ -430,6 +440,7 @@ mod tests {
             created_by: Some("claude-local".to_string()),
             depends_on: vec!["task-plan".to_string()],
             blocks: vec!["task-review".to_string()],
+            action: None,
         }
     }
 
@@ -457,6 +468,23 @@ mod tests {
         assert_eq!(task.created_at, task.updated_at);
         assert!(task.previous_event_id.is_none());
         assert!(task.result.is_none());
+        assert!(task.action.is_none());
+    }
+
+    #[test]
+    fn new_task_honors_action() {
+        let mut opts = create_opts();
+        opts.action = Some(TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({ "package": "api" }),
+        });
+        let task = build_new_task(
+            &opts,
+            "task_abc".to_string(),
+            "me".to_string(),
+            "t".to_string(),
+        );
+        assert_eq!(task.action, opts.action);
     }
 
     #[test]
@@ -489,6 +517,7 @@ mod tests {
             description: None,
             invocation_id: Some("inv_01HZ".to_string()),
             result: None,
+            action: None,
             expected_state_rev: None,
         };
         apply_update(
@@ -524,6 +553,29 @@ mod tests {
         apply_update(&mut task, &update, "t2".to_string(), None);
         assert_eq!(task.state, "succeeded");
         assert_eq!(task.result, Some(json!({ "exit_code": 0 })));
+    }
+
+    #[test]
+    fn update_can_replace_action() {
+        let mut task = build_new_task(
+            &create_opts(),
+            "task_abc".to_string(),
+            "me".to_string(),
+            "t".to_string(),
+        );
+        let mut update = UpdateTaskOptions {
+            task_id: "task_abc".to_string(),
+            ..Default::default()
+        };
+        update.action = Some(TaskAction::Exec {
+            command: vec!["cargo".to_string(), "test".to_string()],
+            cwd: "/repo".to_string(),
+            env: Default::default(),
+            timeout_ms: Some(600_000),
+            stream: true,
+        });
+        apply_update(&mut task, &update, "t2".to_string(), None);
+        assert_eq!(task.action, update.action);
     }
 
     #[test]

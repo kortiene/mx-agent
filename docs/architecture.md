@@ -756,7 +756,8 @@ state_key: <task_id>
   "updated_at": "2026-06-02T12:01:12Z",
   "state_rev": 4,
   "previous_event_id": "$eventid",
-  "result": null
+  "result": null,
+  "action": null
 }
 ```
 
@@ -780,9 +781,10 @@ local policy permits the operation
 no conflicting newer state_rev exists
 ```
 
-Daemon orchestration treats the task's forward-compatible `action` extension as
-structured work while preserving older readers' ability to round-trip unknown
-fields:
+Daemon orchestration treats the optional `action` field as structured work. A
+missing or `null` action means the task is manual/planning-only and must not be
+auto-executed by inferring intent from the title or description. The field is
+additive, so older tasks without it remain valid:
 
 ```json
 {
@@ -803,7 +805,8 @@ or:
     "command": ["cargo", "test", "--all"],
     "cwd": "/home/me/code/project",
     "env": {},
-    "timeout_ms": 600000
+    "timeout_ms": 600000,
+    "stream": true
   }
 }
 ```

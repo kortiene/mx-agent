@@ -9,11 +9,10 @@
 //! stale, dependency-blocked, or policy-denied work without spawning a process
 //! and without exposing Matrix credentials to the CLI/coding agent.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use mx_agent_protocol::id::generate_invocation_id;
-use mx_agent_protocol::schema::TaskState;
-use serde::{Deserialize, Serialize};
+use mx_agent_protocol::schema::{TaskAction, TaskState};
 use serde_json::{json, Map, Value};
 
 use crate::task::UpdateTaskOptions;
@@ -31,50 +30,15 @@ pub const STATE_FAILED: &str = "failed";
 
 const ACTION_FIELD: &str = "action";
 
-/// Structured work encoded in `TaskState.extra["action"]`.
+/// Parse a task action from a task.
 ///
-/// The task event schema remains forward-compatible: older readers preserve the
-/// unknown `action` value in `extra`, while orchestrating daemons parse it into
-/// this enum before dispatching.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TaskAction {
-    /// Invoke a named, policy-controlled tool.
-    Tool {
-        /// Tool name, e.g. `run_tests`.
-        tool: String,
-        /// Tool arguments passed to the dispatcher.
-        #[serde(default)]
-        args: Value,
-    },
-    /// Invoke an exec-style command through the daemon's signed execution path.
-    Exec {
-        /// Command argv: program followed by arguments.
-        command: Vec<String>,
-        /// Working directory for the command.
-        cwd: String,
-        /// Explicit environment overrides. The runner still scrubs inherited
-        /// daemon environment separately.
-        #[serde(default)]
-        env: BTreeMap<String, String>,
-        /// Optional timeout in milliseconds.
-        #[serde(default)]
-        timeout_ms: Option<u64>,
-    },
-}
-
-impl TaskAction {
-    /// Return the stable action kind used in task results.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Tool { .. } => "tool",
-            Self::Exec { .. } => "exec",
-        }
-    }
-}
-
-/// Parse a task action from the task's forward-compatible `extra` map.
+/// The typed [`TaskState::action`] field is preferred. A fallback to
+/// `extra["action"]` preserves already-published tasks created before the field
+/// was modeled directly in the protocol schema.
 pub fn action_from_task(task: &TaskState) -> Result<TaskAction, TaskActionError> {
+    if let Some(action) = &task.action {
+        return Ok(action.clone());
+    }
     let value = task
         .extra
         .get(ACTION_FIELD)
@@ -543,6 +507,7 @@ mod tests {
             state_rev: 1,
             previous_event_id: None,
             result: None,
+            action: None,
             extra: Extra::default(),
         }
     }
@@ -583,6 +548,7 @@ mod tests {
                 state_rev: self.current_rev,
                 previous_event_id: None,
                 result: None,
+                action: None,
                 extra: Extra::default(),
             })
         }
@@ -604,6 +570,7 @@ mod tests {
                 state_rev: self.current_rev,
                 previous_event_id: None,
                 result: options.result,
+                action: None,
                 extra: Extra::default(),
             })
         }
@@ -623,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tool_action_from_extra() {
+    fn parses_legacy_tool_action_from_extra() {
         let t = with_action(
             task("task-a", STATE_PENDING, "agent-a"),
             json!({"type":"tool", "tool":"run_tests", "args":{"package":"cli"}}),
@@ -633,6 +600,25 @@ mod tests {
             TaskAction::Tool {
                 tool: "run_tests".to_string(),
                 args: json!({"package":"cli"})
+            }
+        );
+    }
+
+    #[test]
+    fn typed_action_takes_precedence_over_legacy_extra() {
+        let mut t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"legacy", "args":{}}),
+        );
+        t.action = Some(TaskAction::Tool {
+            tool: "typed".to_string(),
+            args: json!({ "package": "cli" }),
+        });
+        assert_eq!(
+            action_from_task(&t).unwrap(),
+            TaskAction::Tool {
+                tool: "typed".to_string(),
+                args: json!({ "package": "cli" })
             }
         );
     }

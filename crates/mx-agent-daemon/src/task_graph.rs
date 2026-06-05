@@ -254,6 +254,7 @@ mod tests {
             state_rev: 1,
             previous_event_id: None,
             result: None,
+            action: None,
             extra: Default::default(),
         }
     }

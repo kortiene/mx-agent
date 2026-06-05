@@ -501,6 +501,52 @@ pub struct Heartbeat {
     pub extra: Extra,
 }
 
+/// Structured work attached to a [`TaskState`] (architecture §9.2).
+///
+/// A task without an action is a manual/planning task: it can be listed,
+/// assigned, and transitioned by users, but the daemon must not infer executable
+/// work from its title or description. An action describes the requested work;
+/// it is not an authorization grant. Daemons still route execution through the
+/// signed, trust-checked, deny-by-default policy path before spawning anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskAction {
+    /// Invoke a named, policy-controlled tool.
+    Tool {
+        /// Tool name, e.g. `run_tests`.
+        tool: String,
+        /// Tool arguments as a JSON object or value understood by the tool.
+        #[serde(default)]
+        args: Value,
+    },
+    /// Invoke an exec-style command through the daemon's execution path.
+    Exec {
+        /// Command argv: program followed by arguments.
+        command: Vec<String>,
+        /// Working directory for the command.
+        cwd: String,
+        /// Explicit environment overrides.
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        /// Optional timeout in milliseconds.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Whether output should be streamed.
+        #[serde(default)]
+        stream: bool,
+    },
+}
+
+impl TaskAction {
+    /// Return the stable action kind used in task results and diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Tool { .. } => "tool",
+            Self::Exec { .. } => "exec",
+        }
+    }
+}
+
 /// `com.mxagent.task.v1` state content (architecture §9.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskState {
@@ -532,6 +578,11 @@ pub struct TaskState {
     pub previous_event_id: Option<String>,
     /// Result payload, if completed.
     pub result: Option<Value>,
+    /// Optional structured action payload. `None` means this is a manual or
+    /// planning task and must not be auto-executed by inferring intent from
+    /// human-readable fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<TaskAction>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -890,6 +941,83 @@ mod tests {
             "previous_event_id": "$eventid",
             "result": null
         }));
+    }
+
+    #[test]
+    fn task_state_with_tool_action_round_trips() {
+        assert_round_trip::<TaskState>(json!({
+            "task_id": "task-test-api",
+            "title": "Run API tests",
+            "description": "Run npm test after applying latest diff",
+            "state": "assigned",
+            "assigned_to": "developer-pi",
+            "created_by": "claude-local",
+            "depends_on": [],
+            "blocks": [],
+            "invocation_id": null,
+            "created_at": "2026-06-02T12:00:00Z",
+            "updated_at": "2026-06-02T12:01:12Z",
+            "state_rev": 2,
+            "previous_event_id": "$eventid",
+            "result": null,
+            "action": {
+                "type": "tool",
+                "tool": "run_tests",
+                "args": { "package": "api" }
+            }
+        }));
+    }
+
+    #[test]
+    fn task_state_with_exec_action_round_trips() {
+        assert_round_trip::<TaskState>(json!({
+            "task_id": "task-test-api",
+            "title": "Run API tests",
+            "description": "Run npm test after applying latest diff",
+            "state": "assigned",
+            "assigned_to": "developer-pi",
+            "created_by": "claude-local",
+            "depends_on": [],
+            "blocks": [],
+            "invocation_id": null,
+            "created_at": "2026-06-02T12:00:00Z",
+            "updated_at": "2026-06-02T12:01:12Z",
+            "state_rev": 2,
+            "previous_event_id": "$eventid",
+            "result": null,
+            "action": {
+                "type": "exec",
+                "command": ["cargo", "test", "--all"],
+                "cwd": "/home/me/code/project",
+                "env": {},
+                "timeout_ms": 600000,
+                "stream": true
+            }
+        }));
+    }
+
+    #[test]
+    fn task_state_without_action_deserializes_as_manual_task() {
+        let parsed: TaskState = serde_json::from_value(json!({
+            "task_id": "task-plan",
+            "title": "Plan work",
+            "description": "Manual planning task",
+            "state": "pending",
+            "assigned_to": "",
+            "created_by": "claude-local",
+            "depends_on": [],
+            "blocks": [],
+            "invocation_id": null,
+            "created_at": "2026-06-02T12:00:00Z",
+            "updated_at": "2026-06-02T12:00:00Z",
+            "state_rev": 1,
+            "previous_event_id": null,
+            "result": null
+        }))
+        .expect("old task without action must deserialize");
+        assert!(parsed.action.is_none());
+        let value = serde_json::to_value(&parsed).expect("serialize task");
+        assert!(value.get("action").is_none(), "absent actions stay omitted");
     }
 
     #[test]
