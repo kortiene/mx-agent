@@ -817,6 +817,14 @@ or:
 }
 ```
 
+A daemon task scheduler watches a room's task snapshots and decides which tasks
+this agent should attempt to run. A task is *runnable* only when it is in a
+schedulable state (`pending`/`assigned`), is not terminal, has every `depends_on`
+task succeeded, is assigned to this agent (or auto-claim is enabled), carries an
+executable action, and the agent has spare capacity. The scheduler is pure: it
+only computes decisions and logs non-sensitive outcomes; it never executes
+anything itself.
+
 Task state is **advisory**: room membership does not grant execution. A task
 action only becomes executable when it carries a signed `authorization` from a
 locally trusted mx-agent signing key, addressed to the executing agent, within
