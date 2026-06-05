@@ -646,6 +646,7 @@ mod tests {
         opts.action = Some(TaskAction::Tool {
             tool: "run_tests".to_string(),
             args: json!({ "package": "api" }),
+            authorization: None,
         });
         let task = build_new_task(
             &opts,
@@ -742,6 +743,7 @@ mod tests {
             env: Default::default(),
             timeout_ms: Some(600_000),
             stream: true,
+            authorization: None,
         });
         apply_update(&mut task, &update, "t2".to_string(), None);
         assert_eq!(task.action, update.action);
