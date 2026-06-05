@@ -1006,6 +1006,32 @@ The daemon owns long-lived Matrix state:
 - stream chunking/reassembly
 - audit logging
 
+#### Event router (`mx-agent-daemon::event_router`)
+
+The `/sync` loop feeds each sync response through an `EventRouter` that turns
+raw Matrix timeline events into typed mx-agent events and dispatches the
+supported types (`exec.*`, `call.*`, `stream.*`, `task`/`invocation`,
+`approval.*`, `heartbeat`) to handlers. The router is the first gate a remote
+event passes, so it is deliberately conservative:
+
+- it performs **no side effects** — it classifies, parses, replay-checks, and
+  hands off; privileged handlers must still verify signature, local trust,
+  policy, and approval before executing (room membership never implies
+  execution rights);
+- **undecryptable encrypted** (`m.room.encrypted`) events are skipped before
+  classification, so an opaque payload can never reach authorization;
+- **unknown** event types are ignored and **malformed** content is rejected
+  without panicking and without dispatch;
+- privileged `exec.request` events are **replay/expiry-checked** through the
+  persistent replay cache before dispatch;
+- only non-sensitive metadata is logged (event type, room, sender, IDs,
+  category, reason) — never event content.
+
+The routing logic is decoupled from `matrix_sdk` via a transport-agnostic
+`IncomingEvent`, with `events_from_sync_response` adapting a real sync
+response. Dispatched events currently reach a logging stub handler; wiring them
+to the live execution paths is follow-up work.
+
 ### 10.2 IPC Transport
 
 POSIX:

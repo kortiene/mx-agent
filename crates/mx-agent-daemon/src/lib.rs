@@ -11,6 +11,7 @@ pub mod artifact;
 pub mod audit;
 pub mod call;
 pub mod context;
+pub mod event_router;
 pub mod exec;
 pub mod heartbeat;
 pub mod invocation;
@@ -65,6 +66,10 @@ pub use context::{
     share_env_for_session, FetchContextOptions, FetchedContext, ListSharesOptions,
     ShareContextOptions, ShareDiffOptions, ShareEnvOptions, DEFAULT_ENV_INCLUDE,
     DEFAULT_FETCH_SCAN_LIMIT, DIFF_MIME_TYPE, ENV_MIME_TYPE, MAX_INLINE_BYTES,
+};
+pub use event_router::{
+    classify as classify_event, events_from_sync_response, EventCategory, EventMeta, EventRouter,
+    IncomingEvent, RouteOutcome, RoutedEvent,
 };
 pub use exec::{
     authorize_exec_cancel, authorize_exec_request, authorize_exec_request_with_allowance,
