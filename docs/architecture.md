@@ -885,6 +885,12 @@ On restart, an assigned `executing` task whose local invocation is no longer
 live is marked failed with a recovery result instead of being spawned a second
 time.
 
+Tool-backed task actions (`{"type":"tool", ...}`) run through the named-tool
+execution path once authorized: the daemon links an invocation, runs the named
+tool, and finalizes the task `succeeded` (tool exit 0) or `failed` (nonzero or
+un-invokable) with the tool summary recorded in the task `result`. A
+policy-denied tool action never runs and the task becomes `blocked`.
+
 ### 9.3 Workspace State
 
 State event:
