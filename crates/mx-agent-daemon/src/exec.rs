@@ -672,13 +672,21 @@ pub async fn handle_live_exec_stdin(
     let Some(control) = live_exec_control(&stdin.invocation_id) else {
         return;
     };
-    let Ok(agent_id) = authorize_live_control(room, paths, content, &stdin.signature.key_id).await
-    else {
-        tracing::warn!(invocation_id = %stdin.invocation_id, "rejected unauthorized exec stdin control");
-        return;
-    };
-    if agent_id != control.requester_agent {
-        tracing::warn!(invocation_id = %stdin.invocation_id, "rejected exec stdin from non-owner agent");
+    if authorize_live_control(
+        room,
+        paths,
+        content,
+        &stdin.signature.key_id,
+        &control.requester_agent,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            invocation_id = %stdin.invocation_id,
+            requester_agent = %control.requester_agent,
+            "rejected unauthorized exec stdin control"
+        );
         return;
     }
     use base64::Engine as _;
@@ -707,38 +715,63 @@ pub async fn handle_live_exec_cancel(
     let Some(control) = live_exec_control(&cancel.invocation_id) else {
         return;
     };
-    let Ok(agent_id) = authorize_live_control(room, paths, content, &cancel.signature.key_id).await
-    else {
-        tracing::warn!(invocation_id = %cancel.invocation_id, "rejected unauthorized exec cancel control");
-        return;
-    };
-    if agent_id != control.requester_agent {
-        tracing::warn!(invocation_id = %cancel.invocation_id, "rejected exec cancel from non-owner agent");
+    if authorize_live_control(
+        room,
+        paths,
+        content,
+        &cancel.signature.key_id,
+        &control.requester_agent,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            invocation_id = %cancel.invocation_id,
+            requester_agent = %control.requester_agent,
+            "rejected unauthorized exec cancel control"
+        );
         return;
     }
     let _ = control.cancel.send(Some(cancel.reason.clone()));
 }
 
+/// Verify that a signed control frame (stdin / cancel) was sent by the agent
+/// identified by `requester_agent_id`.
+///
+/// The previous implementation searched *all* agents for one whose
+/// `signing_key_id` matched the frame's `key_id`, then compared the result
+/// against the expected requester. When two agents share a signing key (which
+/// happens in the integration-test harness where both daemons load the same key
+/// from a shared data directory), `find` non-deterministically returns
+/// whichever agent the homeserver lists first. If it returns the *target* agent
+/// instead of the requester, the requester-match check fails and the frame is
+/// silently dropped — causing stdin-consuming commands to hang until timeout.
+///
+/// Fix: look up the *specific* requester agent by id, then verify that its
+/// registered key matches the frame's `key_id`. This is deterministic regardless
+/// of key uniqueness.
 async fn authorize_live_control(
     room: &Room,
     paths: &crate::SessionPaths,
     content: &Value,
     key_id: &str,
-) -> Result<String, ()> {
-    let agents = crate::agent::read_all_agent_states(room)
+    requester_agent_id: &str,
+) -> Result<(), ()> {
+    let agent = crate::agent::read_agent_state(room, requester_agent_id)
         .await
-        .map_err(|_| ())?;
-    let agent = agents
-        .into_iter()
-        .find(|agent| agent.signing_key_id == key_id)
+        .ok()
+        .flatten()
         .ok_or(())?;
+    if agent.signing_key_id != key_id {
+        return Err(());
+    }
     let verifying_key = crate::call::verifying_key_from_agent_state(&agent).map_err(|_| ())?;
     signing::verify(&verifying_key, content).map_err(|_| ())?;
     let trust = TrustStore::load(paths).unwrap_or_default();
     if !trust.is_key_trusted(key_id) {
         return Err(());
     }
-    Ok(agent.agent_id)
+    Ok(())
 }
 
 async fn authorize_live_exec(
