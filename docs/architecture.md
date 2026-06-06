@@ -1038,8 +1038,12 @@ The routing logic is decoupled from `matrix_sdk` via a transport-agnostic
 response. `call.request` events now have a live handler: the target daemon
 confirms the request is addressed to one of its registered agents, resolves the
 requester's published signing key, verifies signature/trust/policy, executes the
-named built-in tool, and emits `call.response`. Other routed execution families
-remain stubbed until their live handlers land.
+named built-in tool, and emits `call.response`. Result-side stream events
+(`stream.chunk`, `stream.artifact`, `exec.finished`, `exec.rejected`,
+`exec.cancelled`, and `call.response`) are also forwarded into an in-memory
+subscriber registry keyed by invocation id or request id so IPC clients can wait
+without accessing Matrix state. Other routed execution families remain stubbed
+until their live handlers land.
 
 ### 10.2 IPC Transport
 
