@@ -61,15 +61,14 @@ def _slice_args(args: Sequence[str], start: str, length: str | None = None) -> s
     return " ".join(selected)
 
 
-def render_prompt(command: str, args: Sequence[str]) -> str:
-    """Render a prompt template with Pi-style positional substitutions.
+def substitute_args(text: str, args: Sequence[str]) -> str:
+    """Apply Pi-style positional substitution to prompt-template text.
 
     Supported substitutions are `$1`, `$2`, `$@`, `$ARGUMENTS`, `${@:N}`, and
-    `${@:N:L}`. The rendered workflow is printed by the command wrappers; the
-    scripts do not execute the workflow themselves.
+    `${@:N:L}`. This is the single substitution engine shared by every renderer
+    in this package, so named-template and path-based rendering stay consistent.
     """
 
-    text = load_prompt(command)
     all_args = " ".join(args)
     text = text.replace("$ARGUMENTS", all_args).replace("$@", all_args)
 
@@ -83,6 +82,32 @@ def render_prompt(command: str, args: Sequence[str]) -> str:
         return args[index] if 0 <= index < len(args) else ""
 
     return re.sub(r"\$(\d+)", replace_positional, text)
+
+
+def render_prompt(command: str, args: Sequence[str]) -> str:
+    """Render a named prompt template with Pi-style positional substitutions.
+
+    The rendered workflow is printed by the render-only command wrappers; those
+    wrappers do not execute the workflow themselves.
+    """
+
+    return substitute_args(load_prompt(command), args)
+
+
+def render_prompt_file(path: "str | Path", args: Sequence[str]) -> str:
+    """Render a prompt template selected by filesystem path.
+
+    Unlike `render_prompt`, the template is chosen by path rather than
+    slash-command name, so callers can render either the `.pi/prompts` or the
+    `.claude/commands` variant. YAML frontmatter is stripped before rendering.
+    """
+
+    path = Path(path)
+    try:
+        text = strip_frontmatter(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise AdwError(f"prompt template not found: {path}") from exc
+    return substitute_args(text, args)
 
 
 def print_rendered(command: str, args: Sequence[str]) -> int:

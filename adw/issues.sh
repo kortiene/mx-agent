@@ -1,47 +1,48 @@
 #!/usr/bin/env bash
-# issues.sh — process several GitHub issues in order via scripts/issue.sh.
+# issues.sh — process several GitHub issues in order via adw/issue.py.
 #
 # Runs the headless `/issue` workflow for each issue number you pass, one at a
 # time, in the given order. Useful for working a milestone backlog where later
 # issues depend on earlier ones.
 #
 # Usage:
-#   scripts/issues.sh <spec...> [-- <extra flags for issue.sh>]
+#   adw/issues.sh <spec...> [-- <extra flags for issue.py>]
 #
 # A <spec> is an issue number (e.g. 15) or an inclusive range (15-18 or 15..18).
 # Specs are expanded left to right, preserving order and duplicates.
 #
-# Each issue is verified against GitHub by issue.sh: a run only counts as done
+# Each issue is verified against GitHub by issue.py: a run only counts as done
 # if the issue ends up CLOSED. Already-closed issues are skipped, so a batch is
 # safely resumable just by re-running it.
 #
 # Options:
-#   --runner <name>    Forward --runner to issue.sh (pi|claude). You can also
+#   --runner <name>    Forward --runner to issue.py (pi|claude). You can also
 #                      set MX_AGENT_RUNNER in the environment.
 #   --keep-going       Continue to the next issue even if one fails
 #                      (default: stop at the first failure).
 #   --start <number>   Resume at the first occurrence of this issue in the
 #                      expanded list, skipping everything before it.
 #   --delay <seconds>  Sleep this many seconds between issues (default: 0).
-#   --log-dir <dir>    Forward --log-dir to issue.sh so each run is captured.
-#   --yes, -y          Confirm once for the whole batch (forwarded to issue.sh).
-#   --dry-run          Print what would run; do not invoke issue.sh.
-#   --                 Everything after is forwarded verbatim to issue.sh
+#   --log-dir <dir>    Forward --log-dir to issue.py so each run is captured.
+#   --yes, -y          Confirm once for the whole batch (forwarded to issue.py).
+#   --dry-run          Print what would run; do not invoke issue.py.
+#   --                 Everything after is forwarded verbatim to issue.py
 #                      (e.g. --json, --model sonnet:high, --dry-run).
 #   -h, --help         Show this help.
 #
 # Only one batch may run at a time (guarded by a lock file).
 #
 # Examples:
-#   scripts/issues.sh 15 16 17
-#   scripts/issues.sh 15-22 --json
-#   scripts/issues.sh 15..30 --keep-going -- --model sonnet:high
-#   scripts/issues.sh 15-30 --start 21        # resume from #21
+#   adw/issues.sh 15 16 17
+#   adw/issues.sh 15-22 --json
+#   adw/issues.sh 15..30 --keep-going -- --model sonnet:high
+#   adw/issues.sh 15-30 --start 21        # resume from #21
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ISSUE_SH="$HERE/issue.sh"
+PYTHON="${MX_AGENT_PYTHON:-python3}"
+ISSUE_PY="$HERE/issue.py"
 
 KEEP_GOING=0
 START=0
@@ -77,7 +78,8 @@ while [ $# -gt 0 ]; do
 done
 
 [ "${#SPECS[@]}" -gt 0 ] || { usage; exit 2; }
-[ -x "$ISSUE_SH" ] || die "issue runner not found or not executable: $ISSUE_SH"
+[ -f "$ISSUE_PY" ] || die "issue runner not found: $ISSUE_PY"
+command -v "$PYTHON" >/dev/null 2>&1 || die "python interpreter not found: $PYTHON (set MX_AGENT_PYTHON)"
 [[ "$START" =~ ^[0-9]+$ ]] || die "--start must be a number"
 [[ "$DELAY" =~ ^[0-9]+$ ]] || die "--delay must be a number"
 
@@ -113,7 +115,7 @@ fi
 
 [ "${#ISSUES[@]}" -gt 0 ] || die "no issues to process after expansion/filtering"
 
-# Forward --log-dir and the batch-level confirmation to each issue.sh run.
+# Forward --log-dir and the batch-level confirmation to each issue.py run.
 [ -n "$LOG_DIR" ] && PASSTHRU=(--log-dir "$LOG_DIR" "${PASSTHRU[@]}")
 [ "$ASSUME_YES" -eq 1 ] && PASSTHRU=(--yes "${PASSTHRU[@]}")
 
@@ -156,12 +158,12 @@ for n in "${ISSUES[@]}"; do
   note "[$i/$total] === issue #$n ==="
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '[dry-run]'; printf ' %q' "$ISSUE_SH" "$n" "${PASSTHRU[@]}"; echo
+    printf '[dry-run]'; printf ' %q' "$PYTHON" "$ISSUE_PY" "$n" "${PASSTHRU[@]}"; echo
     DONE+=("$n")
     continue
   fi
 
-  if "$ISSUE_SH" "$n" "${PASSTHRU[@]}"; then
+  if "$PYTHON" "$ISSUE_PY" "$n" "${PASSTHRU[@]}"; then
     note "[$i/$total] issue #$n finished"
     DONE+=("$n")
   else

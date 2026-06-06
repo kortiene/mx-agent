@@ -28,7 +28,7 @@ Workflow:
    - If more than 5 issues are selected, ask for confirmation before proceeding.
 
 2. Preflight all selected issues before implementing any of them
-   - For each normalized issue ID, run `scripts/work_issue.sh <id> --print` to inspect the title, labels, milestone, status, scope, dependencies, and acceptance criteria.
+   - For each normalized issue ID, run `adw/work_issue.sh <id> --print` to inspect the title, labels, milestone, status, scope, dependencies, and acceptance criteria.
    - Use `~/.local/bin/gh` if `gh` is not on PATH.
    - Use `. "$HOME/.cargo/env"` before cargo commands when needed.
    - If an issue is already CLOSED, mark it as skipped and continue.
@@ -51,7 +51,7 @@ Workflow:
    For each issue ID that was not skipped:
    - Confirm the repository is on `main`, updated from origin, and has a clean working tree before starting.
    - Run the equivalent of `/issue <id> <shared notes>` inline, following `.pi/prompts/issue.md` completely:
-     - start the issue with `scripts/work_issue.sh <id> --print` and `scripts/work_issue.sh <id>`
+     - start the issue with `adw/work_issue.sh <id> --print` and `adw/work_issue.sh <id>`
      - read repository context
      - decide whether a `/plan`-style spec is needed
      - implement using `/implement` semantics

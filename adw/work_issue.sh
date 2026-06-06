@@ -10,7 +10,7 @@
 #   6. Prints the scope and acceptance criteria for implementation.
 #
 # Usage:
-#   scripts/work_issue.sh <issue-number> [options]
+#   adw/work_issue.sh <issue-number> [options]
 #
 # Options:
 #   --dry-run        Show what would happen; make no git/GitHub changes.
