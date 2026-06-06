@@ -342,11 +342,16 @@ anything runs:
 > **Alpha status.** A running daemon now **auto-drives** tasks: a live scheduler
 > loop reads `com.mxagent.task.v1` room state and, for each agent this daemon
 > owns, claims assigned, signed, policy-allowed tasks with `state_rev`,
-> dispatches them (locally), finalizes the result, and recovers orphaned
-> `executing` tasks on restart (#199). Task state stays advisory: an unsigned,
-> untrusted, expired, replayed, or policy-denied action is blocked and never
-> spawns. Still landing: routing that auto-dispatch through the signed Matrix
-> transport so an action runs on a *remote* agent's daemon (#200).
+> dispatches them, finalizes the result, and recovers orphaned `executing` tasks
+> on restart (#199). Dispatch runs locally by default; set
+> `MX_AGENT_TASK_DISPATCH=matrix` to route each task action through the signed
+> Matrix-backed `call`/`exec` transport instead, so it runs through the same
+> verify → trust → policy → runner pipeline as a direct CLI invocation, with the
+> task result carrying the exit code, summary, and any output artifact (#200).
+> Task state stays advisory: an unsigned, untrusted, expired, replayed, or
+> policy-denied action is blocked and never spawns. Still landing: tight
+> task↔remote-invocation id unification and forwarding exec `env`/`timeout`
+> through the Matrix transport.
 
 ## Two-agent demo (end to end)
 

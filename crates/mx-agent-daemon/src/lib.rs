@@ -33,6 +33,7 @@ pub mod sync;
 pub mod task;
 pub mod task_diagnostics;
 pub mod task_dispatch;
+pub mod task_dispatch_matrix;
 pub mod task_graph;
 pub mod task_orchestrator;
 pub mod tool_exec;
@@ -124,7 +125,7 @@ pub use runner::{
 };
 pub use scheduler::{ScheduleDecision, TaskScheduler};
 pub use scheduler_loop::{
-    run_scheduler_loop, run_scheduler_tick, MatrixTaskStore, RoutingDispatcher,
+    run_scheduler_loop, run_scheduler_tick, MatrixTaskStore, RoutingDispatcher, TaskDispatchMode,
     DEFAULT_SCHEDULER_INTERVAL,
 };
 pub use session::{
@@ -155,6 +156,7 @@ pub use task_diagnostics::{diagnose_tasks, Severity, TaskDiagnostic};
 pub use task_dispatch::{
     exec_result_from_output, ExecRunRequest, ExecTaskDispatcher, ToolTaskDispatcher,
 };
+pub use task_dispatch_matrix::{MatrixCallTaskDispatcher, MatrixExecTaskDispatcher};
 pub use task_graph::{GraphEdge, GraphNode, TaskGraph};
 pub use task_orchestrator::{
     action_from_task, sign_task_action, task_approval_request, ApprovalDisposition,
