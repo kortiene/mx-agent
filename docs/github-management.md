@@ -193,10 +193,10 @@ The workflow `.github/workflows/project-sync.yml` runs `actions/add-to-project` 
 
 ## Starting Work on an Issue
 
-`scripts/work_issue.sh` takes a GitHub issue number and bootstraps everything needed to start implementing it:
+`python adw/work_issue.py` takes a GitHub issue number and bootstraps everything needed to start implementing it:
 
 ```bash
-scripts/work_issue.sh 3
+python adw/work_issue.py 3
 ```
 
 It will:
@@ -211,63 +211,63 @@ It will:
 Useful flags:
 
 ```bash
-scripts/work_issue.sh 3 --print      # only show issue context, change nothing
-scripts/work_issue.sh 3 --dry-run    # show all actions without performing them
-scripts/work_issue.sh 3 --base main --status "In Progress"
-scripts/work_issue.sh 3 --no-status  # skip board update (no project scope needed)
+python adw/work_issue.py 3 --print      # only show issue context, change nothing
+python adw/work_issue.py 3 --dry-run    # show all actions without performing them
+python adw/work_issue.py 3 --base main --status "In Progress"
+python adw/work_issue.py 3 --no-status  # skip board update (no project scope needed)
 ```
 
-Requirements: `gh` (authenticated; `project` scope needed for board updates), `jq`, and `git`.
+Requirements: `gh` (authenticated; `project` scope needed for board updates) and `git`.
 
 ## Automated Issue Processing
 
-For unattended runs, two scripts drive the [pi](https://github.com/earendil-works/pi-mono) coding agent headlessly through the same `/issue` workflow used interactively (defined in `.pi/prompts/issue.md`).
+For unattended runs, two tools drive a [pi](https://github.com/earendil-works/pi-mono) or Claude Code coding agent headlessly through the same `/issue` workflow used interactively (defined in `.pi/prompts/issue.md`).
 
-### Single issue: `scripts/issue.sh`
+### Single issue: `python adw/issue.py`
 
-The CLI equivalent of typing `/issue <number> [notes]` in pi's editor. It expands the `.pi/prompts/issue.md` template (substituting `$1` and `${@:2}` exactly as pi does), then runs it via `pi -p` (print mode) so the agent implements the issue end-to-end: branch, code, test, open a PR, watch CI, and squash-merge.
+The CLI equivalent of typing `/issue <number> [notes]` in the agent's editor. It expands the `issue.md` template (substituting `$1` and `${@:2}` exactly as pi does), then runs it via the selected runner in print mode — `pi -p` by default, or `claude -p` with `--runner claude` — so the agent implements the issue end-to-end: branch, code, test, open a PR, watch CI, and squash-merge.
 
 ```bash
-scripts/issue.sh 15                            # implement issue #15 end-to-end
-scripts/issue.sh 15 "do not continue on unmet deps"   # notes fill the ${@:2} slot
-scripts/issue.sh 15 --json --model sonnet:high # JSON event stream, pick a model
-scripts/issue.sh 15 --print-prompt             # expand the template only; do not run
-scripts/issue.sh 15 --dry-run                  # show the exact pi invocation
-scripts/issue.sh 15 -- --thinking high -nc     # pass extra flags verbatim to pi
+python adw/issue.py 15                            # implement issue #15 end-to-end
+python adw/issue.py 15 "do not continue on unmet deps"   # notes fill the ${@:2} slot
+python adw/issue.py 15 --json --model sonnet:high # JSON event stream, pick a model
+python adw/issue.py 15 --print-prompt             # expand the template only; do not run
+python adw/issue.py 15 --dry-run                  # show the exact pi invocation
+python adw/issue.py 15 -- --thinking high -nc     # pass extra flags verbatim to pi
 ```
 
 ```bash
-scripts/issue.sh 15 --log-dir ./logs            # tee the transcript to a per-issue log
-scripts/issue.sh 15 --timeout 3600              # abort the run after an hour
-scripts/issue.sh 15 --yes                        # skip the confirmation prompt
-scripts/issue.sh 15 --no-verify                 # skip the post-run CLOSED check
-scripts/issue.sh 15 --force                      # run even if already CLOSED
+python adw/issue.py 15 --log-dir ./logs            # tee the transcript to a per-issue log
+python adw/issue.py 15 --timeout 3600              # abort the run after an hour
+python adw/issue.py 15 --yes                        # skip the confirmation prompt
+python adw/issue.py 15 --no-verify                 # skip the post-run CLOSED check
+python adw/issue.py 15 --force                      # run even if already CLOSED
 ```
 
 By default the script refuses to start on a dirty working tree (`--allow-dirty` to override) and, when run interactively, asks for confirmation before implementing and merging (`--yes`/`MX_AGENT_YES=1` to skip; auto-skipped when stdin is not a terminal). `--timeout` aborts a stuck run.
 
 Notes:
 
-- Slash-command/template expansion only happens in pi's interactive editor, so the script performs the substitution itself before calling `pi -p`.
+- Slash-command/template expansion only happens in the agent's interactive editor, so `issue.py` performs the substitution itself before calling the runner.
 - **Outcome is verified against GitHub.** pi's print-mode exit code only reflects whether the model responded, not whether the issue shipped, so after the run the script checks that the issue is `CLOSED` and fails otherwise. Already-closed issues are skipped and unknown numbers fail fast (before spending tokens). Disable with `--no-verify`; re-run anyway with `--force`.
 - Headless mode cannot ask interactive questions, so the template's "ask whether to continue" step becomes "state the assumption and proceed"; pass a note to steer it.
-- Each run is fully autonomous (edits, pushes, opens a PR, and merges unattended). `pi` is resolved from `PATH`, then `~/.local/share/pi-node/current/bin/pi`, or `PI_BIN`; `gh` from `PATH` then `~/.local/bin/gh` or `GH_BIN`. `PI_MODEL`, `PI_THINKING`, and `MX_AGENT_LOG_DIR` set defaults for the matching flags.
+- Each run is fully autonomous (edits, pushes, opens a PR, and merges unattended). `pi` is resolved from `PATH`, then `~/.local/share/pi-node/current/bin/pi`, or `PI_BIN`; `claude` from `PATH`, then `~/.claude/local/claude` or `~/.local/bin/claude`, or `CLAUDE_BIN`; `gh` from `PATH` then `~/.local/bin/gh` or `GH_BIN`. `PI_MODEL`, `PI_THINKING`, and `MX_AGENT_LOG_DIR` set defaults for the matching flags.
 
-### Many issues in order: `scripts/issues.sh`
+### Many issues in order: `python adw/issues.py`
 
-Processes several issues sequentially via `scripts/issue.sh`, one fully completing (including its CI and merge) before the next begins — important because later backlog issues usually depend on earlier ones being merged to `main`.
+Processes several issues sequentially via `python adw/issue.py`, one fully completing (including its CI and merge) before the next begins — important because later backlog issues usually depend on earlier ones being merged to `main`.
 
 ```bash
-scripts/issues.sh 15 16 17                      # explicit list, stop on first failure
-scripts/issues.sh 15-22                          # inclusive range (also N..M)
-scripts/issues.sh 15..30 --keep-going -- --json --model sonnet:high
-scripts/issues.sh 15-30 --start 21               # resume from #21
-scripts/issues.sh 15 16 18-20 --dry-run          # preview the plan
+python adw/issues.py 15 16 17                      # explicit list, stop on first failure
+python adw/issues.py 15-22                          # inclusive range (also N..M)
+python adw/issues.py 15..30 --keep-going -- --json --model sonnet:high
+python adw/issues.py 15-30 --start 21               # resume from #21
+python adw/issues.py 15 16 18-20 --dry-run          # preview the plan
 ```
 
-It stops at the first failure by default (`--keep-going` to continue), preserves the given order, supports number/range specs, forwards flags after `--` to `issue.sh`, and prints a completed/failed summary (also on Ctrl-C). It confirms once for the whole batch (`--yes` to skip), holds a lock so only one batch runs at a time, and resumes at a given issue with `--start <n>` (index-based). Because each run verifies closure and already-closed issues are skipped, a batch is also **resumable just by re-running it**; `--log-dir <dir>` is forwarded to each run. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
+It stops at the first failure by default (`--keep-going` to continue), supports number/range specs (expanded ascending and de-duplicated), forwards flags after `--` to each `issue.py` run, and prints a completed/failed summary (also on Ctrl-C). It confirms once for the whole batch (`--yes` to skip), holds a lock so only one batch runs at a time, and resumes at the first occurrence of a given issue with `--start <n>`. Because each run verifies closure and already-closed issues are skipped, a batch is also **resumable just by re-running it**; `--log-dir <dir>` is forwarded to each run. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
 
-Requirements: `pi` on `PATH` (or `PI_BIN`), plus the same `gh`/`git`/`cargo` access the interactive workflow uses.
+Requirements: the chosen runner (`pi` or `claude`) on `PATH` (or `PI_BIN`/`CLAUDE_BIN`), plus the same `gh`/`git`/`cargo` access the interactive workflow uses.
 
 ### Manual alternative with gh
 
