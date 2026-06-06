@@ -1,9 +1,13 @@
 //! Command-line surface for `mx-agent`.
 //!
-//! This module defines the full command tree with `clap`. Subcommands are
-//! placeholders at this stage (issue #4): they parse arguments and report that
-//! the operation is not implemented yet. Behavior is filled in by later roadmap
-//! phases.
+//! This module defines the full command tree with `clap` and dispatches each
+//! command. The CLI is stateless: `auth`, `workspace`, `agent`, `trust`,
+//! `approval`, `share`, `invocation`, and `task` are mediated by the daemon over
+//! the local Unix-socket IPC channel, and `call`/`exec` run a daemon-mediated
+//! local execution by default or a signed Matrix-backed remote operation when
+//! `--room`/`--agent` target a remote agent. The CLI never reads the Matrix
+//! session or builds a Matrix client itself. Interactive PTY `exec` and large
+//! artifacts are still landing — see the project status in `README.md`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -3184,7 +3188,7 @@ fn cmd_call(global: &GlobalArgs, args: &CallArgs) -> ExitCode {
 ///
 /// The two carry the same protocol schema payloads; this only re-tags them for
 /// the renderer, which consumes frames the same way regardless of whether they
-/// came from the daemon's local loopback or (later) a remote agent over Matrix.
+/// came from a daemon-mediated local execution or a remote agent over Matrix.
 fn stream_frames_from_exec(
     frames: Vec<mx_agent_daemon::ExecFrame>,
 ) -> Vec<crate::stream::StreamFrame> {

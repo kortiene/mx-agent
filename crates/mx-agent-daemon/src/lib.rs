@@ -1,9 +1,10 @@
 //! The mx-agent daemon.
 //!
 //! The daemon owns the Matrix sync loop, credentials, crypto state, policy
-//! enforcement, and process supervision (see `docs/architecture.md`,
-//! section 10). This is a placeholder that wires the supporting crates
-//! together so the workspace builds end to end.
+//! enforcement, process supervision, and the live task scheduler loop (see
+//! `docs/architecture.md`, section 10). The stateless CLI talks to it over the
+//! local Unix-socket IPC channel; the daemon performs every Matrix operation so
+//! tokens and device keys never leave it.
 
 pub mod agent;
 pub mod approval;

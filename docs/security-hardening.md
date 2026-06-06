@@ -7,10 +7,12 @@ machine. This guide explains how the safety controls fit together and, for each
 one, **what the safe default is and which options weaken it**.
 
 > **Alpha status.** As noted in the [user guide](user-guide.md), `call` and
-> `exec` currently run over a local loopback; the signed Matrix transport to a
-> *remote* daemon is still landing. The trust, signing, replay, policy, audit,
-> and sandbox machinery described here is real and already enforced. Treat every
-> example as running on your own machine.
+> non-PTY `exec` run a daemon-mediated local execution by default and become
+> signed Matrix-backed remote operations when `--room`/`--agent` target a
+> registered, trusted, policy-allowed remote agent; interactive `exec --pty` is
+> not yet carried over the transport. The trust, signing, replay, policy, audit,
+> and sandbox machinery described here is real and already enforced — on the
+> daemon that runs the command, local or remote.
 
 ## Contents
 

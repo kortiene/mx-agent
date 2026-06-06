@@ -1,8 +1,10 @@
 //! The `mx-agent` command-line interface.
 //!
-//! The command surface is defined in [`cli`]. At this stage (issue #4) the
-//! subcommands are placeholders that parse arguments and report that the
-//! operation is not implemented yet; behavior arrives in later roadmap phases.
+//! The command surface is defined in [`cli`]. The CLI is stateless: every
+//! Matrix-backed command is sent to the long-running daemon over the local
+//! Unix-socket IPC channel, so the CLI never reads the Matrix session or builds
+//! a Matrix client itself. A few advanced flows (interactive PTY `exec`, large
+//! artifacts) are still landing — see the project status in `README.md`.
 
 mod cli;
 mod stream;

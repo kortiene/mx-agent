@@ -5,12 +5,13 @@ commit to decide whether it is fit to ship as a public alpha release. It exists
 so that "is this commit alpha-release ready?" has a concrete, repeatable answer
 rather than a judgement call.
 
-> **Alpha status.** `mx-agent` is pre-release software. As noted in the
-> [user guide](user-guide.md) and [security hardening guide](security-hardening.md),
-> the `call` and `exec` runners currently execute **locally** over a daemon
-> loopback; the signed Matrix transport to a *remote* daemon is still landing.
-> This checklist gates an *alpha*, and is deliberately scoped to what the alpha
-> actually ships — see [Known limitations](#known-limitations).
+> **Alpha status.** `mx-agent` is pre-release software. `call` and non-PTY
+> `exec` run a daemon-mediated local execution by default and become signed
+> Matrix-backed remote operations when `--room`/`--agent` target a registered,
+> trusted, policy-allowed remote agent, and a live daemon scheduler loop
+> auto-drives signed, assigned tasks. This checklist gates an *alpha*, and is
+> deliberately scoped to what the alpha actually ships — see
+> [Known limitations](#known-limitations).
 
 ## How to use this document
 
@@ -126,31 +127,25 @@ alpha; the gate's job is to ensure they remain the *complete, documented* set.
 If the candidate commit has a behavior gap not listed here, either fix it or add
 it here before release.
 
-- **Local-loopback execution only.** `call` and `exec` run on the **local**
-  machine over a daemon loopback. The signed Matrix transport that dispatches an
-  invocation to a *remote* agent's daemon is not yet wired up; the
-  `--room`/`--agent` targeting flags are accepted for forward compatibility but
-  do not dispatch remotely. (See the [user guide](user-guide.md#run-exec) and
+- **Interactive PTY `exec` does not run over IPC/remote yet.** `call` and
+  non-PTY `exec` run daemon-mediated locally by default and over the signed
+  Matrix transport to a *remote* agent's daemon when `--room`/`--agent` are
+  given. Interactive `exec --pty` runs locally but is not yet carried over IPC or
+  the Matrix transport (follow-up #155). (See the
+  [user guide](user-guide.md#run-exec) and
   [security hardening guide](security-hardening.md).)
-- **Acceptance validated by unit tests, not live Matrix transport.** Exec
-  acceptance criteria are exercised through unit tests over the loopback runner
-  rather than a real remote Matrix round-trip.
-- **Task orchestration engine is not yet auto-driven by a live `/sync` loop.**
-  Task state CRUD/graph/watch/diagnostics run over Matrix through the daemon, and
-  the daemon **task-orchestration engine** (scheduler, optimistic `state_rev`
-  claiming, tool/exec dispatch, policy + trust/signature + approval enforcement,
-  restart recovery) is implemented and covered by unit and integration tests.
-  What is *not* wired yet is a running daemon that polls a room and executes
-  runnable tasks on its own; today tasks are created, inspected, transitioned,
-  and graphed but do not auto-progress to `executing`/`succeeded` from a live
-  daemon loop.
-- **Some CLI surface is still placeholder.** Beyond the daemon lifecycle, auth,
-  workspace, agent registry, task state, trust, approval, and context-sharing
-  command groups (which run against Matrix), a few commands remain placeholders
-  pending later roadmap phases (see [`docs/roadmap-rust.md`](roadmap-rust.md)).
+- **Live task dispatch defaults to local execution.** A running daemon's
+  scheduler loop auto-claims signed, assigned, policy-allowed tasks and runs them
+  via local tool/exec dispatch; routing that dispatch through the signed
+  Matrix-backed `call`/`exec` transport is opt-in via `MX_AGENT_TASK_DISPATCH=matrix`.
+  An approval-required task is held (fail closed) by the gate-less scheduler loop
+  and is not auto-run.
 - **PTY signal semantics are partial.** Controlling-tty and full Ctrl-C
   semantics for `exec --pty` are intentionally limited; the workspace forbids
   `unsafe`, so PTY/termios use the safe `rustix` path.
+- **Large output artifacts and production E2EE are still landing.** Streaming
+  falls back within timeline budgets; very large artifacts and end-to-end
+  encryption in production are follow-up work.
 - **Sandbox is not a security boundary on its own.** There is no seccomp
   filtering, rlimit capping, or UID/GID remapping; commands run as the daemon's
   user. The built-in fallback backend is `none` (zero isolation) — operators
