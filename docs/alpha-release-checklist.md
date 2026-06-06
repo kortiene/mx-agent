@@ -81,10 +81,11 @@ the gate, not an afterthought. See the
 - [ ] **must** A security review of the changes since the last release has been
       completed (`/security-review`, or an equivalent manual pass over the
       [security-critical areas](../SECURITY.md#security-critical-areas)).
-- [ ] **must** Secret-bearing files keep their modes: `session.json`,
-      `signing_key.ed25519`, `trust.json`, the replay cache, and the IPC socket
-      are `0600`; their directories are `0700`. (Enforced in code and tests;
-      confirm those tests pass.)
+- [ ] **must** Private local-state files keep their modes: `session.json`,
+      `signing_key.ed25519`, `trust.json`, the replay cache, the audit log
+      (`audit.log` — decision metadata, not secrets, but held to the same
+      posture), and the IPC socket are `0600`; their directories are `0700`.
+      (Enforced in code and tests; confirm those tests pass.)
 - [ ] **must** `SECURITY.md` and the [security hardening guide](security-hardening.md)
       accurately describe what this commit enforces — no control documented as
       shipped that has since regressed.
