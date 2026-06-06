@@ -34,7 +34,7 @@ If a box can sync with a homeserver, it can participate — even one that accept
 
 ## Project status
 
-**Public alpha (v0.1.0).** The architecture, protocol schema, IPC layer, policy engine, Ed25519 signing, and sandbox abstraction are in place, and most command groups now run against a real Matrix homeserver through the daemon. Matrix-backed remote `call` and non-PTY `exec` are implemented behind daemon IPC, including signed Matrix stdin/cancel controls for live remote exec; the **live daemon scheduler loop** that would auto-drive tasks over `/sync` remains follow-up work. Each capability below is tagged so you always know what runs today.
+**Public alpha (v0.1.0).** The architecture, protocol schema, IPC layer, policy engine, Ed25519 signing, and sandbox abstraction are in place, and most command groups now run against a real Matrix homeserver through the daemon. Matrix-backed remote `call` and non-PTY `exec` are implemented behind daemon IPC, including signed Matrix stdin/cancel controls for live remote exec. A **live daemon scheduler loop** now auto-drives assigned, signed, policy-allowed tasks from real `com.mxagent.task.v1` room state (claiming with `state_rev`, dispatching, finalizing, and recovering stale work on restart) using local tool/exec dispatch; routing that task dispatch through the signed Matrix-backed remote `call`/`exec` transport is follow-up work. Each capability below is tagged so you always know what runs today.
 
 | Area | Status |
 |---|---|
@@ -45,9 +45,10 @@ If a box can sync with a homeserver, it can participate — even one that accept
 | `auth`, `workspace`, `agent`, `trust`, `approval`, `share` commands (over Matrix, daemon-mediated) | ✅ Implemented |
 | Task state: `task create` / `update` / `list` / `graph` / `watch` (daemon-IPC, over Matrix) | ✅ Implemented |
 | Structured task actions (`tool` / `exec`), lifecycle-transition validation, stable task result schema | ✅ Implemented |
-| Daemon task-orchestration engine: scheduler, optimistic `state_rev` claiming, tool/exec dispatch, policy + trust/signature + approval enforcement, restart recovery, DAG diagnostics | ✅ Implemented (engine + tests); not yet auto-driven by a live `/sync` loop — see limitations |
+| Daemon task-orchestration engine: scheduler, optimistic `state_rev` claiming, tool/exec dispatch, policy + trust/signature + approval enforcement, restart recovery, DAG diagnostics | ✅ Implemented (engine + tests) |
+| Live daemon scheduler loop: auto-claims assigned, signed, policy-allowed tasks from room state and runs them via local tool/exec dispatch, with restart recovery | ✅ Implemented (local dispatch; remote Matrix-backed task dispatch is follow-up) |
 | `call` / `exec` runners | 🟡 `call` and non-PTY `exec` support signed Matrix-backed remote daemon dispatch when `--room`/`--agent` are provided; live remote exec supports signed stdin/cancel controls |
-| Live daemon scheduler loop auto-claiming/executing tasks over `/sync`; remote Matrix-backed `exec`; E2EE in production; `bubblewrap`/container sandboxes; interactive PTY; large artifacts | 🔮 Planned |
+| Routing live scheduler task dispatch through Matrix-backed remote `call`/`exec`; E2EE in production; `bubblewrap`/container sandboxes; interactive PTY; large artifacts | 🔮 Planned |
 
 **Platform: Unix only** (Linux and macOS). Windows was intentionally dropped — the project relies on Unix-domain-socket IPC and Unix process semantics.
 

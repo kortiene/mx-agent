@@ -339,12 +339,14 @@ anything runs:
   against its live invocations — an orphaned local task is marked failed (never
   double-run), and a remote-owned task is left unchanged with a stale warning.
 
-> **Alpha limitation.** This orchestration engine is implemented and covered by
-> unit and integration tests, but it is **not yet auto-driven by a live `/sync`
-> loop**: a running daemon does not yet poll the room and execute tasks on its
-> own. Today you create, inspect, transition, and graph task state over Matrix;
-> automatic end-to-end scheduling/execution — and the signed Matrix transport
-> that carries an action to a *remote* agent's daemon (#155) — are still landing.
+> **Alpha status.** A running daemon now **auto-drives** tasks: a live scheduler
+> loop reads `com.mxagent.task.v1` room state and, for each agent this daemon
+> owns, claims assigned, signed, policy-allowed tasks with `state_rev`,
+> dispatches them (locally), finalizes the result, and recovers orphaned
+> `executing` tasks on restart (#199). Task state stays advisory: an unsigned,
+> untrusted, expired, replayed, or policy-denied action is blocked and never
+> spawns. Still landing: routing that auto-dispatch through the signed Matrix
+> transport so an action runs on a *remote* agent's daemon (#200).
 
 ## Two-agent demo (end to end)
 

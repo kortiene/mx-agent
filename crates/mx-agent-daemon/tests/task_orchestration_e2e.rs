@@ -26,10 +26,13 @@
 //! daemon-driven scheduler has against Matrix is the `TaskStore` (room state
 //! read/write), which is modelled here exactly as the real `update_task`
 //! optimistic-concurrency contract. That keeps the test deterministic and part
-//! of the default `cargo test --all` run. Wiring the same scheduler loop onto a
-//! live `/sync` task feed is tracked separately.
+//! of the default `cargo test --all` run. It drives the same
+//! [`mx_agent_daemon::run_scheduler_tick`] the live daemon scheduler loop uses
+//! (issue #199), so the in-memory store stands in only for real
+//! `com.mxagent.task.v1` room state; a true live `/sync`-driven run is covered
+//! behind the Docker-gated Matrix integration suite.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -81,13 +84,6 @@ impl RoomTaskStore {
 
     fn get(&self, task_id: &str) -> &TaskState {
         self.tasks.get(task_id).expect("task exists")
-    }
-
-    fn running_count(&self) -> u32 {
-        self.tasks
-            .values()
-            .filter(|t| t.state == STATE_EXECUTING)
-            .count() as u32
     }
 
     fn apply(&mut self, options: &UpdateTaskOptions) -> Result<TaskState, TaskStoreError> {
@@ -211,8 +207,9 @@ allow_cwd = ["{cwd}"]
     .expect("policy parses")
 }
 
-/// Run one scheduler tick: detect runnable tasks and process each through the
-/// orchestrator, exactly as a daemon scheduler loop would.
+/// Run one scheduler tick through the shared library entry point the live
+/// daemon scheduler loop uses (recovery over `executing` tasks, then schedule
+/// and process runnable tasks).
 fn tick(
     scheduler: &TaskScheduler,
     orchestrator: &TaskOrchestrator,
@@ -220,19 +217,17 @@ fn tick(
     dispatcher: &mut impl TaskDispatcher,
 ) -> Vec<OrchestrationOutcome> {
     let snapshot = store.snapshot();
-    let running = store.running_count();
-    let runnable_ids: Vec<String> = scheduler
-        .runnable(&snapshot, running)
-        .into_iter()
-        .map(|t| t.task_id.clone())
-        .collect();
-
-    let mut outcomes = Vec::new();
-    for id in runnable_ids {
-        let task = snapshot.iter().find(|t| t.task_id == id).unwrap().clone();
-        outcomes.push(orchestrator.process_one(&task, &snapshot, &mut *store, dispatcher));
-    }
-    outcomes
+    // No long-lived local invocations across a synchronous tick, so recovery
+    // sees an empty live set (matching the live loop's local-dispatch path).
+    let live_invocations = BTreeSet::new();
+    mx_agent_daemon::run_scheduler_tick(
+        scheduler,
+        orchestrator,
+        &snapshot,
+        &live_invocations,
+        store,
+        dispatcher,
+    )
 }
 
 #[test]
