@@ -444,6 +444,20 @@ fn dispatch(
             Ok(params) => dispatch_exec_start(req, &params),
             Err(response) => *response,
         },
+        "exec.stdin" => match parse_params::<crate::ExecStdinParams>(req) {
+            Ok(params) => match serde_json::to_value(crate::handle_exec_stdin_loopback(&params)) {
+                Ok(value) => Response::result(req.id.clone(), value),
+                Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+            },
+            Err(response) => *response,
+        },
+        "exec.cancel" => match parse_params::<crate::ExecCancelParams>(req) {
+            Ok(params) => match serde_json::to_value(crate::handle_exec_cancel_loopback(&params)) {
+                Ok(value) => Response::result(req.id.clone(), value),
+                Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+            },
+            Err(response) => *response,
+        },
         "task.create" => match parse_params::<crate::CreateTaskOptions>(req) {
             Ok(options) => block_on_task_response(req, |session| async move {
                 crate::create_task_for_session(&session, &options).await
@@ -848,6 +862,33 @@ mod tests {
             }
             other => panic!("expected Ok outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn exec_control_methods_return_structured_loopback_status() {
+        let stdin_req = Request::new(
+            json!(1),
+            "exec.stdin",
+            json!({"invocation_id":"inv_1","data":[104,105],"eof":true}),
+        );
+        let stdin_response = dispatch(&stdin_req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        assert!(stdin_response.error.is_none());
+        let stdin: crate::ExecControlResult =
+            serde_json::from_value(stdin_response.result.unwrap()).unwrap();
+        assert_eq!(stdin.invocation_id, "inv_1");
+        assert!(!stdin.accepted);
+
+        let cancel_req = Request::new(
+            json!(2),
+            "exec.cancel",
+            json!({"invocation_id":"inv_1","reason":"test"}),
+        );
+        let cancel_response = dispatch(&cancel_req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        assert!(cancel_response.error.is_none());
+        let cancel: crate::ExecControlResult =
+            serde_json::from_value(cancel_response.result.unwrap()).unwrap();
+        assert_eq!(cancel.invocation_id, "inv_1");
+        assert!(!cancel.accepted);
     }
 
     #[test]

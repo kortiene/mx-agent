@@ -208,11 +208,13 @@ missing or corrupt chunk as a hard error), `--pty` (allocate a pseudo-terminal),
 
 > In this alpha, `exec` is mediated by the daemon over local IPC, so a daemon
 > must be running (`mx-agent daemon start`); otherwise `exec` exits `3`. The
-> daemon — not the CLI — runs the command, but it still runs on your **local**
-> machine as a loopback. The `--room`/`--agent` targeting flags are accepted for
-> forward compatibility but do not yet dispatch to a remote agent over Matrix.
-> `--pty` still runs in the CLI for now; moving it onto the IPC path is
-> follow-up work.
+> daemon — not the CLI — runs non-PTY commands, but they still run on your
+> **local** machine as a loopback. The daemon IPC API includes `exec.start`,
+> `exec.stdin`, and `exec.cancel`; stdin/cancel currently return a structured
+> "not live" response because loopback `exec.start` runs to completion in one
+> request. The `--room`/`--agent` targeting flags are accepted for forward
+> compatibility but do not yet dispatch to a remote agent over Matrix. `--pty`
+> still runs in the CLI for now; moving it onto the IPC path is follow-up work.
 
 ## Track work with tasks
 
