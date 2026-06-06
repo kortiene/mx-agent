@@ -28,8 +28,9 @@
 //! any rejection it emits a `com.mxagent.exec.rejected.v1` carrying a stable,
 //! machine-readable reason and spawns nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -40,19 +41,58 @@ use mx_agent_policy::{Allowance, DenyReason, ExecContext, Outcome, Policy, Sandb
 use mx_agent_protocol::events::state::INVOCATION;
 use mx_agent_protocol::events::timeline::{
     EXEC_ACCEPTED, EXEC_CANCEL, EXEC_CANCELLED, EXEC_FINISHED, EXEC_REJECTED, EXEC_REQUEST,
-    STREAM_ARTIFACT, STREAM_CHUNK,
+    EXEC_STDIN, STREAM_ARTIFACT, STREAM_CHUNK,
 };
 use mx_agent_protocol::schema::{
-    ExecAccepted, ExecCancel, ExecCancelled, ExecFinished, ExecRejected, ExecRequest,
+    ExecAccepted, ExecCancel, ExecCancelled, ExecFinished, ExecRejected, ExecRequest, ExecStdin,
     InvocationState, Signature, StreamKind,
 };
 use mx_agent_protocol::signing::{self, SignatureError, SIGNATURE_FIELD};
 
 use crate::audit::{AuditLog, AuditRecord};
-use crate::runner::{run, RunSpec};
+use crate::runner::{
+    build_command, kill_process_group, terminate_process_group, RunOutput, RunSpec,
+};
 use crate::stream::{capture_child_output, OutputCaps, StreamCaptureConfig};
 use crate::trust::TrustStore;
 use crate::workspace::WorkspaceError;
+
+type StdinFrame = Option<Vec<u8>>;
+
+#[derive(Debug, Clone)]
+struct LiveExecControl {
+    requester_agent: String,
+    stdin: tokio::sync::mpsc::Sender<StdinFrame>,
+    cancel: tokio::sync::watch::Sender<Option<String>>,
+}
+
+static LIVE_EXEC_CONTROLS: OnceLock<Mutex<HashMap<String, LiveExecControl>>> = OnceLock::new();
+
+fn live_exec_controls() -> &'static Mutex<HashMap<String, LiveExecControl>> {
+    LIVE_EXEC_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn insert_live_exec_control(invocation_id: String, control: LiveExecControl) {
+    live_exec_controls()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(invocation_id, control);
+}
+
+fn remove_live_exec_control(invocation_id: &str) {
+    live_exec_controls()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(invocation_id);
+}
+
+fn live_exec_control(invocation_id: &str) -> Option<LiveExecControl> {
+    live_exec_controls()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(invocation_id)
+        .cloned()
+}
 
 /// Why an incoming `com.mxagent.exec.request.v1` was rejected.
 ///
@@ -518,66 +558,170 @@ pub async fn handle_live_exec_request(
         tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to publish running invocation state");
     }
 
-    let output = match run(&RunSpec {
-        command: request.command.clone(),
-        cwd: PathBuf::from(&request.cwd),
-        env: request.env.clone(),
-        env_allowlist: allowance.env_allowlist.clone(),
-        stdin: None,
-        timeout: Some(Duration::from_millis(
-            allowance.max_runtime_ms.unwrap_or(request.timeout_ms),
-        )),
-        sandbox: sandbox_backend(allowance.sandbox),
-        ..Default::default()
-    })
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            let rejection = ExecRejection::PolicyDenied(DenyReason::CommandNotAllowed {
-                command: err.to_string(),
-            });
-            let _ = emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await;
+    let client = client.clone();
+    let room = room.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let result = run_controlled_exec(&request, &allowance).await;
+        remove_live_exec_control(&request.invocation_id);
+        let output = match result {
+            Ok(ControlledExecResult::Finished(output)) => output,
+            Ok(ControlledExecResult::Cancelled {
+                mut output,
+                killed_process_group,
+            }) => {
+                emit_output_events(
+                    &client,
+                    &room,
+                    &request.invocation_id,
+                    &output.stdout,
+                    &output.stderr,
+                    &allowance,
+                )
+                .await;
+                let finished_at = rfc3339_now();
+                let _ = emit_exec_cancelled(
+                    &room,
+                    request.invocation_id.clone(),
+                    crate::runner::CANCEL_SIGNAL,
+                    killed_process_group,
+                    finished_at.clone(),
+                )
+                .await;
+                state.state = crate::invocation::STATE_CANCELLED.to_string();
+                state.exit_code = output.exit_code;
+                state.updated_at = finished_at;
+                state.state_rev = state.state_rev.saturating_add(1);
+                let _ = publish_invocation_state(&room, &state).await;
+                output.stdout.clear();
+                output.stderr.clear();
+                return;
+            }
+            Err(err) => {
+                let rejection = ExecRejection::PolicyDenied(DenyReason::CommandNotAllowed {
+                    command: err.to_string(),
+                });
+                let _ = emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await;
+                return;
+            }
+        };
+
+        emit_output_events(
+            &client,
+            &room,
+            &request.invocation_id,
+            &output.stdout,
+            &output.stderr,
+            &allowance,
+        )
+        .await;
+
+        let exit_code = output.exit_code;
+        let finished = ExecFinished {
+            invocation_id: request.invocation_id.clone(),
+            exit_code,
+            signal: output.signal.and_then(signal_name),
+            duration_ms: started.elapsed().as_millis() as u64,
+            stdout_bytes: output.stdout.len() as u64,
+            stderr_bytes: output.stderr.len() as u64,
+            truncated: false,
+            artifact_mxc: None,
+            extra: Default::default(),
+        };
+        if let Ok(content) = serde_json::to_value(&finished) {
+            if let Err(e) = room.send_raw(EXEC_FINISHED, content).await {
+                tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.finished");
+            }
+        }
+
+        state.state = match exit_code {
+            Some(code) => crate::invocation::terminal_state_for_exit(code).to_string(),
+            None => crate::invocation::STATE_FAILED.to_string(),
+        };
+        state.exit_code = exit_code;
+        state.updated_at = rfc3339_now();
+        state.state_rev = state.state_rev.saturating_add(1);
+        let _ = publish_invocation_state(&room, &state).await;
+    });
+}
+
+/// Handle a routed signed stdin frame for a live invocation running on this daemon.
+pub async fn handle_live_exec_stdin(
+    room: &Room,
+    paths: &crate::SessionPaths,
+    content: &Value,
+    stdin: &ExecStdin,
+) {
+    let Some(control) = live_exec_control(&stdin.invocation_id) else {
+        return;
+    };
+    let Ok(agent_id) = authorize_live_control(room, paths, content, &stdin.signature.key_id).await
+    else {
+        tracing::warn!(invocation_id = %stdin.invocation_id, "rejected unauthorized exec stdin control");
+        return;
+    };
+    if agent_id != control.requester_agent {
+        tracing::warn!(invocation_id = %stdin.invocation_id, "rejected exec stdin from non-owner agent");
+        return;
+    }
+    use base64::Engine as _;
+    let data = match base64::engine::general_purpose::STANDARD.decode(&stdin.data) {
+        Ok(data) => data,
+        Err(_) => {
+            tracing::warn!(invocation_id = %stdin.invocation_id, "rejected malformed exec stdin data");
             return;
         }
     };
-
-    emit_output_events(
-        client,
-        &room,
-        &request.invocation_id,
-        &output.stdout,
-        &output.stderr,
-        &allowance,
-    )
-    .await;
-
-    let exit_code = output.exit_code;
-    let finished = ExecFinished {
-        invocation_id: request.invocation_id.clone(),
-        exit_code,
-        signal: output.signal.and_then(signal_name),
-        duration_ms: 0,
-        stdout_bytes: output.stdout.len() as u64,
-        stderr_bytes: output.stderr.len() as u64,
-        truncated: false,
-        artifact_mxc: None,
-        extra: Default::default(),
-    };
-    if let Ok(content) = serde_json::to_value(&finished) {
-        if let Err(e) = room.send_raw(EXEC_FINISHED, content).await {
-            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.finished");
-        }
+    if !data.is_empty() && control.stdin.send(Some(data)).await.is_err() {
+        tracing::debug!(invocation_id = %stdin.invocation_id, "stdin receiver is closed");
     }
+    if stdin.eof {
+        let _ = control.stdin.send(None).await;
+    }
+}
 
-    state.state = match exit_code {
-        Some(code) => crate::invocation::terminal_state_for_exit(code).to_string(),
-        None => crate::invocation::STATE_FAILED.to_string(),
+/// Handle a routed signed cancellation for a live invocation running on this daemon.
+pub async fn handle_live_exec_cancel(
+    room: &Room,
+    paths: &crate::SessionPaths,
+    content: &Value,
+    cancel: &ExecCancel,
+) {
+    let Some(control) = live_exec_control(&cancel.invocation_id) else {
+        return;
     };
-    state.exit_code = exit_code;
-    state.updated_at = rfc3339_now();
-    state.state_rev = state.state_rev.saturating_add(1);
-    let _ = publish_invocation_state(&room, &state).await;
+    let Ok(agent_id) = authorize_live_control(room, paths, content, &cancel.signature.key_id).await
+    else {
+        tracing::warn!(invocation_id = %cancel.invocation_id, "rejected unauthorized exec cancel control");
+        return;
+    };
+    if agent_id != control.requester_agent {
+        tracing::warn!(invocation_id = %cancel.invocation_id, "rejected exec cancel from non-owner agent");
+        return;
+    }
+    let _ = control.cancel.send(Some(cancel.reason.clone()));
+}
+
+async fn authorize_live_control(
+    room: &Room,
+    paths: &crate::SessionPaths,
+    content: &Value,
+    key_id: &str,
+) -> Result<String, ()> {
+    let agents = crate::agent::read_all_agent_states(room)
+        .await
+        .map_err(|_| ())?;
+    let agent = agents
+        .into_iter()
+        .find(|agent| agent.signing_key_id == key_id)
+        .ok_or(())?;
+    let verifying_key = crate::call::verifying_key_from_agent_state(&agent).map_err(|_| ())?;
+    signing::verify(&verifying_key, content).map_err(|_| ())?;
+    let trust = TrustStore::load(paths).unwrap_or_default();
+    if !trust.is_key_trusted(key_id) {
+        return Err(());
+    }
+    Ok(agent.agent_id)
 }
 
 async fn authorize_live_exec(
@@ -671,6 +815,151 @@ async fn emit_output_events(
         }
     }
     let _ = capture.await;
+}
+
+enum ControlledExecResult {
+    Finished(RunOutput),
+    Cancelled {
+        output: RunOutput,
+        killed_process_group: bool,
+    },
+}
+
+async fn run_controlled_exec(
+    request: &ExecRequest,
+    allowance: &Allowance,
+) -> Result<ControlledExecResult, crate::runner::RunError> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<StdinFrame>(64);
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    insert_live_exec_control(
+        request.invocation_id.clone(),
+        LiveExecControl {
+            requester_agent: request.requesting_agent.clone(),
+            stdin: stdin_tx,
+            cancel: cancel_tx,
+        },
+    );
+
+    let spec = RunSpec {
+        command: request.command.clone(),
+        cwd: PathBuf::from(&request.cwd),
+        env: request.env.clone(),
+        env_allowlist: allowance.env_allowlist.clone(),
+        stdin: request.stdin.then(Vec::new),
+        timeout: Some(Duration::from_millis(
+            allowance.max_runtime_ms.unwrap_or(request.timeout_ms),
+        )),
+        sandbox: sandbox_backend(allowance.sandbox),
+        ..Default::default()
+    };
+    let mut command = build_command(&spec)?;
+    let mut child = command.spawn().map_err(crate::runner::RunError::Spawn)?;
+    let pid = child.id();
+
+    let stdin_task = if request.stdin {
+        child.stdin.take().map(|mut pipe| {
+            tokio::spawn(async move {
+                while let Some(frame) = stdin_rx.recv().await {
+                    match frame {
+                        Some(bytes) => {
+                            if pipe.write_all(&bytes).await.is_err() {
+                                break;
+                            }
+                            let _ = pipe.flush().await;
+                        }
+                        None => break,
+                    }
+                }
+            })
+        })
+    } else {
+        None
+    };
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let mut cancelled = false;
+    let mut killed_process_group = false;
+    let wait = child.wait();
+    tokio::pin!(wait);
+    let status = tokio::select! {
+        status = &mut wait => status.map_err(crate::runner::RunError::Spawn)?,
+        _ = cancel_rx.changed() => {
+            cancelled = true;
+            if let Some(pid) = pid {
+                terminate_process_group(pid);
+                match tokio::time::timeout(spec.grace_period, &mut wait).await {
+                    Ok(status) => status.map_err(crate::runner::RunError::Spawn)?,
+                    Err(_) => {
+                        killed_process_group = true;
+                        kill_process_group(pid);
+                        wait.await.map_err(crate::runner::RunError::Spawn)?
+                    }
+                }
+            } else {
+                wait.await.map_err(crate::runner::RunError::Spawn)?
+            }
+        }
+        _ = tokio::time::sleep(spec.timeout.unwrap_or(Duration::from_secs(u64::MAX))) => {
+            if let Some(pid) = pid {
+                terminate_process_group(pid);
+                match tokio::time::timeout(spec.grace_period, &mut wait).await {
+                    Ok(status) => status.map_err(crate::runner::RunError::Spawn)?,
+                    Err(_) => {
+                        kill_process_group(pid);
+                        wait.await.map_err(crate::runner::RunError::Spawn)?
+                    }
+                }
+            } else {
+                wait.await.map_err(crate::runner::RunError::Spawn)?
+            }
+        }
+    };
+
+    if let Some(task) = stdin_task {
+        let _ = task.await;
+    }
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal = None;
+    let output = RunOutput {
+        exit_code: status.code(),
+        signal,
+        stdout,
+        stderr,
+        timed_out: false,
+    };
+    if cancelled {
+        Ok(ControlledExecResult::Cancelled {
+            output,
+            killed_process_group,
+        })
+    } else {
+        Ok(ControlledExecResult::Finished(output))
+    }
 }
 
 fn sandbox_backend(sandbox: Option<Sandbox>) -> mx_agent_sandbox::Backend {
@@ -811,6 +1100,79 @@ impl std::fmt::Display for CancelRejection {
 }
 
 impl std::error::Error for CancelRejection {}
+
+/// Build and sign a `com.mxagent.exec.stdin.v1` content value.
+///
+/// `data` is base64 encoded inside the signed content; `eof` closes stdin after
+/// the target writes any bytes in this frame.
+pub fn build_signed_exec_stdin(
+    signing_key: &SigningKey,
+    key_id: impl Into<String>,
+    invocation_id: impl Into<String>,
+    data: &[u8],
+    eof: bool,
+    created_at: impl Into<String>,
+    nonce: impl Into<String>,
+) -> Result<Value, SignatureError> {
+    use base64::Engine as _;
+
+    let stdin = ExecStdin {
+        invocation_id: invocation_id.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(data),
+        eof,
+        created_at: created_at.into(),
+        nonce: nonce.into(),
+        signature: Signature {
+            alg: signing::ALG_ED25519.to_string(),
+            key_id: key_id.into(),
+            sig: String::new(),
+        },
+        extra: Default::default(),
+    };
+    let mut content = serde_json::to_value(&stdin).expect("ExecStdin serializes to a JSON object");
+    let key_id = stdin.signature.key_id;
+    signing::sign_into(signing_key, key_id, &mut content)?;
+    Ok(content)
+}
+
+/// Send a signed `com.mxagent.exec.stdin.v1` timeline event into `room`.
+pub async fn send_exec_stdin(
+    room: &Room,
+    signing_key: &SigningKey,
+    key_id: impl Into<String>,
+    invocation_id: impl Into<String>,
+    data: &[u8],
+    eof: bool,
+) -> Result<ExecStdin, WorkspaceError> {
+    let content = build_signed_exec_stdin(
+        signing_key,
+        key_id,
+        invocation_id,
+        data,
+        eof,
+        rfc3339_now(),
+        random_control_nonce(),
+    )
+    .expect("ExecStdin content is always a JSON object");
+    room.send_raw(EXEC_STDIN, content.clone())
+        .await
+        .map_err(WorkspaceError::from)?;
+    serde_json::from_value::<ExecStdin>(content)
+        .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))
+}
+
+fn random_control_nonce() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        bytes.copy_from_slice(&nanos.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
+}
 
 /// Build and sign a `com.mxagent.exec.cancel.v1` content value.
 ///

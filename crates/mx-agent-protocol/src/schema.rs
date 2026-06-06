@@ -136,6 +136,26 @@ pub struct ExecFinished {
     pub extra: Extra,
 }
 
+/// `com.mxagent.exec.stdin.v1` content (architecture §7.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecStdin {
+    /// Invocation identifier.
+    pub invocation_id: String,
+    /// Base64-encoded stdin bytes. Empty when this event only closes stdin.
+    pub data: String,
+    /// Whether this chunk closes stdin after any data is written.
+    pub eof: bool,
+    /// Creation timestamp (RFC 3339).
+    pub created_at: String,
+    /// Random nonce (base64).
+    pub nonce: String,
+    /// Detached signature.
+    pub signature: Signature,
+    /// Forward-compatible unknown fields.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 /// `com.mxagent.exec.cancel.v1` content (architecture §7.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecCancel {
@@ -855,6 +875,18 @@ mod tests {
         assert_eq!(parsed.cols, 80);
         assert_eq!(parsed.pixel_width, 0);
         assert_eq!(parsed.pixel_height, 0);
+    }
+
+    #[test]
+    fn exec_stdin_round_trips() {
+        assert_round_trip::<ExecStdin>(json!({
+            "invocation_id": "inv_01HZ",
+            "data": "aGVsbG8K",
+            "eof": true,
+            "created_at": "2026-06-02T12:01:00Z",
+            "nonce": "base64-random",
+            "signature": { "alg": "ed25519", "key_id": "mxagent-ed25519:abc123", "sig": "base64" }
+        }));
     }
 
     #[test]

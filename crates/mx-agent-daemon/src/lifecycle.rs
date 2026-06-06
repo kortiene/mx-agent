@@ -450,17 +450,11 @@ fn dispatch(
             Err(response) => *response,
         },
         "exec.stdin" => match parse_params::<crate::ExecStdinParams>(req) {
-            Ok(params) => match serde_json::to_value(crate::handle_exec_stdin_loopback(&params)) {
-                Ok(value) => Response::result(req.id.clone(), value),
-                Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
-            },
+            Ok(params) => dispatch_exec_stdin(req, &params),
             Err(response) => *response,
         },
         "exec.cancel" => match parse_params::<crate::ExecCancelParams>(req) {
-            Ok(params) => match serde_json::to_value(crate::handle_exec_cancel_loopback(&params)) {
-                Ok(value) => Response::result(req.id.clone(), value),
-                Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
-            },
+            Ok(params) => dispatch_exec_cancel(req, &params),
             Err(response) => *response,
         },
         "task.create" => match parse_params::<crate::CreateTaskOptions>(req) {
@@ -541,6 +535,47 @@ fn dispatch_call_start(req: &Request, params: &crate::CallStartParams) -> Respon
     match serde_json::to_value(&result) {
         Ok(value) => Response::result(req.id.clone(), value),
         Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+    }
+}
+
+fn dispatch_exec_control_result(req: &Request, result: crate::ExecControlResult) -> Response {
+    match serde_json::to_value(&result) {
+        Ok(value) => Response::result(req.id.clone(), value),
+        Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+    }
+}
+
+fn control_runtime(_req: &Request) -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start async runtime: {e}"))
+}
+
+fn dispatch_exec_stdin(req: &Request, params: &crate::ExecStdinParams) -> Response {
+    if params.room.is_some() {
+        let runtime = match control_runtime(req) {
+            Ok(runtime) => runtime,
+            Err(message) => return Response::error(req.id.clone(), INTERNAL_ERROR, message),
+        };
+        dispatch_exec_control_result(req, runtime.block_on(crate::send_exec_stdin_matrix(params)))
+    } else {
+        dispatch_exec_control_result(req, crate::handle_exec_stdin_loopback(params))
+    }
+}
+
+fn dispatch_exec_cancel(req: &Request, params: &crate::ExecCancelParams) -> Response {
+    if params.room.is_some() {
+        let runtime = match control_runtime(req) {
+            Ok(runtime) => runtime,
+            Err(message) => return Response::error(req.id.clone(), INTERNAL_ERROR, message),
+        };
+        dispatch_exec_control_result(
+            req,
+            runtime.block_on(crate::send_exec_cancel_matrix(params)),
+        )
+    } else {
+        dispatch_exec_control_result(req, crate::handle_exec_cancel_loopback(params))
     }
 }
 

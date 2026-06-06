@@ -384,6 +384,26 @@ async fn handle_routed_events(
             RoutedEvent::ExecRequest(request) => {
                 crate::exec::handle_live_exec_request(client, paths, &meta, &request).await;
             }
+            RoutedEvent::ExecStdin(event) => {
+                if let Ok(room_id) = matrix_sdk::ruma::RoomId::parse(&meta.room_id) {
+                    if let Some(room) = client.get_room(&room_id) {
+                        if let Ok(content) = serde_json::to_value(&*event) {
+                            crate::exec::handle_live_exec_stdin(&room, paths, &content, &event)
+                                .await;
+                        }
+                    }
+                }
+            }
+            RoutedEvent::ExecCancel(event) => {
+                if let Ok(room_id) = matrix_sdk::ruma::RoomId::parse(&meta.room_id) {
+                    if let Some(room) = client.get_room(&room_id) {
+                        if let Ok(content) = serde_json::to_value(&*event) {
+                            crate::exec::handle_live_exec_cancel(&room, paths, &content, &event)
+                                .await;
+                        }
+                    }
+                }
+            }
             RoutedEvent::CallRequest(request) => {
                 crate::call::handle_live_call_request(client, paths, &meta, &request).await;
             }

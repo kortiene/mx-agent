@@ -155,6 +155,9 @@ pub struct ExecStartResult {
 /// Parameters for the `exec.stdin` IPC method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecStdinParams {
+    /// Workspace room that owns the live invocation.
+    #[serde(default)]
+    pub room: Option<String>,
     /// Invocation receiving stdin.
     pub invocation_id: String,
     /// Raw stdin bytes for this frame.
@@ -168,6 +171,9 @@ pub struct ExecStdinParams {
 /// Parameters for the `exec.cancel` IPC method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecCancelParams {
+    /// Workspace room that owns the live invocation.
+    #[serde(default)]
+    pub room: Option<String>,
     /// Invocation to cancel.
     pub invocation_id: String,
     /// Human-readable cancellation reason.
@@ -224,6 +230,110 @@ pub fn handle_exec_cancel_loopback(params: &ExecCancelParams) -> ExecControlResu
         accepted: false,
         message: "exec.cancel is only available for live streaming exec invocations".to_string(),
     }
+}
+
+/// Send an `exec.stdin` IPC request over Matrix when `room` is supplied.
+///
+/// Without `room`, this preserves the local loopback response (`accepted:
+/// false`) because synchronous local exec has no live stdin pipe.
+pub async fn send_exec_stdin_matrix(params: &ExecStdinParams) -> ExecControlResult {
+    let Some(room_target) = params.room.as_deref() else {
+        return handle_exec_stdin_loopback(params);
+    };
+    match send_control_room(room_target).await {
+        Ok((room, signing)) => match crate::send_exec_stdin(
+            &room,
+            signing.signing_key(),
+            signing.key_id(),
+            &params.invocation_id,
+            &params.data,
+            params.eof,
+        )
+        .await
+        {
+            Ok(_) => ExecControlResult {
+                invocation_id: params.invocation_id.clone(),
+                accepted: true,
+                message: "stdin sent over Matrix".to_string(),
+            },
+            Err(e) => ExecControlResult {
+                invocation_id: params.invocation_id.clone(),
+                accepted: false,
+                message: e.to_string(),
+            },
+        },
+        Err(message) => ExecControlResult {
+            invocation_id: params.invocation_id.clone(),
+            accepted: false,
+            message,
+        },
+    }
+}
+
+/// Send an `exec.cancel` IPC request over Matrix when `room` is supplied.
+///
+/// Without `room`, this preserves the local loopback response (`accepted:
+/// false`) because synchronous local exec has no live process handle.
+pub async fn send_exec_cancel_matrix(params: &ExecCancelParams) -> ExecControlResult {
+    let Some(room_target) = params.room.as_deref() else {
+        return handle_exec_cancel_loopback(params);
+    };
+    match send_control_room(room_target).await {
+        Ok((room, signing)) => match crate::send_exec_cancel(
+            &room,
+            signing.signing_key(),
+            signing.key_id(),
+            &params.invocation_id,
+            params.reason.as_deref().unwrap_or("cancelled by operator"),
+            rfc3339_after(Duration::ZERO),
+            generate_request_id(),
+        )
+        .await
+        {
+            Ok(_) => ExecControlResult {
+                invocation_id: params.invocation_id.clone(),
+                accepted: true,
+                message: "cancel sent over Matrix".to_string(),
+            },
+            Err(e) => ExecControlResult {
+                invocation_id: params.invocation_id.clone(),
+                accepted: false,
+                message: e.to_string(),
+            },
+        },
+        Err(message) => ExecControlResult {
+            invocation_id: params.invocation_id.clone(),
+            accepted: false,
+            message,
+        },
+    }
+}
+
+async fn send_control_room(
+    room_target: &str,
+) -> Result<(matrix_sdk::Room, crate::signing::DaemonSigningKey), String> {
+    use matrix_sdk::config::SyncSettings;
+
+    let paths = crate::SessionPaths::resolve();
+    let session = crate::load_session(&paths)
+        .map_err(|e| format!("could not read daemon session: {e}"))?
+        .ok_or_else(|| "not logged in; run `mx-agent auth login` first".to_string())?;
+    let client = crate::matrix::restore_client(&session)
+        .await
+        .map_err(|e| e.to_string())?;
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .map_err(|e| e.to_string())?;
+    let id = crate::workspace::parse_room_or_alias(room_target).map_err(|e| e.to_string())?;
+    let room_id = crate::workspace::resolve_room_id(&client, &id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let room = client
+        .get_room(&room_id)
+        .ok_or_else(|| format!("room not found: {room_target}"))?;
+    let signing = crate::load_or_create_signing_key(&paths).map_err(|e| e.to_string())?;
+    Ok((room, signing))
 }
 
 /// Map a Unix signal number to its name, for reporting signal death.
@@ -304,12 +414,6 @@ async fn start_exec_matrix_inner(
     let Some(target_agent) = params.agent.clone() else {
         return Err("remote exec requires --agent".to_string());
     };
-    if params.stdin.is_some() {
-        return Err(
-            "remote exec stdin is implemented in the follow-up stdin/cancel path".to_string(),
-        );
-    }
-
     let paths = crate::SessionPaths::resolve();
     let session = crate::load_session(&paths)
         .map_err(|e| format!("could not read daemon session: {e}"))?
@@ -352,7 +456,7 @@ async fn start_exec_matrix_inner(
         command: params.command.clone(),
         cwd,
         env: Default::default(),
-        stdin: false,
+        stdin: params.stdin.is_some(),
         stream: params.stream,
         pty: params.pty,
         timeout_ms: 600_000,
@@ -375,6 +479,18 @@ async fn start_exec_matrix_inner(
     room.send_raw(EXEC_REQUEST, content)
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(stdin) = &params.stdin {
+        crate::send_exec_stdin(
+            &room,
+            signing.signing_key(),
+            signing.key_id(),
+            invocation_id,
+            stdin,
+            true,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
 
     let mut frames = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -681,6 +797,7 @@ mod tests {
     #[test]
     fn stdin_and_cancel_loopback_return_stable_not_live_result() {
         let stdin = handle_exec_stdin_loopback(&ExecStdinParams {
+            room: None,
             invocation_id: "inv_1".to_string(),
             data: b"hello".to_vec(),
             eof: true,
@@ -690,6 +807,7 @@ mod tests {
         assert!(stdin.message.contains("live streaming"));
 
         let cancel = handle_exec_cancel_loopback(&ExecCancelParams {
+            room: None,
             invocation_id: "inv_1".to_string(),
             reason: Some("test".to_string()),
         });

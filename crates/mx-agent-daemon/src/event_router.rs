@@ -38,7 +38,7 @@ use serde_json::Value;
 use mx_agent_protocol::events::{state, timeline};
 use mx_agent_protocol::schema::{
     ApprovalDecision, ApprovalRequest, CallRequest, CallResponse, ExecAccepted, ExecCancel,
-    ExecCancelled, ExecFinished, ExecRejected, ExecRequest, Heartbeat, InvocationState,
+    ExecCancelled, ExecFinished, ExecRejected, ExecRequest, ExecStdin, Heartbeat, InvocationState,
     StreamArtifact, StreamChunk, TaskState,
 };
 
@@ -99,6 +99,8 @@ pub enum EventCategory {
     ExecRejected,
     /// `com.mxagent.exec.finished.v1`.
     ExecFinished,
+    /// `com.mxagent.exec.stdin.v1` (privileged).
+    ExecStdin,
     /// `com.mxagent.exec.cancel.v1` (privileged).
     ExecCancel,
     /// `com.mxagent.exec.cancelled.v1`.
@@ -131,6 +133,7 @@ impl EventCategory {
             Self::ExecAccepted => "exec.accepted",
             Self::ExecRejected => "exec.rejected",
             Self::ExecFinished => "exec.finished",
+            Self::ExecStdin => "exec.stdin",
             Self::ExecCancel => "exec.cancel",
             Self::ExecCancelled => "exec.cancelled",
             Self::CallRequest => "call.request",
@@ -153,7 +156,7 @@ impl EventCategory {
     pub fn is_privileged(self) -> bool {
         matches!(
             self,
-            Self::ExecRequest | Self::ExecCancel | Self::CallRequest
+            Self::ExecRequest | Self::ExecStdin | Self::ExecCancel | Self::CallRequest
         )
     }
 }
@@ -166,6 +169,7 @@ pub fn classify(event_type: &str) -> Option<EventCategory> {
         timeline::EXEC_ACCEPTED => EventCategory::ExecAccepted,
         timeline::EXEC_REJECTED => EventCategory::ExecRejected,
         timeline::EXEC_FINISHED => EventCategory::ExecFinished,
+        timeline::EXEC_STDIN => EventCategory::ExecStdin,
         timeline::EXEC_CANCEL => EventCategory::ExecCancel,
         timeline::EXEC_CANCELLED => EventCategory::ExecCancelled,
         timeline::CALL_REQUEST => EventCategory::CallRequest,
@@ -195,6 +199,8 @@ pub enum RoutedEvent {
     ExecRejected(ExecRejected),
     /// An exec invocation finished.
     ExecFinished(Box<ExecFinished>),
+    /// A privileged request to send stdin to a running exec invocation.
+    ExecStdin(Box<ExecStdin>),
     /// A privileged request to cancel a running exec invocation.
     ExecCancel(Box<ExecCancel>),
     /// An exec invocation was cancelled.
@@ -227,6 +233,7 @@ impl RoutedEvent {
             Self::ExecAccepted(_) => EventCategory::ExecAccepted,
             Self::ExecRejected(_) => EventCategory::ExecRejected,
             Self::ExecFinished(_) => EventCategory::ExecFinished,
+            Self::ExecStdin(_) => EventCategory::ExecStdin,
             Self::ExecCancel(_) => EventCategory::ExecCancel,
             Self::ExecCancelled(_) => EventCategory::ExecCancelled,
             Self::CallRequest(_) => EventCategory::CallRequest,
@@ -343,6 +350,7 @@ fn parse_routed(category: EventCategory, content: &Value) -> Option<RoutedEvent>
         EventCategory::ExecAccepted => RoutedEvent::ExecAccepted(parse(content)?),
         EventCategory::ExecRejected => RoutedEvent::ExecRejected(parse(content)?),
         EventCategory::ExecFinished => RoutedEvent::ExecFinished(Box::new(parse(content)?)),
+        EventCategory::ExecStdin => RoutedEvent::ExecStdin(Box::new(parse(content)?)),
         EventCategory::ExecCancel => RoutedEvent::ExecCancel(Box::new(parse(content)?)),
         EventCategory::ExecCancelled => RoutedEvent::ExecCancelled(Box::new(parse(content)?)),
         EventCategory::CallRequest => RoutedEvent::CallRequest(Box::new(parse(content)?)),
@@ -548,7 +556,7 @@ mod tests {
             .chain(state::ALL.iter())
             .filter(|ty| classify(ty).is_some())
             .count();
-        assert_eq!(routed_count, 15);
+        assert_eq!(routed_count, 16);
     }
 
     #[test]
