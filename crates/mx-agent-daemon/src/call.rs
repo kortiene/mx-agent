@@ -107,12 +107,22 @@ fn read_signature(content: &Value) -> Result<Option<Signature>, CallRejection> {
     }
 }
 
+/// Default validity window for a freshly built call request, matching the
+/// `exec.request` 5-minute window. The request's `expires_at` is stamped this
+/// far ahead of `created_at`; the target rejects it after that.
+pub const CALL_REQUEST_TTL: Duration = Duration::from_secs(300);
+
 /// Build and sign a `com.mxagent.call.request.v1` content value.
 ///
 /// Constructs a [`CallRequest`] for `tool` with `args`, then signs the content
 /// with `signing_key`, embedding the detached signature under the `signature`
 /// field. The returned JSON value is ready to be sent as the timeline event's
 /// content.
+///
+/// A fresh `nonce` and the `created_at`/`expires_at` timestamps (the latter
+/// [`CALL_REQUEST_TTL`] ahead of now) are stamped automatically and covered by
+/// the signature, so the target can replay/expiry-check the request just like an
+/// `exec.request`.
 pub fn build_signed_call_request(
     signing_key: &SigningKey,
     key_id: impl Into<String>,
@@ -121,11 +131,17 @@ pub fn build_signed_call_request(
     tool: impl Into<String>,
     args: Value,
 ) -> Result<Value, SignatureError> {
+    let nonce = mx_agent_protocol::id::generate_request_id();
+    let created_at = crate::exec_ipc::rfc3339_after(Duration::ZERO);
+    let expires_at = crate::exec_ipc::rfc3339_after(CALL_REQUEST_TTL);
     build_signed_call_request_for_target(
         signing_key,
         key_id,
         invocation_id,
         request_id,
+        nonce,
+        created_at,
+        expires_at,
         tool,
         args,
         CallTargeting::default(),
@@ -142,11 +158,19 @@ pub struct CallTargeting {
 }
 
 /// Build and sign a targeted live Matrix call request.
+///
+/// `nonce`, `created_at`, and `expires_at` are taken explicitly (mirroring
+/// [`crate::build_signed_exec_request`]) so callers control replay/expiry timing;
+/// they are part of the signed canonical content.
+#[allow(clippy::too_many_arguments)]
 pub fn build_signed_call_request_for_target(
     signing_key: &SigningKey,
     key_id: impl Into<String>,
     invocation_id: impl Into<String>,
     request_id: impl Into<String>,
+    nonce: impl Into<String>,
+    created_at: impl Into<String>,
+    expires_at: impl Into<String>,
     tool: impl Into<String>,
     args: Value,
     targeting: CallTargeting,
@@ -159,6 +183,9 @@ pub fn build_signed_call_request_for_target(
         request_id: request_id.into(),
         tool: tool.into(),
         args,
+        created_at: created_at.into(),
+        expires_at: expires_at.into(),
+        nonce: nonce.into(),
         signature: Signature {
             alg: signing::ALG_ED25519.to_string(),
             key_id: key_id.into(),
@@ -439,11 +466,17 @@ async fn start_call_matrix_inner(
         .ok_or_else(|| "local agent is not registered in the target room".to_string())?;
 
     let signing = load_or_create_signing_key(&paths).map_err(|e| e.to_string())?;
+    let nonce = mx_agent_protocol::id::generate_request_id();
+    let created_at = crate::exec_ipc::rfc3339_after(Duration::ZERO);
+    let expires_at = crate::exec_ipc::rfc3339_after(CALL_REQUEST_TTL);
     let content = build_signed_call_request_for_target(
         signing.signing_key(),
         signing.key_id(),
         invocation_id,
         request_id,
+        nonce,
+        created_at,
+        expires_at,
         params.tool.clone(),
         params.input.clone(),
         CallTargeting {
@@ -673,6 +706,9 @@ allow_tools = ["run_tests", "lint"]
             key_id_for(&key),
             "inv_01HZ",
             "req_01HZ",
+            "nonce-1",
+            "2026-06-02T12:00:00Z",
+            "2026-06-02T12:05:00Z",
             "run_tests",
             json!({ "package": "api" }),
             CallTargeting {
@@ -779,6 +815,64 @@ allow_tools = ["run_tests", "lint"]
         let mut content = signed_request(&key, "run_tests");
         // Tamper with a signed field after signing.
         content["args"]["package"] = json!("prod");
+        let trust = trust_with(&key_id_for(&key));
+        let err = authorize_call_request(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &policy(),
+            ROOM,
+            AGENT,
+        )
+        .unwrap_err();
+        assert_eq!(err, CallRejection::InvalidSignature);
+    }
+
+    #[test]
+    fn built_request_carries_nonce_and_expiry() {
+        // Every built call request must carry replay/expiry fields so the router
+        // can guard it like an exec.request.
+        let key = test_key();
+        let content = signed_request(&key, "run_tests");
+        let request: CallRequest = serde_json::from_value(content).unwrap();
+        assert!(!request.nonce.is_empty(), "nonce must be populated");
+        assert!(
+            !request.created_at.is_empty(),
+            "created_at must be populated"
+        );
+        assert!(
+            !request.expires_at.is_empty(),
+            "expires_at must be populated"
+        );
+    }
+
+    #[test]
+    fn tampered_nonce_fails_signature_check() {
+        // The nonce is part of the signed content: replacing it after signing
+        // (a replay attempt with a fresh nonce) invalidates the signature.
+        let key = test_key();
+        let mut content = signed_request(&key, "run_tests");
+        content["nonce"] = json!("attacker-supplied-nonce");
+        let trust = trust_with(&key_id_for(&key));
+        let err = authorize_call_request(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &policy(),
+            ROOM,
+            AGENT,
+        )
+        .unwrap_err();
+        assert_eq!(err, CallRejection::InvalidSignature);
+    }
+
+    #[test]
+    fn tampered_expiry_fails_signature_check() {
+        // `expires_at` is signed too, so an attacker cannot extend a captured
+        // request's validity window without breaking the signature.
+        let key = test_key();
+        let mut content = signed_request(&key, "run_tests");
+        content["expires_at"] = json!("2099-01-01T00:00:00Z");
         let trust = trust_with(&key_id_for(&key));
         let err = authorize_call_request(
             &content,
@@ -920,6 +1014,9 @@ allow_tools = ["run_tests", "lint"]
             request_id: "req_01HZ".to_string(),
             tool: "definitely_not_a_tool".to_string(),
             args: json!({}),
+            created_at: "2026-06-02T12:00:00Z".to_string(),
+            expires_at: "2026-06-02T12:05:00Z".to_string(),
+            nonce: "nonce-x".to_string(),
             signature: Signature {
                 alg: signing::ALG_ED25519.to_string(),
                 key_id: "k".to_string(),

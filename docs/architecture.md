@@ -1054,8 +1054,9 @@ event passes, so it is deliberately conservative:
   classification, so an opaque payload can never reach authorization;
 - **unknown** event types are ignored and **malformed** content is rejected
   without panicking and without dispatch;
-- privileged `exec.request` events are **replay/expiry-checked** through the
-  persistent replay cache before dispatch;
+- privileged `exec.request` and `call.request` events are
+  **replay/expiry-checked** through the persistent replay cache before dispatch
+  (both carry a signed `nonce` and `expires_at`);
 - only non-sensitive metadata is logged (event type, room, sender, IDs,
   category, reason) — never event content.
 

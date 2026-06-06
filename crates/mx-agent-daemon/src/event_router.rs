@@ -22,8 +22,9 @@
 //!   its declared type is rejected ([`RouteOutcome::Malformed`]) without a panic
 //!   and without calling a handler.
 //! - **Privileged requests are replay-checked.** A privileged
-//!   `com.mxagent.exec.request.v1` is admitted through the persistent
-//!   [`ReplayCache`] (expiry + nonce replay) before it is dispatched.
+//!   `com.mxagent.exec.request.v1` or `com.mxagent.call.request.v1` is admitted
+//!   through the persistent [`ReplayCache`] (expiry + nonce replay) before it is
+//!   dispatched.
 //! - **No payloads are logged.** Callers should log only the event type, room,
 //!   sender, event id, and [`RouteOutcome`] — never the event content.
 //!
@@ -316,12 +317,18 @@ impl EventRouter {
         };
 
         // 4. Replay/expiry-check privileged execution requests before dispatch.
-        //    `exec.request` carries both a nonce and `expires_at`, so it is the
-        //    canonical request the replay cache guards here; `exec.cancel` /
-        //    `call.request` are dispatched to handlers that enforce their own
-        //    signature/nonce checks (architecture §9.2, §13).
-        if let RoutedEvent::ExecRequest(req) = &routed {
-            if self.replay.admit(&req.nonce, &req.expires_at).is_err() {
+        //    Both `exec.request` and `call.request` carry a `nonce` and
+        //    `expires_at` in their signed content, so the replay cache guards
+        //    them here before any handler runs (architecture §9.2, §13). Other
+        //    privileged controls (e.g. `exec.cancel`) are scoped to a live
+        //    invocation and enforce ownership/signature in their own handlers.
+        let replay = match &routed {
+            RoutedEvent::ExecRequest(req) => Some((req.nonce.as_str(), req.expires_at.as_str())),
+            RoutedEvent::CallRequest(req) => Some((req.nonce.as_str(), req.expires_at.as_str())),
+            _ => None,
+        };
+        if let Some((nonce, expires_at)) = replay {
+            if self.replay.admit(nonce, expires_at).is_err() {
                 return RouteOutcome::ReplayRejected(category);
             }
         }
@@ -534,6 +541,21 @@ mod tests {
         })
     }
 
+    fn call_request_content(nonce: &str, expires_at: &str) -> Value {
+        json!({
+            "invocation_id": "inv_1",
+            "request_id": "req_1",
+            "tool": "run_tests",
+            "args": { "package": "api" },
+            "created_at": "2026-06-02T12:00:00Z",
+            "expires_at": expires_at,
+            "nonce": nonce,
+            "requesting_agent": "claude-local",
+            "target_agent": "developer-pi",
+            "signature": signature(),
+        })
+    }
+
     #[test]
     fn classify_maps_every_supported_type() {
         assert_eq!(
@@ -710,6 +732,47 @@ mod tests {
         );
         drop(sink);
         assert_eq!(rec.dispatched, vec![EventCategory::ExecRequest]);
+    }
+
+    #[test]
+    fn valid_call_request_dispatches_once_then_replay_is_rejected() {
+        // Parallels the exec.request replay test: a signed call.request is
+        // admitted once, and a byte-identical re-send (replay) is rejected by the
+        // router before it can reach the call handler a second time.
+        let (mut router, _data) = router("call-replay");
+        let mut rec = Recorder::default();
+        let ev = incoming(
+            timeline::CALL_REQUEST,
+            call_request_content("call-nonce-x", "2099-01-01T00:00:00Z"),
+        );
+        let mut sink = rec.sink();
+        assert_eq!(
+            router.route(&ev, &mut sink),
+            RouteOutcome::Dispatched(EventCategory::CallRequest)
+        );
+        assert_eq!(
+            router.route(&ev, &mut sink),
+            RouteOutcome::ReplayRejected(EventCategory::CallRequest)
+        );
+        drop(sink);
+        assert_eq!(rec.dispatched, vec![EventCategory::CallRequest]);
+    }
+
+    #[test]
+    fn expired_call_request_is_rejected() {
+        let (mut router, _data) = router("call-expired");
+        let mut rec = Recorder::default();
+        let ev = incoming(
+            timeline::CALL_REQUEST,
+            call_request_content("call-nonce-e", "1971-01-01T00:00:00Z"),
+        );
+        let mut sink = rec.sink();
+        assert_eq!(
+            router.route(&ev, &mut sink),
+            RouteOutcome::ReplayRejected(EventCategory::CallRequest)
+        );
+        drop(sink);
+        assert!(rec.dispatched.is_empty());
     }
 
     #[test]
