@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python adw/issues.py",
         description="Deliver several issues in order, or (--print-prompt) render the /issues workflow.",
-        epilog="Everything after `--` is forwarded to each issue.py run (or, with --print-prompt, used as shared notes).",
+        epilog="Everything after `--` is forwarded to the runner (or, with --print-prompt, used as shared notes).",
     )
     parser.add_argument("specs", nargs="*", help="issue selectors: single IDs (12) and ranges (12-15, 12..15)")
     parser.add_argument("--runner", help="forward --runner to issue.py (pi|claude)")
@@ -141,7 +141,9 @@ def run_batch(args: argparse.Namespace, issues: list[int], tail: Sequence[str]) 
         for index, number in enumerate(issues, start=1):
             print(file=sys.stderr)
             note(f"[{index}/{total}] === issue #{number} ===")
-            argv = [str(number), *flags, *tail]
+            # Re-insert `--` so issue.py forwards the tail to the runner rather
+            # than parsing it as its own flags.
+            argv = [str(number), *flags] + (["--", *tail] if tail else [])
 
             if args.dry_run:
                 print("[dry-run] python adw/issue.py " + " ".join(argv))

@@ -90,6 +90,15 @@ class BatchExecutionTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(len(calls), 2)
 
+    def test_tail_after_separator_is_forwarded_to_runner(self) -> None:
+        # `-- <flags>` must reach issue.py after a `--` so they pass to the runner,
+        # not get parsed as issue.py's own flags.
+        code, calls = self._run(
+            ["221", "--runner", "claude", "--yes", "--", "--dangerously-skip-permissions"], lambda a: 0
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [["221", "--runner", "claude", "--yes", "--", "--dangerously-skip-permissions"]])
+
 
 if __name__ == "__main__":
     unittest.main()

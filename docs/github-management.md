@@ -260,12 +260,13 @@ Processes several issues sequentially via `python adw/issue.py`, one fully compl
 ```bash
 python adw/issues.py 15 16 17                      # explicit list, stop on first failure
 python adw/issues.py 15-22                          # inclusive range (also N..M)
-python adw/issues.py 15..30 --keep-going -- --json --model sonnet:high
+python adw/issues.py 15..30 --keep-going --model sonnet:high   # forward --model to each run
 python adw/issues.py 15-30 --start 21               # resume from #21
 python adw/issues.py 15 16 18-20 --dry-run          # preview the plan
+python adw/issues.py 221 --runner claude -- --dangerously-skip-permissions   # flags after -- go to the runner
 ```
 
-It stops at the first failure by default (`--keep-going` to continue), supports number/range specs (expanded ascending and de-duplicated), forwards flags after `--` to each `issue.py` run, and prints a completed/failed summary (also on Ctrl-C). It confirms once for the whole batch (`--yes` to skip), holds a lock so only one batch runs at a time, and resumes at the first occurrence of a given issue with `--start <n>`. Because each run verifies closure and already-closed issues are skipped, a batch is also **resumable just by re-running it**; `--log-dir <dir>` is forwarded to each run. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
+It stops at the first failure by default (`--keep-going` to continue), supports number/range specs (expanded ascending and de-duplicated), forwards flags after `--` to the runner (e.g. `-- --dangerously-skip-permissions` for claude), and prints a completed/failed summary (also on Ctrl-C). It confirms once for the whole batch (`--yes` to skip), holds a lock so only one batch runs at a time, and resumes at the first occurrence of a given issue with `--start <n>`. Because each run verifies closure and already-closed issues are skipped, a batch is also **resumable just by re-running it**; `--log-dir <dir>` is forwarded to each run. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
 
 Requirements: the chosen runner (`pi` or `claude`) on `PATH` (or `PI_BIN`/`CLAUDE_BIN`), plus the same `gh`/`git`/`cargo` access the interactive workflow uses.
 
