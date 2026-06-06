@@ -9,6 +9,16 @@
 //! `exec`/`call` requests and authorizes them, and that a privileged event the
 //! daemon cannot decrypt never reaches authorization and so is not executed.
 //!
+//! The live orchestration tests (issue #202) run the real daemon paths against
+//! the homeserver: [`live_matrix_backed_remote_call_round_trips`] and
+//! [`live_matrix_backed_remote_exec_round_trips_and_denies`] cover signed
+//! remote `call`/`exec` (streaming, stdin, and policy denial), and
+//! [`live_scheduler_executes_signed_task_dag_and_denies`] drives the live
+//! daemon scheduler loop over real `com.mxagent.task.v1` room state — auto
+//! executing a signed, assigned task DAG (honoring dependencies), refusing a
+//! policy-denied action, and holding an approval-required action (fail closed)
+//! — so none of those spawn a process they should not.
+//!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
 //!
@@ -42,15 +52,17 @@ use serde_json::{json, Value};
 use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
-    build_signed_exec_request, load_or_create_signing_key, load_sync_token, login_password,
-    register_agent, restore_client, run_matrix_sync, run_matrix_sync_with_subscribers,
-    save_session, start_call_matrix, start_exec_matrix, BackoffConfig, CallOutcome,
-    CallStartParams, ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams,
-    ExecSubscriberRegistry, MatrixConfig, RegisterAgentOptions, SessionPaths, SyncHealth,
-    SyncState, TrustStore,
+    build_signed_exec_request, create_task, list_tasks, load_or_create_signing_key,
+    load_sync_token, login_password, register_agent, restore_client, run_matrix_sync,
+    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, sign_task_action,
+    start_call_matrix, start_exec_matrix, BackoffConfig, CallOutcome, CallStartParams,
+    CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
+    ExecStartParams, ExecSubscriberRegistry, ListTasksOptions, MatrixConfig, RegisterAgentOptions,
+    SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
+use mx_agent_protocol::schema::TaskAction;
 
 /// Read a required environment variable or fail with an actionable message.
 fn required_env(name: &str) -> String {
@@ -1012,4 +1024,372 @@ async fn daemon_e2ee_privileged_event_coverage() {
         .expect("alice sync task should join")
         .expect("alice sync loop should exit cleanly");
     bob_sync.abort();
+}
+
+/// Build a signed, exec-backed task assigned to [`TARGET_AGENT`].
+///
+/// The action is signed with the shared daemon signing key (`signing`) and
+/// addressed to the target agent, so the live scheduler's authorization
+/// (trust + signature + replay) admits it before policy and dispatch. `room` is
+/// filled in by [`create_task`] from the options.
+fn signed_exec_task(
+    room_id: &str,
+    task_id: &str,
+    command: &[&str],
+    cwd: &std::path::Path,
+    depends_on: Vec<String>,
+    signing: &DaemonSigningKey,
+    requester: &str,
+) -> CreateTaskOptions {
+    let unsigned = TaskAction::Exec {
+        command: command.iter().map(|s| s.to_string()).collect(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        env: BTreeMap::new(),
+        timeout_ms: Some(60_000),
+        stream: false,
+        authorization: None,
+    };
+    let auth = sign_task_action(
+        signing.signing_key(),
+        signing.key_id(),
+        task_id,
+        &unsigned,
+        requester,
+        TARGET_AGENT,
+        "2026-06-04T12:00:00Z",
+        "2099-01-01T00:00:00Z",
+        format!("sched-nonce-{task_id}"),
+    )
+    .expect("sign task action");
+    let action = match unsigned {
+        TaskAction::Exec {
+            command,
+            cwd,
+            env,
+            timeout_ms,
+            stream,
+            ..
+        } => TaskAction::Exec {
+            command,
+            cwd,
+            env,
+            timeout_ms,
+            stream,
+            authorization: Some(auth),
+        },
+        _ => unreachable!("exec action"),
+    };
+    CreateTaskOptions {
+        room: room_id.to_string(),
+        task_id: Some(task_id.to_string()),
+        title: task_id.to_string(),
+        description: String::new(),
+        state: None,
+        assigned_to: TARGET_AGENT.to_string(),
+        created_by: Some(requester.to_string()),
+        depends_on,
+        blocks: Vec::new(),
+        action: Some(action),
+    }
+}
+
+/// Live two-daemon orchestration: the daemon's scheduler loop auto-executes a
+/// signed, assigned task DAG over real Matrix room state, honoring dependencies
+/// and refusing a policy-denied action (issue #202).
+///
+/// This drives the real `#[199]` scheduler loop end to end against the live
+/// homeserver: Bob (the task creator/requester) publishes three signed
+/// `com.mxagent.task.v1` tasks assigned to Alice's agent; Alice runs her real
+/// `/sync` loop plus [`run_scheduler_loop`], which reads the tasks, authorizes
+/// them (trust + signature + replay), checks deny-by-default policy, claims with
+/// `state_rev`, dispatches locally, and finalizes them. The test asserts:
+///
+/// - the assigned `task-plan` auto-progresses to `succeeded`;
+/// - the dependent `task-test` runs only after `task-plan` succeeds; and
+/// - the policy-denied `task-denied` is `blocked` and its command never spawns
+///   (proven by a sentinel file that must not exist).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_scheduler_executes_signed_task_dag_and_denies() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("denied-ran");
+    let approval_sentinel = cwd.join("approval-ran");
+    // A distinct creator identity whose policy rule requires approval.
+    let approver = "@approver:mx-agent.test";
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login should succeed");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore should succeed");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login should succeed");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore should succeed");
+    let requester = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent live scheduler test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 4,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    // Trust the shared daemon signing key (both agents publish it) and allow the
+    // requester to run `sh` in the work dir. `touch` is deliberately not
+    // allowlisted, so `task-denied` is refused before any spawn.
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+
+[rooms."{room}".agents."{approver}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            agent = requester,
+            approver = approver,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    // Alice's real /sync loop keeps her room state (agents + tasks) fresh for
+    // the scheduler, which shares her client.
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    // Bob publishes the signed task DAG.
+    for opts in [
+        signed_exec_task(
+            room_id.as_str(),
+            "task-plan",
+            &["sh", "-c", "exit 0"],
+            &cwd,
+            Vec::new(),
+            &signing,
+            &requester,
+        ),
+        signed_exec_task(
+            room_id.as_str(),
+            "task-test",
+            &["sh", "-c", "exit 0"],
+            &cwd,
+            vec!["task-plan".to_string()],
+            &signing,
+            &requester,
+        ),
+        signed_exec_task(
+            room_id.as_str(),
+            "task-denied",
+            &["touch", sentinel.to_string_lossy().as_ref()],
+            &cwd,
+            Vec::new(),
+            &signing,
+            &requester,
+        ),
+        // Policy-allowed but `requires_approval`: with no approval gate wired,
+        // the live scheduler must fail closed and never run it.
+        signed_exec_task(
+            room_id.as_str(),
+            "task-approval",
+            &[
+                "sh",
+                "-c",
+                &format!("touch {}", approval_sentinel.to_string_lossy()),
+            ],
+            &cwd,
+            Vec::new(),
+            &signing,
+            approver,
+        ),
+    ] {
+        create_task(&bob, &opts)
+            .await
+            .unwrap_or_else(|e| panic!("create {}: {e}", opts.task_id.as_deref().unwrap_or("")));
+    }
+
+    // Run the real daemon scheduler loop on its own thread (it owns a
+    // current-thread runtime and shares Alice's client), driving tasks from the
+    // live room state.
+    let scheduler = {
+        let alice = alice.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            run_scheduler_loop(
+                alice,
+                ExecSubscriberRegistry::new(),
+                TaskDispatchMode::Local,
+                running,
+                Duration::from_secs(1),
+            );
+        })
+    };
+
+    // Poll the room's task state (via Bob) until the DAG settles or we time out.
+    let list_opts = ListTasksOptions {
+        room: room_id.to_string(),
+        state: None,
+        assigned_to: None,
+    };
+    let mut final_states: BTreeMap<String, String> = BTreeMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    loop {
+        if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+            final_states = tasks.into_iter().map(|t| (t.task_id, t.state)).collect();
+            let plan = final_states.get("task-plan").map(String::as_str);
+            let test = final_states.get("task-test").map(String::as_str);
+            let denied = final_states.get("task-denied").map(String::as_str);
+            if plan == Some("succeeded") && test == Some("succeeded") && denied == Some("blocked") {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Stop the scheduler and sync loops before tearing down the environment.
+    running.store(false, Ordering::SeqCst);
+    scheduler.join().expect("scheduler thread joins");
+    alice_sync
+        .await
+        .expect("alice sync task joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    assert_eq!(
+        final_states.get("task-plan").map(String::as_str),
+        Some("succeeded"),
+        "assigned task should auto-progress to succeeded; states: {final_states:?}"
+    );
+    assert_eq!(
+        final_states.get("task-test").map(String::as_str),
+        Some("succeeded"),
+        "dependent task should run only after its dependency succeeds; states: {final_states:?}"
+    );
+    assert_eq!(
+        final_states.get("task-denied").map(String::as_str),
+        Some("blocked"),
+        "policy-denied task must be blocked, not executed; states: {final_states:?}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "policy-denied task's command must never spawn (sentinel must not exist)"
+    );
+    // Approval safety: an action that requires approval is never executed by the
+    // gate-less live scheduler (fail closed), so its command never spawns.
+    assert_ne!(
+        final_states.get("task-approval").map(String::as_str),
+        Some("succeeded"),
+        "approval-required task must not be executed without approval; states: {final_states:?}"
+    );
+    assert!(
+        !approval_sentinel.exists(),
+        "approval-required task's command must never spawn without approval"
+    );
 }
