@@ -43,8 +43,9 @@ use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
     build_signed_exec_request, load_or_create_signing_key, load_sync_token, login_password,
-    restore_client, run_matrix_sync, BackoffConfig, ExecRequestOptions, MatrixConfig, SessionPaths,
-    SyncHealth, SyncState, TrustStore,
+    register_agent, restore_client, run_matrix_sync, save_session, start_call_matrix,
+    BackoffConfig, CallOutcome, CallStartParams, ExecRequestOptions, MatrixConfig,
+    RegisterAgentOptions, SessionPaths, SyncHealth, SyncState, TrustStore,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -295,10 +296,17 @@ async fn create_encrypted_room(client: &Client, name: &str) -> Room {
             ),
         }
     }
-    assert!(
-        room.encryption_state().is_encrypted(),
-        "room should report encryption enabled"
-    );
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if room.encryption_state().is_encrypted() {
+                return;
+            }
+            let _ = client.sync_once(SyncSettings::default()).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("room should report encryption enabled");
     room
 }
 
@@ -340,6 +348,176 @@ async fn decrypted_content(room: &Room, event_id: &EventId) -> Value {
     })
     .await
     .expect("privileged event was never decrypted by the daemon")
+}
+
+/// Live Matrix-backed remote call coverage (issue #194).
+///
+/// Drives two real Matrix users in one room: Bob registers a requester agent,
+/// Alice registers the target agent and runs the daemon sync loop, Bob sends a
+/// signed targeted call through `start_call_matrix`, and Alice's sync handler
+/// verifies signature/trust/policy before executing the tool and emitting a
+/// response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_matrix_backed_remote_call_round_trips() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login should succeed");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore should succeed");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login should succeed");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore should succeed");
+
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent live call integration test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": {
+                mx_agent_protocol::events::state::AGENT: 50,
+            },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["call".to_string()],
+            tools: vec!["run_tests@1.0.0".to_string()],
+            cwd: "/home/me/code/mx-agent".to_string(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["call".to_string()],
+            tools: vec!["run_tests@1.0.0".to_string()],
+            cwd: "/home/me/code/mx-agent".to_string(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_tools = ["run_tests"]
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+        ),
+    )
+    .expect("write policy");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    // `start_call_matrix` is the daemon IPC implementation side and restores
+    // the requester session from disk.
+    save_session(&paths, &bob_session).expect("save requester session");
+    let result = start_call_matrix(&CallStartParams {
+        room: Some(room_id.to_string()),
+        agent: Some(TARGET_AGENT.to_string()),
+        tool: "run_tests".to_string(),
+        input: json!({ "package": "mx-agent-protocol", "name": "canonical" }),
+    })
+    .await;
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("sync task joins")
+        .expect("sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    match result.outcome {
+        CallOutcome::Ok { exit_code, summary } => {
+            assert_eq!(exit_code, 0, "remote tool summary: {summary}");
+        }
+        other => panic!("expected successful remote call, got {other:?}"),
+    }
 }
 
 /// End-to-end encryption coverage for privileged events (issue #61).

@@ -288,10 +288,13 @@ pub async fn run_matrix_sync(
             }
             match client.sync_once(settings).await {
                 Ok(response) => {
-                    if let Some(router) = &router {
+                    let routed = if let Some(router) = &router {
                         let mut router = router.lock().unwrap_or_else(|e| e.into_inner());
-                        route_sync_response(&mut router, &response);
-                    }
+                        route_sync_response(&mut router, &response)
+                    } else {
+                        Vec::new()
+                    };
+                    handle_routed_events(client, paths, routed).await;
                     Ok(response.next_batch)
                 }
                 Err(e) => {
@@ -311,9 +314,13 @@ pub async fn run_matrix_sync(
 /// non-sensitive metadata (event type, room, sender, category, reason) — never
 /// event content (architecture §13.6, issue #192).
 ///
-/// Dispatched events are handed to a stub handler today; follow-up work routes
-/// them to the signed, trust-checked, policy-gated execution paths.
-fn route_sync_response(router: &mut EventRouter, response: &matrix_sdk::sync::SyncResponse) {
+/// Dispatched events are returned to the async Matrix handler after routing so
+/// no handler awaits while holding the router/replay-cache lock.
+fn route_sync_response(
+    router: &mut EventRouter,
+    response: &matrix_sdk::sync::SyncResponse,
+) -> Vec<(EventMeta, RoutedEvent)> {
+    let mut routed_events = Vec::new();
     for event in events_from_sync_response(response) {
         let mut sink = |meta: &EventMeta, routed: RoutedEvent| {
             tracing::debug!(
@@ -321,8 +328,9 @@ fn route_sync_response(router: &mut EventRouter, response: &matrix_sdk::sync::Sy
                 event_type = %meta.event_type,
                 room = %meta.room_id,
                 sender = %meta.sender,
-                "dispatched mx-agent event to handler (stub)"
+                "dispatched mx-agent event to handler"
             );
+            routed_events.push((meta.clone(), routed));
         };
         match router.route(&event, &mut sink) {
             RouteOutcome::Dispatched(_) | RouteOutcome::Ignored => {}
@@ -345,6 +353,29 @@ fn route_sync_response(router: &mut EventRouter, response: &matrix_sdk::sync::Sy
                 sender = %event.sender,
                 "rejected replayed or expired privileged request"
             ),
+        }
+    }
+    routed_events
+}
+
+async fn handle_routed_events(
+    client: &matrix_sdk::Client,
+    paths: &SessionPaths,
+    events: Vec<(EventMeta, RoutedEvent)>,
+) {
+    for (meta, routed) in events {
+        match routed {
+            RoutedEvent::CallRequest(request) => {
+                crate::call::handle_live_call_request(client, paths, &meta, &request).await;
+            }
+            other => {
+                tracing::debug!(
+                    category = other.category().as_str(),
+                    room = %meta.room_id,
+                    sender = %meta.sender,
+                    "no live handler for routed mx-agent event"
+                );
+            }
         }
     }
 }

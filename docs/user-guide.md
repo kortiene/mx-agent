@@ -6,13 +6,12 @@ other, then running a tool call and a remote-style `exec`.
 
 > **Alpha status.** `mx-agent` is pre-release software. The workspace,
 > authentication, agent-registry, task, trust, and context-sharing commands run
-> against a real Matrix homeserver. The `call` and `exec` runners are mediated
-> by the daemon over local IPC (the CLI no longer runs the command itself), but
-> they still execute **locally** as a loopback over the daemon's process runner;
-> the signed Matrix transport that carries an invocation to a *remote* agent's
-> daemon is still landing. Treat every command in this guide as running on your
-> own machine and read [Security warnings](#security-warnings) before pointing
-> it at anything you do not control.
+> against a real Matrix homeserver. `call` is daemon-mediated local loopback by
+> default and uses signed Matrix-backed remote dispatch when `--room`/`--agent`
+> target a registered, trusted, policy-allowed agent. `exec` is still
+> daemon-mediated local loopback. Treat execution commands carefully and read
+> [Security warnings](#security-warnings) before pointing mx-agent at anything
+> you do not control.
 
 ## Contents
 
@@ -180,6 +179,18 @@ echo '{"package":"mx-agent-protocol","name":"canonical"}' \
 ```
 
 Unknown tools exit `127` and invalid arguments exit `64`.
+
+To target a remote daemon, register both agents in the room, approve the
+requester's signing key in the target daemon's trust store, allow the tool in
+local policy, then pass both targeting flags:
+
+```bash
+mx-agent call --room '!room:server' --agent developer-pi \
+  --tool run_tests --arg package=mx-agent-protocol
+```
+
+The target daemon verifies the signed request, local trust, and local policy
+before executing the tool and sending a Matrix response.
 
 ## Run exec
 

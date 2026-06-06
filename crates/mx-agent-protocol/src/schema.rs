@@ -331,6 +331,12 @@ pub struct CallRequest {
     pub args: Value,
     /// Detached signature.
     pub signature: Signature,
+    /// Agent identifier that issued the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requesting_agent: Option<String>,
+    /// Agent identifier expected to execute the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent: Option<String>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -459,6 +465,9 @@ pub struct AgentState {
     pub device_id: String,
     /// Signing key identifier.
     pub signing_key_id: String,
+    /// Base64-no-pad Ed25519 verifying key bytes for `signing_key_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_public_key: Option<String>,
     /// Status, e.g. `active`.
     pub status: String,
     /// Declared capabilities.

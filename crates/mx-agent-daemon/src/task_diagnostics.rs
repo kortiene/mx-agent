@@ -265,6 +265,7 @@ mod tests {
             matrix_user_id: format!("@{agent_id}:server"),
             device_id: "DEV".to_string(),
             signing_key_id: "mxagent-ed25519:abc".to_string(),
+            signing_public_key: None,
             status: "active".to_string(),
             capabilities: Vec::new(),
             tools: tools.iter().map(|s| s.to_string()).collect(),
