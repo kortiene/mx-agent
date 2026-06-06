@@ -586,15 +586,22 @@ impl TaskOrchestrator {
     /// Reconcile every `executing` task against the set of live invocations on
     /// daemon startup/reconnect, returning one outcome per executing task.
     ///
-    /// This is the restart-recovery entry point (architecture §11.3). For each
-    /// `executing` task:
+    /// This is the restart-recovery entry point (architecture §11.3). An
+    /// invocation is "live" when it is present in `live_invocations`; the live
+    /// scheduler loop populates this set with every invocation it has claimed
+    /// during the current run (not only ones still executing), so a task this
+    /// daemon already claimed and finalized in an earlier pass is never recovered
+    /// off a stale local-store snapshot that still shows it `executing` (issue
+    /// #221). For each `executing` task:
     ///
-    /// - **owned by this agent, with a live invocation** — left running
-    ///   ([`OrchestrationOutcome::NotRunnableState`]); the local process is still
-    ///   alive, so nothing is changed and nothing is re-spawned.
+    /// - **owned by this agent, with a live invocation** — left unchanged
+    ///   ([`OrchestrationOutcome::NotRunnableState`]); the invocation is still
+    ///   owned by this run (in flight or already finalized this run), so nothing
+    ///   is changed and nothing is re-spawned.
     /// - **owned by this agent, with no live invocation** — recovered: marked
     ///   `failed` with a recovery result via [`Self::recover_stale_executing`]
-    ///   so the orphaned task is resolved safely and never double-run.
+    ///   so an orphan left by a *previous* daemon run is resolved safely and
+    ///   never double-run.
     /// - **owned by another (remote) agent** — left unchanged and surfaced as a
     ///   stale warning ([`OrchestrationOutcome::StaleRemoteExecuting`]); only the
     ///   owning daemon may resolve it.

@@ -922,7 +922,12 @@ with a recovery result instead of being spawned a second time; and a task owned
 by another (remote) agent is left unchanged and surfaced as a non-sensitive
 stale warning, since only the owning daemon may resolve it. Recovery decisions
 are logged and the recovered task's durable `result` records why it was
-recovered, so the outcome is auditable.
+recovered, so the outcome is auditable. The live scheduler loop also treats
+every invocation it has *claimed during the current run* as live, so a task it
+already claimed and finalized in an earlier pass is never recovered off a stale
+local-store snapshot that still shows it `executing` before the homeserver
+`/sync` echo catches up; only a genuine orphan from a previous daemon run, whose
+invocation this run never claimed, is recovered.
 
 Tool-backed task actions (`{"type":"tool", ...}`) run through the named-tool
 execution path once authorized: the daemon links an invocation, runs the named

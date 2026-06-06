@@ -217,9 +217,10 @@ fn tick(
     dispatcher: &mut impl TaskDispatcher,
 ) -> Vec<OrchestrationOutcome> {
     let snapshot = store.snapshot();
-    // No long-lived local invocations across a synchronous tick, so recovery
-    // sees an empty live set (matching the live loop's local-dispatch path).
-    let live_invocations = BTreeSet::new();
+    // No invocations claimed across a synchronous tick to remember, so recovery
+    // starts from an empty this-run set (matching the live loop's local-dispatch
+    // path on a fresh start).
+    let mut claimed_invocations = BTreeSet::new();
     // A fresh attempt set per tick: the in-memory store updates synchronously,
     // so there is no stale re-read to dedupe (unlike the live loop).
     let mut attempted = std::collections::HashSet::new();
@@ -227,7 +228,7 @@ fn tick(
         scheduler,
         orchestrator,
         &snapshot,
-        &live_invocations,
+        &mut claimed_invocations,
         store,
         dispatcher,
         &mut attempted,

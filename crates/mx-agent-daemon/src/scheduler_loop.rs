@@ -196,13 +196,24 @@ where
 /// This is the single tick used by both the live loop and the deterministic
 /// tests. It first performs restart recovery over `executing` tasks
 /// ([`TaskOrchestrator::recover_executing_tasks`]) — an `executing` task this
-/// daemon owns whose invocation is not in `live_invocations` is finalized
+/// daemon owns whose invocation is *not* one this run has claimed is finalized
 /// `failed` with a recovery result rather than re-run, so a restart never
 /// double-runs work. It then computes the scheduler-runnable tasks and processes
 /// each through [`TaskOrchestrator::process_one`], which authorizes
 /// (signature/trust/replay + deny-by-default policy + approval) before any claim
 /// or dispatch. Returns one [`OrchestrationOutcome`] per recovery decision and
 /// per processed task.
+///
+/// `claimed_invocations` accumulates every invocation id this run has claimed,
+/// and is the set recovery treats as "still owned by this run". It is essential
+/// for the live loop, whose snapshot is read from a local store that lags the
+/// homeserver `/sync` echo: a task this daemon claimed and finalized in an
+/// earlier pass can still appear `executing` in a later pass's snapshot, and
+/// without this set recovery would clobber that real success back to `failed`
+/// (issue #221). A genuine orphan from a *previous* daemon run carries an
+/// invocation id this run never claimed, so it is absent from the set and still
+/// recovered. The in-memory tests start from an empty set, since their store
+/// updates synchronously and never lags.
 ///
 /// `attempted` deduplicates work across ticks by observed `(task_id,
 /// state_rev)`: a task is processed at most once per revision. This is essential
@@ -215,7 +226,7 @@ pub fn run_scheduler_tick<S, D>(
     scheduler: &TaskScheduler,
     orchestrator: &TaskOrchestrator,
     snapshot: &[TaskState],
-    live_invocations: &BTreeSet<String>,
+    claimed_invocations: &mut BTreeSet<String>,
     store: &mut S,
     dispatcher: &mut D,
     attempted: &mut HashSet<(String, u64)>,
@@ -224,7 +235,7 @@ where
     S: TaskStore,
     D: TaskDispatcher,
 {
-    let mut outcomes = orchestrator.recover_executing_tasks(snapshot, live_invocations, store);
+    let mut outcomes = orchestrator.recover_executing_tasks(snapshot, claimed_invocations, store);
 
     let running = snapshot
         .iter()
@@ -242,7 +253,14 @@ where
             if !attempted.insert((task.task_id.clone(), task.state_rev)) {
                 continue;
             }
-            outcomes.push(orchestrator.process_one(task, snapshot, store, dispatcher));
+            let outcome = orchestrator.process_one(task, snapshot, store, dispatcher);
+            // Remember the invocation this pass claimed so a later pass that
+            // re-reads the task as `executing` off a stale snapshot does not
+            // recover (clobber) it.
+            if let Some(invocation_id) = outcome.claimed_invocation_id() {
+                claimed_invocations.insert(invocation_id.to_string());
+            }
+            outcomes.push(outcome);
         }
     }
     outcomes
@@ -279,6 +297,12 @@ pub fn run_scheduler_loop(
     // re-processed at the same revision while the local store catches up to the
     // homeserver. Capped to bound memory on a long-lived daemon.
     let mut attempted: HashSet<(String, u64)> = HashSet::new();
+    // Invocation ids this run has claimed. Restart recovery treats these as still
+    // owned by this run and never recovers them, so a task this daemon claimed and
+    // finalized in an earlier pass is not clobbered to `failed` off a stale
+    // local-store snapshot that still shows it `executing` (issue #221). Capped to
+    // bound memory on a long-lived daemon.
+    let mut claimed_invocations: BTreeSet<String> = BTreeSet::new();
     tracing::info!(
         interval_secs = interval.as_secs(),
         dispatch = ?mode,
@@ -288,6 +312,9 @@ pub fn run_scheduler_loop(
         if attempted.len() > MAX_ATTEMPTED_TRACKED {
             attempted.clear();
         }
+        if claimed_invocations.len() > MAX_ATTEMPTED_TRACKED {
+            claimed_invocations.clear();
+        }
         scheduler_pass(
             &runtime,
             &client,
@@ -295,14 +322,16 @@ pub fn run_scheduler_loop(
             mode,
             &paths,
             &mut attempted,
+            &mut claimed_invocations,
         );
         sleep_interruptible(interval, &running);
     }
     tracing::info!("task scheduler loop stopped");
 }
 
-/// Upper bound on tracked `(task_id, state_rev)` attempts before the set is
-/// cleared, bounding scheduler memory on a long-running daemon.
+/// Upper bound on the tracked `(task_id, state_rev)` attempts and this-run
+/// claimed-invocation sets before each is cleared, bounding scheduler memory on a
+/// long-running daemon.
 const MAX_ATTEMPTED_TRACKED: usize = 50_000;
 
 /// Sleep for `delay`, waking early when `running` is cleared.
@@ -328,6 +357,7 @@ fn scheduler_pass(
     mode: TaskDispatchMode,
     paths: &SessionPaths,
     attempted: &mut HashSet<(String, u64)>,
+    claimed_invocations: &mut BTreeSet<String>,
 ) {
     let local_user = client.user_id().map(|u| u.to_string()).unwrap_or_default();
     if local_user.is_empty() {
@@ -387,6 +417,7 @@ fn scheduler_pass(
                 mode,
                 paths,
                 attempted,
+                claimed_invocations,
             );
         }
     }
@@ -405,6 +436,7 @@ fn scheduler_pass_for_agent(
     mode: TaskDispatchMode,
     paths: &SessionPaths,
     attempted: &mut HashSet<(String, u64)>,
+    claimed_invocations: &mut BTreeSet<String>,
 ) {
     // Deny-by-default: when no policy file is present, the default policy denies
     // every action, so nothing is claimed or dispatched.
@@ -432,10 +464,6 @@ fn scheduler_pass_for_agent(
     // membership never implies execution.
     let scheduler = TaskScheduler::new(agent.agent_id.clone(), agent.load.max_invocations);
 
-    // A `executing` task observed at the start of a fresh pass is stale (local
-    // dispatch runs synchronously; a Matrix dispatch blocks the pass until the
-    // result returns), so recovery uses an empty live-invocation set.
-    let live_invocations = BTreeSet::new();
     // A per-pass cache of the state this store just wrote, so a `claim`
     // immediately followed by a `finalize` checks staleness against the claim's
     // revision rather than the local store, which has not yet received the
@@ -467,7 +495,7 @@ fn scheduler_pass_for_agent(
                 &scheduler,
                 &orchestrator,
                 snapshot,
-                &live_invocations,
+                claimed_invocations,
                 &mut store,
                 &mut dispatcher,
                 attempted,
@@ -485,7 +513,7 @@ fn scheduler_pass_for_agent(
                 &scheduler,
                 &orchestrator,
                 snapshot,
-                &live_invocations,
+                claimed_invocations,
                 &mut store,
                 &mut dispatcher,
                 attempted,
@@ -522,6 +550,23 @@ fn log_outcome(room_id: &str, agent_id: &str, outcome: &OrchestrationOutcome) {
 }
 
 impl OrchestrationOutcome {
+    /// The invocation id this daemon generated and claimed for a task it
+    /// processed this pass, if any.
+    ///
+    /// Used to record this-run invocations so restart recovery never clobbers a
+    /// task this loop already claimed and finalized off a stale snapshot (issue
+    /// #221). Both `Completed` (the task was claimed `executing` and finalized to
+    /// a terminal state) and `Denied` (claimed then blocked) carry the invocation
+    /// this run owns.
+    fn claimed_invocation_id(&self) -> Option<&str> {
+        match self {
+            Self::Completed { invocation_id, .. } | Self::Denied { invocation_id, .. } => {
+                Some(invocation_id)
+            }
+            _ => None,
+        }
+    }
+
     /// A non-sensitive task id for logging, regardless of variant.
     fn task_id_for_log(&self) -> &str {
         match self {
@@ -682,7 +727,7 @@ allow_cwd = ["/repo"]
         let snapshot = store.snapshot();
         let scheduler = TaskScheduler::new(AGENT, 4);
         let orchestrator = orchestrator();
-        let live = BTreeSet::new();
+        let mut claimed = BTreeSet::new();
         // Bridge the in-memory model through MatrixTaskStore so the store
         // adapter (and its error mapping) is exercised too.
         let store_ref = std::cell::RefCell::new(store);
@@ -694,7 +739,7 @@ allow_cwd = ["/repo"]
             &scheduler,
             &orchestrator,
             &snapshot,
-            &live,
+            &mut claimed,
             &mut matrix_store,
             dispatcher,
             &mut attempted,
@@ -728,7 +773,7 @@ allow_cwd = ["/repo"]
         let snapshot = store.snapshot();
         let scheduler = TaskScheduler::new(AGENT, 4);
         let orchestrator = orchestrator();
-        let live = BTreeSet::new();
+        let mut claimed = BTreeSet::new();
         let mut attempted = HashSet::new();
         let mut runs = 0u32;
         let mut dispatcher = RoutingDispatcher::new(
@@ -751,7 +796,7 @@ allow_cwd = ["/repo"]
             &scheduler,
             &orchestrator,
             &snapshot,
-            &live,
+            &mut claimed,
             &mut matrix_store,
             &mut dispatcher,
             &mut attempted,
@@ -761,7 +806,7 @@ allow_cwd = ["/repo"]
             &scheduler,
             &orchestrator,
             &snapshot,
-            &live,
+            &mut claimed,
             &mut matrix_store,
             &mut dispatcher,
             &mut attempted,
@@ -944,6 +989,103 @@ allow_cwd = ["/repo"]
         assert_eq!(
             result.get("reason").and_then(Value::as_str),
             Some("recovered_stale_invocation")
+        );
+    }
+
+    #[test]
+    fn recovery_skips_task_finalized_this_run_off_a_stale_snapshot() {
+        // Deterministic reproduction of the #221 flake. A task this loop claimed
+        // and finalized `succeeded` in an earlier pass still appears `executing`
+        // in a later pass's snapshot, because the local store lags the homeserver
+        // `/sync` echo. Restart recovery must NOT clobber that real success back
+        // to `failed`: the invocation was claimed this run, so it is excluded
+        // from recovery.
+        let mut store = RoomTaskStore::default();
+        store.insert(tool_task("task-plan", "run_tests"));
+
+        let scheduler = TaskScheduler::new(AGENT, 4);
+        let orchestrator = orchestrator();
+        let mut attempted = HashSet::new();
+        // Persisted across both ticks, exactly as the live loop threads it.
+        let mut claimed = BTreeSet::new();
+        let mut dispatcher = RoutingDispatcher::new(
+            ToolTaskDispatcher::with_runner(|_n, _a| {
+                Ok(ToolResult {
+                    exit_code: 0,
+                    summary: "ok".to_string(),
+                })
+            }),
+            ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+        );
+
+        // Pass 1: the task runs to success and its invocation is recorded.
+        let snapshot1 = store.snapshot();
+        {
+            let store_ref = std::cell::RefCell::new(&mut store);
+            let mut matrix_store = MatrixTaskStore::new(ROOM, |options: UpdateTaskOptions| {
+                store_ref.borrow_mut().apply(options)
+            });
+            let first = run_scheduler_tick(
+                &scheduler,
+                &orchestrator,
+                &snapshot1,
+                &mut claimed,
+                &mut matrix_store,
+                &mut dispatcher,
+                &mut attempted,
+            );
+            assert!(
+                first.iter().any(|o| matches!(
+                    o,
+                    OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED
+                )),
+                "first tick should run the task to success: {first:?}"
+            );
+        }
+        assert_eq!(store.state_of("task-plan"), STATE_SUCCEEDED);
+        let invocation = store
+            .tasks
+            .get("task-plan")
+            .unwrap()
+            .invocation_id
+            .clone()
+            .expect("claimed task has an invocation id");
+        assert!(
+            claimed.contains(&invocation),
+            "the claimed invocation must be recorded for this run"
+        );
+
+        // Pass 2: a STALE snapshot still shows the task `executing` with that same
+        // invocation (the success echo has not synced back into the local store).
+        let mut stale = store.tasks.get("task-plan").unwrap().clone();
+        stale.state = STATE_EXECUTING.to_string();
+        let stale_snapshot = vec![stale];
+        {
+            let store_ref = std::cell::RefCell::new(&mut store);
+            let mut matrix_store = MatrixTaskStore::new(ROOM, |options: UpdateTaskOptions| {
+                store_ref.borrow_mut().apply(options)
+            });
+            let second = run_scheduler_tick(
+                &scheduler,
+                &orchestrator,
+                &stale_snapshot,
+                &mut claimed,
+                &mut matrix_store,
+                &mut dispatcher,
+                &mut attempted,
+            );
+            assert!(
+                !second
+                    .iter()
+                    .any(|o| matches!(o, OrchestrationOutcome::RecoveredStale { .. })),
+                "a task finalized this run must not be recovered off a stale snapshot: {second:?}"
+            );
+        }
+        // The real success in the store is untouched.
+        assert_eq!(
+            store.state_of("task-plan"),
+            STATE_SUCCEEDED,
+            "recovery must not clobber a task this run already finalized"
         );
     }
 
