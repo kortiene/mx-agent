@@ -74,7 +74,7 @@ python adw/issues.py 15 16 18-20 --dry-run         # preview the batch plan
 - Repeated IDs are deduplicated while preserving first occurrence.
 - Descending ranges are rejected to avoid accidental reverse-order batch work.
 - With `--print-prompt`, arguments after `--` become shared notes; when
-  executing, they are forwarded verbatim to each `issue.py` run.
+  executing, they are forwarded to the runner (e.g. `-- --dangerously-skip-permissions`).
 
 ```bash
 python adw/issues.py 10 12-14 13 20 --print-prompt -- fix in priority order
