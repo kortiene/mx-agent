@@ -43,9 +43,11 @@ use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
     build_signed_exec_request, load_or_create_signing_key, load_sync_token, login_password,
-    register_agent, restore_client, run_matrix_sync, save_session, start_call_matrix,
-    BackoffConfig, CallOutcome, CallStartParams, ExecRequestOptions, MatrixConfig,
-    RegisterAgentOptions, SessionPaths, SyncHealth, SyncState, TrustStore,
+    register_agent, restore_client, run_matrix_sync, run_matrix_sync_with_subscribers,
+    save_session, start_call_matrix, start_exec_matrix, BackoffConfig, CallOutcome,
+    CallStartParams, ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams,
+    ExecSubscriberRegistry, MatrixConfig, RegisterAgentOptions, SessionPaths, SyncHealth,
+    SyncState, TrustStore,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -518,6 +520,250 @@ allow_tools = ["run_tests"]
         }
         other => panic!("expected successful remote call, got {other:?}"),
     }
+}
+
+/// Live Matrix-backed remote exec coverage (issue #196).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_matrix_backed_remote_exec_round_trips_and_denies() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let denied_file = cwd.join("denied-created");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login should succeed");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore should succeed");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login should succeed");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore should succeed");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent live exec integration test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let subscribers = ExecSubscriberRegistry::new();
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &alice,
+                &paths,
+                health,
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    // Bob/requester also needs a sync loop to receive target stream events and
+    // publish them into the same test registry used by start_exec_matrix.
+    let bob_sync_paths = paths_in(data_dir.join("bob-sync"));
+    bob_sync_paths
+        .ensure_data_dir()
+        .expect("create bob sync dir");
+    let bob_sync = {
+        let bob = bob.clone();
+        let paths = bob_sync_paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &bob,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+
+    save_session(&paths, &bob_session).expect("save requester session");
+    let result = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo hello; echo err >&2; exit 7".to_string(),
+            ],
+            cwd: Some(cwd.clone()),
+            stdin: None,
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+        },
+        &subscribers,
+    )
+    .await;
+
+    match result.outcome {
+        ExecOutcome::Ok { frames } => {
+            assert!(frames
+                .iter()
+                .any(|f| matches!(f, ExecFrame::Chunk(c) if c.data.contains("hello"))));
+            assert!(frames
+                .iter()
+                .any(|f| matches!(f, ExecFrame::Chunk(c) if c.data.contains("err"))));
+            assert!(
+                matches!(frames.last(), Some(ExecFrame::Finished(f)) if f.exit_code == Some(7))
+            );
+        }
+        other => panic!("expected remote exec output, got {other:?}"),
+    }
+
+    let denied = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            command: vec![
+                "touch".to_string(),
+                denied_file.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(cwd.clone()),
+            stdin: None,
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+        },
+        &subscribers,
+    )
+    .await;
+    assert!(matches!(denied.outcome, ExecOutcome::Error { .. }));
+    assert!(!denied_file.exists(), "policy-denied exec must not spawn");
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync task joins")
+        .expect("alice sync exits cleanly");
+    bob_sync
+        .await
+        .expect("bob sync task joins")
+        .expect("bob sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
 }
 
 /// End-to-end encryption coverage for privileged events (issue #61).

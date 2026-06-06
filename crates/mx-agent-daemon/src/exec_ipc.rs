@@ -27,9 +27,11 @@
 //!   here.
 
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use mx_agent_protocol::events::timeline::EXEC_REQUEST;
 use mx_agent_protocol::id::{generate_invocation_id, generate_request_id};
 use mx_agent_protocol::schema::{
     ExecAccepted, ExecCancelled, ExecFinished, ExecRejected, StreamArtifact, StreamChunk,
@@ -37,6 +39,7 @@ use mx_agent_protocol::schema::{
 };
 
 use crate::artifact::{prepare_artifact, ArtifactConfig};
+use crate::exec_subscribers::{ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent};
 use crate::runner::{run, RunError, RunSpec};
 use crate::stream::{capture_child_output, StreamCaptureConfig};
 
@@ -112,6 +115,8 @@ pub enum ExecErrorKind {
     EmptyCommand,
     /// The child process could not be spawned for another reason.
     Spawn,
+    /// A live Matrix-backed remote exec failed or was rejected.
+    Remote,
 }
 
 /// The outcome of an `exec.start` invocation.
@@ -259,6 +264,183 @@ fn error_kind_for(err: &RunError) -> ExecErrorKind {
 /// so the artifact is finalized with an empty `mxc_uri`. A command that runs and
 /// exits nonzero still yields [`ExecOutcome::Ok`]; only a failure to *invoke*
 /// yields [`ExecOutcome::Error`].
+/// Start a live Matrix-backed remote exec and wait for terminal result events.
+///
+/// This is used behind the same `exec.start` IPC method as loopback when both
+/// `room` and `agent` targeting fields are present. The CLI still receives the
+/// same [`ExecStartResult`] shape and renders [`ExecFrame`]s normally.
+pub async fn start_exec_matrix(
+    params: &ExecStartParams,
+    subscribers: &ExecSubscriberRegistry,
+) -> ExecStartResult {
+    let invocation_id = generate_invocation_id();
+    let request_id = generate_request_id();
+    let outcome =
+        match start_exec_matrix_inner(params, subscribers, &invocation_id, &request_id).await {
+            Ok(outcome) => outcome,
+            Err(message) => ExecOutcome::Error {
+                kind: ExecErrorKind::Remote,
+                message,
+            },
+        };
+    ExecStartResult {
+        invocation_id,
+        request_id,
+        outcome,
+    }
+}
+
+async fn start_exec_matrix_inner(
+    params: &ExecStartParams,
+    subscribers: &ExecSubscriberRegistry,
+    invocation_id: &str,
+    request_id: &str,
+) -> Result<ExecOutcome, String> {
+    use matrix_sdk::config::SyncSettings;
+
+    let Some(room_target) = params.room.as_deref() else {
+        return Err("remote exec requires --room".to_string());
+    };
+    let Some(target_agent) = params.agent.clone() else {
+        return Err("remote exec requires --agent".to_string());
+    };
+    if params.stdin.is_some() {
+        return Err(
+            "remote exec stdin is implemented in the follow-up stdin/cancel path".to_string(),
+        );
+    }
+
+    let paths = crate::SessionPaths::resolve();
+    let session = crate::load_session(&paths)
+        .map_err(|e| format!("could not read daemon session: {e}"))?
+        .ok_or_else(|| "not logged in; run `mx-agent auth login` first".to_string())?;
+    let client = crate::matrix::restore_client(&session)
+        .await
+        .map_err(|e| e.to_string())?;
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .map_err(|e| e.to_string())?;
+    let id = crate::workspace::parse_room_or_alias(room_target).map_err(|e| e.to_string())?;
+    let room_id = crate::workspace::resolve_room_id(&client, &id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let room = client
+        .get_room(&room_id)
+        .ok_or_else(|| format!("room not found: {room_target}"))?;
+
+    let local_user = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+    let requester = crate::agent::read_all_agent_states(&room)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|agent| agent.matrix_user_id == local_user)
+        .min_by(|a, b| a.agent_id.cmp(&b.agent_id))
+        .ok_or_else(|| "local agent is not registered in the target room".to_string())?;
+
+    let signing = crate::load_or_create_signing_key(&paths).map_err(|e| e.to_string())?;
+    let created_at = rfc3339_after(Duration::ZERO);
+    let expires_at = rfc3339_after(Duration::from_secs(300));
+    let cwd = params
+        .cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let options = crate::ExecRequestOptions {
+        target_agent,
+        requesting_agent: requester.agent_id,
+        command: params.command.clone(),
+        cwd,
+        env: Default::default(),
+        stdin: false,
+        stream: params.stream,
+        pty: params.pty,
+        timeout_ms: 600_000,
+        task_id: params.task.clone(),
+    };
+    let content = crate::build_signed_exec_request(
+        signing.signing_key(),
+        signing.key_id(),
+        invocation_id,
+        request_id,
+        generate_request_id(),
+        created_at,
+        expires_at,
+        &options,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut subscription =
+        subscribers.subscribe(ExecSubscriptionKey::Invocation(invocation_id.to_string()));
+    room.send_raw(EXEC_REQUEST, content)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out waiting for remote exec result".to_string());
+        }
+        let event =
+            tokio::time::timeout(remaining.min(Duration::from_secs(5)), subscription.recv())
+                .await
+                .map_err(|_| "timed out waiting for remote exec result".to_string())?
+                .ok_or_else(|| "remote exec subscriber closed".to_string())?;
+        match event {
+            ForwardedExecEvent::StreamChunk(chunk) => frames.push(ExecFrame::Chunk(chunk)),
+            ForwardedExecEvent::StreamArtifact(artifact) => {
+                frames.push(ExecFrame::Artifact(artifact))
+            }
+            ForwardedExecEvent::ExecFinished(finished) => {
+                frames.push(ExecFrame::Finished(finished));
+                return Ok(ExecOutcome::Ok { frames });
+            }
+            ForwardedExecEvent::ExecRejected(rejected) => {
+                return Ok(ExecOutcome::Error {
+                    kind: ExecErrorKind::Remote,
+                    message: rejected.reason,
+                });
+            }
+            ForwardedExecEvent::ExecCancelled(cancelled) => {
+                return Ok(ExecOutcome::Error {
+                    kind: ExecErrorKind::Remote,
+                    message: format!("remote exec cancelled ({})", cancelled.signal_sent),
+                });
+            }
+            ForwardedExecEvent::CallResponse(_) => {}
+        }
+    }
+}
+
+fn rfc3339_after(offset: Duration) -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .saturating_add(offset)
+        .as_secs();
+    let days = (secs / 86_400) as i64;
+    let tod = (secs % 86_400) as i64;
+    let (hour, minute, second) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Execute an `exec.start` request locally (loopback), without Matrix.
+///
+/// Mints fresh `invocation_id`/`request_id`, runs the command through the
+/// daemon's process runner, and packages the captured output as ordered
+/// [`ExecFrame`]s ending in a single `Finished` frame.
 pub async fn start_exec_loopback(params: &ExecStartParams) -> ExecStartResult {
     let invocation_id = generate_invocation_id();
     let request_id = generate_request_id();

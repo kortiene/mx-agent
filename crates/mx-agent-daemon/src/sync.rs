@@ -381,6 +381,9 @@ async fn handle_routed_events(
 ) {
     for (meta, routed) in events {
         match routed {
+            RoutedEvent::ExecRequest(request) => {
+                crate::exec::handle_live_exec_request(client, paths, &meta, &request).await;
+            }
             RoutedEvent::CallRequest(request) => {
                 crate::call::handle_live_call_request(client, paths, &meta, &request).await;
             }

@@ -29,21 +29,28 @@
 //! machine-readable reason and spawns nothing.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use matrix_sdk::Room;
 use serde_json::Value;
 
-use mx_agent_policy::{Allowance, DenyReason, ExecContext, Policy};
+use mx_agent_policy::{Allowance, DenyReason, ExecContext, Outcome, Policy, Sandbox};
 use mx_agent_protocol::events::state::INVOCATION;
 use mx_agent_protocol::events::timeline::{
-    EXEC_ACCEPTED, EXEC_CANCEL, EXEC_CANCELLED, EXEC_REJECTED, EXEC_REQUEST,
+    EXEC_ACCEPTED, EXEC_CANCEL, EXEC_CANCELLED, EXEC_FINISHED, EXEC_REJECTED, EXEC_REQUEST,
+    STREAM_ARTIFACT, STREAM_CHUNK,
 };
 use mx_agent_protocol::schema::{
-    ExecAccepted, ExecCancel, ExecCancelled, ExecRejected, ExecRequest, InvocationState, Signature,
+    ExecAccepted, ExecCancel, ExecCancelled, ExecFinished, ExecRejected, ExecRequest,
+    InvocationState, Signature, StreamKind,
 };
 use mx_agent_protocol::signing::{self, SignatureError, SIGNATURE_FIELD};
 
+use crate::audit::{AuditLog, AuditRecord};
+use crate::runner::{run, RunSpec};
+use crate::stream::{capture_child_output, OutputCaps, StreamCaptureConfig};
 use crate::trust::TrustStore;
 use crate::workspace::WorkspaceError;
 
@@ -401,6 +408,341 @@ pub async fn publish_invocation_state(
         .await
         .map_err(WorkspaceError::from)?;
     Ok(())
+}
+
+/// Handle a routed live Matrix `exec.request` on the target daemon.
+///
+/// The handler is intentionally conservative: it ignores requests not addressed
+/// to one of this daemon's registered agents, and for local targets it verifies
+/// the requester public key, signature, trust store, replay/expiry (already
+/// enforced by the router for `exec.request`), and local policy before spawning
+/// anything.
+pub async fn handle_live_exec_request(
+    client: &matrix_sdk::Client,
+    paths: &crate::SessionPaths,
+    meta: &crate::event_router::EventMeta,
+    request: &ExecRequest,
+) {
+    let room_id = match matrix_sdk::ruma::RoomId::parse(&meta.room_id) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, room = %meta.room_id, "invalid room id in routed exec request");
+            return;
+        }
+    };
+    let Some(room) = client.get_room(&room_id) else {
+        tracing::warn!(room = %meta.room_id, "room for routed exec request is unavailable");
+        return;
+    };
+
+    let local_user = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+    let is_local_target = match crate::agent::read_agent_state(&room, &request.target_agent).await {
+        Ok(Some(agent)) => agent.matrix_user_id == local_user,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(error = %e, target_agent = %request.target_agent, "could not read target agent state");
+            false
+        }
+    };
+    if !is_local_target {
+        return;
+    }
+
+    let content = match serde_json::to_value(request) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not reserialize exec request");
+            return;
+        }
+    };
+
+    let authorized = match authorize_live_exec(&room, paths, &content, request, &meta.room_id).await
+    {
+        Ok(value) => value,
+        Err(rejection) => {
+            if let ExecRejection::PolicyDenied(reason) = &rejection {
+                audit_exec_decision(
+                    paths,
+                    &meta.room_id,
+                    request,
+                    &Outcome::Deny(reason.clone()),
+                );
+            }
+            if let Err(e) =
+                emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await
+            {
+                tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec rejection");
+            }
+            return;
+        }
+    };
+    let (request, allowance) = authorized;
+
+    audit_exec_decision(
+        paths,
+        &meta.room_id,
+        &request,
+        &Outcome::Allow(allowance.clone()),
+    );
+
+    match crate::approval::disposition_for_exec(request.clone(), &allowance) {
+        crate::approval::ExecDisposition::RequiresApproval { approval, .. } => {
+            let mut queue = crate::approval::ApprovalQueue::load(paths).unwrap_or_default();
+            queue.enqueue(crate::approval::PendingApproval {
+                room_id: meta.room_id.clone(),
+                request: approval.clone(),
+            });
+            if let Err(e) = queue.save(paths) {
+                tracing::warn!(error = %e, request_id = %approval.request_id, "failed to persist approval request");
+            }
+            if let Err(e) = crate::approval::emit_approval_request(&room, &approval).await {
+                tracing::warn!(error = %e, request_id = %approval.request_id, "failed to emit approval request");
+            }
+            return;
+        }
+        crate::approval::ExecDisposition::Execute(_) => {}
+    }
+
+    if let Err(e) = emit_exec_accepted(&room, request.invocation_id.clone()).await {
+        tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec accepted");
+    }
+    let now = rfc3339_now();
+    let mut state = invocation_state_for(&request, now.clone());
+    if let Err(e) = publish_invocation_state(&room, &state).await {
+        tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to publish accepted invocation state");
+    }
+    state.state = crate::invocation::STATE_RUNNING.to_string();
+    state.updated_at = rfc3339_now();
+    state.state_rev = state.state_rev.saturating_add(1);
+    if let Err(e) = publish_invocation_state(&room, &state).await {
+        tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to publish running invocation state");
+    }
+
+    let output = match run(&RunSpec {
+        command: request.command.clone(),
+        cwd: PathBuf::from(&request.cwd),
+        env: request.env.clone(),
+        env_allowlist: allowance.env_allowlist.clone(),
+        stdin: None,
+        timeout: Some(Duration::from_millis(
+            allowance.max_runtime_ms.unwrap_or(request.timeout_ms),
+        )),
+        sandbox: sandbox_backend(allowance.sandbox),
+        ..Default::default()
+    })
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let rejection = ExecRejection::PolicyDenied(DenyReason::CommandNotAllowed {
+                command: err.to_string(),
+            });
+            let _ = emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await;
+            return;
+        }
+    };
+
+    emit_output_events(
+        client,
+        &room,
+        &request.invocation_id,
+        &output.stdout,
+        &output.stderr,
+        &allowance,
+    )
+    .await;
+
+    let exit_code = output.exit_code;
+    let finished = ExecFinished {
+        invocation_id: request.invocation_id.clone(),
+        exit_code,
+        signal: output.signal.and_then(signal_name),
+        duration_ms: 0,
+        stdout_bytes: output.stdout.len() as u64,
+        stderr_bytes: output.stderr.len() as u64,
+        truncated: false,
+        artifact_mxc: None,
+        extra: Default::default(),
+    };
+    if let Ok(content) = serde_json::to_value(&finished) {
+        if let Err(e) = room.send_raw(EXEC_FINISHED, content).await {
+            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.finished");
+        }
+    }
+
+    state.state = match exit_code {
+        Some(code) => crate::invocation::terminal_state_for_exit(code).to_string(),
+        None => crate::invocation::STATE_FAILED.to_string(),
+    };
+    state.exit_code = exit_code;
+    state.updated_at = rfc3339_now();
+    state.state_rev = state.state_rev.saturating_add(1);
+    let _ = publish_invocation_state(&room, &state).await;
+}
+
+async fn authorize_live_exec(
+    room: &Room,
+    paths: &crate::SessionPaths,
+    content: &Value,
+    request: &ExecRequest,
+    room_id: &str,
+) -> Result<(ExecRequest, Allowance), ExecRejection> {
+    let requester = crate::agent::read_agent_state(room, &request.requesting_agent)
+        .await
+        .map_err(|_| ExecRejection::Malformed)?
+        .ok_or_else(|| ExecRejection::UntrustedKey {
+            key_id: request.signature.key_id.clone(),
+        })?;
+    if requester.signing_key_id != request.signature.key_id {
+        return Err(ExecRejection::InvalidSignature);
+    }
+    let verifying_key = crate::call::verifying_key_from_agent_state(&requester)
+        .map_err(|_| ExecRejection::InvalidSignature)?;
+    let trust = TrustStore::load(paths).unwrap_or_default();
+    let policy = Policy::default_path()
+        .and_then(|path| Policy::load(path).ok())
+        .unwrap_or_default();
+    authorize_exec_request_with_allowance(
+        content,
+        &verifying_key,
+        &trust,
+        &policy,
+        room_id,
+        &request.requesting_agent,
+        &request.target_agent,
+    )
+}
+
+async fn emit_output_events(
+    client: &matrix_sdk::Client,
+    room: &Room,
+    invocation_id: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+    allowance: &Allowance,
+) {
+    let total = stdout.len() + stderr.len();
+    let artifact_config = crate::ArtifactConfig::default();
+    if artifact_config.should_switch(total) {
+        for (stream, data) in [(StreamKind::Stdout, stdout), (StreamKind::Stderr, stderr)] {
+            if data.is_empty() {
+                continue;
+            }
+            let prepared =
+                crate::prepare_artifact(invocation_id, stream, data, &artifact_config).await;
+            match crate::upload_artifact(client, prepared).await {
+                Ok(event) => {
+                    if let Ok(content) = serde_json::to_value(&event) {
+                        let _ = room.send_raw(STREAM_ARTIFACT, content).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, invocation_id, "failed to upload exec output artifact")
+                }
+            }
+        }
+        return;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let stdout_bytes = stdout.to_vec();
+    let stderr_bytes = stderr.to_vec();
+    let invocation = invocation_id.to_string();
+    let config = StreamCaptureConfig::batch().with_caps(OutputCaps {
+        max_output_bytes: allowance.max_output_bytes,
+        max_events_per_second: None,
+    });
+    let capture = tokio::spawn(async move {
+        capture_child_output(
+            &stdout_bytes[..],
+            &stderr_bytes[..],
+            &invocation,
+            config,
+            tx,
+        )
+        .await
+    });
+    while let Some(chunk) = rx.recv().await {
+        if let Ok(content) = serde_json::to_value(&chunk) {
+            if let Err(e) = room.send_raw(STREAM_CHUNK, content).await {
+                tracing::warn!(error = %e, invocation_id, "failed to emit stream.chunk");
+                break;
+            }
+        }
+    }
+    let _ = capture.await;
+}
+
+fn sandbox_backend(sandbox: Option<Sandbox>) -> mx_agent_sandbox::Backend {
+    match sandbox {
+        Some(Sandbox::Bubblewrap) => mx_agent_sandbox::Backend::Bubblewrap,
+        Some(Sandbox::Docker | Sandbox::Podman) => mx_agent_sandbox::Backend::Container,
+        _ => mx_agent_sandbox::Backend::None,
+    }
+}
+
+fn signal_name(n: i32) -> Option<String> {
+    Some(
+        match n {
+            1 => "SIGHUP",
+            2 => "SIGINT",
+            3 => "SIGQUIT",
+            6 => "SIGABRT",
+            8 => "SIGFPE",
+            9 => "SIGKILL",
+            11 => "SIGSEGV",
+            13 => "SIGPIPE",
+            14 => "SIGALRM",
+            15 => "SIGTERM",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+fn audit_exec_decision(
+    paths: &crate::SessionPaths,
+    room_id: &str,
+    request: &ExecRequest,
+    outcome: &Outcome,
+) {
+    let Some(path) = AuditLog::default_path()
+        .or_else(|| Some(paths.data_dir.join(crate::audit::AUDIT_FILE_NAME)))
+    else {
+        return;
+    };
+    let record = AuditRecord::for_exec(
+        room_id,
+        &request.requesting_agent,
+        &request.target_agent,
+        Some(&request.invocation_id),
+        &request.command,
+        outcome,
+    );
+    if let Err(e) = AuditLog::new(path).append(&record) {
+        tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to append exec audit record");
+    }
+}
+
+fn rfc3339_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86_400) as i64;
+    let tod = (secs % 86_400) as i64;
+    let (hour, minute, second) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Why an incoming `com.mxagent.exec.cancel.v1` was rejected (architecture §7.5,

@@ -82,13 +82,13 @@ pub use event_router::{
 pub use exec::{
     authorize_exec_cancel, authorize_exec_request, authorize_exec_request_with_allowance,
     build_signed_exec_cancel, build_signed_exec_request, emit_exec_accepted, emit_exec_cancelled,
-    emit_exec_rejected, invocation_state_for, publish_invocation_state, send_exec_cancel,
-    send_exec_request, CancelRejection, ExecRejection, ExecRequestOptions,
+    emit_exec_rejected, handle_live_exec_request, invocation_state_for, publish_invocation_state,
+    send_exec_cancel, send_exec_request, CancelRejection, ExecRejection, ExecRequestOptions,
 };
 pub use exec_ipc::{
-    handle_exec_cancel_loopback, handle_exec_stdin_loopback, start_exec_loopback, ExecCancelParams,
-    ExecControlResult, ExecErrorKind, ExecFrame, ExecNotification, ExecOutcome, ExecStartParams,
-    ExecStartResult, ExecStdinParams,
+    handle_exec_cancel_loopback, handle_exec_stdin_loopback, start_exec_loopback,
+    start_exec_matrix, ExecCancelParams, ExecControlResult, ExecErrorKind, ExecFrame,
+    ExecNotification, ExecOutcome, ExecStartParams, ExecStartResult, ExecStdinParams,
 };
 pub use exec_subscribers::{
     ExecSubscriberRegistry, ExecSubscription, ExecSubscriptionKey, ForwardStats, ForwardedExecEvent,
@@ -133,7 +133,8 @@ pub use stream::{
     DEFAULT_INTERACTIVE_FLUSH_INTERVAL, DEFAULT_MAX_CHUNK_BYTES,
 };
 pub use sync::{
-    run_matrix_sync, run_sync_loop, Backoff, BackoffConfig, StepError, SyncHealth, SyncState,
+    run_matrix_sync, run_matrix_sync_with_subscribers, run_sync_loop, Backoff, BackoffConfig,
+    StepError, SyncHealth, SyncState,
 };
 pub use task::{
     can_transition, create_task, create_task_for_session, is_known_state, is_runnable, list_tasks,

@@ -34,7 +34,7 @@ If a box can sync with a homeserver, it can participate — even one that accept
 
 ## Project status
 
-**Public alpha (v0.1.0).** The architecture, protocol schema, IPC layer, policy engine, Ed25519 signing, and sandbox abstraction are in place, and most command groups now run against a real Matrix homeserver through the daemon. Matrix-backed remote `call` is implemented behind daemon IPC; raw `exec` remains daemon-mediated local loopback for now. The other main gap is the **live daemon scheduler loop** that would auto-drive tasks over `/sync`. Each capability below is tagged so you always know what runs today.
+**Public alpha (v0.1.0).** The architecture, protocol schema, IPC layer, policy engine, Ed25519 signing, and sandbox abstraction are in place, and most command groups now run against a real Matrix homeserver through the daemon. Matrix-backed remote `call` and non-PTY `exec` are implemented behind daemon IPC; stdin/cancel for remote exec and the **live daemon scheduler loop** that would auto-drive tasks over `/sync` remain follow-up work. Each capability below is tagged so you always know what runs today.
 
 | Area | Status |
 |---|---|
@@ -46,7 +46,7 @@ If a box can sync with a homeserver, it can participate — even one that accept
 | Task state: `task create` / `update` / `list` / `graph` / `watch` (daemon-IPC, over Matrix) | ✅ Implemented |
 | Structured task actions (`tool` / `exec`), lifecycle-transition validation, stable task result schema | ✅ Implemented |
 | Daemon task-orchestration engine: scheduler, optimistic `state_rev` claiming, tool/exec dispatch, policy + trust/signature + approval enforcement, restart recovery, DAG diagnostics | ✅ Implemented (engine + tests); not yet auto-driven by a live `/sync` loop — see limitations |
-| `call` / `exec` runners | 🟡 `call` supports signed Matrix-backed remote daemon dispatch when `--room`/`--agent` are provided; `exec` is daemon-mediated local loopback only |
+| `call` / `exec` runners | 🟡 `call` and non-PTY `exec` support signed Matrix-backed remote daemon dispatch when `--room`/`--agent` are provided; remote exec stdin/cancel still landing |
 | Live daemon scheduler loop auto-claiming/executing tasks over `/sync`; remote Matrix-backed `exec`; E2EE in production; `bubblewrap`/container sandboxes; interactive PTY; large artifacts | 🔮 Planned |
 
 **Platform: Unix only** (Linux and macOS). Windows was intentionally dropped — the project relies on Unix-domain-socket IPC and Unix process semantics.
@@ -85,7 +85,7 @@ mx-agent daemon status --json         # pid, uptime, socket path, version as JSO
 mx-agent daemon stop                  # graceful shutdown (SIGTERM, then SIGKILL)
 ```
 
-The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and `task` command groups run against a real Matrix homeserver through the daemon today. `call` is daemon-mediated local loopback by default and becomes a signed Matrix-backed remote call when `--room` and `--agent` target a registered, trusted, policy-allowed remote agent. `exec` is still daemon-mediated local loopback. See [Project status](#project-status) for the full breakdown.
+The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and `task` command groups run against a real Matrix homeserver through the daemon today. `call` and non-PTY `exec` are daemon-mediated local loopback by default and become signed Matrix-backed remote operations when `--room` and `--agent` target a registered, trusted, policy-allowed remote agent. Remote exec stdin/cancel remains follow-up. See [Project status](#project-status) for the full breakdown.
 
 ---
 

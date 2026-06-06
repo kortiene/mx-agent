@@ -248,6 +248,7 @@ pub fn run_foreground() -> io::Result<()> {
                 started_at,
                 &handler_socket,
                 &handler_health,
+                &exec_subscribers,
             )
         };
         if let Err(e) = mx_agent_ipc::serve_streaming(&listener, handler) {
@@ -419,6 +420,7 @@ fn dispatch(
     started_at: u64,
     socket_path: &str,
     health: &SharedHealth,
+    exec_subscribers: Option<&crate::ExecSubscriberRegistry>,
 ) -> Response {
     match req.method.as_str() {
         "daemon.ping" => Response::result(req.id.clone(), json!({"pong": true})),
@@ -444,7 +446,7 @@ fn dispatch(
             Err(response) => *response,
         },
         "exec.start" => match parse_params::<crate::ExecStartParams>(req) {
-            Ok(params) => dispatch_exec_start(req, &params),
+            Ok(params) => dispatch_exec_start(req, &params, exec_subscribers),
             Err(response) => *response,
         },
         "exec.stdin" => match parse_params::<crate::ExecStdinParams>(req) {
@@ -542,7 +544,11 @@ fn dispatch_call_start(req: &Request, params: &crate::CallStartParams) -> Respon
     }
 }
 
-fn dispatch_exec_start(req: &Request, params: &crate::ExecStartParams) -> Response {
+fn dispatch_exec_start(
+    req: &Request,
+    params: &crate::ExecStartParams,
+    exec_subscribers: Option<&crate::ExecSubscriberRegistry>,
+) -> Response {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -556,7 +562,22 @@ fn dispatch_exec_start(req: &Request, params: &crate::ExecStartParams) -> Respon
             )
         }
     };
-    let result = runtime.block_on(crate::start_exec_loopback(params));
+    let live = params.room.is_some() && params.agent.is_some();
+    let result = if live {
+        match exec_subscribers {
+            Some(registry) => runtime.block_on(crate::start_exec_matrix(params, registry)),
+            None => crate::ExecStartResult {
+                invocation_id: String::new(),
+                request_id: String::new(),
+                outcome: crate::ExecOutcome::Error {
+                    kind: crate::ExecErrorKind::Remote,
+                    message: "remote exec requires daemon subscriber registry".to_string(),
+                },
+            },
+        }
+    } else {
+        runtime.block_on(crate::start_exec_loopback(params))
+    };
     match serde_json::to_value(&result) {
         Ok(value) => Response::result(req.id.clone(), value),
         Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
@@ -647,11 +668,19 @@ fn dispatch_streaming(
     started_at: u64,
     socket_path: &str,
     health: &SharedHealth,
+    exec_subscribers: &crate::ExecSubscriberRegistry,
 ) -> io::Result<()> {
     if req.method == "task.watch" {
         dispatch_task_watch(req, stream)
     } else {
-        let response = dispatch(req, pid, started_at, socket_path, health);
+        let response = dispatch(
+            req,
+            pid,
+            started_at,
+            socket_path,
+            health,
+            Some(exec_subscribers),
+        );
         write_ipc_response(stream, &response)
     }
 }
@@ -811,7 +840,7 @@ mod tests {
     fn task_ipc_methods_validate_params_before_loading_session() {
         for method in ["task.create", "task.update", "task.list", "task.graph"] {
             let req = Request::new(json!(1), method, Value::Null);
-            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None);
+            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
             let error = response.error.expect("invalid params should be rejected");
             assert_eq!(error.code, INVALID_PARAMS);
             assert!(error.message.contains("invalid params"));
@@ -827,7 +856,7 @@ mod tests {
             "task.list",
             json!({"room":"!abc:matrix.org","state":null,"assigned_to":null}),
         );
-        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
         let error = response.error.expect("missing session should be rejected");
         assert_eq!(error.code, INTERNAL_ERROR);
         assert!(error.message.contains("not logged in"));
@@ -837,7 +866,7 @@ mod tests {
     fn exec_start_rejects_invalid_params() {
         // Missing the required `command` field.
         let req = Request::new(json!(1), "exec.start", json!({"cwd":"/tmp"}));
-        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
         let error = response.error.expect("invalid params should be rejected");
         assert_eq!(error.code, INVALID_PARAMS);
         assert!(error.message.contains("exec.start"));
@@ -852,7 +881,7 @@ mod tests {
             "exec.start",
             json!({"command":["true"],"cwd":std::env::temp_dir()}),
         );
-        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
         assert!(response.error.is_none(), "unexpected error: {response:?}");
         let result = response.result.expect("exec.start should return a result");
         let parsed: crate::ExecStartResult = serde_json::from_value(result).unwrap();
@@ -874,7 +903,7 @@ mod tests {
             "exec.stdin",
             json!({"invocation_id":"inv_1","data":[104,105],"eof":true}),
         );
-        let stdin_response = dispatch(&stdin_req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        let stdin_response = dispatch(&stdin_req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
         assert!(stdin_response.error.is_none());
         let stdin: crate::ExecControlResult =
             serde_json::from_value(stdin_response.result.unwrap()).unwrap();
@@ -886,7 +915,7 @@ mod tests {
             "exec.cancel",
             json!({"invocation_id":"inv_1","reason":"test"}),
         );
-        let cancel_response = dispatch(&cancel_req, 1, now_unix(), "/tmp/daemon.sock", &None);
+        let cancel_response = dispatch(&cancel_req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
         assert!(cancel_response.error.is_none());
         let cancel: crate::ExecControlResult =
             serde_json::from_value(cancel_response.result.unwrap()).unwrap();
