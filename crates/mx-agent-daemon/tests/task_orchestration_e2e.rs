@@ -220,6 +220,9 @@ fn tick(
     // No long-lived local invocations across a synchronous tick, so recovery
     // sees an empty live set (matching the live loop's local-dispatch path).
     let live_invocations = BTreeSet::new();
+    // A fresh attempt set per tick: the in-memory store updates synchronously,
+    // so there is no stale re-read to dedupe (unlike the live loop).
+    let mut attempted = std::collections::HashSet::new();
     mx_agent_daemon::run_scheduler_tick(
         scheduler,
         orchestrator,
@@ -227,6 +230,7 @@ fn tick(
         &live_invocations,
         store,
         dispatcher,
+        &mut attempted,
     )
 }
 

@@ -29,7 +29,7 @@
 //! synchronous orchestrator core is reused unchanged and there is no second
 //! `/sync` loop competing for the session token.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -202,6 +202,14 @@ where
 /// (signature/trust/replay + deny-by-default policy + approval) before any claim
 /// or dispatch. Returns one [`OrchestrationOutcome`] per recovery decision and
 /// per processed task.
+///
+/// `attempted` deduplicates work across ticks by observed `(task_id,
+/// state_rev)`: a task is processed at most once per revision. This is essential
+/// for the live loop, whose task snapshot is read from a local store that lags
+/// the homeserver — without it, a just-claimed task that has not yet synced back
+/// would be re-read as still `pending`, re-verified, and rejected by replay
+/// protection (blocking work the scheduler already ran). The in-memory tests
+/// pass a fresh set, since their store updates synchronously.
 pub fn run_scheduler_tick<S, D>(
     scheduler: &TaskScheduler,
     orchestrator: &TaskOrchestrator,
@@ -209,6 +217,7 @@ pub fn run_scheduler_tick<S, D>(
     live_invocations: &BTreeSet<String>,
     store: &mut S,
     dispatcher: &mut D,
+    attempted: &mut HashSet<(String, u64)>,
 ) -> Vec<OrchestrationOutcome>
 where
     S: TaskStore,
@@ -227,6 +236,11 @@ where
         .collect();
     for id in runnable_ids {
         if let Some(task) = snapshot.iter().find(|t| t.task_id == id) {
+            // Skip a task already attempted at this exact revision; record it
+            // before processing so a stale re-read on the next tick is ignored.
+            if !attempted.insert((task.task_id.clone(), task.state_rev)) {
+                continue;
+            }
             outcomes.push(orchestrator.process_one(task, snapshot, store, dispatcher));
         }
     }
@@ -260,17 +274,35 @@ pub fn run_scheduler_loop(
         }
     };
     let paths = SessionPaths::resolve();
+    // Observed `(task_id, state_rev)` pairs already attempted, so a task is never
+    // re-processed at the same revision while the local store catches up to the
+    // homeserver. Capped to bound memory on a long-lived daemon.
+    let mut attempted: HashSet<(String, u64)> = HashSet::new();
     tracing::info!(
         interval_secs = interval.as_secs(),
         dispatch = ?mode,
         "task scheduler loop started"
     );
     while running.load(Ordering::SeqCst) {
-        scheduler_pass(&runtime, &client, &subscribers, mode, &paths);
+        if attempted.len() > MAX_ATTEMPTED_TRACKED {
+            attempted.clear();
+        }
+        scheduler_pass(
+            &runtime,
+            &client,
+            &subscribers,
+            mode,
+            &paths,
+            &mut attempted,
+        );
         sleep_interruptible(interval, &running);
     }
     tracing::info!("task scheduler loop stopped");
 }
+
+/// Upper bound on tracked `(task_id, state_rev)` attempts before the set is
+/// cleared, bounding scheduler memory on a long-running daemon.
+const MAX_ATTEMPTED_TRACKED: usize = 50_000;
 
 /// Sleep for `delay`, waking early when `running` is cleared.
 fn sleep_interruptible(delay: Duration, running: &AtomicBool) {
@@ -294,6 +326,7 @@ fn scheduler_pass(
     subscribers: &ExecSubscriberRegistry,
     mode: TaskDispatchMode,
     paths: &SessionPaths,
+    attempted: &mut HashSet<(String, u64)>,
 ) {
     let local_user = client.user_id().map(|u| u.to_string()).unwrap_or_default();
     if local_user.is_empty() {
@@ -352,6 +385,7 @@ fn scheduler_pass(
                 subscribers,
                 mode,
                 paths,
+                attempted,
             );
         }
     }
@@ -369,6 +403,7 @@ fn scheduler_pass_for_agent(
     subscribers: &ExecSubscriberRegistry,
     mode: TaskDispatchMode,
     paths: &SessionPaths,
+    attempted: &mut HashSet<(String, u64)>,
 ) {
     // Deny-by-default: when no policy file is present, the default policy denies
     // every action, so nothing is claimed or dispatched.
@@ -418,6 +453,7 @@ fn scheduler_pass_for_agent(
                 &live_invocations,
                 &mut store,
                 &mut dispatcher,
+                attempted,
             )
         }
         TaskDispatchMode::Matrix => {
@@ -435,6 +471,7 @@ fn scheduler_pass_for_agent(
                 &live_invocations,
                 &mut store,
                 &mut dispatcher,
+                attempted,
             )
         }
     };
@@ -635,6 +672,7 @@ allow_cwd = ["/repo"]
         let mut matrix_store = MatrixTaskStore::new(ROOM, |options: UpdateTaskOptions| {
             store_ref.borrow_mut().apply(options)
         });
+        let mut attempted = HashSet::new();
         run_scheduler_tick(
             &scheduler,
             &orchestrator,
@@ -642,6 +680,7 @@ allow_cwd = ["/repo"]
             &live,
             &mut matrix_store,
             dispatcher,
+            &mut attempted,
         )
     }
 
@@ -660,6 +699,70 @@ allow_cwd = ["/repo"]
             workspace_to_store_error(WorkspaceError::TaskNotFound("x".to_string())),
             TaskStoreError::NotFound(id) if id == "x"
         ));
+    }
+
+    #[test]
+    fn attempted_set_dedupes_a_task_at_the_same_revision() {
+        // A stale snapshot re-read of the same `(task_id, state_rev)` must not be
+        // re-processed: the live loop relies on this to avoid re-verifying (and
+        // replay-blocking) a task it already ran before the claim syncs back.
+        let mut store = RoomTaskStore::default();
+        store.insert(tool_task("task-a", "run_tests"));
+        let snapshot = store.snapshot();
+        let scheduler = TaskScheduler::new(AGENT, 4);
+        let orchestrator = orchestrator();
+        let live = BTreeSet::new();
+        let mut attempted = HashSet::new();
+        let mut runs = 0u32;
+        let mut dispatcher = RoutingDispatcher::new(
+            ToolTaskDispatcher::with_runner(|_n, _a| {
+                Ok(ToolResult {
+                    exit_code: 0,
+                    summary: "ok".to_string(),
+                })
+            }),
+            ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+        );
+
+        // First tick over the rev-1 snapshot processes the task once.
+        let store_ref = std::cell::RefCell::new(&mut store);
+        let mut matrix_store = MatrixTaskStore::new(ROOM, |options: UpdateTaskOptions| {
+            runs += 1;
+            store_ref.borrow_mut().apply(options)
+        });
+        let first = run_scheduler_tick(
+            &scheduler,
+            &orchestrator,
+            &snapshot,
+            &live,
+            &mut matrix_store,
+            &mut dispatcher,
+            &mut attempted,
+        );
+        // A second tick over the *same* (stale) rev-1 snapshot is a no-op.
+        let second = run_scheduler_tick(
+            &scheduler,
+            &orchestrator,
+            &snapshot,
+            &live,
+            &mut matrix_store,
+            &mut dispatcher,
+            &mut attempted,
+        );
+        drop(matrix_store);
+
+        assert!(
+            first
+                .iter()
+                .any(|o| matches!(o, OrchestrationOutcome::Completed { .. })),
+            "first tick should process the task"
+        );
+        assert!(
+            second.is_empty(),
+            "second tick over the same revision must process nothing: {second:?}"
+        );
+        // claim + finalize ran exactly once (2 store writes), not twice.
+        assert_eq!(runs, 2, "task must be claimed/finalized exactly once");
     }
 
     #[test]
