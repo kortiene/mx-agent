@@ -4,7 +4,7 @@ This guide takes you from nothing to your first remote-style command with mx-age
 
 We define every new term the first time it appears, explain *why* each step exists before giving the command, and end with a "Common errors & fixes" table.
 
-> **What's real in v0.1.0?** mx-agent is a public alpha. The daemon's lifecycle (`start` / `status` / `stop`), local IPC, and the `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and `task` command groups are functional and run against a real Matrix homeserver through the daemon. The remaining gaps: `call` / `exec` run **local-loopback** (remote Matrix transport is landing, #155), and the daemon task-orchestration engine — implemented and tested — is **not yet auto-driven by a live `/sync` loop**. Steps below are tagged ✅ (works today), 🟡 (designed, wiring in progress), or 🔮 (planned).
+> **What's real in v0.1.0?** mx-agent is a public alpha. All command groups except interactive PTY run against a real Matrix homeserver through the daemon — the stateless CLI never holds a Matrix session. `call` and non-PTY `exec` support signed Matrix-backed remote dispatch (including stdin/cancel controls) when `--room`/`--agent` are provided. The live daemon scheduler loop auto-claims and runs assigned tasks from room state. CI is green and stable. Steps below are tagged ✅ (works today), 🟡 (designed, wiring in progress), or 🔮 (planned).
 
 ---
 
