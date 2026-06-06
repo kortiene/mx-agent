@@ -51,10 +51,11 @@ pub use agent::{
     RegisterAgentOptions, DEFAULT_AGENT_KIND, DEFAULT_MAX_INVOCATIONS,
 };
 pub use approval::{
-    approval_decision_for, approval_request_for, decide_approval_for_session,
-    decision_permits_spawn, disposition_for_exec, emit_approval_decision, emit_approval_request,
-    get_pending_approval, list_pending_approvals, ApprovalDecisionRecord, ApprovalQueue,
-    ExecDisposition, PendingApproval, DECISION_APPROVED, DECISION_DENIED,
+    approval_decision_for, approval_request_expiry, approval_request_for,
+    decide_approval_for_session, decision_permits_spawn, disposition_for_exec,
+    emit_approval_decision, emit_approval_request, get_pending_approval, list_pending_approvals,
+    read_approval_decisions, ApprovalDecisionRecord, ApprovalQueue, ExecDisposition,
+    PendingApproval, APPROVAL_REQUEST_TTL, DECISION_APPROVED, DECISION_DENIED,
 };
 pub use artifact::{
     list_stream_artifacts, prepare_artifact, retrieve_artifact, retrieve_artifact_for_session,

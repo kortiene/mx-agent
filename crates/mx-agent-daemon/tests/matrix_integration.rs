@@ -16,8 +16,9 @@
 //! [`live_scheduler_executes_signed_task_dag_and_denies`] drives the live
 //! daemon scheduler loop over real `com.mxagent.task.v1` room state — auto
 //! executing a signed, assigned task DAG (honoring dependencies), refusing a
-//! policy-denied action, and holding an approval-required action (fail closed)
-//! — so none of those spawn a process they should not.
+//! policy-denied action, holding an approval-required action until it is decided
+//! over IPC (approve → runs to `succeeded`; deny → `blocked`, never spawned) —
+//! so none of those spawn a process they should not.
 //!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
@@ -52,13 +53,14 @@ use serde_json::{json, Value};
 use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
-    build_signed_exec_request, create_task, list_tasks, load_or_create_signing_key,
-    load_sync_token, login_password, register_agent, restore_client, run_matrix_sync,
-    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, sign_task_action,
-    start_call_matrix, start_exec_matrix, BackoffConfig, CallOutcome, CallStartParams,
-    CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
-    ExecStartParams, ExecSubscriberRegistry, ListTasksOptions, MatrixConfig, RegisterAgentOptions,
-    SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore,
+    build_signed_exec_request, create_task, decide_approval_for_session, list_pending_approvals,
+    list_tasks, load_or_create_signing_key, load_sync_token, login_password, register_agent,
+    restore_client, run_matrix_sync, run_matrix_sync_with_subscribers, run_scheduler_loop,
+    save_session, sign_task_action, start_call_matrix, start_exec_matrix, BackoffConfig,
+    CallOutcome, CallStartParams, CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome,
+    ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, ListTasksOptions, MatrixConfig,
+    RegisterAgentOptions, SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore,
+    DECISION_APPROVED, DECISION_DENIED,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -1139,6 +1141,7 @@ async fn live_scheduler_executes_signed_task_dag_and_denies() {
     std::fs::create_dir_all(&cwd).expect("create work dir");
     let sentinel = cwd.join("denied-ran");
     let approval_sentinel = cwd.join("approval-ran");
+    let approval_deny_sentinel = cwd.join("approval-deny-ran");
     // A distinct creator identity whose policy rule requires approval.
     let approver = "@approver:mx-agent.test";
 
@@ -1301,8 +1304,8 @@ requires_approval = true
             &signing,
             &requester,
         ),
-        // Policy-allowed but `requires_approval`: with no approval gate wired,
-        // the live scheduler must fail closed and never run it.
+        // Policy-allowed but `requires_approval`: the live scheduler holds it
+        // (fail closed) until an operator approves it over IPC, then it runs.
         signed_exec_task(
             room_id.as_str(),
             "task-approval",
@@ -1310,6 +1313,21 @@ requires_approval = true
                 "sh",
                 "-c",
                 &format!("touch {}", approval_sentinel.to_string_lossy()),
+            ],
+            &cwd,
+            Vec::new(),
+            &signing,
+            approver,
+        ),
+        // Also `requires_approval`: this one is denied over IPC, so it must reach
+        // `blocked` and its command must never spawn.
+        signed_exec_task(
+            room_id.as_str(),
+            "task-approval-deny",
+            &[
+                "sh",
+                "-c",
+                &format!("touch {}", approval_deny_sentinel.to_string_lossy()),
             ],
             &cwd,
             Vec::new(),
@@ -1363,6 +1381,83 @@ requires_approval = true
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // Fail-closed before any decision: both approval-required tasks are held
+    // (still `pending`, never `succeeded`) and their commands have not spawned.
+    assert_ne!(
+        final_states.get("task-approval").map(String::as_str),
+        Some("succeeded"),
+        "approval-required task must be held until approved; states: {final_states:?}"
+    );
+    assert_ne!(
+        final_states.get("task-approval-deny").map(String::as_str),
+        Some("succeeded"),
+        "approval-required task must be held until decided; states: {final_states:?}"
+    );
+    assert!(
+        !approval_sentinel.exists() && !approval_deny_sentinel.exists(),
+        "approval-required commands must not spawn before a decision"
+    );
+
+    // The scheduler enqueues a pending approval per held task into the local
+    // queue (so `mx-agent approval approve/deny` over IPC can resolve it). Wait
+    // for both to appear before deciding.
+    let approve_id = "approval:task-approval";
+    let deny_id = "approval:task-approval-deny";
+    let queue_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        let ids: std::collections::BTreeSet<&str> =
+            pending.iter().map(|p| p.request_id()).collect();
+        if ids.contains(approve_id) && ids.contains(deny_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < queue_deadline,
+            "scheduler should enqueue pending approvals; queued: {ids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Decide over the daemon's session exactly as the `approval.decide` IPC path
+    // does: approve one held task and deny the other. The decision is published
+    // into the room, where the live scheduler resolves it on its next pass.
+    decide_approval_for_session(
+        &alice_session,
+        &paths,
+        approve_id,
+        DECISION_APPROVED,
+        alice_id.as_str(),
+    )
+    .await
+    .expect("approve the held task");
+    decide_approval_for_session(
+        &alice_session,
+        &paths,
+        deny_id,
+        DECISION_DENIED,
+        alice_id.as_str(),
+    )
+    .await
+    .expect("deny the held task");
+
+    // After the decisions, the approved task auto-progresses to `succeeded` and
+    // the denied task is finalized `blocked`.
+    let decided_deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    loop {
+        if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+            final_states = tasks.into_iter().map(|t| (t.task_id, t.state)).collect();
+            let approved = final_states.get("task-approval").map(String::as_str);
+            let denied = final_states.get("task-approval-deny").map(String::as_str);
+            if approved == Some("succeeded") && denied == Some("blocked") {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= decided_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     // Dump the final task state + result for each task to aid CI debugging.
     if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
         for t in &tasks {
@@ -1407,15 +1502,24 @@ requires_approval = true
         !sentinel.exists(),
         "policy-denied task's command must never spawn (sentinel must not exist)"
     );
-    // Approval safety: an action that requires approval is never executed by the
-    // gate-less live scheduler (fail closed), so its command never spawns.
-    assert_ne!(
+    // Approve→execute: the approved task ran to success and its command spawned.
+    assert_eq!(
         final_states.get("task-approval").map(String::as_str),
         Some("succeeded"),
-        "approval-required task must not be executed without approval; states: {final_states:?}"
+        "approved task must auto-progress to succeeded; states: {final_states:?}"
     );
     assert!(
-        !approval_sentinel.exists(),
-        "approval-required task's command must never spawn without approval"
+        approval_sentinel.exists(),
+        "approved task's command must spawn after approval"
+    );
+    // Deny→blocked: the denied task is blocked and its command never spawned.
+    assert_eq!(
+        final_states.get("task-approval-deny").map(String::as_str),
+        Some("blocked"),
+        "denied task must be blocked, not executed; states: {final_states:?}"
+    );
+    assert!(
+        !approval_deny_sentinel.exists(),
+        "denied task's command must never spawn"
     );
 }

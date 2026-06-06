@@ -23,13 +23,15 @@
 //! exec dispatch loop; this module provides the building blocks and enforces
 //! the "does not execute immediately" guarantee.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use matrix_sdk::config::SyncSettings;
+use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::{Client, Room};
 use mx_agent_policy::{Allowance, NetworkPolicy, Sandbox};
 use mx_agent_protocol::events::timeline::{APPROVAL_DECISION, APPROVAL_REQUEST};
@@ -332,6 +334,40 @@ pub async fn emit_approval_decision(
     Ok(())
 }
 
+/// Read recorded `com.mxagent.approval.decision.v1` events from `room`, keyed by
+/// `request_id`.
+///
+/// Scans up to `limit` recent timeline events newest-first and keeps the **first
+/// (newest)** decision seen per `request_id`, so a later decision supersedes an
+/// earlier one. The live scheduler uses this to resolve a held approval-required
+/// task against published decisions (architecture §12): an `approved` decision
+/// lets it proceed, any other (or absent) decision keeps it fail-closed.
+pub async fn read_approval_decisions(
+    room: &Room,
+    limit: u32,
+) -> Result<HashMap<String, ApprovalDecision>, WorkspaceError> {
+    let mut request = MessagesOptions::backward();
+    request.limit = matrix_sdk::ruma::UInt::from(limit);
+    let messages = room.messages(request).await.map_err(WorkspaceError::from)?;
+
+    let mut decisions: HashMap<String, ApprovalDecision> = HashMap::new();
+    for event in messages.chunk {
+        let raw = event.raw();
+        let is_decision =
+            raw.get_field::<String>("type").ok().flatten().as_deref() == Some(APPROVAL_DECISION);
+        if !is_decision {
+            continue;
+        }
+        if let Ok(Some(decision)) = raw.get_field::<ApprovalDecision>("content") {
+            // Newest-first scan: the first occurrence per request_id wins.
+            decisions
+                .entry(decision.request_id.clone())
+                .or_insert(decision);
+        }
+    }
+    Ok(decisions)
+}
+
 /// The outcome of deciding a queued approval.
 ///
 /// Returned by [`decide_approval_for_session`] once the decision has been emitted
@@ -349,6 +385,26 @@ impl ApprovalDecisionRecord {
     pub fn approved(&self) -> bool {
         decision_permits_spawn(&self.decision)
     }
+}
+
+/// Default lifetime stamped onto a queued task approval request.
+///
+/// Bounds the `expires_at` of an emitted `com.mxagent.approval.request.v1` so a
+/// queued approval carries a finite horizon rather than an unbounded one.
+pub const APPROVAL_REQUEST_TTL: Duration = Duration::from_secs(3600);
+
+/// Compute the `expires_at` (RFC 3339 UTC) for an approval request raised at
+/// `now` with lifetime `ttl`.
+///
+/// Pure and deterministic given its inputs (the wall clock is read by the
+/// caller), so it is unit-testable without mocking time.
+pub fn approval_request_expiry(now: SystemTime, ttl: Duration) -> String {
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+        .saturating_add(ttl.as_secs());
+    unix_to_rfc3339(secs)
 }
 
 /// Format the current wall-clock time as an RFC 3339 UTC timestamp.
@@ -697,6 +753,18 @@ mod tests {
             room_id: "!abc:matrix.org".to_string(),
         };
         assert!(!denied.approved());
+    }
+
+    #[test]
+    fn approval_request_expiry_adds_ttl_to_now() {
+        // A known instant plus a one-hour TTL yields the expected RFC 3339 stamp.
+        let base = UNIX_EPOCH + Duration::from_secs(1_748_865_600); // 2025-06-02T12:00:00Z
+        let expiry = approval_request_expiry(base, Duration::from_secs(3600));
+        assert_eq!(expiry, "2025-06-02T13:00:00Z");
+        // The default TTL is bounded (not unbounded) and well-formed.
+        let with_default = approval_request_expiry(base, APPROVAL_REQUEST_TTL);
+        assert_eq!(with_default.len(), 20);
+        assert!(with_default.ends_with('Z'));
     }
 
     #[test]
