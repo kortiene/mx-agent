@@ -6,12 +6,12 @@ other, then running a tool call and a remote-style `exec`.
 
 > **Alpha status.** `mx-agent` is pre-release software. The workspace,
 > authentication, agent-registry, task, trust, and context-sharing commands run
-> against a real Matrix homeserver. `call` is daemon-mediated local loopback by
-> default and uses signed Matrix-backed remote dispatch when `--room`/`--agent`
-> target a registered, trusted, policy-allowed agent. `exec` is still
-> daemon-mediated local loopback. Treat execution commands carefully and read
-> [Security warnings](#security-warnings) before pointing mx-agent at anything
-> you do not control.
+> against a real Matrix homeserver. `call` and non-PTY `exec` are daemon-mediated
+> local loopback by default and use signed Matrix-backed remote dispatch when
+> `--room`/`--agent` target a registered, trusted, policy-allowed agent. Remote
+> exec stdin/cancel remains follow-up. Treat execution commands carefully and
+> read [Security warnings](#security-warnings) before pointing mx-agent at
+> anything you do not control.
 
 ## Contents
 
@@ -208,13 +208,11 @@ missing or corrupt chunk as a hard error), `--pty` (allocate a pseudo-terminal),
 
 > In this alpha, `exec` is mediated by the daemon over local IPC, so a daemon
 > must be running (`mx-agent daemon start`); otherwise `exec` exits `3`. The
-> daemon — not the CLI — runs non-PTY commands, but they still run on your
-> **local** machine as a loopback. The daemon IPC API includes `exec.start`,
-> `exec.stdin`, and `exec.cancel`; stdin/cancel currently return a structured
-> "not live" response because loopback `exec.start` runs to completion in one
-> request. The `--room`/`--agent` targeting flags are accepted for forward
-> compatibility but do not yet dispatch to a remote agent over Matrix. `--pty`
-> still runs in the CLI for now; moving it onto the IPC path is follow-up work.
+> daemon — not the CLI — runs non-PTY commands. Without `--room`/`--agent`, they
+> run on your **local** machine as a loopback; with both targeting flags, the
+> daemon sends a signed Matrix request to the remote agent, which verifies local
+> trust and policy before spawning. Remote stdin/cancel over Matrix is still
+> follow-up work, and `--pty` still runs in the CLI for now.
 
 ## Track work with tasks
 

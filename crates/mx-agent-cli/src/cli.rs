@@ -3483,7 +3483,7 @@ fn cmd_exec(global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
             return match kind {
                 mx_agent_daemon::ExecErrorKind::NotFound => ExitCode::from(127),
                 mx_agent_daemon::ExecErrorKind::EmptyCommand => ExitCode::from(64),
-                mx_agent_daemon::ExecErrorKind::Spawn => {
+                mx_agent_daemon::ExecErrorKind::Spawn | mx_agent_daemon::ExecErrorKind::Remote => {
                     ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
                 }
             };
