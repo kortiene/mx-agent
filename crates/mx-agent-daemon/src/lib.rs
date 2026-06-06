@@ -18,6 +18,7 @@ pub mod exec_ipc;
 pub mod exec_subscribers;
 pub mod heartbeat;
 pub mod invocation;
+pub mod ipc;
 pub mod lifecycle;
 pub mod matrix;
 #[cfg(unix)]
@@ -107,6 +108,10 @@ pub use invocation::{
     cancel_invocation_for_session, get_invocation, get_invocation_for_session, invocation_for_task,
     is_terminal, list_invocations, list_invocations_for_session, task_result_from_invocation,
     task_state_for_invocation, terminal_state_for_exit, ListInvocationsOptions,
+};
+pub use ipc::{
+    ApprovalDecideParams, InvocationCancelParams, RoomAgentParams, RoomInvocationParams,
+    RoomParams, TrustPublishParams,
 };
 pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,

@@ -32,7 +32,7 @@ pub const DEFAULT_AGENT_KIND: &str = "generic";
 pub const DEFAULT_MAX_INVOCATIONS: u32 = 1;
 
 /// Options for [`register_agent`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RegisterAgentOptions {
     /// Room ID or alias to register in.
     pub room: String,
@@ -198,7 +198,7 @@ pub(crate) async fn read_agent_state(
 }
 
 /// Options for [`list_agents`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ListAgentsOptions {
     /// Room ID or alias to list agents in.
     pub room: String,

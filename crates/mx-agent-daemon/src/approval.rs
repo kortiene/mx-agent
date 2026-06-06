@@ -336,7 +336,7 @@ pub async fn emit_approval_decision(
 ///
 /// Returned by [`decide_approval_for_session`] once the decision has been emitted
 /// into the room and the request removed from the local queue.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalDecisionRecord {
     /// The decision event that was emitted.
     pub decision: ApprovalDecision,

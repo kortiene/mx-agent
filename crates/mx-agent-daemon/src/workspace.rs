@@ -58,7 +58,7 @@ impl fmt::Display for WorkspaceVisibility {
 }
 
 /// Options for [`create_workspace`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CreateWorkspaceOptions {
     /// Optional room alias localpart (the `my-project` in `#my-project:server`).
     pub alias: Option<String>,
@@ -158,7 +158,7 @@ pub struct WorkspaceStatus {
 }
 
 /// Options for [`attach_workspace`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AttachWorkspaceOptions {
     /// Room ID or alias to attach to.
     pub room: String,

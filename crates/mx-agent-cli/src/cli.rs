@@ -7,8 +7,6 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
@@ -1112,39 +1110,36 @@ fn trust_publish(global: &GlobalArgs, args: &TrustPublishArgs) -> ExitCode {
             return ExitCode::from(3);
         }
     };
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    // Publishing the resolved local record is daemon-mediated: the daemon owns
+    // the Matrix session (issue #201).
+    let params = mx_agent_daemon::TrustPublishParams {
+        room: args.room.clone(),
+        entry,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::publish_trust_state_for_session(&session, &args.room, &entry).await {
-            Ok(state) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    println!(
-                        "mx-agent: published {} trust for agent {} to {}",
-                        state.status, state.agent_id, args.room
-                    );
-                    println!("  key:         {}", state.key_id);
-                    println!("  fingerprint: {}", state.fingerprint);
-                    println!("  trusted_by:  {}", state.trusted_by);
-                }
-                ExitCode::SUCCESS
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::TrustState>(
+        global,
+        "trust.publish",
+        &params,
+    ) {
+        Ok(state) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!(
+                    "mx-agent: published {} trust for agent {} to {}",
+                    state.status, state.agent_id, args.room
+                );
+                println!("  key:         {}", state.key_id);
+                println!("  fingerprint: {}", state.fingerprint);
+                println!("  trusted_by:  {}", state.trusted_by);
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not publish trust state: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 /// Inspect trust state published in a workspace room, combined with the local
@@ -1159,66 +1154,62 @@ fn trust_state(global: &GlobalArgs, args: &TrustStateArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    // Reading published trust state is daemon-mediated; the local store
+    // reconciliation below stays CLI-side (local-only, issue #201).
+    let params = mx_agent_daemon::RoomParams {
+        room: args.room.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::list_trust_states_for_session(&session, &args.room).await {
-            Ok(states) => {
-                let states: Vec<_> = states
-                    .into_iter()
-                    .filter(|s| args.agent.as_deref().map_or(true, |a| s.agent_id == a))
-                    .collect();
-                let effective = mx_agent_daemon::effective_trust_table(&local, &states);
-                let effective: Vec<_> = effective
-                    .into_iter()
-                    .filter(|t| args.agent.as_deref().map_or(true, |a| t.agent_id == a))
-                    .collect();
-                if global.json {
-                    let obj = serde_json::json!({
-                        "published": states,
-                        "effective": effective.iter().map(|t| serde_json::json!({
-                            "agent_id": t.agent_id,
-                            "key_id": t.key_id,
-                            "trusted": t.trusted,
-                            "source": format!("{:?}", t.source).to_lowercase(),
-                        })).collect::<Vec<_>>(),
-                    });
-                    println!("{obj}");
-                } else if states.is_empty() {
-                    println!("mx-agent: no trust state published in {}", args.room);
-                } else {
-                    println!(
-                        "mx-agent: {} published trust record(s) in {}",
-                        states.len(),
-                        args.room
-                    );
-                    for s in &states {
-                        println!("  {} {}", s.status, s.key_id);
-                        println!("    agent:       {}", s.agent_id);
-                        println!("    fingerprint: {}", s.fingerprint);
-                        println!("    trusted_by:  {}", s.trusted_by);
-                    }
-                    println!("mx-agent: effective trust (local store wins):");
-                    for t in &effective {
-                        let label = if t.trusted { "trusted" } else { "untrusted" };
-                        let source = format!("{:?}", t.source).to_lowercase();
-                        println!("  {label} {} {} (via {source})", t.agent_id, t.key_id);
-                    }
+    match daemon_ipc_call::<_, Vec<mx_agent_protocol::schema::TrustState>>(
+        global,
+        "trust.state",
+        &params,
+    ) {
+        Ok(states) => {
+            let states: Vec<_> = states
+                .into_iter()
+                .filter(|s| args.agent.as_deref().map_or(true, |a| s.agent_id == a))
+                .collect();
+            let effective = mx_agent_daemon::effective_trust_table(&local, &states);
+            let effective: Vec<_> = effective
+                .into_iter()
+                .filter(|t| args.agent.as_deref().map_or(true, |a| t.agent_id == a))
+                .collect();
+            if global.json {
+                let obj = serde_json::json!({
+                    "published": states,
+                    "effective": effective.iter().map(|t| serde_json::json!({
+                        "agent_id": t.agent_id,
+                        "key_id": t.key_id,
+                        "trusted": t.trusted,
+                        "source": format!("{:?}", t.source).to_lowercase(),
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{obj}");
+            } else if states.is_empty() {
+                println!("mx-agent: no trust state published in {}", args.room);
+            } else {
+                println!(
+                    "mx-agent: {} published trust record(s) in {}",
+                    states.len(),
+                    args.room
+                );
+                for s in &states {
+                    println!("  {} {}", s.status, s.key_id);
+                    println!("    agent:       {}", s.agent_id);
+                    println!("    fingerprint: {}", s.fingerprint);
+                    println!("    trusted_by:  {}", s.trusted_by);
                 }
-                ExitCode::SUCCESS
+                println!("mx-agent: effective trust (local store wins):");
+                for t in &effective {
+                    let label = if t.trusted { "trusted" } else { "untrusted" };
+                    let source = format!("{:?}", t.source).to_lowercase();
+                    println!("  {label} {} {} (via {source})", t.agent_id, t.key_id);
+                }
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not read trust state: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 /// Show the local daemon signing key fingerprint, generating the key on first
@@ -1258,33 +1249,6 @@ fn handle_workspace(global: &GlobalArgs, cmd: &WorkspaceCommand) -> ExitCode {
     }
 }
 
-/// Build a single-threaded async runtime, reporting a clear error on failure.
-fn build_runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            eprintln!("mx-agent: could not start async runtime: {e}");
-            ExitCode::FAILURE
-        })
-}
-
-/// Load the persisted Matrix session, reporting a clear error if absent.
-fn load_session_or_exit() -> Result<mx_agent_daemon::StoredSession, ExitCode> {
-    let paths = mx_agent_daemon::SessionPaths::resolve();
-    match mx_agent_daemon::load_session(&paths) {
-        Ok(Some(session)) => Ok(session),
-        Ok(None) => {
-            eprintln!("mx-agent: not logged in; run `mx-agent auth login` first");
-            Err(ExitCode::from(3))
-        }
-        Err(e) => {
-            eprintln!("mx-agent: could not read session: {e}");
-            Err(ExitCode::FAILURE)
-        }
-    }
-}
-
 /// Print a [`WorkspaceInfo`] and return success.
 fn report_workspace_info(global: &GlobalArgs, info: &mx_agent_daemon::WorkspaceInfo, verb: &str) {
     if global.json {
@@ -1303,10 +1267,6 @@ fn report_workspace_info(global: &GlobalArgs, info: &mx_agent_daemon::WorkspaceI
 }
 
 fn workspace_create(global: &GlobalArgs, args: &WorkspaceCreateArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let visibility = match args.visibility {
         Visibility::Private => mx_agent_daemon::WorkspaceVisibility::Private,
         Visibility::Public => mx_agent_daemon::WorkspaceVisibility::Public,
@@ -1317,53 +1277,30 @@ fn workspace_create(global: &GlobalArgs, args: &WorkspaceCreateArgs) -> ExitCode
         topic: args.topic.clone(),
         visibility,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-
-    runtime.block_on(async {
-        match mx_agent_daemon::create_workspace_for_session(&session, &options).await {
-            Ok(info) => {
-                report_workspace_info(global, &info, "created");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("mx-agent: could not create workspace: {e}");
-                ExitCode::FAILURE
-            }
+    match daemon_ipc_call::<_, mx_agent_daemon::WorkspaceInfo>(global, "workspace.create", &options)
+    {
+        Ok(info) => {
+            report_workspace_info(global, &info, "created");
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn workspace_join(global: &GlobalArgs, args: &WorkspaceJoinArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    let params = mx_agent_daemon::RoomParams {
+        room: args.room.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::join_workspace_for_session(&session, &args.room).await {
-            Ok(info) => {
-                report_workspace_info(global, &info, "joined");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("mx-agent: could not join workspace: {e}");
-                ExitCode::FAILURE
-            }
+    match daemon_ipc_call::<_, mx_agent_daemon::WorkspaceInfo>(global, "workspace.join", &params) {
+        Ok(info) => {
+            report_workspace_info(global, &info, "joined");
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn workspace_attach(global: &GlobalArgs, args: &WorkspaceAttachArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let path = match &args.path {
         Some(p) => p.clone(),
         None => match std::env::current_dir() {
@@ -1379,42 +1316,37 @@ fn workspace_attach(global: &GlobalArgs, args: &WorkspaceAttachArgs) -> ExitCode
         path: path.to_string_lossy().into_owned(),
         project_id: args.project_id.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::attach_workspace_for_session(&session, &options).await {
-            Ok(state) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    println!("mx-agent: attached workspace to {}", args.room);
-                    println!("  project:   {}", state.project_id);
-                    println!("  path:      {}", state.path);
-                    if let Some(repo) = &state.repo {
-                        if let Some(url) = &repo.remote_url {
-                            println!("  remote:    {url}");
-                        }
-                        if let Some(branch) = &repo.branch {
-                            println!("  branch:    {branch}");
-                        }
-                        if let Some(commit) = &repo.commit {
-                            println!("  commit:    {commit}");
-                        }
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::WorkspaceState>(
+        global,
+        "workspace.attach",
+        &options,
+    ) {
+        Ok(state) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: attached workspace to {}", args.room);
+                println!("  project:   {}", state.project_id);
+                println!("  path:      {}", state.path);
+                if let Some(repo) = &state.repo {
+                    if let Some(url) = &repo.remote_url {
+                        println!("  remote:    {url}");
+                    }
+                    if let Some(branch) = &repo.branch {
+                        println!("  branch:    {branch}");
+                    }
+                    if let Some(commit) = &repo.commit {
+                        println!("  commit:    {commit}");
                     }
                 }
-                ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not attach workspace: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 /// Render a [`WorkspaceStatus`] as a human-readable block.
@@ -1459,96 +1391,113 @@ fn workspace_status(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode
     if args.watch {
         return workspace_status_watch(global, args);
     }
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    let params = mx_agent_daemon::RoomParams {
+        room: args.room.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::workspace_status_for_session(&session, &args.room).await {
-            Ok(status) => {
-                if global.json {
-                    println!("{}", status.to_json());
-                } else {
-                    print_workspace_status(&status);
-                }
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("mx-agent: could not read workspace status: {e}");
-                ExitCode::FAILURE
-            }
-        }
-    })
-}
-
-/// Render a single workspace-status watch update to the terminal.
-fn render_status_update(
-    json: bool,
-    update: mx_agent_daemon::WatchUpdate<'_, mx_agent_daemon::WorkspaceStatus>,
-) {
-    use mx_agent_daemon::WatchUpdate;
-    match update {
-        WatchUpdate::Initial(status)
-        | WatchUpdate::Changed {
-            current: status, ..
-        } => {
-            if json {
+    match daemon_ipc_call::<_, mx_agent_daemon::WorkspaceStatus>(
+        global,
+        "workspace.status",
+        &params,
+    ) {
+        Ok(status) => {
+            if global.json {
                 println!("{}", status.to_json());
             } else {
-                print_workspace_status(status);
+                print_workspace_status(&status);
             }
+            ExitCode::SUCCESS
         }
-        WatchUpdate::Reconnecting { attempt, error } => {
-            eprintln!("mx-agent: reconnecting (attempt {attempt}): {error}");
-        }
-        WatchUpdate::Reconnected => {
-            eprintln!("mx-agent: reconnected");
-        }
+        Err(code) => code,
     }
 }
 
-fn workspace_status_watch(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let running = Arc::new(AtomicBool::new(true));
-    let json = global.json;
-    let callback =
-        move |update: mx_agent_daemon::WatchUpdate<'_, mx_agent_daemon::WorkspaceStatus>| {
-            render_status_update(json, update);
-        };
-    runtime.block_on(async {
-        let watch = mx_agent_daemon::watch_workspace_status_for_session(
-            &session,
-            &args.room,
-            mx_agent_daemon::WatchConfig::default(),
-            &running,
-            callback,
-        );
-        tokio::select! {
-            result = watch => match result {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("mx-agent: could not watch workspace status: {e}");
-                    ExitCode::FAILURE
-                }
-            },
-            _ = tokio::signal::ctrl_c() => {
-                running.store(false, Ordering::SeqCst);
-                eprintln!("mx-agent: watch stopped");
-                ExitCode::SUCCESS
+/// Render one streamed `workspace.watch` IPC payload to the terminal.
+fn render_workspace_watch_ipc_payload(json: bool, payload: Value) -> Result<(), String> {
+    let event = payload
+        .get("event")
+        .and_then(Value::as_str)
+        .ok_or("watch payload missing event")?;
+    match event {
+        "initial" | "changed" => {
+            let key = if event == "initial" {
+                "status"
+            } else {
+                "current"
+            };
+            let value = payload.get(key).cloned().unwrap_or(Value::Null);
+            let status: mx_agent_daemon::WorkspaceStatus = serde_json::from_value(value)
+                .map_err(|e| format!("invalid workspace status payload: {e}"))?;
+            if json {
+                println!("{}", status.to_json());
+            } else {
+                print_workspace_status(&status);
             }
         }
-    })
+        "reconnecting" => {
+            let attempt = payload.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+            let error = payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            eprintln!("mx-agent: reconnecting (attempt {attempt}): {error}");
+        }
+        "reconnected" => eprintln!("mx-agent: reconnected"),
+        other => return Err(format!("unknown watch event kind {other:?}")),
+    }
+    Ok(())
+}
+
+fn workspace_status_watch(global: &GlobalArgs, args: &WorkspaceStatusArgs) -> ExitCode {
+    // Daemon-mediated streaming watch: the daemon owns the Matrix session and
+    // streams status snapshots over the open IPC connection (issue #201).
+    let params = mx_agent_daemon::RoomParams {
+        room: args.room.clone(),
+    };
+    let params = match serde_json::to_value(&params) {
+        Ok(params) => params,
+        Err(e) => {
+            eprintln!("mx-agent: could not encode workspace.watch request: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let socket = daemon_socket_path(global);
+    let mut client = match mx_agent_ipc::Client::connect(&socket) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!(
+                "mx-agent: could not contact daemon at {}: {e}; run `mx-agent daemon start`",
+                socket.display()
+            );
+            return ExitCode::from(3);
+        }
+    };
+    let request = mx_agent_ipc::Request::new(Value::from(1_u64), "workspace.watch", params);
+    if let Err(e) = client.send(&request) {
+        eprintln!("mx-agent: daemon IPC request workspace.watch failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    loop {
+        let response = match client.recv() {
+            Ok(response) => response,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mx-agent: daemon IPC request workspace.watch failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Some(error) = response.error {
+            eprintln!(
+                "mx-agent: daemon rejected workspace.watch: {}",
+                error.message
+            );
+            return ExitCode::FAILURE;
+        }
+        let payload = response.result.unwrap_or(Value::Null);
+        if let Err(e) = render_workspace_watch_ipc_payload(global.json, payload) {
+            eprintln!("mx-agent: daemon returned invalid workspace.watch response: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 }
 
 /// Handle the `daemon` command group.
@@ -1562,180 +1511,150 @@ fn handle_agent(global: &GlobalArgs, cmd: &AgentCommand) -> ExitCode {
 }
 
 fn agent_list(global: &GlobalArgs, args: &AgentListArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::ListAgentsOptions {
         room: args.room.clone(),
         capabilities: args.capabilities.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::list_agents_for_session(&session, &options).await {
-            Ok(agents) => {
-                if global.json {
+    match daemon_ipc_call::<_, Vec<mx_agent_protocol::schema::AgentState>>(
+        global,
+        "agent.list",
+        &options,
+    ) {
+        Ok(agents) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&agents).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else if agents.is_empty() {
+                println!("mx-agent: no agents registered in {}", args.room);
+            } else {
+                println!("mx-agent: {} agent(s) in {}", agents.len(), args.room);
+                for agent in &agents {
+                    let caps = if agent.capabilities.is_empty() {
+                        "-".to_string()
+                    } else {
+                        agent.capabilities.join(",")
+                    };
                     println!(
-                        "{}",
-                        serde_json::to_string(&agents).unwrap_or_else(|_| "[]".to_string())
+                        "  {:<24} {:<8} {:<8} {}",
+                        agent.agent_id, agent.kind, agent.status, caps
                     );
-                } else if agents.is_empty() {
-                    println!("mx-agent: no agents registered in {}", args.room);
-                } else {
-                    println!("mx-agent: {} agent(s) in {}", agents.len(), args.room);
-                    for agent in &agents {
-                        let caps = if agent.capabilities.is_empty() {
-                            "-".to_string()
-                        } else {
-                            agent.capabilities.join(",")
-                        };
-                        println!(
-                            "  {:<24} {:<8} {:<8} {}",
-                            agent.agent_id, agent.kind, agent.status, caps
-                        );
-                    }
                 }
-                ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not list agents: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn agent_show(global: &GlobalArgs, args: &AgentShowArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    let params = mx_agent_daemon::RoomAgentParams {
+        room: args.room.clone(),
+        agent_id: args.agent_id.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::show_agent_for_session(&session, &args.room, &args.agent_id).await {
-            Ok(Some(state)) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    println!("mx-agent: agent {}", state.agent_id);
-                    println!("  kind:         {}", state.kind);
-                    println!("  status:       {}", state.status);
-                    println!("  user:         {}", state.matrix_user_id);
-                    println!("  device:       {}", state.device_id);
-                    println!("  cwd:          {}", state.workspace.cwd);
-                    if !state.workspace.project_id.is_empty() {
-                        println!("  project:      {}", state.workspace.project_id);
-                    }
-                    if !state.workspace.git_commit.is_empty() {
-                        println!("  git commit:   {}", state.workspace.git_commit);
-                    }
-                    if !state.capabilities.is_empty() {
-                        println!("  capabilities: {}", state.capabilities.join(", "));
-                    }
-                    if !state.tools.is_empty() {
-                        println!("  tools:        {}", state.tools.join(", "));
-                    }
-                    println!(
-                        "  load:         {}/{} invocations",
-                        state.load.running_invocations, state.load.max_invocations
-                    );
-                    println!("  state_rev:    {}", state.state_rev);
+    match daemon_ipc_call::<_, Option<mx_agent_protocol::schema::AgentState>>(
+        global,
+        "agent.show",
+        &params,
+    ) {
+        Ok(Some(state)) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: agent {}", state.agent_id);
+                println!("  kind:         {}", state.kind);
+                println!("  status:       {}", state.status);
+                println!("  user:         {}", state.matrix_user_id);
+                println!("  device:       {}", state.device_id);
+                println!("  cwd:          {}", state.workspace.cwd);
+                if !state.workspace.project_id.is_empty() {
+                    println!("  project:      {}", state.workspace.project_id);
                 }
-                ExitCode::SUCCESS
-            }
-            Ok(None) => {
-                if global.json {
-                    println!("null");
-                } else {
-                    eprintln!(
-                        "mx-agent: agent {} not found in {}",
-                        args.agent_id, args.room
-                    );
+                if !state.workspace.git_commit.is_empty() {
+                    println!("  git commit:   {}", state.workspace.git_commit);
                 }
-                ExitCode::from(3)
+                if !state.capabilities.is_empty() {
+                    println!("  capabilities: {}", state.capabilities.join(", "));
+                }
+                if !state.tools.is_empty() {
+                    println!("  tools:        {}", state.tools.join(", "));
+                }
+                println!(
+                    "  load:         {}/{} invocations",
+                    state.load.running_invocations, state.load.max_invocations
+                );
+                println!("  state_rev:    {}", state.state_rev);
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not show agent: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Ok(None) => {
+            if global.json {
+                println!("null");
+            } else {
+                eprintln!(
+                    "mx-agent: agent {} not found in {}",
+                    args.agent_id, args.room
+                );
+            }
+            ExitCode::from(3)
+        }
+        Err(code) => code,
+    }
 }
 
 fn agent_tools(global: &GlobalArgs, args: &AgentToolsArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    let params = mx_agent_daemon::RoomAgentParams {
+        room: args.room.clone(),
+        agent_id: args.agent_id.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::agent_tools_for_session(&session, &args.room, &args.agent_id).await {
-            Ok(Some(tools)) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&tools).unwrap_or_else(|_| "{}".to_string())
-                    );
+    match daemon_ipc_call::<_, Option<mx_agent_daemon::AgentTools>>(global, "agent.tools", &params)
+    {
+        Ok(Some(tools)) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&tools).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: tools for agent {}", tools.agent_id);
+                if tools.tools.is_empty() {
+                    println!("  (no tools advertised)");
                 } else {
-                    println!("mx-agent: tools for agent {}", tools.agent_id);
-                    if tools.tools.is_empty() {
-                        println!("  (no tools advertised)");
-                    } else {
-                        for reference in &tools.tools {
-                            let name = reference.split('@').next().unwrap_or(reference);
-                            match tools.schemas.iter().find(|s| s.name == name) {
-                                Some(schema) => {
-                                    println!(
-                                        "  {} ({})",
-                                        schema.qualified_ref(),
-                                        schema.description
-                                    );
-                                    println!("    input:  {}", schema.input_schema);
-                                    println!("    output: {}", schema.output_schema);
-                                }
-                                None => println!("  {reference}"),
+                    for reference in &tools.tools {
+                        let name = reference.split('@').next().unwrap_or(reference);
+                        match tools.schemas.iter().find(|s| s.name == name) {
+                            Some(schema) => {
+                                println!("  {} ({})", schema.qualified_ref(), schema.description);
+                                println!("    input:  {}", schema.input_schema);
+                                println!("    output: {}", schema.output_schema);
                             }
+                            None => println!("  {reference}"),
                         }
                     }
                 }
-                ExitCode::SUCCESS
             }
-            Ok(None) => {
-                if global.json {
-                    println!("null");
-                } else {
-                    eprintln!(
-                        "mx-agent: agent {} not found in {}",
-                        args.agent_id, args.room
-                    );
-                }
-                ExitCode::from(3)
-            }
-            Err(e) => {
-                eprintln!("mx-agent: could not list agent tools: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Ok(None) => {
+            if global.json {
+                println!("null");
+            } else {
+                eprintln!(
+                    "mx-agent: agent {} not found in {}",
+                    args.agent_id, args.room
+                );
+            }
+            ExitCode::from(3)
+        }
+        Err(code) => code,
+    }
 }
 
 fn agent_register(global: &GlobalArgs, args: &AgentRegisterArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let cwd = match &args.cwd {
         Some(p) => p.clone(),
         None => match std::env::current_dir() {
@@ -1756,50 +1675,45 @@ fn agent_register(global: &GlobalArgs, args: &AgentRegisterArgs) -> ExitCode {
         project_id: args.project_id.clone(),
         max_invocations: args.max_invocations,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::register_agent_for_session(&session, &options).await {
-            Ok(state) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    println!("mx-agent: registered agent {}", state.agent_id);
-                    println!("  kind:         {}", state.kind);
-                    println!("  user:         {}", state.matrix_user_id);
-                    println!("  device:       {}", state.device_id);
-                    println!("  cwd:          {}", state.workspace.cwd);
-                    if !state.workspace.project_id.is_empty() {
-                        println!("  project:      {}", state.workspace.project_id);
-                    }
-                    if !state.workspace.git_commit.is_empty() {
-                        println!("  git commit:   {}", state.workspace.git_commit);
-                    }
-                    if !state.capabilities.is_empty() {
-                        println!("  capabilities: {}", state.capabilities.join(", "));
-                    }
-                    if !state.tools.is_empty() {
-                        println!("  tools:        {}", state.tools.join(", "));
-                    }
-                    println!(
-                        "  load:         {}/{} invocations",
-                        state.load.running_invocations, state.load.max_invocations
-                    );
-                    println!("  state_rev:    {}", state.state_rev);
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::AgentState>(
+        global,
+        "agent.register",
+        &options,
+    ) {
+        Ok(state) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: registered agent {}", state.agent_id);
+                println!("  kind:         {}", state.kind);
+                println!("  user:         {}", state.matrix_user_id);
+                println!("  device:       {}", state.device_id);
+                println!("  cwd:          {}", state.workspace.cwd);
+                if !state.workspace.project_id.is_empty() {
+                    println!("  project:      {}", state.workspace.project_id);
                 }
-                ExitCode::SUCCESS
+                if !state.workspace.git_commit.is_empty() {
+                    println!("  git commit:   {}", state.workspace.git_commit);
+                }
+                if !state.capabilities.is_empty() {
+                    println!("  capabilities: {}", state.capabilities.join(", "));
+                }
+                if !state.tools.is_empty() {
+                    println!("  tools:        {}", state.tools.join(", "));
+                }
+                println!(
+                    "  load:         {}/{} invocations",
+                    state.load.running_invocations, state.load.max_invocations
+                );
+                println!("  state_rev:    {}", state.state_rev);
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not register agent: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 /// Handle the `task` command group.
@@ -2329,67 +2243,45 @@ fn share_file(global: &GlobalArgs, args: &ShareFileArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::ShareContextOptions {
         room: args.room.clone(),
         name: args.name.clone(),
         mime_type: args.mime_type.clone(),
         data,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::share_context_for_session(&session, &options).await {
-            Ok(share) => {
-                report_share(global, &share);
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("mx-agent: could not share context: {e}");
-                ExitCode::FAILURE
-            }
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::ContextShare>(
+        global,
+        "share.file",
+        &options,
+    ) {
+        Ok(share) => {
+            report_share(global, &share);
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn share_diff(global: &GlobalArgs, args: &ShareDiffArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::ShareDiffOptions {
         room: args.room.clone(),
         base: args.base.clone(),
         stat: args.format == DiffFormat::Stat,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::share_diff_for_session(&session, &options).await {
-            Ok(share) => {
-                report_share(global, &share);
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("mx-agent: could not share diff: {e}");
-                ExitCode::FAILURE
-            }
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::ContextShare>(
+        global,
+        "share.diff",
+        &options,
+    ) {
+        Ok(share) => {
+            report_share(global, &share);
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn share_env(global: &GlobalArgs, args: &ShareEnvArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     // An empty `--include` falls back to the documented default fact set.
     let include = if args.include.is_empty() {
         mx_agent_daemon::DEFAULT_ENV_INCLUDE
@@ -2403,61 +2295,47 @@ fn share_env(global: &GlobalArgs, args: &ShareEnvArgs) -> ExitCode {
         room: args.room.clone(),
         include,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::share_env_for_session(&session, &options).await {
-            Ok(share) => {
-                report_share(global, &share);
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("mx-agent: could not share environment: {e}");
-                ExitCode::FAILURE
-            }
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::ContextShare>(
+        global,
+        "share.env",
+        &options,
+    ) {
+        Ok(share) => {
+            report_share(global, &share);
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn share_list(global: &GlobalArgs, args: &ShareListArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::ListSharesOptions {
         room: args.room.clone(),
         limit: args.limit,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::list_context_shares_for_session(&session, &options).await {
-            Ok(shares) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&shares).unwrap_or_else(|_| "[]".to_string())
-                    );
-                } else if shares.is_empty() {
-                    println!("mx-agent: no shared context in {}", args.room);
-                } else {
-                    println!("mx-agent: {} share(s) in {}", shares.len(), args.room);
-                    for share in &shares {
-                        print_context_share(share);
-                    }
+    match daemon_ipc_call::<_, Vec<mx_agent_protocol::schema::ContextShare>>(
+        global,
+        "share.list",
+        &options,
+    ) {
+        Ok(shares) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&shares).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else if shares.is_empty() {
+                println!("mx-agent: no shared context in {}", args.room);
+            } else {
+                println!("mx-agent: {} share(s) in {}", shares.len(), args.room);
+                for share in &shares {
+                    print_context_share(share);
                 }
-                ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not list shared context: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 /// Write a verified artifact to `--output` or stdout.
@@ -2516,28 +2394,15 @@ fn emit_fetched_context(
 }
 
 fn share_get(global: &GlobalArgs, args: &ShareGetArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::FetchContextOptions {
         room: args.room.clone(),
         context_id: args.context_id.clone(),
         limit: args.limit,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::fetch_context_for_session(&session, &options).await {
-            Ok(fetched) => emit_fetched_context(global, &fetched, args.output.as_ref()),
-            Err(e) => {
-                eprintln!("mx-agent: could not get shared context: {e}");
-                ExitCode::FAILURE
-            }
-        }
-    })
+    match daemon_ipc_call::<_, mx_agent_daemon::FetchedContext>(global, "share.get", &options) {
+        Ok(fetched) => emit_fetched_context(global, &fetched, args.output.as_ref()),
+        Err(code) => code,
+    }
 }
 
 /// Handle the `invocation` command group.
@@ -2606,29 +2471,20 @@ fn emit_retrieved_artifact(
 }
 
 fn invocation_artifact(global: &GlobalArgs, args: &InvocationArtifactArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::RetrieveArtifactOptions {
         room: args.room.clone(),
         invocation_id: args.invocation_id.clone(),
         stream: args.stream.to_stream_kind(),
         limit: args.limit,
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::retrieve_artifact_for_session(&session, &options).await {
-            Ok(retrieved) => emit_retrieved_artifact(global, &retrieved, args.output.as_ref()),
-            Err(e) => {
-                eprintln!("mx-agent: could not retrieve artifact: {e}");
-                ExitCode::FAILURE
-            }
-        }
-    })
+    match daemon_ipc_call::<_, mx_agent_daemon::RetrievedArtifact>(
+        global,
+        "invocation.artifact",
+        &options,
+    ) {
+        Ok(retrieved) => emit_retrieved_artifact(global, &retrieved, args.output.as_ref()),
+        Err(code) => code,
+    }
 }
 
 /// Render a single invocation as a human-readable block.
@@ -2647,146 +2503,108 @@ fn print_invocation(invocation: &mx_agent_protocol::schema::InvocationState) {
 }
 
 fn invocation_list(global: &GlobalArgs, args: &InvocationListArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
-    };
     let options = mx_agent_daemon::ListInvocationsOptions {
         room: args.room.clone(),
         state: args.state.clone(),
         task_id: args.task.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::list_invocations_for_session(&session, &options).await {
-            Ok(invocations) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&invocations).unwrap_or_else(|_| "[]".to_string())
-                    );
-                } else if invocations.is_empty() {
-                    println!("mx-agent: no invocations in {}", args.room);
-                } else {
-                    println!(
-                        "mx-agent: {} invocation(s) in {}",
-                        invocations.len(),
-                        args.room
-                    );
-                    for invocation in &invocations {
-                        print_invocation(invocation);
-                    }
+    match daemon_ipc_call::<_, Vec<mx_agent_protocol::schema::InvocationState>>(
+        global,
+        "invocation.list",
+        &options,
+    ) {
+        Ok(invocations) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&invocations).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else if invocations.is_empty() {
+                println!("mx-agent: no invocations in {}", args.room);
+            } else {
+                println!(
+                    "mx-agent: {} invocation(s) in {}",
+                    invocations.len(),
+                    args.room
+                );
+                for invocation in &invocations {
+                    print_invocation(invocation);
                 }
-                ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not list invocations: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 fn invocation_show(global: &GlobalArgs, args: &InvocationShowArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    let params = mx_agent_daemon::RoomInvocationParams {
+        room: args.room.clone(),
+        invocation_id: args.invocation_id.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    runtime.block_on(async {
-        match mx_agent_daemon::get_invocation_for_session(&session, &args.room, &args.invocation_id)
-            .await
-        {
-            Ok(Some(invocation)) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&invocation).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else {
-                    print_invocation(&invocation);
-                }
-                ExitCode::SUCCESS
-            }
-            Ok(None) => {
-                eprintln!(
-                    "mx-agent: invocation {:?} was not found in {}",
-                    args.invocation_id, args.room
+    match daemon_ipc_call::<_, Option<mx_agent_protocol::schema::InvocationState>>(
+        global,
+        "invocation.get",
+        &params,
+    ) {
+        Ok(Some(invocation)) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&invocation).unwrap_or_else(|_| "{}".to_string())
                 );
-                ExitCode::FAILURE
+            } else {
+                print_invocation(&invocation);
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not show invocation: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Ok(None) => {
+            eprintln!(
+                "mx-agent: invocation {:?} was not found in {}",
+                args.invocation_id, args.room
+            );
+            ExitCode::FAILURE
+        }
+        Err(code) => code,
+    }
 }
 
 fn invocation_cancel(global: &GlobalArgs, args: &InvocationCancelArgs) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    // The daemon owns the signing key and signs the cancel so the target agent
+    // can verify the requester before terminating the command (issue #201).
+    let params = mx_agent_daemon::InvocationCancelParams {
+        room: args.room.clone(),
+        invocation_id: args.invocation_id.clone(),
+        reason: Some(args.reason.clone()),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    // The cancel is signed with the daemon's own key so the target agent can
-    // verify the requester before terminating the command.
-    let paths = mx_agent_daemon::SessionPaths::resolve();
-    let key = match mx_agent_daemon::load_or_create_signing_key(&paths) {
-        Ok(key) => key,
-        Err(e) => {
-            eprintln!("mx-agent: could not load signing key: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let key_id = key.key_id();
-    runtime.block_on(async {
-        match mx_agent_daemon::cancel_invocation_for_session(
-            &session,
-            key.signing_key(),
-            &key_id,
-            &args.room,
-            &args.invocation_id,
-            &args.reason,
-        )
-        .await
-        {
-            Ok(invocation) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&invocation).unwrap_or_else(|_| "{}".to_string())
-                    );
-                } else if invocation.state == "cancelled" {
-                    println!(
-                        "mx-agent: cancelled invocation {}",
-                        invocation.invocation_id
-                    );
-                    print_invocation(&invocation);
-                } else {
-                    // The invocation had already finished before we could cancel.
-                    println!(
-                        "mx-agent: invocation {} already {}; nothing to cancel",
-                        invocation.invocation_id, invocation.state
-                    );
-                }
-                ExitCode::SUCCESS
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::InvocationState>(
+        global,
+        "invocation.cancel",
+        &params,
+    ) {
+        Ok(invocation) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&invocation).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else if invocation.state == "cancelled" {
+                println!(
+                    "mx-agent: cancelled invocation {}",
+                    invocation.invocation_id
+                );
+                print_invocation(&invocation);
+            } else {
+                // The invocation had already finished before we could cancel.
+                println!(
+                    "mx-agent: invocation {} already {}; nothing to cancel",
+                    invocation.invocation_id, invocation.state
+                );
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not cancel invocation: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 /// Handle the `approval` command group.
@@ -2879,52 +2697,39 @@ fn approval_show(global: &GlobalArgs, args: &ApprovalShowArgs) -> ExitCode {
 /// [`mx_agent_daemon::DECISION_DENIED`]. The decision-maker identity defaults to
 /// the logged-in user unless `--by` overrides it.
 fn approval_decide(global: &GlobalArgs, args: &ApprovalDecideArgs, decision: &str) -> ExitCode {
-    let runtime = match build_runtime() {
-        Ok(rt) => rt,
-        Err(code) => return code,
+    // The daemon owns the Matrix session and signing key; it resolves the
+    // decision-maker default to its own user ID when `--by` is omitted (#201).
+    let params = mx_agent_daemon::ApprovalDecideParams {
+        request_id: args.request_id.clone(),
+        decision: decision.to_string(),
+        by: args.by.clone(),
     };
-    let session = match load_session_or_exit() {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let approved_by = args.by.clone().unwrap_or_else(|| session.user_id.clone());
-    let paths = mx_agent_daemon::SessionPaths::resolve();
-    runtime.block_on(async {
-        match mx_agent_daemon::decide_approval_for_session(
-            &session,
-            &paths,
-            &args.request_id,
-            decision,
-            &approved_by,
-        )
-        .await
-        {
-            Ok(record) => {
-                if global.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&record.decision)
-                            .unwrap_or_else(|_| "{}".to_string())
-                    );
+    match daemon_ipc_call::<_, mx_agent_daemon::ApprovalDecisionRecord>(
+        global,
+        "approval.decide",
+        &params,
+    ) {
+        Ok(record) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&record.decision).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                let verb = if record.approved() {
+                    "approved"
                 } else {
-                    let verb = if record.approved() {
-                        "approved"
-                    } else {
-                        "denied"
-                    };
-                    println!(
-                        "mx-agent: {verb} approval request {} in {}",
-                        record.decision.request_id, record.room_id
-                    );
-                }
-                ExitCode::SUCCESS
+                    "denied"
+                };
+                println!(
+                    "mx-agent: {verb} approval request {} in {}",
+                    record.decision.request_id, record.room_id
+                );
             }
-            Err(e) => {
-                eprintln!("mx-agent: could not decide approval: {e}");
-                ExitCode::FAILURE
-            }
+            ExitCode::SUCCESS
         }
-    })
+        Err(code) => code,
+    }
 }
 
 /// Handle the `daemon` command group.

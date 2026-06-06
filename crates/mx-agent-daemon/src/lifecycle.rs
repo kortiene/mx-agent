@@ -558,10 +558,160 @@ fn dispatch(
             }),
             Err(response) => *response,
         },
-        "task.watch" => Response::error(
+        // --- workspace (issue #201) ---
+        "workspace.create" => match parse_params::<crate::CreateWorkspaceOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::create_workspace_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "workspace.join" => match parse_params::<crate::RoomParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::join_workspace_for_session(&session, &params.room).await
+            }),
+            Err(response) => *response,
+        },
+        "workspace.attach" => match parse_params::<crate::AttachWorkspaceOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::attach_workspace_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "workspace.status" => match parse_params::<crate::RoomParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::workspace_status_for_session(&session, &params.room).await
+            }),
+            Err(response) => *response,
+        },
+        // --- agent (issue #201) ---
+        "agent.register" => match parse_params::<crate::RegisterAgentOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::register_agent_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "agent.list" => match parse_params::<crate::ListAgentsOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::list_agents_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "agent.show" => match parse_params::<crate::RoomAgentParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::show_agent_for_session(&session, &params.room, &params.agent_id).await
+            }),
+            Err(response) => *response,
+        },
+        "agent.tools" => match parse_params::<crate::RoomAgentParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::agent_tools_for_session(&session, &params.room, &params.agent_id).await
+            }),
+            Err(response) => *response,
+        },
+        // --- trust (issue #201) ---
+        "trust.publish" => match parse_params::<crate::TrustPublishParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::publish_trust_state_for_session(&session, &params.room, &params.entry).await
+            }),
+            Err(response) => *response,
+        },
+        "trust.state" => match parse_params::<crate::RoomParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::list_trust_states_for_session(&session, &params.room).await
+            }),
+            Err(response) => *response,
+        },
+        // --- approval (issue #201) ---
+        "approval.decide" => match parse_params::<crate::ApprovalDecideParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                let approved_by = params.by.clone().unwrap_or_else(|| session.user_id.clone());
+                crate::decide_approval_for_session(
+                    &session,
+                    &SessionPaths::resolve(),
+                    &params.request_id,
+                    &params.decision,
+                    &approved_by,
+                )
+                .await
+            }),
+            Err(response) => *response,
+        },
+        // --- share (issue #201) ---
+        "share.file" => match parse_params::<crate::ShareContextOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::share_context_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "share.diff" => match parse_params::<crate::ShareDiffOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::share_diff_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "share.env" => match parse_params::<crate::ShareEnvOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::share_env_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "share.list" => match parse_params::<crate::ListSharesOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::list_context_shares_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "share.get" => match parse_params::<crate::FetchContextOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::fetch_context_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        // --- invocation (issue #201) ---
+        "invocation.list" => match parse_params::<crate::ListInvocationsOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::list_invocations_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "invocation.get" => match parse_params::<crate::RoomInvocationParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::get_invocation_for_session(&session, &params.room, &params.invocation_id)
+                    .await
+            }),
+            Err(response) => *response,
+        },
+        "invocation.cancel" => match parse_params::<crate::InvocationCancelParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                let signing = crate::load_or_create_signing_key(&SessionPaths::resolve())
+                    .map_err(|e| crate::WorkspaceError::Io(io::Error::other(e.to_string())))?;
+                let key_id = signing.key_id();
+                let reason = params
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "cancelled by operator".to_string());
+                crate::cancel_invocation_for_session(
+                    &session,
+                    signing.signing_key(),
+                    &key_id,
+                    &params.room,
+                    &params.invocation_id,
+                    &reason,
+                )
+                .await
+            }),
+            Err(response) => *response,
+        },
+        "invocation.artifact" => match parse_params::<crate::RetrieveArtifactOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::retrieve_artifact_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
+        "task.watch" | "workspace.watch" => Response::error(
             req.id.clone(),
             METHOD_NOT_FOUND,
-            "task.watch requires a streaming IPC connection",
+            "this method requires a streaming IPC connection",
         ),
         other => Response::error(
             req.id.clone(),
@@ -759,6 +909,85 @@ fn dispatch_task_watch(
     }
 }
 
+/// Stream `workspace.watch` updates to the CLI over the open IPC connection
+/// (issue #201), mirroring [`dispatch_task_watch`]. The daemon owns the Matrix
+/// session; the CLI never restores it.
+fn dispatch_workspace_watch(
+    req: &Request,
+    stream: &mut std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    let params = match parse_params::<crate::RoomParams>(req) {
+        Ok(params) => params,
+        Err(response) => return write_ipc_response(stream, &response),
+    };
+    let session = match load_daemon_session_response(req) {
+        Ok(session) => session,
+        Err(response) => return write_ipc_response(stream, &response),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return write_ipc_response(
+                stream,
+                &Response::error(
+                    req.id.clone(),
+                    INTERNAL_ERROR,
+                    format!("could not start async runtime: {e}"),
+                ),
+            )
+        }
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
+    let write_failed = Arc::new(AtomicBool::new(false));
+    let stream_cell = std::cell::RefCell::new(stream);
+    let request_id = req.id.clone();
+    let running_for_callback = running.clone();
+    let write_failed_for_callback = write_failed.clone();
+    let callback = |update: crate::WatchUpdate<'_, crate::WorkspaceStatus>| {
+        let payload: Value = match update {
+            crate::WatchUpdate::Initial(status) => json!({ "event": "initial", "status": status }),
+            crate::WatchUpdate::Changed { previous, current } => json!({
+                "event": "changed",
+                "previous": previous,
+                "current": current,
+            }),
+            crate::WatchUpdate::Reconnecting { attempt, error } => json!({
+                "event": "reconnecting",
+                "attempt": attempt,
+                "error": error,
+            }),
+            crate::WatchUpdate::Reconnected => json!({ "event": "reconnected" }),
+        };
+        let response = Response::result(request_id.clone(), payload);
+        if write_ipc_response(&mut stream_cell.borrow_mut(), &response).is_err() {
+            write_failed_for_callback.store(true, Ordering::SeqCst);
+            running_for_callback.store(false, Ordering::SeqCst);
+        }
+    };
+
+    let result = runtime.block_on(crate::watch_workspace_status_for_session(
+        &session,
+        &params.room,
+        crate::WatchConfig::default(),
+        &running,
+        callback,
+    ));
+    if write_failed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => write_ipc_response(
+            &mut stream_cell.borrow_mut(),
+            &Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+        ),
+    }
+}
+
 fn dispatch_streaming(
     req: &Request,
     stream: &mut std::os::unix::net::UnixStream,
@@ -770,6 +999,8 @@ fn dispatch_streaming(
 ) -> io::Result<()> {
     if req.method == "task.watch" {
         dispatch_task_watch(req, stream)
+    } else if req.method == "workspace.watch" {
+        dispatch_workspace_watch(req, stream)
     } else {
         let response = dispatch(
             req,
@@ -958,6 +1189,76 @@ mod tests {
         let error = response.error.expect("missing session should be rejected");
         assert_eq!(error.code, INTERNAL_ERROR);
         assert!(error.message.contains("not logged in"));
+    }
+
+    /// Every daemon-mediated Matrix command added in issue #201 must validate
+    /// its params before loading the session, so malformed input is a clean
+    /// `INVALID_PARAMS` error rather than a panic or a session read.
+    #[test]
+    fn matrix_ipc_methods_validate_params_before_loading_session() {
+        let methods = [
+            "workspace.create",
+            "workspace.join",
+            "workspace.attach",
+            "workspace.status",
+            "agent.register",
+            "agent.list",
+            "agent.show",
+            "agent.tools",
+            "trust.publish",
+            "trust.state",
+            "approval.decide",
+            "share.file",
+            "share.diff",
+            "share.env",
+            "share.list",
+            "share.get",
+            "invocation.list",
+            "invocation.get",
+            "invocation.cancel",
+            "invocation.artifact",
+        ];
+        for method in methods {
+            // `null` params never satisfy a struct-shaped parameter.
+            let req = Request::new(json!(1), method, Value::Null);
+            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("{method}: invalid params should be rejected"));
+            assert_eq!(error.code, INVALID_PARAMS, "{method}");
+            assert!(error.message.contains("invalid params"), "{method}");
+            assert!(error.message.contains(method), "{method}");
+        }
+    }
+
+    /// A valid Matrix-backed request with no stored daemon session is reported
+    /// as "not logged in" rather than attempting a Matrix operation.
+    #[test]
+    fn matrix_ipc_methods_report_missing_daemon_session() {
+        let _rt = TempRuntime::new("matrix-session");
+        let req = Request::new(
+            json!(1),
+            "workspace.status",
+            json!({"room":"!abc:matrix.org"}),
+        );
+        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+        let error = response.error.expect("missing session should be rejected");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(error.message.contains("not logged in"));
+    }
+
+    /// The streaming methods are rejected on the single-response path so a
+    /// non-streaming caller gets a clear error instead of a hang.
+    #[test]
+    fn streaming_methods_require_streaming_connection() {
+        for method in ["task.watch", "workspace.watch"] {
+            let req = Request::new(json!(1), method, json!({"room":"!abc:matrix.org"}));
+            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+            let error = response
+                .error
+                .expect("streaming method on single-response path");
+            assert_eq!(error.code, METHOD_NOT_FOUND, "{method}");
+        }
     }
 
     #[test]
