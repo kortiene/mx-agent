@@ -220,12 +220,11 @@ Then point the daemon at it (`homeserver_url = "http://127.0.0.1:8008"`). See
 
 ### Wiki sync
 
-The `wiki/` folder is mirrored to the GitHub wiki on pushes to `main` via a local
-pre-push hook. Install it once per clone:
-
-```bash
-sh scripts/install-wiki-hook.sh
-```
+The `wiki/` folder is the source of truth for the GitHub wiki. A GitHub Action
+([`.github/workflows/wiki-sync.yml`](.github/workflows/wiki-sync.yml)) mirrors it
+to the wiki automatically whenever `wiki/**` changes land on `main` — no local
+setup is required. To force a re-sync, run the **wiki-sync** workflow manually
+from the Actions tab.
 
 ---
 
