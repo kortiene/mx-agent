@@ -92,7 +92,7 @@ mx-agent has two qualitatively different transport needs, and the protocol match
 | **Low-latency, ultra-secure 1:1 signaling** (a single privileged request/ack between two specific daemons) | **Olm ephemeral to-device messages** | To-device messages are addressed to one device, are not part of room history, and are encrypted with Olm 1:1 sessions. Minimal overhead, minimal residue, forward secrecy. Ideal for a signed `exec.request` handshake where you don't want every room member's daemon to process it. |
 | **High-throughput, multi-party stream data** (continuous `stdout`/`stderr`, fan-out to observers, durable replay) | **Matrix room timeline events** (Megolm-encrypted), with **media artifacts** for bulk | Timeline events are ordered, durable, replayable after reconnect, and naturally fan out to every room member. Megolm group encryption amortizes crypto across many recipients. Large payloads escape to media so the timeline stays light. |
 
-> **Implementation status.** E2EE (Olm/Megolm) is provided by `matrix-sdk` 0.18 behind the `e2e-encryption` feature and is currently exercised in **test builds** (integration test, issue #61). Plain-timeline transport is the default path while E2EE is being wired into production builds. The wire schemas below are stable regardless of whether a given deployment has E2EE enabled. "Matrix RTC"–style real-time channels are a 🔮 future option for the highest-throughput interactive PTY streams; today, interactive output uses chunked timeline events with a 50 ms flush.
+> **Implementation status.** E2EE (Olm/Megolm) is provided by `matrix-sdk` 0.18 behind the `e2e-encryption` feature. The daemon decrypts privileged E2EE events and fails safe on undecryptable events today; production hardening work remains for device verification UX, cross-signing, and key backup. The wire schemas below are stable regardless of whether a given deployment has E2EE enabled. "Matrix RTC"–style real-time channels are a 🔮 future option for the highest-throughput interactive PTY streams; today, interactive output uses chunked timeline events with a 50 ms flush.
 
 ### Signature envelope
 
@@ -106,7 +106,7 @@ Every **privileged** timeline event (`exec.request`, `exec.cancel`, `call.reques
 }
 ```
 
-The verifying daemon recomputes canonical JSON, checks the signature against the trusted `key_id` (see [[Security & Sandboxing|Security-and-Sandboxing]]), then validates `nonce`/`expires_at` before any routing or policy decision.
+The verifying daemon recomputes canonical JSON, checks the signature against the trusted `key_id` (see [[Security & Sandboxing|Security-and-Sandboxing]]), then validates `nonce`/`expires_at` before any routing or policy decision for request types whose schema carries those fields.
 
 ---
 

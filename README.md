@@ -41,14 +41,17 @@ If a box can sync with a homeserver, it can participate — even one that accept
 | Daemon lifecycle (`start` / `status` / `stop`), background + foreground | ✅ Implemented |
 | Local IPC: Unix-socket JSON-RPC 2.0 with `0600` perms + `SO_PEERCRED` peer check | ✅ Implemented |
 | Structured logging, secret redaction, dev Matrix homeserver (Tuwunel) | ✅ Implemented |
-| Protocol event schema, Ed25519 signing, policy parser, `none` sandbox backend | ✅ Implemented |
+| Protocol event schema, Ed25519 signing, policy parser, sandbox selection | ✅ Implemented |
 | `auth`, `workspace`, `agent`, `trust`, `approval`, `share`, `invocation` commands fully daemon-IPC-mediated (CLI never restores a Matrix session/client) | ✅ Implemented |
 | Task state: `task create` / `update` / `list` / `graph` / `watch` (daemon-IPC, over Matrix) | ✅ Implemented |
 | Structured task actions (`tool` / `exec`), lifecycle-transition validation, stable task result schema | ✅ Implemented |
 | Daemon task-orchestration engine: scheduler, optimistic `state_rev` claiming, tool/exec dispatch, policy + trust/signature + approval enforcement, restart recovery, DAG diagnostics | ✅ Implemented (engine + tests) |
 | Live daemon scheduler loop: auto-claims assigned, signed, policy-allowed tasks from room state and runs them, with restart recovery | ✅ Implemented (local tool/exec dispatch by default; signed Matrix-backed `call`/`exec` task dispatch is opt-in via `MX_AGENT_TASK_DISPATCH=matrix`) |
 | `call` / `exec` runners | 🟡 `call` and non-PTY `exec` support signed Matrix-backed remote daemon dispatch when `--room`/`--agent` are provided; live remote exec supports signed stdin/cancel controls |
-| E2EE in production; `bubblewrap`/container sandboxes; interactive PTY; large artifacts; tight task↔remote-invocation id unification | 🔮 Planned |
+| Sandbox backends | ✅ Implemented (`none` fallback by default; `bubblewrap` and Docker/Podman container backends are policy-selectable, but not a standalone security boundary) |
+| E2EE privileged-event handling | ✅ Implemented for decrypting privileged events and failing safe on undecryptable events; production hardening (device verification UX, cross-signing, key backup) remains planned |
+| Large-output artifact mode | ✅ Implemented (Matrix media offload, SHA-256 integrity, optional zstd compression, tail preview); very-large-output tuning remains planned |
+| Interactive PTY over IPC/remote; tight task↔remote-invocation id unification | 🔮 Planned |
 
 **Platform: Unix only** (Linux and macOS). Windows was intentionally dropped — the project relies on Unix-domain-socket IPC and Unix process semantics.
 
@@ -108,7 +111,7 @@ A *local* exec follows the **same path** as a remote one: the daemon signs an ev
 
 mx-agent is **zero-trust and deny-by-default**: room membership grants nothing on its own.
 
-- Every privileged request is **Ed25519-signed**; the target verifies the signature, nonce, and expiry, then checks **local policy** before running anything.
+- Every privileged request is **Ed25519-signed** and checked against **local policy** before running anything; request types that carry nonce/expiry fields are also replay/expiry checked.
 - The coding agent **never sees** Matrix tokens or device keys — they stay inside the daemon (`0600`, user-owned).
 - Child processes start from an **environment allowlist** with secret scrubbing (`GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_*`, …).
 - The local IPC socket enforces a **`SO_PEERCRED` UID check** and refuses cross-user or world-accessible runtime dirs.

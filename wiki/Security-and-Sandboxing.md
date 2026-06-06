@@ -2,7 +2,7 @@
 
 A hardening guide for deploying mx-agent in environments where remote agents can run commands on your machines. mx-agent's security posture is **zero-trust and deny-by-default**: room membership grants nothing; every privileged action must independently pass cryptographic and policy checks on the machine that would execute it.
 
-> **Implementation status.** The IPC peer-credential check, the deny-by-default policy engine (parser + validator), Ed25519 signing/verification, allowlist-based environment scrubbing, and audit-log structure are **✅ implemented**. The `none` sandbox backend is implemented; **`bubblewrap` and `container` backends are 🟡 designed but not yet shipped** — selecting them today falls back to the centralized `Restrictions` (cwd, env, timeout, output cap) without OS-level isolation. No canonical `policy.toml` ships in-repo yet; the schema below is the one the engine parses. The whole workspace **forbids `unsafe` Rust** (`unsafe_code = "forbid"`) and uses `rustix`/`nix` for syscalls.
+> **Implementation status.** The IPC peer-credential check, the deny-by-default policy engine (parser + validator), Ed25519 signing/verification, allowlist-based environment scrubbing, audit-log structure, and `none`/`bubblewrap`/container sandbox backends are **✅ implemented**. `none` is the built-in fallback and provides zero isolation; `bubblewrap` and Docker/Podman container backends are policy-selectable but are not a standalone security boundary (no seccomp, rlimit caps, or UID/GID remap). No canonical `policy.toml` ships in-repo yet; the schema below is the one the engine parses. The whole workspace **forbids `unsafe` Rust** (`unsafe_code = "forbid"`) and uses `rustix`/`nix` for syscalls.
 
 ---
 
@@ -29,7 +29,7 @@ A single agent is pinned by three separate cryptographic facts, so compromising 
 
 ### End-to-end encryption over Matrix
 
-When E2EE is enabled, message *contents* are encrypted between daemons (Olm for 1:1 to-device signaling, Megolm for room streams); the homeserver relays ciphertext only. E2EE protects confidentiality and binds the device identity — but note it is **orthogonal to authorization**: a correctly decrypted request from a trusted device is *still* rejected if its Ed25519 signature, nonce, expiry, or local policy fails. Encryption answers "did this really come from that device, privately?"; policy answers "is that device allowed to do this here?".
+When E2EE is enabled, message *contents* are encrypted between daemons (Olm for 1:1 to-device signaling, Megolm for room streams); the homeserver relays ciphertext only. E2EE protects confidentiality and binds the device identity — but note it is **orthogonal to authorization**: a correctly decrypted request from a trusted device is *still* rejected if its Ed25519 signature, local policy, or any schema-provided nonce/expiry check fails. Encryption answers "did this really come from that device, privately?"; policy answers "is that device allowed to do this here?".
 
 ### Trust bootstrap modes (architecture §13.2)
 
@@ -101,13 +101,12 @@ A complete, fully-commented `policy.toml`. Place it at `~/.config/mx-agent/polic
 # ─────────────────────────────────────────────────────────────────────────────
 # Global execution defaults. These bound EVERY invocation and are the floor that
 # OS-level sandbox backends build on. They are enforced even by the `none`
-# backend (the only backend implemented in v0.1.0).
+# backend (zero isolation) and by the `bubblewrap`/container backends.
 # ─────────────────────────────────────────────────────────────────────────────
 [execution]
-default_sandbox = "bubblewrap"      # 🟡 designed; falls back to centralized
-                                    #    Restrictions until the backend ships.
-                                    #    Use "none" to be explicit about today's
-                                    #    behavior.
+default_sandbox = "bubblewrap"      # Select the implemented bubblewrap backend.
+                                    # Use "none" only to be explicit about zero
+                                    # isolation.
 network         = "deny"            # Deny child network access by default.
                                     # Blocks data exfiltration and SSRF: a
                                     # compromised command cannot phone home or

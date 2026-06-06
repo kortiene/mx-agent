@@ -10,9 +10,10 @@ one, **what the safe default is and which options weaken it**.
 > non-PTY `exec` run a daemon-mediated local execution by default and become
 > signed Matrix-backed remote operations when `--room`/`--agent` target a
 > registered, trusted, policy-allowed remote agent; interactive `exec --pty` is
-> not yet carried over the transport. The trust, signing, replay, policy, audit,
-> and sandbox machinery described here is real and already enforced — on the
-> daemon that runs the command, local or remote.
+> not yet carried over the transport. The trust, signing, policy, audit, and
+> sandbox machinery described here is real and already enforced — on the daemon
+> that runs the command, local or remote. Replay/expiry checks are enforced for
+> request types whose schema carries nonce/expiry fields.
 
 ## Contents
 
@@ -27,15 +28,16 @@ one, **what the safe default is and which options weaken it**.
 
 ## Threat model in one paragraph
 
-A request to run something on your machine has to clear five independent gates
-before a single byte executes: it must carry a **valid Ed25519 signature**, the
-signing key must be in your **local trust store**, the request must be **fresh**
-(not expired, not a replayed nonce), the **policy engine** must explicitly allow
-the room + agent + command + working directory, and — if the policy says so — a
-human must **approve** it. Every gate is deny-by-default. Removing any one of
-them (trusting a key you did not verify, marking a room `trusted` with a wide
-`allow_commands` list, running with `sandbox = "none"`) widens your exposure;
-the rest of this guide is about doing that deliberately rather than by accident.
+A request to run something on your machine has to clear independent gates before
+a single byte executes: it must carry a **valid Ed25519 signature**, the signing
+key must be in your **local trust store**, the **policy engine** must explicitly
+allow the room + agent + command + working directory, and — if the request schema
+carries freshness fields — it must be **fresh** (not expired, not a replayed
+nonce). If policy requires human approval, that approval must also be present.
+Every gate is deny-by-default. Removing any one of them (trusting a key you did
+not verify, marking a room `trusted` with a wide `allow_commands` list, running
+with `sandbox = "none"`) widens your exposure; the rest of this guide is about
+doing that deliberately rather than by accident.
 
 ## Safe defaults at a glance
 

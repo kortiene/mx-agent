@@ -144,14 +144,20 @@ it here before release.
 - **PTY signal semantics are partial.** Controlling-tty and full Ctrl-C
   semantics for `exec --pty` are intentionally limited; the workspace forbids
   `unsafe`, so PTY/termios use the safe `rustix` path.
-- **Large output artifacts and production E2EE are still landing.** Streaming
-  falls back within timeline budgets; very large artifacts and end-to-end
-  encryption in production are follow-up work.
-- **Sandbox is not a security boundary on its own.** There is no seccomp
-  filtering, rlimit capping, or UID/GID remapping; commands run as the daemon's
-  user. The built-in fallback backend is `none` (zero isolation) — operators
-  must choose `bubblewrap`/`docker`/`podman`. Bound the blast radius with policy
-  (cwd, env scrub, runtime/output caps) and a real sandbox backend.
+- **Very-large-output tuning and production E2EE hardening are still landing.**
+  Large-output artifact mode already ships: streams that exceed the timeline
+  budget can be uploaded as Matrix media with SHA-256 integrity, optional zstd
+  compression, and a tail preview. E2EE privileged-event decryption and
+  fail-safe handling for undecryptable events also ship today. Remaining E2EE
+  production hardening includes device verification UX, cross-signing, and key
+  backup; remaining artifact work is tuning for very large outputs.
+- **Sandbox is not a security boundary on its own.** The `none`, `bubblewrap`,
+  and Docker/Podman container backends are implemented and policy-selectable,
+  but there is no seccomp filtering, rlimit capping, or UID/GID remapping;
+  commands run as the daemon's user. The built-in fallback backend is `none`
+  (zero isolation) — operators must choose `bubblewrap`/`docker`/`podman`. Bound
+  the blast radius with policy (cwd, env scrub, runtime/output caps) and a real
+  sandbox backend.
 - **Bundled homeserver is dev-only.** The Tuwunel homeserver in `dev/matrix`
   binds to loopback, disables federation, and is for local testing only — never
   for production identities or data.
