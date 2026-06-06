@@ -351,7 +351,7 @@ async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, Worksp
 /// parsed content together with its Matrix event ID (when available).
 ///
 /// Returns `Ok(None)` when no task with that ID exists in the room.
-async fn read_task_state(
+pub(crate) async fn read_task_state(
     room: &Room,
     task_id: &str,
 ) -> Result<Option<(TaskState, Option<String>)>, WorkspaceError> {
@@ -487,18 +487,38 @@ pub(crate) async fn update_task_in_room(
     room: &Room,
     options: &UpdateTaskOptions,
 ) -> Result<TaskState, WorkspaceError> {
-    let (mut state, event_id) = read_task_state(room, &options.task_id)
+    let (state, event_id) = read_task_state(room, &options.task_id)
         .await?
         .ok_or_else(|| WorkspaceError::TaskNotFound(options.task_id.clone()))?;
+    apply_and_publish_task(room, state, event_id, options).await
+}
 
-    check_not_stale(&state.task_id, state.state_rev, options.expected_state_rev)?;
+/// Apply an update onto an already-known `current` task state and publish it,
+/// without re-reading the room.
+///
+/// This is the body of [`update_task_in_room`] after the read. The daemon's
+/// scheduler loop uses it with a per-pass cache of the state it just wrote, so a
+/// `claim` immediately followed by a `finalize` checks staleness against the
+/// claim's revision rather than the lagging local store (which has not yet
+/// received the daemon's own echo over `/sync`). The same stale-update guard and
+/// lifecycle-transition validation as [`update_task_in_room`] apply.
+pub(crate) async fn apply_and_publish_task(
+    room: &Room,
+    mut current: TaskState,
+    previous_event_id: Option<String>,
+    options: &UpdateTaskOptions,
+) -> Result<TaskState, WorkspaceError> {
+    check_not_stale(
+        &current.task_id,
+        current.state_rev,
+        options.expected_state_rev,
+    )?;
     if let Some(to) = &options.state {
-        check_transition(&state.task_id, &state.state, to)?;
+        check_transition(&current.task_id, &current.state, to)?;
     }
-
-    apply_update(&mut state, options, now_rfc3339(), event_id);
-    publish_task_state(room, &options.task_id, &state).await?;
-    Ok(state)
+    apply_update(&mut current, options, now_rfc3339(), previous_event_id);
+    publish_task_state(room, &options.task_id, &current).await?;
+    Ok(current)
 }
 
 /// Update a task, restoring the authenticated client from `session`.

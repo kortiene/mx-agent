@@ -41,7 +41,8 @@ use mx_agent_protocol::schema::{TaskAction, TaskState};
 use crate::scheduler::TaskScheduler;
 use crate::session::SessionPaths;
 use crate::task::{
-    read_tasks, update_task_in_room, ListTasksOptions, UpdateTaskOptions, STATE_EXECUTING,
+    apply_and_publish_task, read_task_state, read_tasks, ListTasksOptions, UpdateTaskOptions,
+    STATE_EXECUTING,
 };
 use crate::task_dispatch::{ExecTaskDispatcher, ToolTaskDispatcher};
 use crate::task_dispatch_matrix::{MatrixCallTaskDispatcher, MatrixExecTaskDispatcher};
@@ -435,8 +436,24 @@ fn scheduler_pass_for_agent(
     // dispatch runs synchronously; a Matrix dispatch blocks the pass until the
     // result returns), so recovery uses an empty live-invocation set.
     let live_invocations = BTreeSet::new();
+    // A per-pass cache of the state this store just wrote, so a `claim`
+    // immediately followed by a `finalize` checks staleness against the claim's
+    // revision rather than the local store, which has not yet received the
+    // daemon's own echo over `/sync` (otherwise the finalize would be rejected
+    // as stale and the task would never reach a terminal state).
+    let mut write_cache: BTreeMap<String, (TaskState, Option<String>)> = BTreeMap::new();
     let mut store = MatrixTaskStore::new(room_id.to_string(), |options: UpdateTaskOptions| {
-        runtime.block_on(update_task_in_room(room, &options))
+        let (current, event_id) = match write_cache.get(&options.task_id) {
+            Some((state, event_id)) => (state.clone(), event_id.clone()),
+            None => match runtime.block_on(read_task_state(room, &options.task_id))? {
+                Some(found) => found,
+                None => return Err(WorkspaceError::TaskNotFound(options.task_id.clone())),
+            },
+        };
+        let updated =
+            runtime.block_on(apply_and_publish_task(room, current, event_id, &options))?;
+        write_cache.insert(updated.task_id.clone(), (updated.clone(), None));
+        Ok(updated)
     });
 
     // Local dispatch runs the action in-process; Matrix dispatch routes it

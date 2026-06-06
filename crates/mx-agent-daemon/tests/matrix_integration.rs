@@ -1111,6 +1111,12 @@ fn signed_exec_task(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_scheduler_executes_signed_task_dag_and_denies() {
+    // Capture the scheduler thread's non-sensitive decision logs so a failure is
+    // diagnosable from CI output (`--nocapture`).
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -1350,6 +1356,21 @@ requires_approval = true
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Dump the final task state + result for each task to aid CI debugging.
+    if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+        for t in &tasks {
+            eprintln!(
+                "DIAG task={} state={} result={}",
+                t.task_id,
+                t.state,
+                t.result
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "null".to_string())
+            );
+        }
     }
 
     // Stop the scheduler and sync loops before tearing down the environment.
