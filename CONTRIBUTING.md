@@ -77,12 +77,25 @@ Notes:
 
 ## Running the integration tests
 
-Some tests exercise a real Matrix homeserver via Docker:
+The default `cargo test --all` needs no homeserver. The live Matrix
+integration/E2E tests are `#[ignore]`d and run against a throwaway Tuwunel
+homeserver via Docker. The one-command harness boots the homeserver, registers
+the two test users, and runs the whole `#[ignore]`d suite:
+
+```bash
+scripts/matrix_integration_test.sh              # run the live E2E suite
+scripts/matrix_integration_test.sh --teardown   # ...and stop the homeserver after
+```
+
+That suite covers the live daemon paths end to end (issue #202): login/`/sync`,
+signed remote `call` and `exec` (streaming, stdin, and policy denial), E2EE
+privileged-event handling, and the live scheduler loop auto-executing a signed,
+assigned task DAG over real room state while refusing policy-denied and
+approval-required actions. To drive the homeserver manually instead:
 
 ```bash
 scripts/matrix_dev.sh up              # start a loopback-only Tuwunel homeserver
 scripts/matrix_dev.sh register alice  # register a test user, print an access token
-cargo test --all                      # run the suite
 scripts/matrix_dev.sh reset           # wipe homeserver data when done
 ```
 
