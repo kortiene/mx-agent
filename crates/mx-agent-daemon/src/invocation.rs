@@ -143,7 +143,7 @@ pub fn task_result_from_invocation(
 }
 
 /// Options for [`list_invocations`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ListInvocationsOptions {
     /// Room ID or alias to list invocations in.
     pub room: String,

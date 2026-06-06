@@ -1138,9 +1138,12 @@ Response:
 }
 ```
 
-Task commands are daemon-mediated over the same local IPC channel so the CLI
-never reads Matrix session files or tokens. The daemon owns Matrix restoration
-and calls the task state helpers internally:
+Every Matrix-backed command group is daemon-mediated over the same local IPC
+channel so the CLI never reads Matrix session files, tokens, or device keys and
+never restores a Matrix client: the daemon owns Matrix restoration and calls the
+existing helpers internally (issue #201). `auth login` stays CLI-initiated (it
+receives the password and writes the session into the daemon-owned data dir);
+`auth status`/`logout` read only local session metadata.
 
 | Method | Params | Result |
 |---|---|---|
@@ -1149,6 +1152,17 @@ and calls the task state helpers internally:
 | `task.list` | `ListTasksOptions` | `TaskState[]` |
 | `task.graph` | `ListTasksOptions` | `TaskGraph` |
 | `task.watch` | `ListTasksOptions` | stream of watch event envelopes |
+| `workspace.create` / `.attach` | `CreateWorkspaceOptions` / `AttachWorkspaceOptions` | `WorkspaceInfo` / `WorkspaceState` |
+| `workspace.join` / `.status` | `RoomParams` | `WorkspaceInfo` / `WorkspaceStatus` |
+| `workspace.watch` | `RoomParams` | stream of watch event envelopes |
+| `agent.register` / `.list` | `RegisterAgentOptions` / `ListAgentsOptions` | `AgentState` / `AgentState[]` |
+| `agent.show` / `.tools` | `RoomAgentParams` | `AgentState?` / `AgentTools?` |
+| `trust.publish` / `.state` | `TrustPublishParams` / `RoomParams` | `TrustState` / `TrustState[]` |
+| `approval.decide` | `ApprovalDecideParams` | `ApprovalDecisionRecord` |
+| `share.file` / `.diff` / `.env` | `ShareContextOptions` / `ShareDiffOptions` / `ShareEnvOptions` | `ContextShare` |
+| `share.list` / `.get` | `ListSharesOptions` / `FetchContextOptions` | `ContextShare[]` / `FetchedContext` |
+| `invocation.list` / `.get` | `ListInvocationsOptions` / `RoomInvocationParams` | `InvocationState[]` / `InvocationState?` |
+| `invocation.cancel` / `.artifact` | `InvocationCancelParams` / `RetrieveArtifactOptions` | `InvocationState` / `RetrievedArtifact` |
 
 `task.watch` keeps the Unix-socket connection open and sends one JSON-RPC
 response frame per event using the original request id. Event envelopes carry

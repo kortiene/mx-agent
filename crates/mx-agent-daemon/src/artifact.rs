@@ -313,7 +313,7 @@ fn sha256_b64(data: &[u8]) -> String {
 pub const DEFAULT_ARTIFACT_SCAN_LIMIT: u32 = 100;
 
 /// Options for [`retrieve_artifact`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RetrieveArtifactOptions {
     /// Room ID or alias to retrieve the artifact from.
     pub room: String,
@@ -339,7 +339,7 @@ impl Default for RetrieveArtifactOptions {
 
 /// A stream artifact retrieved, verified, and decompressed by
 /// [`retrieve_artifact`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RetrievedArtifact {
     /// The artifact metadata as published in the room.
     pub artifact: StreamArtifact,

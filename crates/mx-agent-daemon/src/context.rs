@@ -56,7 +56,7 @@ pub const ENV_MIME_TYPE: &str = "application/json";
 pub const DEFAULT_ENV_INCLUDE: &[&str] = &["node", "npm", "os", "git"];
 
 /// Options for [`share_context`]: share an arbitrary typed payload.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ShareContextOptions {
     /// Room ID or alias to share into.
     pub room: String,
@@ -69,7 +69,7 @@ pub struct ShareContextOptions {
 }
 
 /// Options for [`share_diff`]: capture and share the current git diff.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ShareDiffOptions {
     /// Room ID or alias to share into.
     pub room: String,
@@ -81,7 +81,7 @@ pub struct ShareDiffOptions {
 }
 
 /// Options for [`share_env`]: collect and share environment metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShareEnvOptions {
     /// Room ID or alias to share into.
     pub room: String,
@@ -99,7 +99,7 @@ impl Default for ShareEnvOptions {
 }
 
 /// Options for [`list_context_shares`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ListSharesOptions {
     /// Room ID or alias to list shares from.
     pub room: String,
@@ -112,7 +112,7 @@ pub struct ListSharesOptions {
 pub const DEFAULT_FETCH_SCAN_LIMIT: u32 = 100;
 
 /// Options for [`fetch_context`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FetchContextOptions {
     /// Room ID or alias to fetch the share from.
     pub room: String,
@@ -134,7 +134,7 @@ impl Default for FetchContextOptions {
 }
 
 /// A context artifact retrieved and verified by [`fetch_context`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FetchedContext {
     /// The share metadata as published in the room.
     pub share: ContextShare,

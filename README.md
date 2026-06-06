@@ -42,7 +42,7 @@ If a box can sync with a homeserver, it can participate — even one that accept
 | Local IPC: Unix-socket JSON-RPC 2.0 with `0600` perms + `SO_PEERCRED` peer check | ✅ Implemented |
 | Structured logging, secret redaction, dev Matrix homeserver (Tuwunel) | ✅ Implemented |
 | Protocol event schema, Ed25519 signing, policy parser, `none` sandbox backend | ✅ Implemented |
-| `auth`, `workspace`, `agent`, `trust`, `approval`, `share` commands (over Matrix, daemon-mediated) | ✅ Implemented |
+| `auth`, `workspace`, `agent`, `trust`, `approval`, `share`, `invocation` commands fully daemon-IPC-mediated (CLI never restores a Matrix session/client) | ✅ Implemented |
 | Task state: `task create` / `update` / `list` / `graph` / `watch` (daemon-IPC, over Matrix) | ✅ Implemented |
 | Structured task actions (`tool` / `exec`), lifecycle-transition validation, stable task result schema | ✅ Implemented |
 | Daemon task-orchestration engine: scheduler, optimistic `state_rev` claiming, tool/exec dispatch, policy + trust/signature + approval enforcement, restart recovery, DAG diagnostics | ✅ Implemented (engine + tests) |
@@ -86,7 +86,7 @@ mx-agent daemon status --json         # pid, uptime, socket path, version as JSO
 mx-agent daemon stop                  # graceful shutdown (SIGTERM, then SIGKILL)
 ```
 
-The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The `auth` / `workspace` / `agent` / `trust` / `approval` / `share` and `task` command groups run against a real Matrix homeserver through the daemon today. `call` and non-PTY `exec` are daemon-mediated local loopback by default and become signed Matrix-backed remote operations when `--room` and `--agent` target a registered, trusted, policy-allowed remote agent. Live remote exec stdin/cancel controls are signed and policy/ownership checked by the target daemon. See [Project status](#project-status) for the full breakdown.
+The daemon owns all long-lived state (Matrix session, keys, policy). The CLI is stateless and talks to it over `$XDG_RUNTIME_DIR/mx-agent/daemon.sock`. The `auth` / `workspace` / `agent` / `trust` / `approval` / `share` / `invocation` and `task` command groups run against a real Matrix homeserver entirely through the daemon over local IPC today — the stateless CLI never reads the Matrix session file or builds a Matrix client itself (`auth login` stays CLI-initiated to receive the password and hand the session to the daemon). `call` and non-PTY `exec` are daemon-mediated local loopback by default and become signed Matrix-backed remote operations when `--room` and `--agent` target a registered, trusted, policy-allowed remote agent. Live remote exec stdin/cancel controls are signed and policy/ownership checked by the target daemon. See [Project status](#project-status) for the full breakdown.
 
 ---
 
