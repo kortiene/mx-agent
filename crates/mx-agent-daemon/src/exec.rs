@@ -44,8 +44,8 @@ use mx_agent_protocol::events::timeline::{
     EXEC_STDIN, STREAM_ARTIFACT, STREAM_CHUNK,
 };
 use mx_agent_protocol::schema::{
-    ExecAccepted, ExecCancel, ExecCancelled, ExecFinished, ExecRejected, ExecRequest, ExecStdin,
-    InvocationState, Signature, StreamKind,
+    AgentState, ExecAccepted, ExecCancel, ExecCancelled, ExecFinished, ExecRejected, ExecRequest,
+    ExecStdin, InvocationState, Signature, StreamKind,
 };
 use mx_agent_protocol::signing::{self, SignatureError, SIGNATURE_FIELD};
 
@@ -757,17 +757,41 @@ async fn authorize_live_control(
     key_id: &str,
     requester_agent_id: &str,
 ) -> Result<(), ()> {
-    let agent = crate::agent::read_agent_state(room, requester_agent_id)
+    let agents = crate::agent::read_all_agent_states(room)
         .await
-        .ok()
-        .flatten()
+        .map_err(|_| ())?;
+    let trust = TrustStore::load(paths).unwrap_or_default();
+    authorize_control_from_states(&agents, requester_agent_id, content, key_id, &trust)
+}
+
+/// Pure core of [`authorize_live_control`]: given every agent state in the room,
+/// decide whether a signed control frame (stdin / cancel) is authorized.
+///
+/// The requester is resolved by **agent id**, never by signing key. Resolving by
+/// key was the cause of a heisenbug: when two agents publish the same
+/// `signing_key_id` (e.g. the integration-test harness loads one key from a
+/// shared data dir), a key search returns an arbitrary agent. If it returned the
+/// *target* rather than the requester, the owner check failed and the frame —
+/// including stdin EOF — was silently dropped, hanging the command until
+/// timeout. Looking the requester up by id is deterministic regardless of
+/// whether agents share keys, and the frame's `key_id` is still required to
+/// match that specific requester's registered key.
+fn authorize_control_from_states(
+    agents: &[AgentState],
+    requester_agent_id: &str,
+    content: &Value,
+    key_id: &str,
+    trust: &TrustStore,
+) -> Result<(), ()> {
+    let agent = agents
+        .iter()
+        .find(|agent| agent.agent_id == requester_agent_id)
         .ok_or(())?;
     if agent.signing_key_id != key_id {
         return Err(());
     }
-    let verifying_key = crate::call::verifying_key_from_agent_state(&agent).map_err(|_| ())?;
+    let verifying_key = crate::call::verifying_key_from_agent_state(agent).map_err(|_| ())?;
     signing::verify(&verifying_key, content).map_err(|_| ())?;
-    let trust = TrustStore::load(paths).unwrap_or_default();
     if !trust.is_key_trusted(key_id) {
         return Err(());
     }
@@ -1558,6 +1582,138 @@ allow_cwd = ["/home/me/code/project"]
                 panic!("exec should have finished, not been cancelled")
             }
         }
+    }
+
+    /// Build an agent state whose published key matches `key`.
+    fn agent_with(agent_id: &str, key: &SigningKey) -> AgentState {
+        use mx_agent_protocol::schema::{AgentLoad, AgentWorkspace};
+        let vk = key.verifying_key();
+        AgentState {
+            agent_id: agent_id.to_string(),
+            kind: "pi".to_string(),
+            matrix_user_id: format!("{agent_id}:matrix.org"),
+            device_id: "DEV".to_string(),
+            signing_key_id: crate::signing::key_id_for_verifying_key(&vk),
+            signing_public_key: Some(crate::signing::encode_verifying_key(&vk)),
+            status: "active".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            workspace: AgentWorkspace {
+                cwd: "/tmp".to_string(),
+                project_id: String::new(),
+                git_commit: String::new(),
+            },
+            load: AgentLoad {
+                running_invocations: 0,
+                max_invocations: 1,
+            },
+            last_seen_ts: 0,
+            state_rev: 1,
+            extra: Default::default(),
+        }
+    }
+
+    /// A signed `exec.stdin` control frame from `key`.
+    fn signed_stdin(key: &SigningKey) -> Value {
+        build_signed_exec_stdin(
+            key,
+            crate::signing::key_id_for_verifying_key(&key.verifying_key()),
+            "inv_01HZ",
+            b"hello\n",
+            true,
+            "2026-06-02T12:00:00Z",
+            "base64-nonce",
+        )
+        .expect("signs stdin")
+    }
+
+    #[test]
+    fn control_authorized_by_requester_id_even_when_agents_share_a_key() {
+        // Regression for the flaky live exec test: when the target and requester
+        // publish the same signing key (the test harness loads one key from a
+        // shared data dir), the requester must still be resolved by agent id.
+        // The old key-search returned whichever agent the homeserver listed
+        // first; if that was the target, the owner check failed and stdin (with
+        // EOF) was dropped, hanging the command.
+        let key = test_key();
+        let key_id = crate::signing::key_id_for_verifying_key(&key.verifying_key());
+        let trust = trust_with(&key_id);
+        let content = signed_stdin(&key);
+
+        let target = agent_with("developer-pi", &key);
+        let requester = agent_with("@bob:matrix.org", &key);
+
+        for agents in [
+            vec![target.clone(), requester.clone()],
+            vec![requester.clone(), target.clone()],
+        ] {
+            assert!(
+                authorize_control_from_states(
+                    &agents,
+                    "@bob:matrix.org",
+                    &content,
+                    &key_id,
+                    &trust
+                )
+                .is_ok(),
+                "the real requester must authorize regardless of agent ordering"
+            );
+        }
+    }
+
+    #[test]
+    fn control_rejected_when_frame_key_is_not_the_requesters_key() {
+        let requester_key = test_key();
+        let other_key = SigningKey::from_bytes(&[9u8; 32]);
+        let requester_key_id =
+            crate::signing::key_id_for_verifying_key(&requester_key.verifying_key());
+        let other_key_id = crate::signing::key_id_for_verifying_key(&other_key.verifying_key());
+
+        let content = signed_stdin(&other_key);
+        let mut trust = TrustStore::default();
+        trust.approve("@bob:matrix.org", &requester_key_id, None, None, None);
+        trust.approve("@bob:matrix.org", &other_key_id, None, None, None);
+
+        let agents = vec![agent_with("@bob:matrix.org", &requester_key)];
+        assert!(
+            authorize_control_from_states(
+                &agents,
+                "@bob:matrix.org",
+                &content,
+                &other_key_id,
+                &trust
+            )
+            .is_err(),
+            "a frame bearing a key other than the requester's registered key must be rejected"
+        );
+    }
+
+    #[test]
+    fn control_rejected_when_key_untrusted() {
+        let key = test_key();
+        let key_id = crate::signing::key_id_for_verifying_key(&key.verifying_key());
+        let content = signed_stdin(&key);
+        let agents = vec![agent_with("@bob:matrix.org", &key)];
+        let trust = TrustStore::default();
+        assert!(
+            authorize_control_from_states(&agents, "@bob:matrix.org", &content, &key_id, &trust)
+                .is_err(),
+            "an untrusted key must be rejected"
+        );
+    }
+
+    #[test]
+    fn control_rejected_when_requester_not_in_room() {
+        let key = test_key();
+        let key_id = crate::signing::key_id_for_verifying_key(&key.verifying_key());
+        let trust = trust_with(&key_id);
+        let content = signed_stdin(&key);
+        let agents = vec![agent_with("developer-pi", &key)];
+        assert!(
+            authorize_control_from_states(&agents, "@bob:matrix.org", &content, &key_id, &trust)
+                .is_err(),
+            "an unknown requester id must be rejected"
+        );
     }
 
     #[test]

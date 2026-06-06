@@ -34,11 +34,9 @@ cargo build --all
 cargo run -p mx-agent-cli -- --help
 ```
 
-If you'll be editing the wiki, install the wiki-sync pre-push hook once:
-
-```bash
-sh scripts/install-wiki-hook.sh
-```
+Wiki pages live in `wiki/` and are the source of truth. A GitHub Action mirrors
+them to the GitHub wiki automatically when changes to `wiki/**` land on `main` —
+edit the files in `wiki/`, not the wiki UI.
 
 ## Workspace layout
 
