@@ -472,8 +472,22 @@ pub async fn update_task(
     options: &UpdateTaskOptions,
 ) -> Result<TaskState, WorkspaceError> {
     let room = sync_and_get_room(client, &options.room).await?;
+    update_task_in_room(&room, options).await
+}
 
-    let (mut state, event_id) = read_task_state(&room, &options.task_id)
+/// Update a task against an already-resolved [`Room`], performing no `/sync`.
+///
+/// This is the body of [`update_task`] without room resolution. The daemon's
+/// scheduler loop shares the daemon's Matrix client and must not run a second
+/// overlapping `/sync`, so it reads room state populated by the main sync loop
+/// and writes task state events directly through the room handle. The same
+/// stale-update guard ([`WorkspaceError::StaleTaskUpdate`]) and lifecycle
+/// transition validation as [`update_task`] apply (architecture §9.2, §9.4).
+pub(crate) async fn update_task_in_room(
+    room: &Room,
+    options: &UpdateTaskOptions,
+) -> Result<TaskState, WorkspaceError> {
+    let (mut state, event_id) = read_task_state(room, &options.task_id)
         .await?
         .ok_or_else(|| WorkspaceError::TaskNotFound(options.task_id.clone()))?;
 
@@ -483,7 +497,7 @@ pub async fn update_task(
     }
 
     apply_update(&mut state, options, now_rfc3339(), event_id);
-    publish_task_state(&room, &options.task_id, &state).await?;
+    publish_task_state(room, &options.task_id, &state).await?;
     Ok(state)
 }
 

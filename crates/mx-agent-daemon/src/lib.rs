@@ -25,6 +25,7 @@ pub mod pty;
 pub mod replay;
 pub mod runner;
 pub mod scheduler;
+pub mod scheduler_loop;
 pub mod session;
 pub mod signing;
 pub mod stream;
@@ -122,6 +123,10 @@ pub use runner::{
     RunOutput, RunSpec, CANCEL_SIGNAL, DEFAULT_GRACE_PERIOD,
 };
 pub use scheduler::{ScheduleDecision, TaskScheduler};
+pub use scheduler_loop::{
+    run_scheduler_loop, run_scheduler_tick, MatrixTaskStore, RoutingDispatcher,
+    DEFAULT_SCHEDULER_INTERVAL,
+};
 pub use session::{
     auth_status, clear_session, clear_sync_token, load_session, load_sync_token, save_session,
     save_sync_token, AuthStatus, Secret, SessionPaths, StoredSession,

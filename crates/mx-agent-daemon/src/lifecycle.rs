@@ -230,9 +230,12 @@ pub fn run_foreground() -> io::Result<()> {
     // Start the Matrix sync loop if a session is present. The loop's health is
     // shared with the IPC handler so `daemon.status` reports live progress. The
     // loop runs on its own Tokio runtime and is signalled to stop on shutdown.
+    // When a session is present the same restored client also drives the live
+    // task scheduler loop (architecture §9.2, issue #199).
     let sync_running = Arc::new(AtomicBool::new(true));
     let exec_subscribers = crate::ExecSubscriberRegistry::new();
-    let (sync_thread, health) = spawn_sync_loop(sync_running.clone(), exec_subscribers.clone());
+    let (sync_thread, scheduler_thread, health) =
+        spawn_matrix_workers(sync_running.clone(), exec_subscribers.clone());
 
     // Serve IPC requests on a background thread. The thread is torn down when
     // the process exits after shutdown.
@@ -263,9 +266,12 @@ pub fn run_foreground() -> io::Result<()> {
         tracing::info!(signal, "received shutdown signal");
     }
 
-    // Signal the sync loop to stop and wait briefly for it to wind down.
+    // Signal the sync and scheduler loops to stop and wait for them to wind down.
     sync_running.store(false, Ordering::SeqCst);
     if let Some(handle) = sync_thread {
+        let _ = handle.join();
+    }
+    if let Some(handle) = scheduler_thread {
         let _ = handle.join();
     }
 
@@ -275,33 +281,53 @@ pub fn run_foreground() -> io::Result<()> {
     Ok(())
 }
 
-/// Spawn the Matrix sync loop on a dedicated thread, if a session is stored.
+/// Type alias for the pair of background worker threads (sync + scheduler).
+type WorkerThreads = (
+    Option<std::thread::JoinHandle<()>>,
+    Option<std::thread::JoinHandle<()>>,
+);
+
+/// Spawn the Matrix sync loop and the live task scheduler loop, if a session is
+/// stored, sharing one restored client between them.
 ///
-/// Returns `None` (and does nothing) when no Matrix session exists yet, so the
-/// daemon runs cleanly before login. The thread owns a current-thread Tokio
-/// runtime that drives [`crate::sync::run_matrix_sync`].
-fn spawn_sync_loop(
+/// Returns `(None, None, None)` (and does nothing) when no Matrix session exists
+/// yet, so the daemon runs cleanly before login. The sync thread owns a
+/// current-thread Tokio runtime that drives [`crate::sync::run_matrix_sync`];
+/// the scheduler thread owns its own runtime and drives
+/// [`crate::run_scheduler_loop`] over the same client, so only the sync loop
+/// advances the session token while the scheduler reads task state and claims
+/// runnable assigned tasks (architecture §9.2, issue #199).
+fn spawn_matrix_workers(
     running: Arc<AtomicBool>,
     exec_subscribers: crate::ExecSubscriberRegistry,
-) -> (Option<std::thread::JoinHandle<()>>, SharedHealth) {
+) -> (
+    Option<std::thread::JoinHandle<()>>,
+    Option<std::thread::JoinHandle<()>>,
+    SharedHealth,
+) {
     let session_paths = SessionPaths::resolve();
     let session = match load_session(&session_paths) {
         Ok(Some(session)) => session,
         Ok(None) => {
-            tracing::info!("no Matrix session stored; sync loop not started");
-            return (None, None);
+            tracing::info!("no Matrix session stored; sync and scheduler loops not started");
+            return (None, None, None);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "could not load Matrix session; sync loop not started");
-            return (None, None);
+            tracing::warn!(error = %e, "could not load Matrix session; sync and scheduler loops not started");
+            return (None, None, None);
         }
     };
 
     // The health handle is created up front and shared with the IPC handler so
-    // status reflects the loop's progress live.
+    // status reflects the loop's progress live. The restored client is published
+    // into a shared slot so the scheduler thread can share it without opening a
+    // second client (which would race on the session token).
     let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let shared_client: Arc<Mutex<Option<matrix_sdk::Client>>> = Arc::new(Mutex::new(None));
     let loop_health = health.clone();
-    let handle = std::thread::spawn(move || {
+    let sync_running = running.clone();
+    let publish_client = shared_client.clone();
+    let sync_handle = std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -324,12 +350,13 @@ fn spawn_sync_loop(
                     return;
                 }
             };
+            *publish_client.lock().unwrap_or_else(|e| e.into_inner()) = Some(client.clone());
             if let Err(e) = crate::sync::run_matrix_sync_with_subscribers(
                 &client,
                 &SessionPaths::resolve(),
                 loop_health,
                 BackoffConfig::default(),
-                running,
+                sync_running,
                 Some(exec_subscribers),
             )
             .await
@@ -338,7 +365,28 @@ fn spawn_sync_loop(
             }
         });
     });
-    (Some(handle), Some(health))
+
+    let scheduler_handle = std::thread::spawn(move || {
+        // Wait for the sync thread to publish the restored client (or for
+        // shutdown), then drive the scheduler loop over the same client.
+        let client = loop {
+            if !running.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(client) = shared_client
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                break client;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        crate::run_scheduler_loop(client, running, crate::DEFAULT_SCHEDULER_INTERVAL);
+    });
+
+    let threads: WorkerThreads = (Some(sync_handle), Some(scheduler_handle));
+    (threads.0, threads.1, Some(health))
 }
 
 fn write_ipc_response(
