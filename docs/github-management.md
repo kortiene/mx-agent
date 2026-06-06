@@ -193,10 +193,10 @@ The workflow `.github/workflows/project-sync.yml` runs `actions/add-to-project` 
 
 ## Starting Work on an Issue
 
-`adw/work_issue.sh` takes a GitHub issue number and bootstraps everything needed to start implementing it:
+`python adw/work_issue.py` takes a GitHub issue number and bootstraps everything needed to start implementing it:
 
 ```bash
-adw/work_issue.sh 3
+python adw/work_issue.py 3
 ```
 
 It will:
@@ -211,13 +211,13 @@ It will:
 Useful flags:
 
 ```bash
-adw/work_issue.sh 3 --print      # only show issue context, change nothing
-adw/work_issue.sh 3 --dry-run    # show all actions without performing them
-adw/work_issue.sh 3 --base main --status "In Progress"
-adw/work_issue.sh 3 --no-status  # skip board update (no project scope needed)
+python adw/work_issue.py 3 --print      # only show issue context, change nothing
+python adw/work_issue.py 3 --dry-run    # show all actions without performing them
+python adw/work_issue.py 3 --base main --status "In Progress"
+python adw/work_issue.py 3 --no-status  # skip board update (no project scope needed)
 ```
 
-Requirements: `gh` (authenticated; `project` scope needed for board updates), `jq`, and `git`.
+Requirements: `gh` (authenticated; `project` scope needed for board updates) and `git`.
 
 ## Automated Issue Processing
 
@@ -253,21 +253,21 @@ Notes:
 - Headless mode cannot ask interactive questions, so the template's "ask whether to continue" step becomes "state the assumption and proceed"; pass a note to steer it.
 - Each run is fully autonomous (edits, pushes, opens a PR, and merges unattended). `pi` is resolved from `PATH`, then `~/.local/share/pi-node/current/bin/pi`, or `PI_BIN`; `claude` from `PATH`, then `~/.claude/local/claude` or `~/.local/bin/claude`, or `CLAUDE_BIN`; `gh` from `PATH` then `~/.local/bin/gh` or `GH_BIN`. `PI_MODEL`, `PI_THINKING`, and `MX_AGENT_LOG_DIR` set defaults for the matching flags.
 
-### Many issues in order: `adw/issues.sh`
+### Many issues in order: `python adw/issues.py`
 
 Processes several issues sequentially via `python adw/issue.py`, one fully completing (including its CI and merge) before the next begins — important because later backlog issues usually depend on earlier ones being merged to `main`.
 
 ```bash
-adw/issues.sh 15 16 17                      # explicit list, stop on first failure
-adw/issues.sh 15-22                          # inclusive range (also N..M)
-adw/issues.sh 15..30 --keep-going -- --json --model sonnet:high
-adw/issues.sh 15-30 --start 21               # resume from #21
-adw/issues.sh 15 16 18-20 --dry-run          # preview the plan
+python adw/issues.py 15 16 17                      # explicit list, stop on first failure
+python adw/issues.py 15-22                          # inclusive range (also N..M)
+python adw/issues.py 15..30 --keep-going -- --json --model sonnet:high
+python adw/issues.py 15-30 --start 21               # resume from #21
+python adw/issues.py 15 16 18-20 --dry-run          # preview the plan
 ```
 
-It stops at the first failure by default (`--keep-going` to continue), preserves the given order, supports number/range specs, forwards flags after `--` to `issue.py`, and prints a completed/failed summary (also on Ctrl-C). It confirms once for the whole batch (`--yes` to skip), holds a lock so only one batch runs at a time, and resumes at a given issue with `--start <n>` (index-based). Because each run verifies closure and already-closed issues are skipped, a batch is also **resumable just by re-running it**; `--log-dir <dir>` is forwarded to each run. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
+It stops at the first failure by default (`--keep-going` to continue), supports number/range specs (expanded ascending and de-duplicated), forwards flags after `--` to each `issue.py` run, and prints a completed/failed summary (also on Ctrl-C). It confirms once for the whole batch (`--yes` to skip), holds a lock so only one batch runs at a time, and resumes at the first occurrence of a given issue with `--start <n>`. Because each run verifies closure and already-closed issues are skipped, a batch is also **resumable just by re-running it**; `--log-dir <dir>` is forwarded to each run. It deliberately does not parallelize, since concurrent merges to `main` would conflict.
 
-Requirements: `pi` on `PATH` (or `PI_BIN`), plus the same `gh`/`git`/`cargo` access the interactive workflow uses.
+Requirements: the chosen runner (`pi` or `claude`) on `PATH` (or `PI_BIN`/`CLAUDE_BIN`), plus the same `gh`/`git`/`cargo` access the interactive workflow uses.
 
 ### Manual alternative with gh
 

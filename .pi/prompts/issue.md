@@ -20,11 +20,11 @@ Follow this exact workflow and do not stop until the issue is shipped or you hit
 
 1. Validate input and start the issue
    - If `$1` is missing, stop and ask for an issue number.
-   - Run `adw/work_issue.sh $1 --print` first to read the title, labels, milestone, scope, and acceptance criteria. Treat the acceptance criteria as the definition of done.
+   - Run `python adw/work_issue.py $1 --print` first to read the title, labels, milestone, scope, and acceptance criteria. Treat the acceptance criteria as the definition of done.
    - If the issue is CLOSED, stop and tell me.
    - If the issue has unmet dependencies (a "Depends on" line referencing another open issue), warn me and ask whether to continue.
    - Stop for real blockers such as acceptance criteria that conflict with repository security constraints, require real secrets/credentials, or require broad architecture decisions with insufficient detail.
-   - Then run `adw/work_issue.sh $1` to create the branch, assign the issue, and move its board card to In Progress.
+   - Then run `python adw/work_issue.py $1` to create the branch, assign the issue, and move its board card to In Progress.
    - Use `~/.local/bin/gh` if `gh` is not on PATH and `. "$HOME/.cargo/env"` before any cargo command when needed.
 
 2. Read repository context

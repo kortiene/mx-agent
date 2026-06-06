@@ -13,7 +13,7 @@ Already-closed issues are skipped, and unknown issue numbers fail fast before
 spending tokens.
 
 Use `--print-prompt` for the old render-only behavior, or `--dry-run` to print
-the exact runner command without executing it. `adw/issues.sh` drives this module
+the exact runner command without executing it. `adw/issues.py` drives this module
 to process several issues in order.
 """
 
@@ -31,15 +31,19 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adw.common import AdwError, render_prompt_file
+from adw._exec import (
+    assume_yes,
+    confirm,
+    detect_repo,
+    issue_state,
+    note,
+    resolve_gh_bin,
+    resolve_runner_bin,
+    working_tree_dirty,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNNERS = ("pi", "claude")
-
-
-def note(message: str) -> None:
-    """Print a progress note to stderr (stdout carries runner output)."""
-
-    print(f">> {message}", file=sys.stderr)
 
 
 def default_template(runner: str) -> Path:
@@ -55,42 +59,6 @@ def default_template(runner: str) -> Path:
         if claude_template.is_file():
             return claude_template
     return REPO_ROOT / ".pi" / "prompts" / "issue.md"
-
-
-def _resolve_bin(env_var: str, name: str, fallbacks: Sequence[Path]) -> "str | None":
-    """Resolve an executable via an env override, `$PATH`, then fallbacks."""
-
-    override = os.environ.get(env_var)
-    if override:
-        return override
-    found = shutil.which(name)
-    if found:
-        return found
-    for candidate in fallbacks:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return None
-
-
-def resolve_runner_bin(runner: str) -> str:
-    """Resolve the runner executable, raising `AdwError` if it is missing."""
-
-    home = Path.home()
-    if runner == "pi":
-        found = _resolve_bin("PI_BIN", "pi", [home / ".local/share/pi-node/current/bin/pi"])
-        if found:
-            return found
-        raise AdwError("pi CLI not found; install pi or set PI_BIN")
-    found = _resolve_bin("CLAUDE_BIN", "claude", [home / ".claude/local/claude", home / ".local/bin/claude"])
-    if found:
-        return found
-    raise AdwError("claude CLI not found; install Claude Code or set CLAUDE_BIN")
-
-
-def resolve_gh_bin() -> "str | None":
-    """Resolve the `gh` executable for skip/verify, or `None` if unavailable."""
-
-    return _resolve_bin("GH_BIN", "gh", [Path.home() / ".local/bin/gh"])
 
 
 def build_runner_command(
@@ -123,53 +91,6 @@ def build_runner_command(
     cmd += list(passthru)
     cmd.append(prompt)
     return cmd
-
-
-def issue_state(gh_bin: "str | None", issue: int, repo: str) -> str:
-    """Return an issue's state via `gh`, or `UNKNOWN` if undeterminable."""
-
-    if not gh_bin:
-        return "UNKNOWN"
-    args = [gh_bin, "issue", "view", str(issue)]
-    if repo:
-        args += ["--repo", repo]
-    args += ["--json", "state", "-q", ".state"]
-    try:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
-    except OSError:
-        return "UNKNOWN"
-    if result.returncode != 0:
-        return "UNKNOWN"
-    return result.stdout.strip() or "UNKNOWN"
-
-
-def detect_repo(gh_bin: "str | None") -> str:
-    """Best-effort `owner/repo` detection via `gh`, or empty string."""
-
-    if not gh_bin:
-        return ""
-    try:
-        result = subprocess.run(
-            [gh_bin, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
-
-
-def working_tree_dirty() -> bool:
-    """Return True when inside a git work tree with uncommitted changes."""
-
-    inside = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, check=False
-    )
-    if inside.returncode != 0:
-        return False
-    status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=False)
-    return bool(status.stdout.strip())
 
 
 def wrap_timeout(cmd: Sequence[str], timeout: int) -> list[str]:
@@ -330,12 +251,8 @@ def _run(args: argparse.Namespace, passthru: Sequence[str]) -> int:
     if not args.allow_dirty and working_tree_dirty():
         raise AdwError("working tree is dirty; commit/stash first or pass --allow-dirty")
 
-    assume_yes = args.yes or os.environ.get("MX_AGENT_YES") == "1"
-    if not assume_yes and sys.stdin.isatty():
-        sys.stderr.write(f">> About to autonomously implement and MERGE issue #{issue}. Continue? [y/N] ")
-        sys.stderr.flush()
-        reply = sys.stdin.readline().strip().lower()
-        if reply not in ("y", "yes"):
+    if not assume_yes(args.yes) and sys.stdin.isatty():
+        if not confirm(f">> About to autonomously implement and MERGE issue #{issue}. Continue? [y/N] "):
             raise AdwError("aborted")
 
     note(f"running /issue {issue} headlessly via {args.runner} ({runner_bin})")
