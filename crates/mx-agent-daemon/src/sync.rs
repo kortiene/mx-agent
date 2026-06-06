@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::event_router::{
     events_from_sync_response, EventMeta, EventRouter, RouteOutcome, RoutedEvent,
 };
+use crate::exec_subscribers::{ExecSubscriberRegistry, ForwardedExecEvent};
 use crate::replay::ReplayCache;
 use crate::session::{load_sync_token, save_sync_token, SessionPaths};
 
@@ -261,6 +262,19 @@ pub async fn run_matrix_sync(
     backoff_config: BackoffConfig,
     running: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    run_matrix_sync_with_subscribers(client, paths, health, backoff_config, running, None).await
+}
+
+/// Drive a real Matrix `/sync` loop and forward routed stream/result events to
+/// `subscribers` when provided.
+pub async fn run_matrix_sync_with_subscribers(
+    client: &matrix_sdk::Client,
+    paths: &SessionPaths,
+    health: Arc<Mutex<SyncHealth>>,
+    backoff_config: BackoffConfig,
+    running: Arc<AtomicBool>,
+    subscribers: Option<ExecSubscriberRegistry>,
+) -> std::io::Result<()> {
     use matrix_sdk::config::SyncSettings;
 
     // The event router observes mx-agent events on each sync (architecture
@@ -281,6 +295,7 @@ pub async fn run_matrix_sync(
 
     run_sync_loop(paths, health, backoff_config, running, move |token| {
         let router = router.clone();
+        let subscribers = subscribers.clone();
         async move {
             let mut settings = SyncSettings::default().timeout(Duration::from_secs(30));
             if let Some(token) = token {
@@ -294,7 +309,7 @@ pub async fn run_matrix_sync(
                     } else {
                         Vec::new()
                     };
-                    handle_routed_events(client, paths, routed).await;
+                    handle_routed_events(client, paths, subscribers.as_ref(), routed).await;
                     Ok(response.next_batch)
                 }
                 Err(e) => {
@@ -361,12 +376,37 @@ fn route_sync_response(
 async fn handle_routed_events(
     client: &matrix_sdk::Client,
     paths: &SessionPaths,
+    subscribers: Option<&ExecSubscriberRegistry>,
     events: Vec<(EventMeta, RoutedEvent)>,
 ) {
     for (meta, routed) in events {
         match routed {
             RoutedEvent::CallRequest(request) => {
                 crate::call::handle_live_call_request(client, paths, &meta, &request).await;
+            }
+            RoutedEvent::StreamChunk(event) => {
+                publish_forwarded(subscribers, &meta, ForwardedExecEvent::StreamChunk(*event))
+            }
+            RoutedEvent::StreamArtifact(event) => publish_forwarded(
+                subscribers,
+                &meta,
+                ForwardedExecEvent::StreamArtifact(*event),
+            ),
+            RoutedEvent::ExecRejected(event) => {
+                publish_forwarded(subscribers, &meta, ForwardedExecEvent::ExecRejected(event));
+            }
+            RoutedEvent::ExecFinished(event) => {
+                publish_forwarded(subscribers, &meta, ForwardedExecEvent::ExecFinished(*event))
+            }
+            RoutedEvent::ExecCancelled(event) => {
+                publish_forwarded(
+                    subscribers,
+                    &meta,
+                    ForwardedExecEvent::ExecCancelled(*event),
+                );
+            }
+            RoutedEvent::CallResponse(event) => {
+                publish_forwarded(subscribers, &meta, ForwardedExecEvent::CallResponse(*event));
             }
             other => {
                 tracing::debug!(
@@ -378,6 +418,33 @@ async fn handle_routed_events(
             }
         }
     }
+}
+
+fn publish_forwarded(
+    subscribers: Option<&ExecSubscriberRegistry>,
+    meta: &EventMeta,
+    event: ForwardedExecEvent,
+) {
+    let Some(subscribers) = subscribers else {
+        tracing::debug!(
+            event_type = %meta.event_type,
+            room = %meta.room_id,
+            sender = %meta.sender,
+            "no exec subscriber registry configured for routed result event"
+        );
+        return;
+    };
+    let key = event.key();
+    let stats = subscribers.publish(event);
+    tracing::debug!(
+        event_type = %meta.event_type,
+        room = %meta.room_id,
+        sender = %meta.sender,
+        key = ?key,
+        delivered = stats.delivered,
+        pruned = stats.pruned,
+        "forwarded routed Matrix result event to exec subscribers"
+    );
 }
 
 /// Classify a Matrix sync error: an unknown/missing access token is fatal

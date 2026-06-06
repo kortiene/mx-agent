@@ -231,7 +231,8 @@ pub fn run_foreground() -> io::Result<()> {
     // shared with the IPC handler so `daemon.status` reports live progress. The
     // loop runs on its own Tokio runtime and is signalled to stop on shutdown.
     let sync_running = Arc::new(AtomicBool::new(true));
-    let (sync_thread, health) = spawn_sync_loop(sync_running.clone());
+    let exec_subscribers = crate::ExecSubscriberRegistry::new();
+    let (sync_thread, health) = spawn_sync_loop(sync_running.clone(), exec_subscribers.clone());
 
     // Serve IPC requests on a background thread. The thread is torn down when
     // the process exits after shutdown.
@@ -280,6 +281,7 @@ pub fn run_foreground() -> io::Result<()> {
 /// runtime that drives [`crate::sync::run_matrix_sync`].
 fn spawn_sync_loop(
     running: Arc<AtomicBool>,
+    exec_subscribers: crate::ExecSubscriberRegistry,
 ) -> (Option<std::thread::JoinHandle<()>>, SharedHealth) {
     let session_paths = SessionPaths::resolve();
     let session = match load_session(&session_paths) {
@@ -321,12 +323,13 @@ fn spawn_sync_loop(
                     return;
                 }
             };
-            if let Err(e) = crate::sync::run_matrix_sync(
+            if let Err(e) = crate::sync::run_matrix_sync_with_subscribers(
                 &client,
                 &SessionPaths::resolve(),
                 loop_health,
                 BackoffConfig::default(),
                 running,
+                Some(exec_subscribers),
             )
             .await
             {

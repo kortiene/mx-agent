@@ -15,6 +15,7 @@ pub mod context;
 pub mod event_router;
 pub mod exec;
 pub mod exec_ipc;
+pub mod exec_subscribers;
 pub mod heartbeat;
 pub mod invocation;
 pub mod lifecycle;
@@ -88,6 +89,9 @@ pub use exec_ipc::{
     handle_exec_cancel_loopback, handle_exec_stdin_loopback, start_exec_loopback, ExecCancelParams,
     ExecControlResult, ExecErrorKind, ExecFrame, ExecNotification, ExecOutcome, ExecStartParams,
     ExecStartResult, ExecStdinParams,
+};
+pub use exec_subscribers::{
+    ExecSubscriberRegistry, ExecSubscription, ExecSubscriptionKey, ForwardStats, ForwardedExecEvent,
 };
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
