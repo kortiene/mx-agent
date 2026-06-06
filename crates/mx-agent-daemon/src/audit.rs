@@ -13,8 +13,9 @@
 //! requested and decided*, not credentials, so it can be retained and shared
 //! for review without leaking tokens or private keys.
 
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -185,16 +186,28 @@ impl AuditLog {
     }
 
     /// Append a decision record to the log.
+    ///
+    /// The audit trail records who asked for what, so it is held to the same
+    /// private-file posture as the rest of the daemon's local state: the parent
+    /// directory is created `0700` and the log file `0600` (consistent with
+    /// `session.json`, the replay cache, and the signing key). The file is
+    /// created with mode `0o600` atomically via [`OpenOptionsExt::mode`] — no
+    /// world-readable window between create and `chmod` — and its permissions
+    /// are re-asserted on every append so a pre-existing log left loose by an
+    /// earlier build or an operator mistake is tightened back to `0600`.
     pub fn append(&self, record: &AuditRecord) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
-                std::fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent)?;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
             }
         }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&self.path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(record.to_json_line().as_bytes())?;
         file.write_all(b"\n")?;
         Ok(())
@@ -485,6 +498,79 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_creates_log_and_dir_with_private_modes() {
+        // Security (#224): the audit log holds decision metadata (rooms,
+        // requester/target agents, timestamps) and must match the daemon's
+        // 0600/0700 private-state posture rather than honouring the umask.
+        let base = std::env::temp_dir().join(format!("mx-audit-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // The parent directory does not exist yet, so append must create it.
+        let parent = base.join("audit");
+        let path = parent.join(AUDIT_FILE_NAME);
+        let log = AuditLog::new(&path);
+
+        log.append(&AuditRecord::for_exec(
+            "!r",
+            "@a",
+            "t",
+            None,
+            &argv(&["true"]),
+            &allow(),
+        ))
+        .expect("append");
+
+        let dir_mode = std::fs::metadata(&parent)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "audit dir must be private (0700)");
+        let file_mode = std::fs::metadata(&path)
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "audit file must be private (0600)");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn append_tightens_preexisting_loose_log() {
+        // A log left world-readable by an earlier build is re-tightened to 0600
+        // on the next append, not left exposed.
+        let base = std::env::temp_dir().join(format!("mx-audit-tighten-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mk base");
+        let path = base.join(AUDIT_FILE_NAME);
+        std::fs::write(&path, b"{}\n").expect("seed log");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        let log = AuditLog::new(&path);
+        log.append(&AuditRecord::for_exec(
+            "!r",
+            "@a",
+            "t",
+            None,
+            &argv(&["true"]),
+            &allow(),
+        ))
+        .expect("append");
+
+        let file_mode = std::fs::metadata(&path)
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "pre-existing log must be tightened to 0600"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

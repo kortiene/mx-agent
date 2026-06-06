@@ -310,7 +310,10 @@ and configure those limits in your container runtime.
 Every authorization decision — allow or deny — is appended to an audit log.
 
 - **Location:** `~/.config/mx-agent/audit.log` (honours `MX_AGENT_CONFIG_DIR` /
-  `XDG_CONFIG_HOME`).
+  `XDG_CONFIG_HOME`). Created `0600` inside a `0700` directory — the same
+  private-state posture as `session.json`, `signing_key.ed25519`, `trust.json`,
+  and the replay cache — so decision metadata is not world-readable under a
+  loose umask.
 - **Format:** newline-delimited JSON, one decision per line, opened in append
   mode so external log rotation works.
 
@@ -338,9 +341,9 @@ them with `MX_AGENT_LOG` (filter directives, falls back to `RUST_LOG`) and
 `MX_AGENT_LOG_FORMAT` (`human` or `json`). The same secret-key redaction applies
 to structured fields here.
 
-> **Safe vs unsafe:** the audit log is append-only and lives under your config
-> dir at default permissions — ship it to a tamper-evident store if you need
-> non-repudiation, and never disable redaction. Treat a burst of
+> **Safe vs unsafe:** the audit log is append-only and lives `0600` under your
+> config dir — ship it to a tamper-evident store if you need non-repudiation,
+> and never disable redaction. Treat a burst of
 > `deny:untrusted_room` / `deny:command_not_allowed` entries as a signal worth
 > investigating.
 
