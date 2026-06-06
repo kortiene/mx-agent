@@ -95,9 +95,12 @@ pub fn can_transition(from: &str, to: &str) -> bool {
     }
     match from {
         STATE_PROPOSED => matches!(to, STATE_PENDING | STATE_CANCELLED | STATE_SUPERSEDED),
+        // A pending task may be claimed straight to `executing` by the scheduler
+        // (architecture §9.2: the daemon "claims the pending task ... sets state =
+        // executing"); the intermediate `assigned` state is optional.
         STATE_PENDING => matches!(
             to,
-            STATE_ASSIGNED | STATE_BLOCKED | STATE_CANCELLED | STATE_SUPERSEDED
+            STATE_ASSIGNED | STATE_EXECUTING | STATE_BLOCKED | STATE_CANCELLED | STATE_SUPERSEDED
         ),
         STATE_ASSIGNED => matches!(
             to,
@@ -619,6 +622,8 @@ mod tests {
         assert!(can_transition(STATE_PROPOSED, STATE_PENDING));
         assert!(can_transition(STATE_PENDING, STATE_ASSIGNED));
         assert!(can_transition(STATE_ASSIGNED, STATE_EXECUTING));
+        // The scheduler claims a pending task straight to executing.
+        assert!(can_transition(STATE_PENDING, STATE_EXECUTING));
         assert!(can_transition(STATE_EXECUTING, STATE_SUCCEEDED));
         assert!(can_transition(STATE_EXECUTING, STATE_FAILED));
         assert!(can_transition(STATE_EXECUTING, STATE_CANCELLED));
