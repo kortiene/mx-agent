@@ -558,11 +558,28 @@ pub async fn handle_live_exec_request(
         tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to publish running invocation state");
     }
 
+    // Register the live-exec control *synchronously*, before spawning the run
+    // task, so a stdin or cancel frame routed in the same (or a later) sync
+    // batch always finds this invocation. Registering inside the spawned task
+    // left a window where early stdin — including its EOF — was silently
+    // dropped by `handle_live_exec_stdin`, hanging stdin-consuming commands
+    // such as `cat` until their timeout.
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<StdinFrame>(64);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    insert_live_exec_control(
+        request.invocation_id.clone(),
+        LiveExecControl {
+            requester_agent: request.requesting_agent.clone(),
+            stdin: stdin_tx,
+            cancel: cancel_tx,
+        },
+    );
+
     let client = client.clone();
     let room = room.clone();
     tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let result = run_controlled_exec(&request, &allowance).await;
+        let result = run_controlled_exec(&request, &allowance, stdin_rx, cancel_rx).await;
         remove_live_exec_control(&request.invocation_id);
         let output = match result {
             Ok(ControlledExecResult::Finished(output)) => output,
@@ -655,13 +672,21 @@ pub async fn handle_live_exec_stdin(
     let Some(control) = live_exec_control(&stdin.invocation_id) else {
         return;
     };
-    let Ok(agent_id) = authorize_live_control(room, paths, content, &stdin.signature.key_id).await
-    else {
-        tracing::warn!(invocation_id = %stdin.invocation_id, "rejected unauthorized exec stdin control");
-        return;
-    };
-    if agent_id != control.requester_agent {
-        tracing::warn!(invocation_id = %stdin.invocation_id, "rejected exec stdin from non-owner agent");
+    if authorize_live_control(
+        room,
+        paths,
+        content,
+        &stdin.signature.key_id,
+        &control.requester_agent,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            invocation_id = %stdin.invocation_id,
+            requester_agent = %control.requester_agent,
+            "rejected unauthorized exec stdin control"
+        );
         return;
     }
     use base64::Engine as _;
@@ -690,38 +715,63 @@ pub async fn handle_live_exec_cancel(
     let Some(control) = live_exec_control(&cancel.invocation_id) else {
         return;
     };
-    let Ok(agent_id) = authorize_live_control(room, paths, content, &cancel.signature.key_id).await
-    else {
-        tracing::warn!(invocation_id = %cancel.invocation_id, "rejected unauthorized exec cancel control");
-        return;
-    };
-    if agent_id != control.requester_agent {
-        tracing::warn!(invocation_id = %cancel.invocation_id, "rejected exec cancel from non-owner agent");
+    if authorize_live_control(
+        room,
+        paths,
+        content,
+        &cancel.signature.key_id,
+        &control.requester_agent,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            invocation_id = %cancel.invocation_id,
+            requester_agent = %control.requester_agent,
+            "rejected unauthorized exec cancel control"
+        );
         return;
     }
     let _ = control.cancel.send(Some(cancel.reason.clone()));
 }
 
+/// Verify that a signed control frame (stdin / cancel) was sent by the agent
+/// identified by `requester_agent_id`.
+///
+/// The previous implementation searched *all* agents for one whose
+/// `signing_key_id` matched the frame's `key_id`, then compared the result
+/// against the expected requester. When two agents share a signing key (which
+/// happens in the integration-test harness where both daemons load the same key
+/// from a shared data directory), `find` non-deterministically returns
+/// whichever agent the homeserver lists first. If it returns the *target* agent
+/// instead of the requester, the requester-match check fails and the frame is
+/// silently dropped — causing stdin-consuming commands to hang until timeout.
+///
+/// Fix: look up the *specific* requester agent by id, then verify that its
+/// registered key matches the frame's `key_id`. This is deterministic regardless
+/// of key uniqueness.
 async fn authorize_live_control(
     room: &Room,
     paths: &crate::SessionPaths,
     content: &Value,
     key_id: &str,
-) -> Result<String, ()> {
-    let agents = crate::agent::read_all_agent_states(room)
+    requester_agent_id: &str,
+) -> Result<(), ()> {
+    let agent = crate::agent::read_agent_state(room, requester_agent_id)
         .await
-        .map_err(|_| ())?;
-    let agent = agents
-        .into_iter()
-        .find(|agent| agent.signing_key_id == key_id)
+        .ok()
+        .flatten()
         .ok_or(())?;
+    if agent.signing_key_id != key_id {
+        return Err(());
+    }
     let verifying_key = crate::call::verifying_key_from_agent_state(&agent).map_err(|_| ())?;
     signing::verify(&verifying_key, content).map_err(|_| ())?;
     let trust = TrustStore::load(paths).unwrap_or_default();
     if !trust.is_key_trusted(key_id) {
         return Err(());
     }
-    Ok(agent.agent_id)
+    Ok(())
 }
 
 async fn authorize_live_exec(
@@ -825,22 +875,20 @@ enum ControlledExecResult {
     },
 }
 
+/// Run an authorized exec under live stdin/cancel control.
+///
+/// The caller (`handle_live_exec_request`) creates the stdin/cancel channels
+/// and registers the [`LiveExecControl`] *before* spawning this future, so that
+/// control frames routed concurrently are never lost. This function therefore
+/// receives the receiver halves rather than creating them itself; frames queued
+/// onto the channels before the child process drains them are still delivered.
 async fn run_controlled_exec(
     request: &ExecRequest,
     allowance: &Allowance,
+    mut stdin_rx: tokio::sync::mpsc::Receiver<StdinFrame>,
+    mut cancel_rx: tokio::sync::watch::Receiver<Option<String>>,
 ) -> Result<ControlledExecResult, crate::runner::RunError> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<StdinFrame>(64);
-    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel::<Option<String>>(None);
-    insert_live_exec_control(
-        request.invocation_id.clone(),
-        LiveExecControl {
-            requester_agent: request.requesting_agent.clone(),
-            stdin: stdin_tx,
-            cancel: cancel_tx,
-        },
-    );
 
     let spec = RunSpec {
         command: request.command.clone(),
@@ -1457,6 +1505,59 @@ allow_cwd = ["/home/me/code/project"]
         let request = authorize(&content, &key, &trust).expect("authorized");
         assert_eq!(request.invocation_id, "inv_01HZ");
         assert_eq!(request.command, vec!["cargo", "test"]);
+    }
+
+    /// Regression test for the stdin-registration race: stdin (and its EOF)
+    /// queued onto the control channel *before* the child process drains it must
+    /// still reach the command. Previously the control was registered inside the
+    /// spawned run task, so a stdin frame routed first was silently dropped and a
+    /// `cat`-style command hung until timeout. `handle_live_exec_request` now
+    /// registers the control and creates these channels before spawning, so this
+    /// path delivers pre-queued stdin deterministically.
+    #[tokio::test]
+    async fn prequeued_stdin_reaches_the_command() {
+        let key = test_key();
+        let mut opts = options(&["cat"], "/");
+        opts.stdin = true;
+        let content = signed_request(&key, &opts);
+        let request: ExecRequest = serde_json::from_value(content).unwrap();
+
+        let allowance = Allowance {
+            max_runtime_ms: Some(30_000),
+            max_output_bytes: Some(1_000_000),
+            sandbox: None,
+            network: None,
+            requires_approval: false,
+            env_allowlist: Vec::new(),
+        };
+
+        // Queue stdin and EOF before run_controlled_exec is even polled — the
+        // exact ordering the old code lost.
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<StdinFrame>(64);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        stdin_tx
+            .send(Some(b"race-proof stdin\n".to_vec()))
+            .await
+            .expect("queue stdin");
+        stdin_tx.send(None).await.expect("queue eof");
+        drop(stdin_tx);
+
+        let result = run_controlled_exec(&request, &allowance, stdin_rx, cancel_rx)
+            .await
+            .expect("exec runs");
+        match result {
+            ControlledExecResult::Finished(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    stdout.contains("race-proof stdin"),
+                    "cat should echo stdin queued before the process drained it; got {stdout:?}"
+                );
+                assert_eq!(output.exit_code, Some(0));
+            }
+            ControlledExecResult::Cancelled { .. } => {
+                panic!("exec should have finished, not been cancelled")
+            }
+        }
     }
 
     #[test]

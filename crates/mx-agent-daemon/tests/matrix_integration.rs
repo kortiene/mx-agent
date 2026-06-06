@@ -538,6 +538,11 @@ allow_tools = ["run_tests"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_matrix_backed_remote_exec_round_trips_and_denies() {
+    // Enable logging so CI captures daemon decisions on failure (--nocapture).
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
