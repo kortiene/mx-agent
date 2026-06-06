@@ -59,8 +59,10 @@ pub use artifact::{
 };
 pub use audit::{redact_command, AuditDecision, AuditLog, AuditRecord, AUDIT_FILE_NAME};
 pub use call::{
-    authorize_call_request, build_signed_call_request, emit_call_response, execute_authorized_call,
-    rejection_response, send_call_request, success_response, CallRejection,
+    authorize_call_request, build_signed_call_request, build_signed_call_request_for_target,
+    emit_call_response, execute_authorized_call, handle_live_call_request, rejection_response,
+    send_call_request, start_call_matrix, success_response, verifying_key_from_agent_state,
+    CallRejection, CallTargeting,
 };
 pub use call_ipc::{
     start_call_loopback, CallErrorKind, CallOutcome, CallStartParams, CallStartResult,
@@ -116,6 +118,7 @@ pub use session::{
     save_sync_token, AuthStatus, Secret, SessionPaths, StoredSession,
 };
 pub use signing::{
+    decode_verifying_key, encode_verifying_key, key_id_for_verifying_key,
     load_or_create_signing_key, DaemonSigningKey, SigningKeyError, KEY_ALG, KEY_ID_PREFIX,
 };
 pub use stream::{

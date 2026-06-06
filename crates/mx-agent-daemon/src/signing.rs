@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use base64::Engine as _;
-use ed25519_dalek::{SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
+use ed25519_dalek::{SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH};
 use sha2::{Digest, Sha256};
 
 use crate::session::SessionPaths;
@@ -105,10 +105,34 @@ impl DaemonSigningKey {
 
     /// The stable key identifier (`mxagent-ed25519:<base64-fingerprint>`).
     pub fn key_id(&self) -> String {
-        let digest = Sha256::digest(self.verifying_key().as_bytes());
-        let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
-        format!("{KEY_ID_PREFIX}:{b64}")
+        key_id_for_verifying_key(&self.verifying_key())
     }
+
+    /// Base64-no-pad encoding of the Ed25519 verifying key bytes.
+    pub fn public_key_b64(&self) -> String {
+        encode_verifying_key(&self.verifying_key())
+    }
+}
+
+/// Compute the stable key identifier for a verifying key.
+pub fn key_id_for_verifying_key(key: &VerifyingKey) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
+    format!("{KEY_ID_PREFIX}:{b64}")
+}
+
+/// Base64-no-pad encode raw Ed25519 verifying-key bytes for Matrix state.
+pub fn encode_verifying_key(key: &VerifyingKey) -> String {
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(key.as_bytes())
+}
+
+/// Decode a Matrix-published Ed25519 verifying key.
+pub fn decode_verifying_key(encoded: &str) -> Result<VerifyingKey, SigningKeyError> {
+    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(encoded.as_bytes())
+        .map_err(|_| SigningKeyError::Malformed)?;
+    let raw: [u8; PUBLIC_KEY_LENGTH] = bytes.try_into().map_err(|_| SigningKeyError::Malformed)?;
+    VerifyingKey::from_bytes(&raw).map_err(|_| SigningKeyError::Malformed)
 }
 
 /// Compute the `SHA256:<base64>` fingerprint of a verifying key.

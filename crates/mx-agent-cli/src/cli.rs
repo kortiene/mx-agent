@@ -3366,7 +3366,9 @@ fn cmd_call(global: &GlobalArgs, args: &CallArgs) -> ExitCode {
                 mx_agent_daemon::CallErrorKind::UnknownTool
                 | mx_agent_daemon::CallErrorKind::NotFound => ExitCode::from(127),
                 mx_agent_daemon::CallErrorKind::InvalidArgs => ExitCode::from(64),
-                mx_agent_daemon::CallErrorKind::Spawn => ExitCode::from(128),
+                mx_agent_daemon::CallErrorKind::Spawn | mx_agent_daemon::CallErrorKind::Remote => {
+                    ExitCode::from(128)
+                }
             }
         }
     }

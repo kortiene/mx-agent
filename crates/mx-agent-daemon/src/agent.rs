@@ -20,7 +20,8 @@ use mx_agent_protocol::events::state::AGENT as AGENT_STATE_TYPE;
 use mx_agent_protocol::schema::{AgentLoad, AgentState, AgentWorkspace, ToolSchema};
 
 use crate::matrix::restore_client;
-use crate::session::StoredSession;
+use crate::session::{SessionPaths, StoredSession};
+use crate::signing::load_or_create_signing_key;
 use crate::tools::ToolRegistry;
 use crate::workspace::{git_output, parse_room_or_alias, resolve_room_id, WorkspaceError};
 
@@ -128,12 +129,16 @@ pub async fn register_agent(
     let previous = read_agent_state(&room, &agent_id).await?;
     let state_rev = previous.map(|a| a.state_rev + 1).unwrap_or(1);
 
+    let signing = load_or_create_signing_key(&SessionPaths::resolve())
+        .map_err(|e| WorkspaceError::InvalidTarget(format!("could not load signing key: {e}")))?;
+
     let state = AgentState {
         agent_id: agent_id.clone(),
         kind: options.kind.clone(),
         matrix_user_id,
         device_id,
-        signing_key_id: String::new(),
+        signing_key_id: signing.key_id(),
+        signing_public_key: Some(signing.public_key_b64()),
         status: "active".to_string(),
         capabilities: options.capabilities.clone(),
         tools: options.tools.clone(),
@@ -267,7 +272,7 @@ async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, Worksp
 }
 
 /// Read every `com.mxagent.agent.v1` state event from a room.
-async fn read_all_agent_states(room: &Room) -> Result<Vec<AgentState>, WorkspaceError> {
+pub(crate) async fn read_all_agent_states(room: &Room) -> Result<Vec<AgentState>, WorkspaceError> {
     use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState as RawState;
 
     let raws = room
@@ -398,6 +403,7 @@ mod tests {
             matrix_user_id: "@a:server".to_string(),
             device_id: "DEV".to_string(),
             signing_key_id: String::new(),
+            signing_public_key: None,
             status: "active".to_string(),
             capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
             tools: tools.iter().map(|s| s.to_string()).collect(),

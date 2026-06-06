@@ -707,6 +707,7 @@ state_key: <agent_id>
   "matrix_user_id": "@pi:matrix.org",
   "device_id": "MXAGENTDEVICE01",
   "signing_key_id": "mxagent-ed25519:abc123",
+  "signing_public_key": "base64-no-pad-ed25519-public-key",
   "status": "active",
   "capabilities": ["shell", "edit", "test", "repo:node", "sandbox:docker"],
   "tools": ["run_tests@1.0.0", "lint@1.0.0"],
@@ -723,6 +724,11 @@ state_key: <agent_id>
   "state_rev": 7
 }
 ```
+
+`signing_public_key` is non-secret public key material. Remote privileged
+handlers decode it, verify that its SHA-256 digest matches `signing_key_id`, and
+then use the resulting Ed25519 verifying key for request signatures; the local
+trust store still decides whether the key id is authorized.
 
 Liveness should combine:
 
@@ -1029,8 +1035,11 @@ event passes, so it is deliberately conservative:
 
 The routing logic is decoupled from `matrix_sdk` via a transport-agnostic
 `IncomingEvent`, with `events_from_sync_response` adapting a real sync
-response. Dispatched events currently reach a logging stub handler; wiring them
-to the live execution paths is follow-up work.
+response. `call.request` events now have a live handler: the target daemon
+confirms the request is addressed to one of its registered agents, resolves the
+requester's published signing key, verifies signature/trust/policy, executes the
+named built-in tool, and emits `call.response`. Other routed execution families
+remain stubbed until their live handlers land.
 
 ### 10.2 IPC Transport
 

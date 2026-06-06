@@ -63,6 +63,8 @@ pub enum CallErrorKind {
     NotFound,
     /// The tool's underlying process could not be spawned for another reason.
     Spawn,
+    /// The live Matrix-backed remote call failed or was rejected.
+    Remote,
 }
 
 /// The outcome of a `call.start` invocation.

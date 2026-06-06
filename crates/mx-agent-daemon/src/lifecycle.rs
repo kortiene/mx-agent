@@ -437,13 +437,7 @@ fn dispatch(
             }
         }
         "call.start" => match parse_params::<crate::CallStartParams>(req) {
-            Ok(params) => {
-                let result = crate::start_call_loopback(&params);
-                match serde_json::to_value(&result) {
-                    Ok(value) => Response::result(req.id.clone(), value),
-                    Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
-                }
-            }
+            Ok(params) => dispatch_call_start(req, &params),
             Err(response) => *response,
         },
         "exec.start" => match parse_params::<crate::ExecStartParams>(req) {
@@ -505,6 +499,32 @@ fn dispatch(
 ///
 /// The loopback needs no Matrix session (it runs the command on the local
 /// host), so — unlike the task methods — this does not load the daemon session.
+fn dispatch_call_start(req: &Request, params: &crate::CallStartParams) -> Response {
+    let live = params.room.is_some() && params.agent.is_some();
+    let result = if live {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                return Response::error(
+                    req.id.clone(),
+                    INTERNAL_ERROR,
+                    format!("could not start async runtime: {e}"),
+                )
+            }
+        };
+        runtime.block_on(crate::start_call_matrix(params))
+    } else {
+        crate::start_call_loopback(params)
+    };
+    match serde_json::to_value(&result) {
+        Ok(value) => Response::result(req.id.clone(), value),
+        Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+    }
+}
+
 fn dispatch_exec_start(req: &Request, params: &crate::ExecStartParams) -> Response {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

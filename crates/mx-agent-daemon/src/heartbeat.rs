@@ -230,6 +230,7 @@ mod tests {
             matrix_user_id: "@pi:matrix.org".to_string(),
             device_id: "DEV".to_string(),
             signing_key_id: String::new(),
+            signing_public_key: None,
             status: status.to_string(),
             capabilities: vec![],
             tools: vec![],
