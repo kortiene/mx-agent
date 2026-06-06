@@ -18,6 +18,9 @@ use serde_json::{json, Value};
 /// The built-in `run_tests` tool name.
 pub const RUN_TESTS: &str = "run_tests";
 
+/// The built-in `lint` tool name.
+pub const LINT: &str = "lint";
+
 /// Structured outcome of a successful tool execution.
 ///
 /// This mirrors the `output_schema` advertised by the built-in tools: an
@@ -85,6 +88,7 @@ impl std::error::Error for ToolError {
 pub fn execute_tool(name: &str, args: &Value) -> Result<ToolResult, ToolError> {
     match name {
         RUN_TESTS => run_tests(args),
+        LINT => lint(args),
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
 }
@@ -147,13 +151,16 @@ fn run_tests_command(args: &Value) -> Result<(String, Vec<String>), ToolError> {
 }
 
 /// Summarize a process exit code into a short human-readable line.
-fn summarize(program: &str, code: Option<i32>) -> (i32, String) {
+///
+/// `label` names the operation (e.g. `"cargo test"` or `"cargo clippy"`) so the
+/// summary reads naturally for whichever built-in tool produced it.
+fn summarize(label: &str, code: Option<i32>) -> (i32, String) {
     match code {
-        Some(0) => (0, format!("{program} tests passed")),
-        Some(code) => (code, format!("{program} tests failed (exit code {code})")),
+        Some(0) => (0, format!("{label} passed")),
+        Some(code) => (code, format!("{label} failed (exit code {code})")),
         // Terminated by a signal: report the conventional 128+signal style code
         // is not available here, so use a generic nonzero failure.
-        None => (1, format!("{program} terminated by signal")),
+        None => (1, format!("{label} terminated by signal")),
     }
 }
 
@@ -164,7 +171,63 @@ fn run_tests(args: &Value) -> Result<ToolResult, ToolError> {
         .args(&argv)
         .status()
         .map_err(ToolError::Spawn)?;
-    let (exit_code, summary) = summarize(&program, status.code());
+    let (exit_code, summary) = summarize("cargo test", status.code());
+    Ok(ToolResult { exit_code, summary })
+}
+
+/// Build the program and argument vector for a `lint` invocation.
+///
+/// The built-in linter shells out to `cargo clippy`. Supported arguments (all
+/// validated against the tool's `input_schema`):
+///
+/// - `path` (optional string): forwarded as `--manifest-path <path>` so a
+///   specific crate's `Cargo.toml` can be linted; omitted to lint the workspace
+///   rooted at the daemon's working directory.
+/// - `fix` (optional bool): when `true`, forwarded as `--fix` to apply
+///   machine-applicable lint fixes. Clippy's own VCS safety check still applies,
+///   so the working tree must be clean for `--fix` to take effect.
+///
+/// Kept separate from [`lint`] so the command construction is unit testable
+/// without spawning a process.
+fn lint_command(args: &Value) -> Result<(String, Vec<String>), ToolError> {
+    let obj = args
+        .as_object()
+        .ok_or_else(|| ToolError::InvalidArgs("expected a JSON object".to_string()))?;
+
+    let path = match obj.get("path") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::String(_)) => {
+            return Err(ToolError::InvalidArgs("path must be non-empty".to_string()))
+        }
+        Some(_) => return Err(ToolError::InvalidArgs("path must be a string".to_string())),
+    };
+
+    let fix = match obj.get("fix") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(ToolError::InvalidArgs("fix must be a boolean".to_string())),
+    };
+
+    let mut argv = vec!["clippy".to_string()];
+    if let Some(path) = path {
+        argv.push("--manifest-path".to_string());
+        argv.push(path);
+    }
+    if fix {
+        argv.push("--fix".to_string());
+    }
+    Ok(("cargo".to_string(), argv))
+}
+
+/// Run the built-in `lint` tool.
+fn lint(args: &Value) -> Result<ToolResult, ToolError> {
+    let (program, argv) = lint_command(args)?;
+    let status = Command::new(&program)
+        .args(&argv)
+        .status()
+        .map_err(ToolError::Spawn)?;
+    let (exit_code, summary) = summarize("cargo clippy", status.code());
     Ok(ToolResult { exit_code, summary })
 }
 
@@ -226,13 +289,13 @@ mod tests {
     #[test]
     fn summarize_maps_exit_codes() {
         assert_eq!(
-            summarize("cargo", Some(0)),
-            (0, "cargo tests passed".to_string())
+            summarize("cargo test", Some(0)),
+            (0, "cargo test passed".to_string())
         );
-        let (code, summary) = summarize("cargo", Some(101));
+        let (code, summary) = summarize("cargo test", Some(101));
         assert_eq!(code, 101);
         assert!(summary.contains("failed"));
-        let (code, _) = summarize("cargo", None);
+        let (code, _) = summarize("cargo test", None);
         assert_eq!(code, 1);
     }
 
@@ -264,6 +327,88 @@ mod tests {
     fn run_tests_via(program: &str, args: &Value) -> Result<ToolResult, ToolError> {
         // Validate args the same way the real tool does.
         run_tests_command(args)?;
+        let status = Command::new(program).status().map_err(ToolError::Spawn)?;
+        let (exit_code, summary) = summarize(program, status.code());
+        Ok(ToolResult { exit_code, summary })
+    }
+
+    #[test]
+    fn lint_builds_default_command() {
+        let (program, argv) = lint_command(&json!({})).unwrap();
+        assert_eq!(program, "cargo");
+        assert_eq!(argv, vec!["clippy"]);
+    }
+
+    #[test]
+    fn lint_forwards_path_as_manifest_path() {
+        let (_, argv) = lint_command(&json!({ "path": "crates/foo/Cargo.toml" })).unwrap();
+        assert_eq!(
+            argv,
+            vec!["clippy", "--manifest-path", "crates/foo/Cargo.toml"]
+        );
+    }
+
+    #[test]
+    fn lint_adds_fix_flag() {
+        let (_, argv) = lint_command(&json!({ "fix": true })).unwrap();
+        assert_eq!(argv, vec!["clippy", "--fix"]);
+        // `fix: false` is the default and must not add the flag.
+        let (_, argv) = lint_command(&json!({ "fix": false })).unwrap();
+        assert_eq!(argv, vec!["clippy"]);
+    }
+
+    #[test]
+    fn lint_combines_path_and_fix() {
+        let (_, argv) = lint_command(&json!({ "path": "Cargo.toml", "fix": true })).unwrap();
+        assert_eq!(
+            argv,
+            vec!["clippy", "--manifest-path", "Cargo.toml", "--fix"]
+        );
+    }
+
+    #[test]
+    fn lint_rejects_bad_types() {
+        assert!(matches!(
+            lint_command(&json!({ "path": 1 })).unwrap_err(),
+            ToolError::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            lint_command(&json!({ "path": "" })).unwrap_err(),
+            ToolError::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            lint_command(&json!({ "fix": "yes" })).unwrap_err(),
+            ToolError::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            lint_command(&json!([])).unwrap_err(),
+            ToolError::InvalidArgs(_)
+        ));
+    }
+
+    #[test]
+    fn execute_tool_dispatches_lint() {
+        // Before this fix `lint` returned `UnknownTool`; it must now be
+        // recognized and fail only on bad arguments, never as unknown.
+        let err = execute_tool(LINT, &json!([])).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn lint_executes_and_reports_exit_code() {
+        // Use trivially-true/false programs rather than cargo to keep the test
+        // fast and hermetic while still exercising the spawn + summarize path.
+        let result = lint_via("true", &json!({})).unwrap();
+        assert_eq!(result.exit_code, 0);
+        let result = lint_via("false", &json!({})).unwrap();
+        assert_ne!(result.exit_code, 0);
+    }
+
+    /// Test-only variant of [`lint`] that runs an arbitrary `program` instead of
+    /// `cargo`, used to exercise the spawn + summarize path quickly.
+    fn lint_via(program: &str, args: &Value) -> Result<ToolResult, ToolError> {
+        // Validate args the same way the real tool does.
+        lint_command(args)?;
         let status = Command::new(program).status().map_err(ToolError::Spawn)?;
         let (exit_code, summary) = summarize(program, status.code());
         Ok(ToolResult { exit_code, summary })
