@@ -327,6 +327,9 @@ fn spawn_matrix_workers(
     let loop_health = health.clone();
     let sync_running = running.clone();
     let publish_client = shared_client.clone();
+    // The scheduler shares the registry the sync loop forwards Matrix exec
+    // results into, so Matrix-backed task dispatch can await those results.
+    let exec_subscribers_for_scheduler = exec_subscribers.clone();
     let sync_handle = std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -366,6 +369,12 @@ fn spawn_matrix_workers(
         });
     });
 
+    // Task dispatch defaults to local in-process execution; opt into the signed
+    // Matrix-backed `call`/`exec` transport with `MX_AGENT_TASK_DISPATCH=matrix`
+    // (issue #200). The scheduler shares the daemon's exec subscriber registry so
+    // Matrix exec results forwarded by the sync loop reach the dispatcher.
+    let dispatch_mode = crate::TaskDispatchMode::from_env();
+    let scheduler_subscribers = exec_subscribers_for_scheduler;
     let scheduler_handle = std::thread::spawn(move || {
         // Wait for the sync thread to publish the restored client (or for
         // shutdown), then drive the scheduler loop over the same client.
@@ -382,7 +391,13 @@ fn spawn_matrix_workers(
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        crate::run_scheduler_loop(client, running, crate::DEFAULT_SCHEDULER_INTERVAL);
+        crate::run_scheduler_loop(
+            client,
+            scheduler_subscribers,
+            dispatch_mode,
+            running,
+            crate::DEFAULT_SCHEDULER_INTERVAL,
+        );
     });
 
     let threads: WorkerThreads = (Some(sync_handle), Some(scheduler_handle));

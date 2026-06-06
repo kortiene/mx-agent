@@ -44,16 +44,42 @@ use crate::task::{
     read_tasks, update_task_in_room, ListTasksOptions, UpdateTaskOptions, STATE_EXECUTING,
 };
 use crate::task_dispatch::{ExecTaskDispatcher, ToolTaskDispatcher};
+use crate::task_dispatch_matrix::{MatrixCallTaskDispatcher, MatrixExecTaskDispatcher};
 use crate::task_orchestrator::{
     OrchestrationOutcome, TaskDispatcher, TaskExecutionResult, TaskOrchestrator, TaskStore,
     TaskStoreError,
 };
 use crate::trust::TrustStore;
 use crate::workspace::WorkspaceError;
-use crate::ReplayCache;
+use crate::{ExecSubscriberRegistry, ReplayCache};
 
 /// Default interval between live scheduler passes.
 pub const DEFAULT_SCHEDULER_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How the live scheduler loop dispatches a runnable task's action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDispatchMode {
+    /// Run the action in-process via the local tool/exec dispatchers (the
+    /// verified default).
+    Local,
+    /// Route the action through the signed Matrix-backed `call`/`exec` transport
+    /// (issue #200), so it runs through the same verify → trust → policy →
+    /// runner pipeline as a direct CLI invocation.
+    Matrix,
+}
+
+impl TaskDispatchMode {
+    /// Resolve the dispatch mode from `MX_AGENT_TASK_DISPATCH`.
+    ///
+    /// `matrix` selects the Matrix-backed transport; anything else (including
+    /// unset) keeps the local default.
+    pub fn from_env() -> Self {
+        match std::env::var("MX_AGENT_TASK_DISPATCH").ok().as_deref() {
+            Some("matrix") => Self::Matrix,
+            _ => Self::Local,
+        }
+    }
+}
 
 /// A [`TaskStore`] backed by real `com.mxagent.task.v1` Matrix room state.
 ///
@@ -218,6 +244,8 @@ where
 /// a transient failure never stops the loop or panics the daemon.
 pub fn run_scheduler_loop(
     client: matrix_sdk::Client,
+    subscribers: ExecSubscriberRegistry,
+    mode: TaskDispatchMode,
     running: Arc<AtomicBool>,
     interval: Duration,
 ) {
@@ -234,10 +262,11 @@ pub fn run_scheduler_loop(
     let paths = SessionPaths::resolve();
     tracing::info!(
         interval_secs = interval.as_secs(),
+        dispatch = ?mode,
         "task scheduler loop started"
     );
     while running.load(Ordering::SeqCst) {
-        scheduler_pass(&runtime, &client, &paths);
+        scheduler_pass(&runtime, &client, &subscribers, mode, &paths);
         sleep_interruptible(interval, &running);
     }
     tracing::info!("task scheduler loop stopped");
@@ -262,6 +291,8 @@ fn sleep_interruptible(delay: Duration, running: &AtomicBool) {
 fn scheduler_pass(
     runtime: &Arc<tokio::runtime::Runtime>,
     client: &matrix_sdk::Client,
+    subscribers: &ExecSubscriberRegistry,
+    mode: TaskDispatchMode,
     paths: &SessionPaths,
 ) {
     let local_user = client.user_id().map(|u| u.to_string()).unwrap_or_default();
@@ -318,6 +349,8 @@ fn scheduler_pass(
                 agent,
                 &snapshot,
                 &verifying_keys,
+                subscribers,
+                mode,
                 paths,
             );
         }
@@ -325,6 +358,7 @@ fn scheduler_pass(
 }
 
 /// Tick the orchestrator for a single local `agent` against a room snapshot.
+#[allow(clippy::too_many_arguments)]
 fn scheduler_pass_for_agent(
     runtime: &Arc<tokio::runtime::Runtime>,
     room: &matrix_sdk::Room,
@@ -332,6 +366,8 @@ fn scheduler_pass_for_agent(
     agent: &mx_agent_protocol::schema::AgentState,
     snapshot: &[TaskState],
     verifying_keys: &BTreeMap<String, VerifyingKey>,
+    subscribers: &ExecSubscriberRegistry,
+    mode: TaskDispatchMode,
     paths: &SessionPaths,
 ) {
     // Deny-by-default: when no policy file is present, the default policy denies
@@ -360,23 +396,48 @@ fn scheduler_pass_for_agent(
     // membership never implies execution.
     let scheduler = TaskScheduler::new(agent.agent_id.clone(), agent.load.max_invocations);
 
-    // Local synchronous dispatch runs each task to completion within the tick,
-    // so any `executing` task observed at the start of a fresh pass is stale and
-    // recovery uses an empty live-invocation set.
+    // A `executing` task observed at the start of a fresh pass is stale (local
+    // dispatch runs synchronously; a Matrix dispatch blocks the pass until the
+    // result returns), so recovery uses an empty live-invocation set.
     let live_invocations = BTreeSet::new();
-    let mut dispatcher = RoutingDispatcher::default();
     let mut store = MatrixTaskStore::new(room_id.to_string(), |options: UpdateTaskOptions| {
         runtime.block_on(update_task_in_room(room, &options))
     });
 
-    let outcomes = run_scheduler_tick(
-        &scheduler,
-        &orchestrator,
-        snapshot,
-        &live_invocations,
-        &mut store,
-        &mut dispatcher,
-    );
+    // Local dispatch runs the action in-process; Matrix dispatch routes it
+    // through the signed Matrix `call`/`exec` transport (issue #200), so the
+    // daemon's own /sync loop receives the request and runs it through the full
+    // verify → trust → policy → runner pipeline.
+    let outcomes = match mode {
+        TaskDispatchMode::Local => {
+            let mut dispatcher = RoutingDispatcher::default();
+            run_scheduler_tick(
+                &scheduler,
+                &orchestrator,
+                snapshot,
+                &live_invocations,
+                &mut store,
+                &mut dispatcher,
+            )
+        }
+        TaskDispatchMode::Matrix => {
+            let call = MatrixCallTaskDispatcher::new(room_id.to_string(), |params| {
+                runtime.block_on(crate::start_call_matrix(&params))
+            });
+            let exec = MatrixExecTaskDispatcher::new(room_id.to_string(), |params| {
+                runtime.block_on(crate::start_exec_matrix(&params, subscribers))
+            });
+            let mut dispatcher = RoutingDispatcher::new(call, exec);
+            run_scheduler_tick(
+                &scheduler,
+                &orchestrator,
+                snapshot,
+                &live_invocations,
+                &mut store,
+                &mut dispatcher,
+            )
+        }
+    };
     for outcome in &outcomes {
         log_outcome(room_id, &agent.agent_id, outcome);
     }
