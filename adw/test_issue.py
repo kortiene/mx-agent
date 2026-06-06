@@ -37,30 +37,28 @@ class BuildRunnerCommandTests(unittest.TestCase):
             json_mode=True,
             model="sonnet:high",
             thinking="high",
-            session_name="issue #15",
             passthru=["-nc"],
             prompt="PROMPT",
         )
         self.assertEqual(
             cmd,
-            ["/bin/pi", "-p", "--mode", "json", "--name", "issue #15",
-             "--model", "sonnet:high", "--thinking", "high", "-nc", "PROMPT"],
+            ["/bin/pi", "-p", "--mode", "json", "--model", "sonnet:high", "--thinking", "high", "-nc", "PROMPT"],
         )
+        # pi has no --name flag (it errors on it); ensure we never emit one.
+        self.assertNotIn("--name", cmd)
 
-    def test_claude_command_ignores_thinking_and_name(self) -> None:
+    def test_claude_command_ignores_thinking(self) -> None:
         cmd = issue_mod.build_runner_command(
             "claude",
             "/bin/claude",
             json_mode=False,
             model="opus",
             thinking="high",
-            session_name="issue #15",
             passthru=[],
             prompt="PROMPT",
         )
         self.assertEqual(cmd, ["/bin/claude", "-p", "--model", "opus", "PROMPT"])
         self.assertNotIn("--thinking", cmd)
-        self.assertNotIn("--name", cmd)
 
 
 class DefaultTemplateTests(unittest.TestCase):
