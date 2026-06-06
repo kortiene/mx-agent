@@ -20,6 +20,13 @@
 //! over IPC (approve → runs to `succeeded`; deny → `blocked`, never spawned) —
 //! so none of those spawn a process they should not.
 //!
+//! [`two_daemons_discover_each_other_and_compute_liveness`] (issue #227) adds a
+//! focused two-daemon discovery + liveness contract test: two independent
+//! daemons (distinct signing identities) register in one room, each discovers
+//! the other's `com.mxagent.agent.v1` state, a real heartbeat refreshes the
+//! durable liveness state, and the `LivenessConfig` thresholds drive the
+//! Active → Stale → Offline transition deterministically off an injected clock.
+//!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
 //!
@@ -53,18 +60,20 @@ use serde_json::{json, Value};
 use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
-    build_signed_exec_request, create_task, decide_approval_for_session, list_pending_approvals,
-    list_tasks, load_or_create_signing_key, load_sync_token, login_password, register_agent,
-    restore_client, run_matrix_sync, run_matrix_sync_with_subscribers, run_scheduler_loop,
-    save_session, sign_task_action, start_call_matrix, start_exec_matrix, BackoffConfig,
-    CallOutcome, CallStartParams, CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome,
-    ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, ListTasksOptions, MatrixConfig,
+    build_signed_exec_request, create_task, decide_approval_for_session, emit_heartbeat,
+    list_agents, list_pending_approvals, list_tasks, load_or_create_signing_key, load_sync_token,
+    login_password, register_agent, restore_client, run_matrix_sync,
+    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, show_agent,
+    sign_task_action, start_call_matrix, start_exec_matrix, BackoffConfig, CallOutcome,
+    CallStartParams, CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome,
+    ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, HeartbeatConfig,
+    ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig,
     RegisterAgentOptions, SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore,
     DECISION_APPROVED, DECISION_DENIED,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
-use mx_agent_protocol::schema::TaskAction;
+use mx_agent_protocol::schema::{AgentState, TaskAction};
 
 /// Read a required environment variable or fail with an actionable message.
 fn required_env(name: &str) -> String {
@@ -1522,4 +1531,388 @@ requires_approval = true
         !approval_deny_sentinel.exists(),
         "denied task's command must never spawn"
     );
+}
+
+/// App-level agent id daemon A (Alice) advertises in the discovery test.
+const ALICE_AGENT: &str = "claude-local";
+/// App-level agent id daemon B (Bob) advertises in the discovery test.
+const BOB_AGENT: &str = "developer-pi";
+
+/// Poll [`list_agents`] until every id in `expected` is present (bounded), then
+/// return the discovered agents keyed by `agent_id`.
+///
+/// `list_agents` re-syncs the client on each call, so retrying it also drives
+/// the daemon's view of room state forward without a background sync loop —
+/// deterministic discovery with a bounded retry instead of a fixed sleep.
+async fn discover_agents(
+    client: &Client,
+    room: &str,
+    expected: &[&str],
+) -> BTreeMap<String, AgentState> {
+    let opts = ListAgentsOptions {
+        room: room.to_string(),
+        capabilities: Vec::new(),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(agents) = list_agents(client, &opts).await {
+            let map: BTreeMap<String, AgentState> = agents
+                .into_iter()
+                .map(|a| (a.agent_id.clone(), a))
+                .collect();
+            if expected.iter().all(|id| map.contains_key(*id)) {
+                return map;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "agents {expected:?} were not all discovered before the timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Pin the stable `--json` shape of a discovered agent.
+///
+/// `mx-agent agent list --json` and `agent show --json` serialize [`AgentState`]
+/// verbatim (`crates/mx-agent-cli/src/cli.rs`), so a field rename or drop here
+/// would silently break automation consuming that JSON. Assert the documented
+/// keys exist with the right value types, including the nested `workspace` and
+/// `load` objects, and that `signing_key_id` round-trips the publishing daemon's
+/// key.
+fn assert_stable_agent_json(state: &AgentState, expected_key_id: &str) {
+    let v = serde_json::to_value(state).expect("agent state serializes to json");
+    let obj = v.as_object().expect("agent --json is an object");
+    for key in [
+        "agent_id",
+        "kind",
+        "matrix_user_id",
+        "device_id",
+        "signing_key_id",
+        "signing_public_key",
+        "status",
+        "capabilities",
+        "tools",
+        "workspace",
+        "load",
+        "last_seen_ts",
+        "state_rev",
+    ] {
+        assert!(
+            obj.contains_key(key),
+            "agent --json missing stable key `{key}`: {v}"
+        );
+    }
+    assert_eq!(
+        obj["signing_key_id"],
+        json!(expected_key_id),
+        "discovered signing_key_id must round-trip the publishing daemon's key"
+    );
+    assert!(
+        obj["capabilities"].is_array(),
+        "capabilities must be a JSON array"
+    );
+    assert!(obj["tools"].is_array(), "tools must be a JSON array");
+    assert!(
+        obj["last_seen_ts"].is_u64(),
+        "last_seen_ts must be a JSON number"
+    );
+    assert!(obj["state_rev"].is_u64(), "state_rev must be a JSON number");
+
+    let ws = obj["workspace"]
+        .as_object()
+        .expect("workspace must be a JSON object");
+    for key in ["cwd", "project_id", "git_commit"] {
+        assert!(
+            ws.contains_key(key),
+            "workspace --json missing `{key}`: {v}"
+        );
+    }
+    let load = obj["load"].as_object().expect("load must be a JSON object");
+    for key in ["running_invocations", "max_invocations"] {
+        assert!(load.contains_key(key), "load --json missing `{key}`: {v}");
+    }
+}
+
+/// Two-daemon agent discovery + liveness coverage (issue #227).
+///
+/// Two independent daemons — two Matrix users, each with its **own** data dir and
+/// therefore its own Ed25519 signing identity — join one workspace room and each
+/// register a `com.mxagent.agent.v1` agent. The test asserts the two contracts
+/// the discovery/liveness feature promises but that no focused test pinned
+/// before:
+///
+/// 1. **Discovery.** Daemon A sees daemon B's published agent state (and vice
+///    versa) over `/sync`, carrying B's advertised kind, capabilities, tools, and
+///    its distinct `signing_key_id`/public key. `show_agent` agrees with
+///    `list_agents`.
+/// 2. **Heartbeat-driven liveness.** B emits a real `com.mxagent.heartbeat.v1`
+///    that refreshes its durable state; A observes the advanced
+///    `last_seen_ts`/`state_rev`. Given that durable `last_seen_ts`, the
+///    `LivenessConfig` thresholds drive the documented Active → Stale → Offline
+///    transition (architecture §9.1).
+///
+/// Liveness is evaluated against an **injected** `now` clock and injected
+/// thresholds rather than wall-clock sleeps, so the state-machine assertion is
+/// deterministic and cannot flake the way time-based waits did in #221. Finally
+/// it pins the `--json` agent output shape automation depends on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn two_daemons_discover_each_other_and_compute_liveness() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    // Each daemon gets its own data dir so it has a distinct signing identity,
+    // exactly like two independent installs. `register_agent` loads its signing
+    // key from `MX_AGENT_DATA_DIR` (via `SessionPaths::resolve`), so point the env
+    // var at the right daemon's dir around each registration call. The `#[ignore]`
+    // suite runs single-threaded (`--test-threads=1`), so toggling this
+    // process-global env var here does not race other tests.
+    let base = throwaway_data_dir();
+    let alice_dir = base.join("alice");
+    let bob_dir = base.join("bob");
+    paths_in(alice_dir.clone())
+        .ensure_data_dir()
+        .expect("create alice data dir");
+    paths_in(bob_dir.clone())
+        .ensure_data_dir()
+        .expect("create bob data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login should succeed");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore should succeed");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login should succeed");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore should succeed");
+
+    // Bob creates the shared workspace room; Alice (the second daemon) joins.
+    let room = create_public_room(&bob, "mx-agent discovery + liveness test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+
+    // Both daemons must be able to publish `com.mxagent.agent.v1` state. Bob (room
+    // creator, PL 100) grants Alice PL 50, the `state_default` for agent state.
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    // Register Bob's agent under Bob's data dir/signing key.
+    std::env::set_var(ENV_DATA_DIR, &bob_dir);
+    let bob_signing =
+        load_or_create_signing_key(&paths_in(bob_dir.clone())).expect("bob signing key");
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(BOB_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec![
+                "shell".to_string(),
+                "edit".to_string(),
+                "test".to_string(),
+                "repo:node".to_string(),
+            ],
+            tools: vec!["run_tests@1.0.0".to_string(), "lint@1.0.0".to_string()],
+            cwd: "/home/me/code/project".to_string(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 4,
+        },
+    )
+    .await
+    .expect("register bob agent");
+
+    // Register Alice's agent under Alice's data dir/signing key.
+    std::env::set_var(ENV_DATA_DIR, &alice_dir);
+    let alice_signing =
+        load_or_create_signing_key(&paths_in(alice_dir.clone())).expect("alice signing key");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(ALICE_AGENT.to_string()),
+            kind: "claude-code".to_string(),
+            capabilities: vec!["plan".to_string(), "review".to_string()],
+            tools: vec![],
+            cwd: "/home/me/code/project".to_string(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register alice agent");
+    std::env::remove_var(ENV_DATA_DIR);
+
+    // Sanity: the two daemons really do have distinct signing identities.
+    assert_ne!(
+        bob_signing.key_id(),
+        alice_signing.key_id(),
+        "two independent daemons must have distinct signing keys"
+    );
+
+    // ---- Criterion: each daemon discovers BOTH agents over /sync. ----
+    let by_alice = discover_agents(&alice, room_id.as_str(), &[ALICE_AGENT, BOB_AGENT]).await;
+    let by_bob = discover_agents(&bob, room_id.as_str(), &[ALICE_AGENT, BOB_AGENT]).await;
+
+    // Daemon A (Alice) sees daemon B (Bob) with B's advertised metadata.
+    let bob_seen_by_alice = by_alice.get(BOB_AGENT).expect("alice discovers bob");
+    assert_eq!(bob_seen_by_alice.kind, "pi");
+    assert_eq!(
+        bob_seen_by_alice.capabilities,
+        vec!["shell", "edit", "test", "repo:node"]
+    );
+    assert_eq!(
+        bob_seen_by_alice.tools,
+        vec!["run_tests@1.0.0", "lint@1.0.0"]
+    );
+    assert_eq!(
+        bob_seen_by_alice.signing_key_id,
+        bob_signing.key_id(),
+        "discovered agent must carry the publishing daemon's signing key id"
+    );
+    assert!(
+        bob_seen_by_alice.signing_public_key.is_some(),
+        "discovered agent must advertise its public signing key"
+    );
+
+    // Daemon B (Bob) sees daemon A (Alice) with A's advertised metadata.
+    let alice_seen_by_bob = by_bob.get(ALICE_AGENT).expect("bob discovers alice");
+    assert_eq!(alice_seen_by_bob.kind, "claude-code");
+    assert_eq!(alice_seen_by_bob.capabilities, vec!["plan", "review"]);
+    assert!(
+        alice_seen_by_bob.tools.is_empty(),
+        "alice advertised no tools"
+    );
+    assert_eq!(alice_seen_by_bob.signing_key_id, alice_signing.key_id());
+
+    // The two discovered signing identities differ, confirming per-daemon keys
+    // survive the publish → discover round trip.
+    assert_ne!(
+        bob_seen_by_alice.signing_key_id, alice_seen_by_bob.signing_key_id,
+        "discovery must preserve each daemon's distinct signing identity"
+    );
+
+    // Single-agent discovery (`show_agent`) agrees with the list view.
+    let bob_shown = show_agent(&alice, room_id.as_str(), BOB_AGENT)
+        .await
+        .expect("show bob")
+        .expect("bob is registered");
+    assert_eq!(
+        &bob_shown, bob_seen_by_alice,
+        "show_agent and list_agents must report the same state"
+    );
+
+    // ---- Criterion: a real heartbeat refreshes B's durable liveness state. ----
+    // Force a state refresh (zero refresh interval) so the timeline heartbeat also
+    // advances the durable `last_seen_ts`/`state_rev` A reads.
+    let initial_last_seen = bob_seen_by_alice.last_seen_ts;
+    let initial_state_rev = bob_seen_by_alice.state_rev;
+    assert!(
+        initial_last_seen > 0,
+        "registration must stamp a real last_seen_ts"
+    );
+    let hb_cfg = HeartbeatConfig {
+        state_refresh: Duration::ZERO,
+        ..HeartbeatConfig::default()
+    };
+    let refreshed = emit_heartbeat(&room, BOB_AGENT, "active", &hb_cfg, 0)
+        .await
+        .expect("emit heartbeat");
+    assert!(
+        refreshed,
+        "a forced state-refresh heartbeat must rewrite the durable agent state"
+    );
+
+    // A re-discovers B and observes the heartbeat-advanced durable state. The
+    // refresh may race the heartbeat's `/sync` echo, so poll with a bounded
+    // deadline rather than a fixed sleep.
+    let hb_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let bob_after_hb = loop {
+        let map = discover_agents(&alice, room_id.as_str(), &[BOB_AGENT]).await;
+        let b = map.get(BOB_AGENT).expect("alice still sees bob");
+        if b.state_rev > initial_state_rev {
+            break b.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < hb_deadline,
+            "heartbeat-refreshed state (state_rev > {initial_state_rev}) was not observed in time"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        bob_after_hb.last_seen_ts >= initial_last_seen,
+        "heartbeat must not move last_seen_ts backwards"
+    );
+    assert!(
+        bob_after_hb.state_rev > initial_state_rev,
+        "heartbeat state refresh must advance state_rev"
+    );
+
+    // ---- Criterion: liveness transitions Active → Stale → Offline. ----
+    // Inject thresholds and the `now` clock — no sleeps — so this is deterministic
+    // (the flakiness class tracked in #221). "Heartbeats lapse" is modeled by
+    // evaluating liveness at increasing `now` past B's last heartbeat.
+    let cfg = LivenessConfig {
+        stale_after: Duration::from_secs(10),
+        offline_after: Duration::from_secs(30),
+    };
+    let last_seen = bob_after_hb.last_seen_ts;
+    assert_eq!(
+        cfg.liveness_of(&bob_after_hb, last_seen + 1_000),
+        Liveness::Active,
+        "within the stale window the agent is active"
+    );
+    assert_eq!(
+        cfg.liveness_of(
+            &bob_after_hb,
+            last_seen + cfg.stale_after.as_millis() as u64
+        ),
+        Liveness::Stale,
+        "past the stale threshold the agent is stale"
+    );
+    assert_eq!(
+        cfg.liveness_of(
+            &bob_after_hb,
+            last_seen + cfg.offline_after.as_millis() as u64
+        ),
+        Liveness::Offline,
+        "past the offline threshold the agent is offline"
+    );
+
+    // ---- Criterion: the `--json` agent output shape is stable. ----
+    assert_stable_agent_json(&bob_after_hb, &bob_signing.key_id());
+    assert_stable_agent_json(alice_seen_by_bob, &alice_signing.key_id());
 }
