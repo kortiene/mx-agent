@@ -410,6 +410,7 @@ com.mxagent.exec.request.v1
 com.mxagent.exec.accepted.v1
 com.mxagent.exec.rejected.v1
 com.mxagent.exec.finished.v1
+com.mxagent.exec.stdin.v1
 com.mxagent.exec.cancel.v1
 com.mxagent.exec.cancelled.v1
 com.mxagent.call.request.v1
@@ -523,9 +524,29 @@ For non-UTF-8 data, use base64:
 }
 ```
 
-### 7.5 Cancellation
+### 7.5 Stdin and Cancellation
 
-Requester sends:
+Requester may stream stdin to a live invocation with signed control events:
+
+```json
+{
+  "type": "com.mxagent.exec.stdin.v1",
+  "content": {
+    "invocation_id": "inv_01HZ...",
+    "data": "aGVsbG8K",
+    "eof": true,
+    "created_at": "2026-06-02T12:00:02Z",
+    "nonce": "base64-random",
+    "signature": { "alg": "ed25519", "key_id": "mxagent-ed25519:abc123", "sig": "base64..." }
+  }
+}
+```
+
+`data` is base64-encoded raw stdin bytes. `eof=true` closes stdin after any
+bytes in the frame are written. The target accepts stdin only when the signature
+verifies against a trusted agent key and that agent is the invocation requester.
+
+Requester sends cancellation:
 
 ```json
 {
@@ -1040,12 +1061,14 @@ confirms the request is addressed to one of its registered agents, resolves the
 requester's published signing key, verifies signature/trust/policy, executes the
 named built-in tool, and emits `call.response`. `exec.request` events also have
 a live non-PTY handler: the target daemon verifies signature/trust/replay/policy,
-emits `exec.accepted`/`exec.rejected`, publishes invocation state, runs the
-command, emits stream/result events, and never spawns denied or approval-pending
-requests. Result-side stream events (`stream.chunk`, `stream.artifact`,
-`exec.finished`, `exec.rejected`, `exec.cancelled`, and `call.response`) are
-forwarded into an in-memory subscriber registry keyed by invocation id or
-request id so IPC clients can wait without accessing Matrix state.
+emits `exec.accepted`/`exec.rejected`, publishes invocation state, spawns a
+supervised live task, emits stream/result events, and never spawns denied or
+approval-pending requests. While running, signed `exec.stdin` and `exec.cancel`
+controls are accepted only from the trusted invocation requester. Result-side
+stream events (`stream.chunk`, `stream.artifact`, `exec.finished`,
+`exec.rejected`, `exec.cancelled`, and `call.response`) are forwarded into an
+in-memory subscriber registry keyed by invocation id or request id so IPC
+clients can wait without accessing Matrix state.
 
 ### 10.2 IPC Transport
 

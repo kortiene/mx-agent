@@ -273,7 +273,7 @@ impl std::error::Error for RunError {
 ///
 /// Kept separate from [`run`] so the command construction is testable without
 /// actually waiting on a child.
-fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
+pub(crate) fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
     if spec.command.is_empty() {
         return Err(RunError::EmptyCommand);
     }

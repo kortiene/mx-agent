@@ -732,6 +732,33 @@ allow_cwd = ["{cwd}"]
         other => panic!("expected remote exec output, got {other:?}"),
     }
 
+    let stdin_result = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            command: vec!["sh".to_string(), "-c".to_string(), "cat".to_string()],
+            cwd: Some(cwd.clone()),
+            stdin: Some(b"stdin over matrix\n".to_vec()),
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+        },
+        &subscribers,
+    )
+    .await;
+    match stdin_result.outcome {
+        ExecOutcome::Ok { frames } => {
+            assert!(frames
+                .iter()
+                .any(|f| matches!(f, ExecFrame::Chunk(c) if c.data.contains("stdin over matrix"))));
+            assert!(
+                matches!(frames.last(), Some(ExecFrame::Finished(f)) if f.exit_code == Some(0))
+            );
+        }
+        other => panic!("expected remote stdin output, got {other:?}"),
+    }
+
     let denied = start_exec_matrix(
         &ExecStartParams {
             room: Some(room_id.to_string()),

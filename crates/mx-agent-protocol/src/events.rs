@@ -39,6 +39,8 @@ pub mod timeline {
     pub const EXEC_REJECTED: &str = "com.mxagent.exec.rejected.v1";
     /// Notification that an exec invocation has finished.
     pub const EXEC_FINISHED: &str = "com.mxagent.exec.finished.v1";
+    /// Request to send stdin to a running exec invocation.
+    pub const EXEC_STDIN: &str = "com.mxagent.exec.stdin.v1";
     /// Request to cancel a running exec invocation.
     pub const EXEC_CANCEL: &str = "com.mxagent.exec.cancel.v1";
     /// Confirmation that an exec invocation was cancelled.
@@ -68,6 +70,7 @@ pub mod timeline {
         EXEC_ACCEPTED,
         EXEC_REJECTED,
         EXEC_FINISHED,
+        EXEC_STDIN,
         EXEC_CANCEL,
         EXEC_CANCELLED,
         CALL_REQUEST,
@@ -153,13 +156,14 @@ mod tests {
     fn expected_event_counts() {
         // Guards against accidental additions/removals diverging from
         // docs/architecture.md section 7.1.
-        assert_eq!(timeline::ALL.len(), 15);
+        assert_eq!(timeline::ALL.len(), 16);
         assert_eq!(state::ALL.len(), 6);
     }
 
     #[test]
     fn canonical_values_match_architecture_doc() {
         assert_eq!(timeline::EXEC_REQUEST, "com.mxagent.exec.request.v1");
+        assert_eq!(timeline::EXEC_STDIN, "com.mxagent.exec.stdin.v1");
         assert_eq!(timeline::STREAM_CHUNK, "com.mxagent.stream.chunk.v1");
         assert_eq!(timeline::PTY_RESIZE, "com.mxagent.pty.resize.v1");
         assert_eq!(state::AGENT, "com.mxagent.agent.v1");
