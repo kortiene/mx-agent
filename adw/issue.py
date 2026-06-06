@@ -68,7 +68,6 @@ def build_runner_command(
     json_mode: bool,
     model: str,
     thinking: str,
-    session_name: str,
     passthru: Sequence[str],
     prompt: str,
 ) -> list[str]:
@@ -78,7 +77,6 @@ def build_runner_command(
     if runner == "pi":
         if json_mode:
             cmd += ["--mode", "json"]
-        cmd += ["--name", session_name]
         if model:
             cmd += ["--model", model]
         if thinking:
@@ -148,7 +146,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--thinking", default=os.environ.get("PI_THINKING", ""), help="pi --thinking level (ignored by claude)"
     )
-    parser.add_argument("--name", default="", help="session display name (pi only)")
     parser.add_argument("--repo", default=os.environ.get("REPO", ""), help="owner/repo for issue lookups")
     parser.add_argument(
         "--log-dir", default=os.environ.get("MX_AGENT_LOG_DIR", ""), help="tee transcript to <dir>/issue-<n>-<ts>.log"
@@ -215,14 +212,12 @@ def _run(args: argparse.Namespace, passthru: Sequence[str]) -> int:
         note(f"thinking level '{args.thinking}' is ignored by the claude runner")
 
     runner_bin = resolve_runner_bin(args.runner)
-    session_name = args.name or f"issue #{issue}"
     cmd = build_runner_command(
         args.runner,
         runner_bin,
         json_mode=args.json,
         model=args.model,
         thinking=args.thinking,
-        session_name=session_name,
         passthru=passthru,
         prompt=prompt,
     )
