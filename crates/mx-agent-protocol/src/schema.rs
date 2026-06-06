@@ -349,6 +349,12 @@ pub struct CallRequest {
     pub tool: String,
     /// Tool arguments.
     pub args: Value,
+    /// Creation timestamp (RFC 3339).
+    pub created_at: String,
+    /// Expiry timestamp (RFC 3339); the target rejects the request after this.
+    pub expires_at: String,
+    /// Random nonce, unique per request, used for replay protection.
+    pub nonce: String,
     /// Detached signature.
     pub signature: Signature,
     /// Agent identifier that issued the request.
@@ -1281,6 +1287,9 @@ mod tests {
             "request_id": "req_01HZ",
             "tool": "run_tests",
             "args": { "suite": "api" },
+            "created_at": "2026-06-02T12:00:00Z",
+            "expires_at": "2026-06-02T12:05:00Z",
+            "nonce": "base64-random",
             "signature": { "alg": "ed25519", "key_id": "mxagent-ed25519:abc123", "sig": "base64" }
         }));
         assert_round_trip::<CallResponse>(json!({

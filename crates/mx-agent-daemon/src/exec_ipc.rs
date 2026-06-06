@@ -530,7 +530,11 @@ async fn start_exec_matrix_inner(
     }
 }
 
-fn rfc3339_after(offset: Duration) -> String {
+/// Format an RFC 3339 UTC timestamp `offset` after the current wall-clock time.
+///
+/// Shared by the exec and call request builders to stamp `created_at` /
+/// `expires_at` consistently.
+pub(crate) fn rfc3339_after(offset: Duration) -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
