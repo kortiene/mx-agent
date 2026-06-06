@@ -29,30 +29,40 @@
 //! synchronous orchestrator core is reused unchanged and there is no second
 //! `/sync` loop competing for the session token.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
 use mx_agent_policy::Policy;
 use mx_agent_protocol::schema::{TaskAction, TaskState};
 
+use crate::approval::{
+    approval_request_expiry, decision_permits_spawn, read_approval_decisions, ApprovalQueue,
+    APPROVAL_REQUEST_TTL,
+};
 use crate::scheduler::TaskScheduler;
 use crate::session::SessionPaths;
 use crate::task::{
     apply_and_publish_task, read_task_state, read_tasks, ListTasksOptions, UpdateTaskOptions,
-    STATE_EXECUTING,
+    STATE_ASSIGNED, STATE_EXECUTING, STATE_PENDING,
 };
 use crate::task_dispatch::{ExecTaskDispatcher, ToolTaskDispatcher};
 use crate::task_dispatch_matrix::{MatrixCallTaskDispatcher, MatrixExecTaskDispatcher};
 use crate::task_orchestrator::{
-    OrchestrationOutcome, TaskDispatcher, TaskExecutionResult, TaskOrchestrator, TaskStore,
-    TaskStoreError,
+    OrchestrationOutcome, QueueApprovalGate, TaskDispatcher, TaskExecutionResult, TaskOrchestrator,
+    TaskStore, TaskStoreError,
 };
 use crate::trust::TrustStore;
 use crate::workspace::WorkspaceError;
 use crate::{ExecSubscriberRegistry, ReplayCache};
+
+/// Upper bound on recent timeline events scanned for approval decisions per room
+/// per pass. Bounds the cost of resolving held approval-required tasks.
+const APPROVAL_DECISIONS_SCAN_LIMIT: u32 = 100;
 
 /// Default interval between live scheduler passes.
 pub const DEFAULT_SCHEDULER_INTERVAL: Duration = Duration::from_secs(5);
@@ -254,6 +264,14 @@ where
                 continue;
             }
             let outcome = orchestrator.process_one(task, snapshot, store, dispatcher);
+            // A task held pending an approval decision stays at this same
+            // `state_rev`, so drop it from `attempted` to let a later pass
+            // re-evaluate it once a decision is published (otherwise it would be
+            // skipped forever at this revision and never resume). It is not yet
+            // verified-by-replay, claimed, or finalized, so re-processing is safe.
+            if matches!(outcome, OrchestrationOutcome::AwaitingApproval { .. }) {
+                attempted.remove(&(task.task_id.clone(), task.state_rev));
+            }
             // Remember the invocation this pass claimed so a later pass that
             // re-reads the task as `executing` off a stale snapshot does not
             // recover (clobber) it.
@@ -363,6 +381,17 @@ fn scheduler_pass(
     if local_user.is_empty() {
         return;
     }
+
+    // The on-disk approval queue is daemon-global. Load it once per pass behind a
+    // shared handle each gate enqueues/removes through, then persist if it
+    // changed. The published `com.mxagent.approval.decision.v1` event is the
+    // source of truth for fail-closed safety; the queue is operator-visibility
+    // state (so `mx-agent approval list/approve` can see and resolve a request).
+    let approval_queue = Rc::new(RefCell::new(ApprovalQueue::load(paths).unwrap_or_default()));
+    let approval_queue_before = approval_queue.borrow().clone();
+    // A single, finite expiry stamped onto requests raised this pass.
+    let approval_expires_at = approval_request_expiry(SystemTime::now(), APPROVAL_REQUEST_TTL);
+
     for room in client.joined_rooms() {
         let room_id = room.room_id().to_string();
         let agents = match runtime.block_on(crate::agent::read_all_agent_states(&room)) {
@@ -405,6 +434,38 @@ fn scheduler_pass(
             }
         };
 
+        // Resolve held approval-required tasks against published decisions, but
+        // only read the timeline when this room has a runnable candidate for an
+        // owned agent — a held approval-required task stays `pending` until it is
+        // decided, so this keeps resolving it while skipping the round-trip for
+        // rooms with no pending/assigned work. (Gating on the queue instead would
+        // break the approve flow: the operator's `approval approve` removes the
+        // queued entry, so the decision must still be read on the next pass.) The
+        // map is keyed by `request_id` and records whether the decision permits a
+        // spawn (only an explicit `approved` does; everything else fails closed.)
+        let owned_ids: BTreeSet<&str> = owned.iter().map(|a| a.agent_id.as_str()).collect();
+        let has_runnable_candidate = snapshot.iter().any(|task| {
+            matches!(task.state.as_str(), STATE_PENDING | STATE_ASSIGNED)
+                && owned_ids.contains(task.assigned_to.as_str())
+        });
+        let decisions: HashMap<String, bool> = if has_runnable_candidate {
+            match runtime.block_on(read_approval_decisions(
+                &room,
+                APPROVAL_DECISIONS_SCAN_LIMIT,
+            )) {
+                Ok(found) => found
+                    .into_iter()
+                    .map(|(id, decision)| (id, decision_permits_spawn(&decision)))
+                    .collect(),
+                Err(e) => {
+                    tracing::debug!(error = %e, room = %room_id, "scheduler pass could not read approval decisions");
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
         for agent in owned {
             scheduler_pass_for_agent(
                 runtime,
@@ -418,7 +479,18 @@ fn scheduler_pass(
                 paths,
                 attempted,
                 claimed_invocations,
+                &decisions,
+                Rc::clone(&approval_queue),
+                &approval_expires_at,
             );
+        }
+    }
+
+    // Persist the approval queue only if a gate enqueued or resolved something
+    // this pass, so `mx-agent approval list/approve` sees held requests.
+    if *approval_queue.borrow() != approval_queue_before {
+        if let Err(e) = approval_queue.borrow().save(paths) {
+            tracing::warn!(error = %e, "scheduler pass could not persist approval queue");
         }
     }
 }
@@ -437,6 +509,9 @@ fn scheduler_pass_for_agent(
     paths: &SessionPaths,
     attempted: &mut HashSet<(String, u64)>,
     claimed_invocations: &mut BTreeSet<String>,
+    decisions: &HashMap<String, bool>,
+    approval_queue: Rc<RefCell<ApprovalQueue>>,
+    approval_expires_at: &str,
 ) {
     // Deny-by-default: when no policy file is present, the default policy denies
     // every action, so nothing is claimed or dispatched.
@@ -459,6 +534,21 @@ fn scheduler_pass_for_agent(
     for (key_id, key) in verifying_keys {
         orchestrator = orchestrator.with_verifying_key(key_id.clone(), *key);
     }
+
+    // Approval gate: a task local policy marks `requires_approval` is held until a
+    // published decision approves it. The first undecided encounter enqueues a
+    // pending approval into the shared queue (persisted by the caller); a recorded
+    // `approved` decision lets it proceed, any other decision blocks it. Without
+    // this gate the orchestrator fails closed and never runs the action.
+    let decisions = decisions.clone();
+    let gate = QueueApprovalGate::new(
+        room_id.to_string(),
+        agent.agent_id.clone(),
+        approval_expires_at.to_string(),
+        approval_queue,
+        move |request_id: &str| decisions.get(request_id).copied(),
+    );
+    orchestrator = orchestrator.with_approval_gate(Box::new(gate));
 
     // Only tasks assigned to this agent are claimed (auto-claim disabled): room
     // membership never implies execution.
@@ -1112,5 +1202,263 @@ allow_cwd = ["/repo"]
         ));
         // Avoid an unused-import style warning for ToolError in this module.
         let _ = ToolError::UnknownTool("x".to_string());
+    }
+
+    /// Policy that allows the planner's `run_tests` tool but marks it
+    /// `requires_approval`, so the approval gate must be consulted before any
+    /// claim/dispatch.
+    fn approval_policy() -> Policy {
+        Policy::parse(&format!(
+            r#"
+[rooms."{ROOM}"]
+trusted = true
+
+[rooms."{ROOM}".agents."{PLANNER}"]
+allow_tools = ["run_tests"]
+requires_approval = true
+"#
+        ))
+        .expect("approval policy parses")
+    }
+
+    /// Run one tick with an approval gate wired exactly as the live loop does:
+    /// the gate shares `queue` and resolves decisions from `decisions`
+    /// (`request_id -> permits_spawn`). Returns the outcomes; `queue` reflects the
+    /// gate's enqueues/removes afterward.
+    fn tick_with_approval<D: TaskDispatcher>(
+        store: &mut RoomTaskStore,
+        dispatcher: &mut D,
+        decisions: HashMap<String, bool>,
+        queue: Rc<RefCell<ApprovalQueue>>,
+    ) -> Vec<OrchestrationOutcome> {
+        let snapshot = store.snapshot();
+        let scheduler = TaskScheduler::new(AGENT, 4);
+        let gate = QueueApprovalGate::new(
+            ROOM,
+            AGENT,
+            "2026-06-05T00:00:00Z",
+            Rc::clone(&queue),
+            move |request_id: &str| decisions.get(request_id).copied(),
+        );
+        let orchestrator = TaskOrchestrator::new(AGENT)
+            .with_room_id(ROOM)
+            .with_policy(approval_policy())
+            .with_approval_gate(Box::new(gate));
+        let mut claimed = BTreeSet::new();
+        let store_ref = std::cell::RefCell::new(store);
+        let mut matrix_store = MatrixTaskStore::new(ROOM, |options: UpdateTaskOptions| {
+            store_ref.borrow_mut().apply(options)
+        });
+        let mut attempted = HashSet::new();
+        run_scheduler_tick(
+            &scheduler,
+            &orchestrator,
+            &snapshot,
+            &mut claimed,
+            &mut matrix_store,
+            dispatcher,
+            &mut attempted,
+        )
+    }
+
+    #[test]
+    fn approval_required_task_is_held_and_enqueued_without_a_decision() {
+        // With no decision recorded, the gate holds the task (fail closed): it is
+        // not spawned, stays re-schedulable, and a pending approval is enqueued
+        // into the shared queue (which the live loop persists for the operator).
+        let mut store = RoomTaskStore::default();
+        store.insert(tool_task("task-a", "run_tests"));
+        let mut dispatcher = RoutingDispatcher::new(
+            ToolTaskDispatcher::with_runner(|_n, _a| panic!("held task must not spawn")),
+            ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+        );
+        let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        let outcomes = tick_with_approval(
+            &mut store,
+            &mut dispatcher,
+            HashMap::new(),
+            Rc::clone(&queue),
+        );
+        assert!(
+            outcomes.iter().any(|o| matches!(
+                o,
+                OrchestrationOutcome::AwaitingApproval { request_id: Some(id), .. }
+                    if id == "approval:task-a"
+            )),
+            "task must be held awaiting approval: {outcomes:?}"
+        );
+        assert_eq!(store.state_of("task-a"), STATE_PENDING);
+        let pending = queue.borrow();
+        let queued = pending
+            .get("approval:task-a")
+            .expect("a pending approval is enqueued for the operator");
+        assert_eq!(queued.room_id, ROOM);
+        assert_eq!(queued.request.target, AGENT);
+    }
+
+    #[test]
+    fn approved_decision_lets_task_run_to_success() {
+        // A recorded `approved` decision resolves the gate so the task proceeds to
+        // claim/dispatch and succeeds, and the approval leaves the queue.
+        let mut store = RoomTaskStore::default();
+        store.insert(tool_task("task-a", "run_tests"));
+        let mut dispatcher = RoutingDispatcher::new(
+            ToolTaskDispatcher::with_runner(|_n, _a| {
+                Ok(ToolResult {
+                    exit_code: 0,
+                    summary: "ok".to_string(),
+                })
+            }),
+            ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+        );
+        let decisions = HashMap::from([("approval:task-a".to_string(), true)]);
+        let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        let outcomes =
+            tick_with_approval(&mut store, &mut dispatcher, decisions, Rc::clone(&queue));
+        assert!(
+            outcomes.iter().any(|o| matches!(
+                o,
+                OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED
+            )),
+            "approved task must run to success: {outcomes:?}"
+        );
+        assert_eq!(store.state_of("task-a"), STATE_SUCCEEDED);
+        assert!(
+            queue.borrow().get("approval:task-a").is_none(),
+            "an approved request is removed from the queue"
+        );
+    }
+
+    #[test]
+    fn held_task_resumes_on_a_later_tick_after_approval() {
+        // The `attempted` dedup must not permanently skip a held approval task at
+        // its (unchanging) revision: once a decision lands, a later tick over the
+        // same `attempted` set re-evaluates and runs it.
+        let mut store = RoomTaskStore::default();
+        store.insert(tool_task("task-a", "run_tests"));
+        let scheduler = TaskScheduler::new(AGENT, 4);
+        let mut attempted = HashSet::new();
+        let mut claimed = BTreeSet::new();
+
+        // Tick 1: no decision -> held, command never spawns.
+        {
+            let snapshot = store.snapshot();
+            let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+            let gate = QueueApprovalGate::new(
+                ROOM,
+                AGENT,
+                "2026-06-05T00:00:00Z",
+                Rc::clone(&queue),
+                move |_id: &str| None,
+            );
+            let orchestrator = TaskOrchestrator::new(AGENT)
+                .with_room_id(ROOM)
+                .with_policy(approval_policy())
+                .with_approval_gate(Box::new(gate));
+            let mut dispatcher = RoutingDispatcher::new(
+                ToolTaskDispatcher::with_runner(|_n, _a| panic!("held task must not spawn")),
+                ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+            );
+            let store_ref = std::cell::RefCell::new(&mut store);
+            let mut matrix_store = MatrixTaskStore::new(ROOM, |options: UpdateTaskOptions| {
+                store_ref.borrow_mut().apply(options)
+            });
+            let outcomes = run_scheduler_tick(
+                &scheduler,
+                &orchestrator,
+                &snapshot,
+                &mut claimed,
+                &mut matrix_store,
+                &mut dispatcher,
+                &mut attempted,
+            );
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| matches!(o, OrchestrationOutcome::AwaitingApproval { .. })),
+                "tick 1 must hold the task: {outcomes:?}"
+            );
+        }
+        assert_eq!(store.state_of("task-a"), STATE_PENDING);
+
+        // Tick 2: same `attempted` set, now approved -> the held task is
+        // re-evaluated and runs to success.
+        {
+            let snapshot = store.snapshot();
+            let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+            let decisions = HashMap::from([("approval:task-a".to_string(), true)]);
+            let gate = QueueApprovalGate::new(
+                ROOM,
+                AGENT,
+                "2026-06-05T00:00:00Z",
+                Rc::clone(&queue),
+                move |id: &str| decisions.get(id).copied(),
+            );
+            let orchestrator = TaskOrchestrator::new(AGENT)
+                .with_room_id(ROOM)
+                .with_policy(approval_policy())
+                .with_approval_gate(Box::new(gate));
+            let mut dispatcher = RoutingDispatcher::new(
+                ToolTaskDispatcher::with_runner(|_n, _a| {
+                    Ok(ToolResult {
+                        exit_code: 0,
+                        summary: "ok".to_string(),
+                    })
+                }),
+                ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+            );
+            let store_ref = std::cell::RefCell::new(&mut store);
+            let mut matrix_store = MatrixTaskStore::new(ROOM, |options: UpdateTaskOptions| {
+                store_ref.borrow_mut().apply(options)
+            });
+            let outcomes = run_scheduler_tick(
+                &scheduler,
+                &orchestrator,
+                &snapshot,
+                &mut claimed,
+                &mut matrix_store,
+                &mut dispatcher,
+                &mut attempted,
+            );
+            assert!(
+                outcomes.iter().any(|o| matches!(
+                    o,
+                    OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED
+                )),
+                "tick 2 must run the approved task: {outcomes:?}"
+            );
+        }
+        assert_eq!(store.state_of("task-a"), STATE_SUCCEEDED);
+    }
+
+    #[test]
+    fn denied_decision_blocks_task_without_spawning() {
+        // A recorded `denied` decision blocks the task; the command never spawns.
+        let mut store = RoomTaskStore::default();
+        store.insert(tool_task("task-a", "run_tests"));
+        let mut dispatcher = RoutingDispatcher::new(
+            ToolTaskDispatcher::with_runner(|_n, _a| panic!("denied task must never spawn")),
+            ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+        );
+        let decisions = HashMap::from([("approval:task-a".to_string(), false)]);
+        let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        let outcomes =
+            tick_with_approval(&mut store, &mut dispatcher, decisions, Rc::clone(&queue));
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, OrchestrationOutcome::Denied { .. })),
+            "denied task must be blocked: {outcomes:?}"
+        );
+        assert_eq!(store.state_of("task-a"), STATE_BLOCKED);
+        let result = store.tasks.get("task-a").unwrap().result.clone().unwrap();
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("approval_denied")
+        );
+        assert!(
+            queue.borrow().get("approval:task-a").is_none(),
+            "a denied request is removed from the queue"
+        );
     }
 }

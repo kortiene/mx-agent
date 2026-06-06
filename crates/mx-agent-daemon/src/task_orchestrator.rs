@@ -11,6 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
@@ -408,6 +409,11 @@ impl TaskOrchestrator {
         };
 
         let invocation_id = generate_invocation_id();
+        // Signature/trust first (idempotent), then deny-by-default policy, then
+        // approval. The single-use replay/expiry nonce is consumed *after*
+        // approval so a task held pending a decision over several passes is not
+        // replay-blocked when it resumes; it is burned only on the pass that goes
+        // on to claim and dispatch.
         if let Err(outcome) =
             self.verify_task_action_authorization(task, &action, &invocation_id, store)
         {
@@ -422,6 +428,9 @@ impl TaskOrchestrator {
             if let Err(outcome) = self.resolve_approval(task, &action, &invocation_id, store) {
                 return outcome;
             }
+        }
+        if let Err(outcome) = self.admit_task_action_replay(task, &action, &invocation_id, store) {
+            return outcome;
         }
 
         // Optimistic claim: transition pending/assigned -> executing only if the
@@ -663,16 +672,21 @@ impl TaskOrchestrator {
         outcomes
     }
 
-    /// Require a trusted, signed, non-replayed authorization before a task
-    /// action may execute.
+    /// Require a trusted, signed authorization (addressed to this agent) before a
+    /// task action may execute.
     ///
-    /// Task state is advisory: when trust or replay enforcement is configured,
-    /// an action must carry a valid [`TaskActionAuthorization`] from a locally
-    /// trusted signing key, addressed to this agent, within its expiry, and
-    /// with a fresh nonce. Any failure blocks the task without dispatching. When
-    /// neither a trust store nor a replay cache is configured, this check is a
-    /// no-op (the deterministic scheduler core used in tests and by callers that
-    /// supply authorization elsewhere).
+    /// Task state is advisory: when trust or replay enforcement is configured, an
+    /// action must carry a [`TaskActionAuthorization`] from a locally trusted
+    /// signing key, addressed to this agent, with a valid signature. Any failure
+    /// blocks the task without dispatching. This step is **idempotent** (no cache
+    /// side effects) so it can be re-run safely while a task is held for approval;
+    /// the single-use replay/expiry nonce is consumed separately, only once the
+    /// action is about to execute (see [`admit_task_action_replay`]). When neither
+    /// a trust store nor a replay cache is configured, this check is a no-op (the
+    /// deterministic scheduler core used in tests and by callers that supply
+    /// authorization elsewhere).
+    ///
+    /// [`admit_task_action_replay`]: Self::admit_task_action_replay
     fn verify_task_action_authorization<S>(
         &self,
         task: &TaskState,
@@ -730,20 +744,52 @@ impl TaskOrchestrator {
             }
         }
 
-        // Replay/expiry protection. Denials are side-effect free in the cache.
-        if let Some(cache) = &self.replay_cache {
-            let admit = cache.borrow_mut().admit(&auth.nonce, &auth.expires_at);
-            if let Err(err) = admit {
-                let reason = match err {
-                    ReplayError::Expired => "expired",
-                    ReplayError::Replayed => "replayed",
-                    ReplayError::MalformedTimestamp => "malformed_expiry",
-                    ReplayError::Io(_) => "replay_cache_unavailable",
-                };
-                return self.block_unauthorized(task, action, invocation_id, reason, store);
-            }
-        }
+        Ok(())
+    }
 
+    /// Consume the single-use replay/expiry nonce for an authorized task action,
+    /// blocking the task if it is expired or already seen.
+    ///
+    /// This is the **side-effecting** half of authorization: it records the nonce
+    /// so the same signed authorization cannot run twice. It is deliberately
+    /// invoked only once the action is fully authorized *and* approved (right
+    /// before the claim), so a task held for approval over several scheduler
+    /// passes is not falsely rejected as a replay when it resumes — the nonce is
+    /// burned only on the pass that actually executes. Signature/trust are checked
+    /// separately and idempotently in [`verify_task_action_authorization`]. A no-op
+    /// when no replay cache is configured.
+    ///
+    /// [`verify_task_action_authorization`]: Self::verify_task_action_authorization
+    fn admit_task_action_replay<S>(
+        &self,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        store: &mut S,
+    ) -> Result<(), OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        let Some(cache) = &self.replay_cache else {
+            return Ok(());
+        };
+        // `verify_task_action_authorization` already rejected an unsigned action
+        // whenever a replay cache (or trust store) is configured, so an authorized
+        // action reaching here carries an authorization; fail closed otherwise.
+        let Some(auth) = action.authorization() else {
+            return self.block_unauthorized(task, action, invocation_id, "unsigned", store);
+        };
+        // Denials are side-effect free in the cache.
+        let admit = cache.borrow_mut().admit(&auth.nonce, &auth.expires_at);
+        if let Err(err) = admit {
+            let reason = match err {
+                ReplayError::Expired => "expired",
+                ReplayError::Replayed => "replayed",
+                ReplayError::MalformedTimestamp => "malformed_expiry",
+                ReplayError::Io(_) => "replay_cache_unavailable",
+            };
+            return self.block_unauthorized(task, action, invocation_id, reason, store);
+        }
         Ok(())
     }
 
@@ -1091,14 +1137,19 @@ pub fn task_approval_request(
 /// operator can inspect it via `mx-agent approval list`) and returns
 /// [`ApprovalDisposition::Pending`]. A decision is resolved through the supplied
 /// closure, which the daemon wires to recorded approval decisions: `Some(true)`
-/// approves, `Some(false)` denies, and `None` keeps the action pending. After a
-/// run the caller can persist the gate's [`queue`](Self::queue) so pending
-/// approvals survive a restart.
+/// approves, `Some(false)` denies, and `None` keeps the action pending.
+///
+/// The queue is held behind a shared [`Rc<RefCell<ApprovalQueue>>`] so the caller
+/// can observe the gate's enqueues/removes after a run — boxed as a trait object
+/// the gate is otherwise unreachable — and persist them so pending approvals
+/// survive a restart and are resolvable by `mx-agent approval approve/deny`. The
+/// gate is single-threaded by construction (built and used on the scheduler
+/// thread), so the non-`Send` `Rc` is sound here.
 pub struct QueueApprovalGate<R> {
     room_id: String,
     target_agent: String,
     expires_at: String,
-    queue: ApprovalQueue,
+    queue: Rc<RefCell<ApprovalQueue>>,
     resolve_decision: R,
 }
 
@@ -1110,13 +1161,15 @@ where
     ///
     /// `expires_at` is stamped onto emitted approval requests; `resolve_decision`
     /// maps a request id to a recorded decision (`Some(true)`/`Some(false)`) or
-    /// `None` when still undecided. `queue` seeds the gate with any approvals
-    /// already persisted (so a restart does not re-emit them).
+    /// `None` when still undecided. `queue` is the shared queue the gate enqueues
+    /// pending approvals into and removes decided ones from; pass it pre-seeded
+    /// with any persisted approvals so a restart does not re-emit them, and read
+    /// it back via [`queue`](Self::queue) after a run to persist changes.
     pub fn new(
         room_id: impl Into<String>,
         target_agent: impl Into<String>,
         expires_at: impl Into<String>,
-        queue: ApprovalQueue,
+        queue: Rc<RefCell<ApprovalQueue>>,
         resolve_decision: R,
     ) -> Self {
         Self {
@@ -1128,9 +1181,10 @@ where
         }
     }
 
-    /// Borrow the gate's approval queue (for inspection or persistence).
-    pub fn queue(&self) -> &ApprovalQueue {
-        &self.queue
+    /// A handle to the gate's shared approval queue (for inspection or
+    /// persistence after a run).
+    pub fn queue(&self) -> Rc<RefCell<ApprovalQueue>> {
+        Rc::clone(&self.queue)
     }
 }
 
@@ -1143,15 +1197,15 @@ where
         let request_id = request.request_id.clone();
         match (self.resolve_decision)(&request_id) {
             Some(true) => {
-                self.queue.remove(&request_id);
+                self.queue.borrow_mut().remove(&request_id);
                 ApprovalDisposition::Approved
             }
             Some(false) => {
-                self.queue.remove(&request_id);
+                self.queue.borrow_mut().remove(&request_id);
                 ApprovalDisposition::Denied("approval denied by operator".to_string())
             }
             None => {
-                self.queue.enqueue(PendingApproval {
+                self.queue.borrow_mut().enqueue(PendingApproval {
                     room_id: self.room_id.clone(),
                     request,
                 });
@@ -1548,18 +1602,18 @@ requires_approval = true
     #[test]
     fn queue_gate_enqueues_inspectable_pending_then_resolves() {
         use std::cell::Cell;
-        use std::rc::Rc;
         // Decision source: pending first, then approved.
         let approved = Rc::new(Cell::new(false));
         let flag = approved.clone();
+        let shared_queue = Rc::new(RefCell::new(ApprovalQueue::default()));
         let gate = QueueApprovalGate::new(
             "!room:server",
             "agent-a",
             "2026-06-05T00:00:00Z",
-            ApprovalQueue::default(),
+            Rc::clone(&shared_queue),
             move |_request_id: &str| if flag.get() { Some(true) } else { None },
         );
-        let gate = std::cell::RefCell::new(gate);
+        let gate = RefCell::new(gate);
         let t = approval_tool_task();
         let action = action_from_task(&t).unwrap();
 
@@ -1570,9 +1624,12 @@ requires_approval = true
             first,
             ApprovalDisposition::Pending("approval:task-a".to_string())
         );
+        // The shared queue handle observes the gate's enqueue (this is what the
+        // live loop persists so `mx-agent approval approve` can resolve it).
         let queued = gate
             .borrow()
             .queue()
+            .borrow()
             .get("approval:task-a")
             .expect("pending approval is inspectable")
             .clone();
@@ -1580,11 +1637,16 @@ requires_approval = true
         assert_eq!(queued.request.target, "agent-a");
         assert!(queued.request.summary.contains("task-a"));
 
-        // After the operator approves, the gate resolves to Approved.
+        // After the operator approves, the gate resolves to Approved and removes
+        // the request from the shared queue.
         approved.set(true);
         assert_eq!(
             gate.borrow_mut().evaluate(&t, &action),
             ApprovalDisposition::Approved
+        );
+        assert!(
+            shared_queue.borrow().get("approval:task-a").is_none(),
+            "an approved request is removed from the queue"
         );
     }
 
@@ -2338,5 +2400,72 @@ requires_approval = true
             .get("summary")
             .and_then(Value::as_str)
             .is_some_and(|s| s.contains("replayed")));
+    }
+
+    #[test]
+    fn approval_held_task_is_not_replay_blocked_when_it_resumes() {
+        // Regression for the core of issue #223: an approval-required signed task
+        // is held on the first pass (no decision) and must NOT burn its single-use
+        // replay nonce while held, so that when it is approved on a later pass the
+        // same authorization runs instead of being rejected as a replay.
+        use std::cell::Cell;
+        struct SwitchGate(Rc<Cell<bool>>);
+        impl TaskApprovalGate for SwitchGate {
+            fn evaluate(&mut self, _task: &TaskState, _action: &TaskAction) -> ApprovalDisposition {
+                if self.0.get() {
+                    ApprovalDisposition::Approved
+                } else {
+                    ApprovalDisposition::Pending("approval:task-a".to_string())
+                }
+            }
+        }
+
+        let approved = Rc::new(Cell::new(false));
+        let (t, _action) = signed_tool_action(&future_rfc3339(), "nonce-approval-resume");
+        let (cache, dir) = replay_cache("approval-resume");
+        let orchestrator = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy_requires_approval())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .with_replay_cache(cache)
+            .with_approval_gate(Box::new(SwitchGate(Rc::clone(&approved))));
+
+        // Pass 1: undecided -> held; the task is neither claimed nor finalized and
+        // the replay nonce is not consumed.
+        let mut held_store = MemoryStore::default();
+        let mut panic_dispatcher = PanicDispatcher;
+        let first = orchestrator.process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut held_store,
+            &mut panic_dispatcher,
+        );
+        assert!(
+            matches!(first, OrchestrationOutcome::AwaitingApproval { .. }),
+            "first pass should hold the task: {first:?}"
+        );
+        assert!(held_store.finalized_state.is_none());
+
+        // Pass 2: approved -> the same authorization now runs to success. Had the
+        // nonce been burned while held, this would be blocked as "replayed".
+        approved.set(true);
+        let mut run_store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let second = orchestrator.process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut run_store,
+            &mut dispatcher,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&second, OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED),
+            "an approved held task must run, not be replay-blocked: {second:?}"
+        );
     }
 }
