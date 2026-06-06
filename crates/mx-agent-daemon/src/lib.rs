@@ -85,7 +85,9 @@ pub use exec::{
     send_exec_request, CancelRejection, ExecRejection, ExecRequestOptions,
 };
 pub use exec_ipc::{
-    start_exec_loopback, ExecErrorKind, ExecFrame, ExecOutcome, ExecStartParams, ExecStartResult,
+    handle_exec_cancel_loopback, handle_exec_stdin_loopback, start_exec_loopback, ExecCancelParams,
+    ExecControlResult, ExecErrorKind, ExecFrame, ExecNotification, ExecOutcome, ExecStartParams,
+    ExecStartResult, ExecStdinParams,
 };
 pub use heartbeat::{
     emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,

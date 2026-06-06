@@ -31,7 +31,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use mx_agent_protocol::id::{generate_invocation_id, generate_request_id};
-use mx_agent_protocol::schema::{ExecFinished, StreamArtifact, StreamChunk, StreamKind};
+use mx_agent_protocol::schema::{
+    ExecAccepted, ExecCancelled, ExecFinished, ExecRejected, StreamArtifact, StreamChunk,
+    StreamKind,
+};
 
 use crate::artifact::{prepare_artifact, ArtifactConfig};
 use crate::runner::{run, RunError, RunSpec};
@@ -142,6 +145,80 @@ pub struct ExecStartResult {
     pub request_id: String,
     /// The execution outcome.
     pub outcome: ExecOutcome,
+}
+
+/// Parameters for the `exec.stdin` IPC method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecStdinParams {
+    /// Invocation receiving stdin.
+    pub invocation_id: String,
+    /// Raw stdin bytes for this frame.
+    #[serde(default)]
+    pub data: Vec<u8>,
+    /// Whether this frame closes stdin.
+    #[serde(default)]
+    pub eof: bool,
+}
+
+/// Parameters for the `exec.cancel` IPC method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecCancelParams {
+    /// Invocation to cancel.
+    pub invocation_id: String,
+    /// Human-readable cancellation reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Result for fire-and-forget exec control methods (`exec.stdin`, `exec.cancel`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecControlResult {
+    /// Invocation the control request addressed.
+    pub invocation_id: String,
+    /// Whether a live invocation accepted the control request.
+    pub accepted: bool,
+    /// Non-sensitive status message.
+    pub message: String,
+}
+
+/// Daemon-to-CLI exec notification payloads for streaming transports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+pub enum ExecNotification {
+    /// The daemon accepted an exec request.
+    ExecAccepted(ExecAccepted),
+    /// The daemon rejected an exec request before spawning.
+    ExecRejected(ExecRejected),
+    /// A stdout/stderr/artifact/finished frame.
+    Frame(ExecFrame),
+    /// The daemon cancelled an invocation.
+    ExecCancelled(ExecCancelled),
+}
+
+/// Loopback `exec.stdin` response.
+///
+/// The current loopback `exec.start` runs to completion in one request, so there
+/// is no live stdin pipe to address. The method exists now so clients and future
+/// remote/streaming handlers share a stable API.
+pub fn handle_exec_stdin_loopback(params: &ExecStdinParams) -> ExecControlResult {
+    ExecControlResult {
+        invocation_id: params.invocation_id.clone(),
+        accepted: false,
+        message: "exec.stdin is only available for live streaming exec invocations".to_string(),
+    }
+}
+
+/// Loopback `exec.cancel` response.
+///
+/// The current loopback `exec.start` is synchronous and returns only after the
+/// child has finished, so there is no daemon-side live invocation table to
+/// cancel yet. The method is part of the IPC API for later streaming/remote exec.
+pub fn handle_exec_cancel_loopback(params: &ExecCancelParams) -> ExecControlResult {
+    ExecControlResult {
+        invocation_id: params.invocation_id.clone(),
+        accepted: false,
+        message: "exec.cancel is only available for live streaming exec invocations".to_string(),
+    }
 }
 
 /// Map a Unix signal number to its name, for reporting signal death.
@@ -417,6 +494,44 @@ mod tests {
         let value = serde_json::to_value(&frame).unwrap();
         assert_eq!(value["kind"], "finished");
         assert_eq!(value["exit_code"], 0);
+    }
+
+    #[test]
+    fn stdin_and_cancel_loopback_return_stable_not_live_result() {
+        let stdin = handle_exec_stdin_loopback(&ExecStdinParams {
+            invocation_id: "inv_1".to_string(),
+            data: b"hello".to_vec(),
+            eof: true,
+        });
+        assert_eq!(stdin.invocation_id, "inv_1");
+        assert!(!stdin.accepted);
+        assert!(stdin.message.contains("live streaming"));
+
+        let cancel = handle_exec_cancel_loopback(&ExecCancelParams {
+            invocation_id: "inv_1".to_string(),
+            reason: Some("test".to_string()),
+        });
+        assert_eq!(cancel.invocation_id, "inv_1");
+        assert!(!cancel.accepted);
+        assert!(cancel.message.contains("live streaming"));
+    }
+
+    #[test]
+    fn notification_serializes_with_method_tag() {
+        let notification = ExecNotification::Frame(ExecFrame::Finished(ExecFinished {
+            invocation_id: "inv_1".to_string(),
+            exit_code: Some(0),
+            signal: None,
+            duration_ms: 1,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            truncated: false,
+            artifact_mxc: None,
+            extra: Default::default(),
+        }));
+        let value = serde_json::to_value(notification).unwrap();
+        assert_eq!(value["method"], "frame");
+        assert_eq!(value["params"]["kind"], "finished");
     }
 
     #[test]
