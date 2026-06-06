@@ -4,13 +4,15 @@ This guide walks a new user from a fresh checkout to a working **two-agent
 demo**: two agents registered in a shared Matrix workspace, discovering each
 other, then running a tool call and a remote-style `exec`.
 
-> **Alpha status.** `mx-agent` is pre-release software. The workspace,
-> authentication, agent-registry, task, trust, and context-sharing commands run
-> against a real Matrix homeserver. `call` and non-PTY `exec` are daemon-mediated
-> local loopback by default and use signed Matrix-backed remote dispatch when
-> `--room`/`--agent` target a registered, trusted, policy-allowed agent. Remote
-> exec stdin/cancel controls are signed Matrix events for non-PTY live exec.
-> Treat execution commands carefully and
+> **Alpha status.** `mx-agent` is pre-release software. The workspace, auth,
+> agent-registry, task, trust, approval, context-sharing, and invocation commands
+> run against a real Matrix homeserver entirely through the daemon over local IPC
+> — the stateless CLI never reads the Matrix session or builds a Matrix client
+> itself. `call` and non-PTY `exec` run daemon-mediated locally by default and
+> use signed Matrix-backed remote dispatch when `--room`/`--agent` target a
+> registered, trusted, policy-allowed agent, with signed Matrix stdin/cancel
+> controls for live remote exec. A live daemon scheduler loop auto-drives signed,
+> assigned tasks. Treat execution commands carefully and
 > read [Security warnings](#security-warnings) before pointing mx-agent at
 > anything you do not control.
 

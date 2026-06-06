@@ -154,7 +154,7 @@ cargo build --all       # build every crate
 cargo test --all        # run all tests
 cargo fmt --check       # verify formatting
 cargo clippy --all-targets --all-features -- -D warnings
-cargo run -p mx-agent-cli -- --help   # run the placeholder CLI
+cargo run -p mx-agent-cli -- --help   # explore the CLI command surface
 ```
 
 The same checks run in CI (`.github/workflows/ci.yml`) and must pass on every PR.
