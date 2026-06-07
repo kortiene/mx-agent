@@ -398,7 +398,10 @@ fn response_to_outcome(response: CallResponse) -> CallOutcome {
 pub async fn start_call_matrix(params: &CallStartParams) -> CallStartResult {
     use mx_agent_protocol::id::{generate_invocation_id, generate_request_id};
 
-    let invocation_id = generate_invocation_id();
+    let invocation_id = params
+        .invocation_id
+        .clone()
+        .unwrap_or_else(generate_invocation_id);
     let request_id = generate_request_id();
     let Some(room_target) = params.room.as_deref() else {
         return crate::start_call_loopback(params);

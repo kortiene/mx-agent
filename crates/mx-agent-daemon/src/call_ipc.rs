@@ -45,6 +45,12 @@ pub struct CallStartParams {
     /// Tool input as a JSON object/value understood by the tool.
     #[serde(default)]
     pub input: Value,
+    /// Preset invocation id to run the call under. `None` mints a fresh id (the
+    /// default for direct CLI `call`); task dispatch sets it so the call's
+    /// invocation id and the owning task's recorded `invocation_id` are a single
+    /// unified id (issue #239).
+    #[serde(default)]
+    pub invocation_id: Option<String>,
 }
 
 /// Stable, machine-readable kind of a tool-invocation failure.
@@ -108,7 +114,10 @@ pub struct CallStartResult {
 /// [`CallErrorKind`]. A tool that runs and exits nonzero still yields
 /// [`CallOutcome::Ok`]; only a failure to invoke yields [`CallOutcome::Error`].
 pub fn start_call_loopback(params: &CallStartParams) -> CallStartResult {
-    let invocation_id = generate_invocation_id();
+    let invocation_id = params
+        .invocation_id
+        .clone()
+        .unwrap_or_else(generate_invocation_id);
     let request_id = generate_request_id();
     let outcome = match execute_tool(&params.tool, &params.input) {
         Ok(result) => CallOutcome::Ok {
@@ -147,6 +156,7 @@ mod tests {
             agent: Some("developer-pi".to_string()),
             tool: tool.to_string(),
             input,
+            invocation_id: None,
         }
     }
 
@@ -155,6 +165,16 @@ mod tests {
         let result = start_call_loopback(&params("run_tests", json!({ "package": "x" })));
         assert!(validate(IdKind::Invocation, &result.invocation_id).is_ok());
         assert!(validate(IdKind::Request, &result.request_id).is_ok());
+    }
+
+    #[test]
+    fn loopback_honors_preset_invocation_id() {
+        // Task dispatch presets the orchestrator's invocation id so the call runs
+        // under the unified id; absence still mints a fresh one (issue #239).
+        let mut p = params("run_tests", json!({ "package": "x" }));
+        p.invocation_id = Some("inv_preset".to_string());
+        let result = start_call_loopback(&p);
+        assert_eq!(result.invocation_id, "inv_preset");
     }
 
     #[test]

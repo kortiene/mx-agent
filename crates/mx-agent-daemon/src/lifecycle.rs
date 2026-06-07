@@ -558,6 +558,30 @@ fn dispatch(
             }),
             Err(response) => *response,
         },
+        "task.cancel" => match parse_params::<crate::TaskCancelParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                // The daemon owns the signing key and signs the linked
+                // invocation's cancel so the target agent can verify the
+                // requester before terminating the command (issue #239).
+                let signing = crate::load_or_create_signing_key(&SessionPaths::resolve())
+                    .map_err(|e| crate::WorkspaceError::Io(io::Error::other(e.to_string())))?;
+                let key_id = signing.key_id();
+                let reason = params
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "cancelled by operator".to_string());
+                crate::cancel_task_for_session(
+                    &session,
+                    signing.signing_key(),
+                    &key_id,
+                    &params.room,
+                    &params.task_id,
+                    &reason,
+                )
+                .await
+            }),
+            Err(response) => *response,
+        },
         // --- workspace (issue #201) ---
         "workspace.create" => match parse_params::<crate::CreateWorkspaceOptions>(req) {
             Ok(options) => block_on_task_response(req, |session| async move {
@@ -1167,7 +1191,13 @@ mod tests {
 
     #[test]
     fn task_ipc_methods_validate_params_before_loading_session() {
-        for method in ["task.create", "task.update", "task.list", "task.graph"] {
+        for method in [
+            "task.create",
+            "task.update",
+            "task.list",
+            "task.graph",
+            "task.cancel",
+        ] {
             let req = Request::new(json!(1), method, Value::Null);
             let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
             let error = response.error.expect("invalid params should be rejected");
