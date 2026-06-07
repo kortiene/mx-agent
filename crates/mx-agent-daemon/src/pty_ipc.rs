@@ -409,6 +409,8 @@ async fn setup_remote_pty(
     // Tell the target the real initial window size right away.
     let _ = crate::exec::send_pty_resize(
         &room,
+        signing.signing_key(),
+        signing.key_id(),
         &invocation_id,
         PtyWinsize::new(params.rows, params.cols),
     )
@@ -536,6 +538,8 @@ fn forward_client_frames_to_matrix(
                 {
                     let _ = handle.block_on(crate::exec::send_pty_resize(
                         &room,
+                        &signing_key,
+                        key_id.clone(),
                         &invocation_id,
                         frame.into(),
                     ));

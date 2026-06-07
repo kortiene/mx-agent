@@ -63,9 +63,6 @@ type StdinFrame = Option<Vec<u8>>;
 #[derive(Debug, Clone)]
 struct LiveExecControl {
     requester_agent: String,
-    /// Matrix user id of the requester, used to authorize the unsigned
-    /// `pty.resize` window-size hint (architecture §7.1; issue #238).
-    requester_user: String,
     stdin: tokio::sync::mpsc::Sender<StdinFrame>,
     cancel: tokio::sync::watch::Sender<Option<String>>,
     /// Live terminal-resize channel for an interactive PTY invocation; `None`
@@ -565,16 +562,6 @@ pub async fn handle_live_exec_request(
         tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to publish running invocation state");
     }
 
-    // Resolve the requester's Matrix user id so an (unsigned) `pty.resize`
-    // window hint can be authorized by homeserver-authenticated sender identity
-    // for an interactive PTY invocation (issue #238).
-    let requester_user = crate::agent::read_agent_state(&room, &request.requesting_agent)
-        .await
-        .ok()
-        .flatten()
-        .map(|agent| agent.matrix_user_id)
-        .unwrap_or_default();
-
     // Register the live-exec control *synchronously*, before spawning the run
     // task, so a stdin or cancel frame routed in the same (or a later) sync
     // batch always finds this invocation. Registering inside the spawned task
@@ -588,7 +575,6 @@ pub async fn handle_live_exec_request(
         request.invocation_id.clone(),
         LiveExecControl {
             requester_agent: request.requesting_agent.clone(),
-            requester_user,
             stdin: stdin_tx,
             cancel: cancel_tx,
             resize: request.pty.then_some(resize_tx),
@@ -1349,26 +1335,71 @@ async fn emit_pty_chunk(room: &Room, invocation_id: &str, data: &[u8], eof: bool
     }
 }
 
-/// Send an unsigned `com.mxagent.pty.resize.v1` window-size hint into `room`.
+/// Build and sign a `com.mxagent.pty.resize.v1` content value.
 ///
-/// Resize carries no signature: it changes only the window size of an
-/// already-authorized, running invocation and can execute nothing. The target
-/// authorizes it by Matrix sender identity (see [`handle_live_pty_resize`]).
-pub async fn send_pty_resize(
-    room: &Room,
+/// Constructs a [`PtyResize`] for `invocation_id` carrying the new terminal
+/// `size`, then signs the content with `signing_key`, embedding the detached
+/// signature under the `signature` field. The returned JSON value is ready to be
+/// sent as the timeline event's content. Resize is a signed control event like
+/// [`build_signed_exec_stdin`] / [`build_signed_exec_cancel`].
+pub fn build_signed_pty_resize(
+    signing_key: &SigningKey,
+    key_id: impl Into<String>,
     invocation_id: impl Into<String>,
     size: PtyWinsize,
-) -> Result<(), WorkspaceError> {
+    created_at: impl Into<String>,
+    nonce: impl Into<String>,
+) -> Result<Value, SignatureError> {
+    // Build the unsigned content with a placeholder signature, then sign it in
+    // place. `sign_into` excludes the `signature` field from the signed bytes,
+    // so the placeholder does not affect the result.
     let resize = PtyResize {
         invocation_id: invocation_id.into(),
         rows: size.rows,
         cols: size.cols,
         pixel_width: size.pixel_width,
         pixel_height: size.pixel_height,
+        created_at: created_at.into(),
+        nonce: nonce.into(),
+        signature: Signature {
+            alg: signing::ALG_ED25519.to_string(),
+            key_id: key_id.into(),
+            sig: String::new(),
+        },
         extra: Default::default(),
     };
-    let content = serde_json::to_value(&resize)
-        .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    let mut content = serde_json::to_value(&resize).expect("PtyResize serializes to a JSON object");
+    let key_id = resize.signature.key_id;
+    signing::sign_into(signing_key, key_id, &mut content)?;
+    Ok(content)
+}
+
+/// Send a signed `com.mxagent.pty.resize.v1` window-size control into `room`.
+///
+/// Resize is signed like `exec.stdin` / `exec.cancel`: it changes only the
+/// window size of an already-authorized, running invocation and can execute
+/// nothing, but it is still verified against a locally trusted signing key owned
+/// by the requester (see [`handle_live_pty_resize`]) so a spoofed sender cannot
+/// jam another invocation's terminal. Builds and signs the resize with
+/// [`build_signed_pty_resize`], then emits it as a Matrix timeline event.
+pub async fn send_pty_resize(
+    room: &Room,
+    signing_key: &SigningKey,
+    key_id: impl Into<String>,
+    invocation_id: impl Into<String>,
+    size: PtyWinsize,
+) -> Result<(), WorkspaceError> {
+    // Signing only fails when the content is not a JSON object; the content we
+    // build here is always an object, so this cannot fail in practice.
+    let content = build_signed_pty_resize(
+        signing_key,
+        key_id,
+        invocation_id,
+        size,
+        rfc3339_now(),
+        random_control_nonce(),
+    )
+    .expect("PtyResize content is always a JSON object");
     room.send_raw(PTY_RESIZE, content)
         .await
         .map_err(WorkspaceError::from)?;
@@ -1378,19 +1409,38 @@ pub async fn send_pty_resize(
 /// Handle a routed `com.mxagent.pty.resize.v1` for a live PTY invocation on this
 /// daemon.
 ///
-/// Resize is an unsigned, non-executing window-size hint, so it is authorized by
-/// the homeserver-authenticated Matrix `sender`: only the invocation's original
-/// requester may resize its terminal. Room membership alone never resizes
-/// another agent's session, and a resize for an unknown or non-PTY invocation is
-/// silently ignored.
-pub async fn handle_live_pty_resize(sender: &str, resize: &PtyResize) {
+/// Resize is a signed control event, so it is authorized through the same
+/// `authorize_live_control` gate (signature → trust → ownership) as
+/// `exec.stdin` / `exec.cancel`: only the invocation's original requester, using
+/// a locally trusted signing key, may resize its terminal. Room membership or a
+/// spoofed Matrix sender alone never resizes another agent's session, and a
+/// resize for an unknown or non-PTY invocation is silently ignored. Resize is
+/// idempotent (it only sets the current window size and executes nothing), so it
+/// is not router-replay-checked — a replayed resize at most re-applies the same
+/// dimensions.
+pub async fn handle_live_pty_resize(
+    room: &Room,
+    paths: &crate::SessionPaths,
+    content: &Value,
+    resize: &PtyResize,
+) {
     let Some(control) = live_exec_control(&resize.invocation_id) else {
         return;
     };
-    if control.requester_user.is_empty() || control.requester_user != sender {
+    if authorize_live_control(
+        room,
+        paths,
+        content,
+        &resize.signature.key_id,
+        &control.requester_agent,
+    )
+    .await
+    .is_err()
+    {
         tracing::warn!(
             invocation_id = %resize.invocation_id,
-            "rejected unauthorized pty resize"
+            requester_agent = %control.requester_agent,
+            "rejected unauthorized pty resize control"
         );
         return;
     }
@@ -2085,6 +2135,122 @@ allow_cwd = ["/home/me/code/project"]
                 .is_err(),
             "an unknown requester id must be rejected"
         );
+    }
+
+    /// A signed `pty.resize` control frame from `key`.
+    fn signed_resize(key: &SigningKey) -> Value {
+        build_signed_pty_resize(
+            key,
+            crate::signing::key_id_for_verifying_key(&key.verifying_key()),
+            "inv_01HZ",
+            PtyWinsize::new(50, 132),
+            "2026-06-02T12:00:00Z",
+            "base64-nonce",
+        )
+        .expect("signs resize")
+    }
+
+    #[test]
+    fn build_signed_pty_resize_is_verifiable_by_owner() {
+        // A resize built by the requester verifies through the same
+        // signature → trust → ownership gate as stdin/cancel.
+        let key = test_key();
+        let key_id = crate::signing::key_id_for_verifying_key(&key.verifying_key());
+        let trust = trust_with(&key_id);
+        let content = signed_resize(&key);
+        let agents = vec![agent_with("@bob:matrix.org", &key)];
+        assert!(
+            authorize_control_from_states(&agents, "@bob:matrix.org", &content, &key_id, &trust)
+                .is_ok(),
+            "a signed resize from the trusted owner must authorize"
+        );
+    }
+
+    #[test]
+    fn unsigned_resize_is_rejected() {
+        let key = test_key();
+        let key_id = crate::signing::key_id_for_verifying_key(&key.verifying_key());
+        let trust = trust_with(&key_id);
+        let mut content = signed_resize(&key);
+        // Strip the signature: an unsigned resize must not authorize, unlike the
+        // pre-#244 sender-authorized hint.
+        content
+            .as_object_mut()
+            .unwrap()
+            .remove(SIGNATURE_FIELD)
+            .unwrap();
+        assert!(
+            authorize_control_from_states(
+                &agents_with_owner(&key),
+                "@bob:matrix.org",
+                &content,
+                &key_id,
+                &trust
+            )
+            .is_err(),
+            "an unsigned resize must be rejected"
+        );
+    }
+
+    #[test]
+    fn resize_from_untrusted_key_is_rejected() {
+        let key = test_key();
+        let key_id = crate::signing::key_id_for_verifying_key(&key.verifying_key());
+        let content = signed_resize(&key);
+        let trust = TrustStore::default();
+        assert!(
+            authorize_control_from_states(
+                &agents_with_owner(&key),
+                "@bob:matrix.org",
+                &content,
+                &key_id,
+                &trust
+            )
+            .is_err(),
+            "a resize signed by an untrusted key must be rejected"
+        );
+    }
+
+    #[test]
+    fn resize_from_non_owner_is_rejected() {
+        // The signature verifies and the key is trusted, but the requester id is
+        // not the invocation's owner.
+        let key = test_key();
+        let key_id = crate::signing::key_id_for_verifying_key(&key.verifying_key());
+        let trust = trust_with(&key_id);
+        let content = signed_resize(&key);
+        let agents = vec![agent_with("@mallory:matrix.org", &key)];
+        assert!(
+            authorize_control_from_states(&agents, "@bob:matrix.org", &content, &key_id, &trust)
+                .is_err(),
+            "a resize from an agent that is not the requester must be rejected"
+        );
+    }
+
+    #[test]
+    fn tampered_resize_fails_signature_check() {
+        let key = test_key();
+        let key_id = crate::signing::key_id_for_verifying_key(&key.verifying_key());
+        let trust = trust_with(&key_id);
+        let mut content = signed_resize(&key);
+        // Mutate a signed field after signing: verification must fail.
+        content.as_object_mut().unwrap()["rows"] = serde_json::json!(200);
+        assert!(
+            authorize_control_from_states(
+                &agents_with_owner(&key),
+                "@bob:matrix.org",
+                &content,
+                &key_id,
+                &trust
+            )
+            .is_err(),
+            "a resize whose signed content was altered must be rejected"
+        );
+    }
+
+    /// The room as seen by a resize handler: the requester `@bob` published `key`.
+    fn agents_with_owner(key: &SigningKey) -> Vec<AgentState> {
+        vec![agent_with("@bob:matrix.org", key)]
     }
 
     #[test]

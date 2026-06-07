@@ -88,10 +88,11 @@ pub use event_router::{
 pub use exec::{
     authorize_exec_cancel, authorize_exec_request, authorize_exec_request_with_allowance,
     build_signed_exec_cancel, build_signed_exec_request, build_signed_exec_stdin,
-    emit_exec_accepted, emit_exec_cancelled, emit_exec_rejected, handle_live_exec_cancel,
-    handle_live_exec_request, handle_live_exec_stdin, handle_live_pty_resize, invocation_state_for,
-    publish_invocation_state, send_exec_cancel, send_exec_request, send_exec_stdin,
-    send_pty_resize, CancelRejection, ExecRejection, ExecRequestOptions,
+    build_signed_pty_resize, emit_exec_accepted, emit_exec_cancelled, emit_exec_rejected,
+    handle_live_exec_cancel, handle_live_exec_request, handle_live_exec_stdin,
+    handle_live_pty_resize, invocation_state_for, publish_invocation_state, send_exec_cancel,
+    send_exec_request, send_exec_stdin, send_pty_resize, CancelRejection, ExecRejection,
+    ExecRequestOptions,
 };
 pub use exec_ipc::{
     handle_exec_cancel_loopback, handle_exec_stdin_loopback, send_exec_cancel_matrix,
