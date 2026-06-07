@@ -86,7 +86,8 @@ scripts/matrix_integration_test.sh --teardown   # ...and stop the homeserver aft
 ```
 
 That suite covers the live daemon paths end to end (issue #202): login/`/sync`,
-signed remote `call` and `exec` (streaming, stdin, and policy denial), E2EE
+signed remote `call` and `exec` (streaming, stdin, policy denial, and interactive
+`--pty` with terminal resize), E2EE
 privileged-event handling, and the live scheduler loop auto-executing a signed,
 assigned task DAG over real room state while refusing policy-denied and
 approval-required actions. To drive the homeserver manually instead:

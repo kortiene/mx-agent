@@ -41,15 +41,16 @@ use mx_agent_policy::{Allowance, DenyReason, ExecContext, Outcome, Policy, Sandb
 use mx_agent_protocol::events::state::INVOCATION;
 use mx_agent_protocol::events::timeline::{
     EXEC_ACCEPTED, EXEC_CANCEL, EXEC_CANCELLED, EXEC_FINISHED, EXEC_REJECTED, EXEC_REQUEST,
-    EXEC_STDIN, STREAM_ARTIFACT, STREAM_CHUNK,
+    EXEC_STDIN, PTY_RESIZE, STREAM_ARTIFACT, STREAM_CHUNK,
 };
 use mx_agent_protocol::schema::{
     AgentState, ExecAccepted, ExecCancel, ExecCancelled, ExecFinished, ExecRejected, ExecRequest,
-    ExecStdin, InvocationState, Signature, StreamKind,
+    ExecStdin, InvocationState, PtyResize, Signature, StreamChunk, StreamKind,
 };
 use mx_agent_protocol::signing::{self, SignatureError, SIGNATURE_FIELD};
 
 use crate::audit::{AuditLog, AuditRecord};
+use crate::pty::{PtySession, PtyWinsize};
 use crate::runner::{
     build_command, kill_process_group, terminate_process_group, RunOutput, RunSpec,
 };
@@ -62,8 +63,14 @@ type StdinFrame = Option<Vec<u8>>;
 #[derive(Debug, Clone)]
 struct LiveExecControl {
     requester_agent: String,
+    /// Matrix user id of the requester, used to authorize the unsigned
+    /// `pty.resize` window-size hint (architecture §7.1; issue #238).
+    requester_user: String,
     stdin: tokio::sync::mpsc::Sender<StdinFrame>,
     cancel: tokio::sync::watch::Sender<Option<String>>,
+    /// Live terminal-resize channel for an interactive PTY invocation; `None`
+    /// for non-PTY exec, which has no terminal to resize.
+    resize: Option<tokio::sync::mpsc::Sender<PtyWinsize>>,
 }
 
 static LIVE_EXEC_CONTROLS: OnceLock<Mutex<HashMap<String, LiveExecControl>>> = OnceLock::new();
@@ -558,6 +565,16 @@ pub async fn handle_live_exec_request(
         tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to publish running invocation state");
     }
 
+    // Resolve the requester's Matrix user id so an (unsigned) `pty.resize`
+    // window hint can be authorized by homeserver-authenticated sender identity
+    // for an interactive PTY invocation (issue #238).
+    let requester_user = crate::agent::read_agent_state(&room, &request.requesting_agent)
+        .await
+        .ok()
+        .flatten()
+        .map(|agent| agent.matrix_user_id)
+        .unwrap_or_default();
+
     // Register the live-exec control *synchronously*, before spawning the run
     // task, so a stdin or cancel frame routed in the same (or a later) sync
     // batch always finds this invocation. Registering inside the spawned task
@@ -566,14 +583,32 @@ pub async fn handle_live_exec_request(
     // such as `cat` until their timeout.
     let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<StdinFrame>(64);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    let (resize_tx, resize_rx) = tokio::sync::mpsc::channel::<PtyWinsize>(16);
     insert_live_exec_control(
         request.invocation_id.clone(),
         LiveExecControl {
             requester_agent: request.requesting_agent.clone(),
+            requester_user,
             stdin: stdin_tx,
             cancel: cancel_tx,
+            resize: request.pty.then_some(resize_tx),
         },
     );
+
+    // Interactive PTY exec takes a dedicated live-streaming path: the daemon
+    // allocates a pseudo-terminal, streams the merged master output as
+    // `stream:"pty"` chunks as it is produced, and applies signed stdin / cancel
+    // and (sender-authorized) resize controls (issue #238).
+    if request.pty {
+        let room = room.clone();
+        tokio::spawn(async move {
+            run_pty_exec_task(
+                room, request, allowance, stdin_rx, resize_rx, cancel_rx, state,
+            )
+            .await;
+        });
+        return;
+    }
 
     let client = client.clone();
     let room = room.clone();
@@ -1031,6 +1066,342 @@ async fn run_controlled_exec(
         })
     } else {
         Ok(ControlledExecResult::Finished(output))
+    }
+}
+
+/// The terminal outcome of an interactive PTY invocation.
+struct PtyExecOutcome {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    cancelled: bool,
+    killed_process_group: bool,
+    output_bytes: u64,
+}
+
+/// Drive an interactive PTY invocation to completion, emitting the terminal
+/// `exec.finished` / `exec.cancelled` event and invocation state (issue #238).
+///
+/// Live merged output is streamed as `stream:"pty"` chunks by
+/// [`run_controlled_pty_exec`] while the command runs; this wraps that with the
+/// same finalization shape as the non-PTY live path.
+#[allow(clippy::too_many_arguments)]
+async fn run_pty_exec_task(
+    room: Room,
+    request: ExecRequest,
+    allowance: Allowance,
+    stdin_rx: tokio::sync::mpsc::Receiver<StdinFrame>,
+    resize_rx: tokio::sync::mpsc::Receiver<PtyWinsize>,
+    cancel_rx: tokio::sync::watch::Receiver<Option<String>>,
+    mut state: InvocationState,
+) {
+    let started = std::time::Instant::now();
+    let outcome =
+        run_controlled_pty_exec(&request, &allowance, &room, stdin_rx, resize_rx, cancel_rx).await;
+    remove_live_exec_control(&request.invocation_id);
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let rejection = ExecRejection::PolicyDenied(DenyReason::CommandNotAllowed {
+                command: err.to_string(),
+            });
+            let _ = emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await;
+            return;
+        }
+    };
+
+    if outcome.cancelled {
+        let finished_at = rfc3339_now();
+        let _ = emit_exec_cancelled(
+            &room,
+            request.invocation_id.clone(),
+            crate::runner::CANCEL_SIGNAL,
+            outcome.killed_process_group,
+            finished_at.clone(),
+        )
+        .await;
+        state.state = crate::invocation::STATE_CANCELLED.to_string();
+        state.exit_code = outcome.exit_code;
+        state.updated_at = finished_at;
+        state.state_rev = state.state_rev.saturating_add(1);
+        let _ = publish_invocation_state(&room, &state).await;
+        return;
+    }
+
+    let finished = ExecFinished {
+        invocation_id: request.invocation_id.clone(),
+        exit_code: outcome.exit_code,
+        signal: outcome.signal.and_then(signal_name),
+        duration_ms: started.elapsed().as_millis() as u64,
+        // A PTY is a single merged stream, so all bytes are reported under
+        // stdout and stderr is zero (architecture §7.3).
+        stdout_bytes: outcome.output_bytes,
+        stderr_bytes: 0,
+        truncated: false,
+        artifact_mxc: None,
+        extra: Default::default(),
+    };
+    if let Ok(content) = serde_json::to_value(&finished) {
+        if let Err(e) = room.send_raw(EXEC_FINISHED, content).await {
+            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.finished for pty");
+        }
+    }
+    state.state = match outcome.exit_code {
+        Some(code) => crate::invocation::terminal_state_for_exit(code).to_string(),
+        None => crate::invocation::STATE_FAILED.to_string(),
+    };
+    state.exit_code = outcome.exit_code;
+    state.updated_at = rfc3339_now();
+    state.state_rev = state.state_rev.saturating_add(1);
+    let _ = publish_invocation_state(&room, &state).await;
+}
+
+/// Run an authorized interactive PTY exec under live stdin/resize/cancel control,
+/// streaming the merged terminal output to `room` as `stream:"pty"` chunks.
+///
+/// PTY master I/O is blocking, so the read/write/resize loops run on dedicated
+/// OS threads that bridge to the async chunker and the control channels. The
+/// child runs in its own process group, so a cancel or timeout signals the whole
+/// group (architecture §7.4/§7.5).
+async fn run_controlled_pty_exec(
+    request: &ExecRequest,
+    allowance: &Allowance,
+    room: &Room,
+    stdin_rx: tokio::sync::mpsc::Receiver<StdinFrame>,
+    resize_rx: tokio::sync::mpsc::Receiver<PtyWinsize>,
+    mut cancel_rx: tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<PtyExecOutcome, crate::runner::RunError> {
+    use std::io::{Read as _, Write as _};
+
+    let spec = RunSpec {
+        command: request.command.clone(),
+        cwd: PathBuf::from(&request.cwd),
+        env: request.env.clone(),
+        env_allowlist: allowance.env_allowlist.clone(),
+        timeout: Some(Duration::from_millis(
+            allowance.max_runtime_ms.unwrap_or(request.timeout_ms),
+        )),
+        sandbox: sandbox_backend(allowance.sandbox),
+        ..Default::default()
+    };
+    // The requester sends an initial `pty.resize` with the real terminal size
+    // immediately, so the conventional 24x80 is only the pre-resize default.
+    let session = PtySession::spawn(&spec, PtyWinsize::default())?;
+    let pid = Some(session.id());
+    let reader = session
+        .try_clone_reader()
+        .map_err(crate::runner::RunError::Spawn)?;
+    let stdin_writer = session
+        .try_clone_writer()
+        .map_err(crate::runner::RunError::Spawn)?;
+    let resize_fd = session
+        .try_clone_writer()
+        .map_err(crate::runner::RunError::Spawn)?;
+
+    // Output: a blocking reader thread feeds the async chunker over an mpsc.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                // A PTY master reports EIO once the slave is gone; treat any read
+                // error as end-of-stream.
+                Err(_) => break,
+            }
+        }
+    });
+    // Stdin: drain the control channel, writing keystrokes to the master.
+    std::thread::spawn(move || {
+        let mut writer = stdin_writer;
+        let mut rx = stdin_rx;
+        while let Some(frame) = rx.blocking_recv() {
+            match frame {
+                Some(bytes) => {
+                    if writer.write_all(&bytes).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+                // For a PTY, end-of-input is the literal Ctrl-D byte; stop
+                // forwarding rather than closing the master (which would kill the
+                // session).
+                None => break,
+            }
+        }
+    });
+    // Resize: apply each new window size to the master.
+    std::thread::spawn(move || {
+        let fd = resize_fd;
+        let mut rx = resize_rx;
+        while let Some(size) = rx.blocking_recv() {
+            let _ = rustix::termios::tcsetwinsize(&fd, size.into());
+        }
+    });
+
+    // Chunker: forward merged output to the room as `stream:"pty"` chunks until
+    // the reader thread closes the channel (the child exited), then emit EOF.
+    let chunk_room = room.clone();
+    let chunk_invocation = request.invocation_id.clone();
+    let chunker = tokio::spawn(async move {
+        let mut seq = 0u64;
+        let mut total = 0u64;
+        while let Some(bytes) = out_rx.recv().await {
+            total += bytes.len() as u64;
+            emit_pty_chunk(&chunk_room, &chunk_invocation, &bytes, false, &mut seq).await;
+        }
+        emit_pty_chunk(&chunk_room, &chunk_invocation, &[], true, &mut seq).await;
+        total
+    });
+
+    let grace = spec.grace_period;
+    let timeout = spec.timeout.unwrap_or(Duration::from_secs(u64::MAX));
+    let mut wait = tokio::task::spawn_blocking(move || {
+        let mut session = session;
+        session.wait()
+    });
+    let mut cancelled = false;
+    let mut killed_process_group = false;
+    let status = tokio::select! {
+        res = &mut wait => join_wait(res)?,
+        _ = cancel_rx.changed() => {
+            cancelled = true;
+            terminate_then_kill(pid, grace, &mut wait, &mut killed_process_group).await?
+        }
+        _ = tokio::time::sleep(timeout) => {
+            terminate_then_kill(pid, grace, &mut wait, &mut killed_process_group).await?
+        }
+    };
+    let output_bytes = chunker.await.unwrap_or(0);
+
+    let signal = {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal()
+    };
+    Ok(PtyExecOutcome {
+        exit_code: status.code(),
+        signal,
+        cancelled,
+        killed_process_group,
+        output_bytes,
+    })
+}
+
+/// Resolve a blocking-wait join result into the child's exit status.
+fn join_wait(
+    res: Result<std::io::Result<std::process::ExitStatus>, tokio::task::JoinError>,
+) -> Result<std::process::ExitStatus, crate::runner::RunError> {
+    match res {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(e)) => Err(crate::runner::RunError::Spawn(e)),
+        Err(e) => Err(crate::runner::RunError::Spawn(std::io::Error::other(e))),
+    }
+}
+
+/// SIGTERM the child's process group, then escalate to SIGKILL after `grace`,
+/// returning the child's final exit status.
+async fn terminate_then_kill(
+    pid: Option<u32>,
+    grace: Duration,
+    wait: &mut tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    killed_process_group: &mut bool,
+) -> Result<std::process::ExitStatus, crate::runner::RunError> {
+    let Some(pid) = pid else {
+        return join_wait(wait.await);
+    };
+    terminate_process_group(pid);
+    match tokio::time::timeout(grace, &mut *wait).await {
+        Ok(res) => join_wait(res),
+        Err(_) => {
+            *killed_process_group = true;
+            kill_process_group(pid);
+            join_wait(wait.await)
+        }
+    }
+}
+
+/// Emit one `com.mxagent.stream.chunk.v1` of merged PTY output (base64) into
+/// `room`, advancing `seq`.
+async fn emit_pty_chunk(room: &Room, invocation_id: &str, data: &[u8], eof: bool, seq: &mut u64) {
+    use base64::Engine as _;
+    let chunk = StreamChunk {
+        invocation_id: invocation_id.to_string(),
+        stream: StreamKind::Pty,
+        seq: *seq,
+        encoding: "base64".to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(data),
+        eof,
+        compressed: false,
+        sha256: None,
+        timestamp: rfc3339_now(),
+        extra: Default::default(),
+    };
+    *seq += 1;
+    if let Ok(content) = serde_json::to_value(&chunk) {
+        if let Err(e) = room.send_raw(STREAM_CHUNK, content).await {
+            tracing::warn!(error = %e, invocation_id, "failed to emit pty stream.chunk");
+        }
+    }
+}
+
+/// Send an unsigned `com.mxagent.pty.resize.v1` window-size hint into `room`.
+///
+/// Resize carries no signature: it changes only the window size of an
+/// already-authorized, running invocation and can execute nothing. The target
+/// authorizes it by Matrix sender identity (see [`handle_live_pty_resize`]).
+pub async fn send_pty_resize(
+    room: &Room,
+    invocation_id: impl Into<String>,
+    size: PtyWinsize,
+) -> Result<(), WorkspaceError> {
+    let resize = PtyResize {
+        invocation_id: invocation_id.into(),
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: size.pixel_width,
+        pixel_height: size.pixel_height,
+        extra: Default::default(),
+    };
+    let content = serde_json::to_value(&resize)
+        .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    room.send_raw(PTY_RESIZE, content)
+        .await
+        .map_err(WorkspaceError::from)?;
+    Ok(())
+}
+
+/// Handle a routed `com.mxagent.pty.resize.v1` for a live PTY invocation on this
+/// daemon.
+///
+/// Resize is an unsigned, non-executing window-size hint, so it is authorized by
+/// the homeserver-authenticated Matrix `sender`: only the invocation's original
+/// requester may resize its terminal. Room membership alone never resizes
+/// another agent's session, and a resize for an unknown or non-PTY invocation is
+/// silently ignored.
+pub async fn handle_live_pty_resize(sender: &str, resize: &PtyResize) {
+    let Some(control) = live_exec_control(&resize.invocation_id) else {
+        return;
+    };
+    if control.requester_user.is_empty() || control.requester_user != sender {
+        tracing::warn!(
+            invocation_id = %resize.invocation_id,
+            "rejected unauthorized pty resize"
+        );
+        return;
+    }
+    if let Some(resize_tx) = &control.resize {
+        let size = PtyWinsize {
+            rows: resize.rows,
+            cols: resize.cols,
+            pixel_width: resize.pixel_width,
+            pixel_height: resize.pixel_height,
+        };
+        let _ = resize_tx.send(size).await;
     }
 }
 

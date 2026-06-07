@@ -24,6 +24,7 @@ pub mod lifecycle;
 pub mod matrix;
 #[cfg(unix)]
 pub mod pty;
+pub mod pty_ipc;
 pub mod replay;
 pub mod runner;
 pub mod scheduler;
@@ -88,9 +89,9 @@ pub use exec::{
     authorize_exec_cancel, authorize_exec_request, authorize_exec_request_with_allowance,
     build_signed_exec_cancel, build_signed_exec_request, build_signed_exec_stdin,
     emit_exec_accepted, emit_exec_cancelled, emit_exec_rejected, handle_live_exec_cancel,
-    handle_live_exec_request, handle_live_exec_stdin, invocation_state_for,
+    handle_live_exec_request, handle_live_exec_stdin, handle_live_pty_resize, invocation_state_for,
     publish_invocation_state, send_exec_cancel, send_exec_request, send_exec_stdin,
-    CancelRejection, ExecRejection, ExecRequestOptions,
+    send_pty_resize, CancelRejection, ExecRejection, ExecRequestOptions,
 };
 pub use exec_ipc::{
     handle_exec_cancel_loopback, handle_exec_stdin_loopback, send_exec_cancel_matrix,
@@ -125,6 +126,10 @@ pub use matrix::{
 pub use mx_agent_protocol::schema::{TaskAction, TaskActionAuthorization, TaskResult};
 #[cfg(unix)]
 pub use pty::{PtySession, PtyWinsize};
+pub use pty_ipc::{
+    run_pty_loopback, ExecPtyParams, PtyResizeFrame, PtyServerFrame, PtyStdinFrame,
+    METHOD_EXEC_PTY, METHOD_PTY_RESIZE, METHOD_PTY_STDIN,
+};
 pub use replay::{ReplayCache, ReplayError, DEFAULT_CAPACITY};
 pub use runner::{
     is_secret_var, kill_process_group, run, sanitize_env, terminate_process_group, RunError,
