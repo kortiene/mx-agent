@@ -224,10 +224,14 @@ fn tick(
     // A fresh attempt set per tick: the in-memory store updates synchronously,
     // so there is no stale re-read to dedupe (unlike the live loop).
     let mut attempted = std::collections::HashSet::new();
+    // No invocation snapshot in this in-memory tick: every not-live executing
+    // task is treated as a stale orphan (the historical recovery behavior).
+    let invocations = std::collections::BTreeMap::new();
     mx_agent_daemon::run_scheduler_tick(
         scheduler,
         orchestrator,
         &snapshot,
+        &invocations,
         &mut claimed_invocations,
         store,
         dispatcher,

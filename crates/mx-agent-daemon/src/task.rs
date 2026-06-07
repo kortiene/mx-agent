@@ -13,15 +13,19 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::SigningKey;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::TASK as TASK_STATE_TYPE;
 use mx_agent_protocol::id::generate_task_id;
-use mx_agent_protocol::schema::{TaskAction, TaskState};
+use mx_agent_protocol::schema::{InvocationState, TaskAction, TaskResult, TaskState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::invocation::{
+    cancel_invocation, task_result_from_invocation, task_state_for_invocation,
+};
 use crate::matrix::restore_client;
 use crate::session::StoredSession;
 use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
@@ -533,6 +537,135 @@ pub async fn update_task_for_session(
     update_task(&client, options).await
 }
 
+/// Decide the terminal state and structured `result` for a cancelled task,
+/// reconciling against its linked invocation by the unified id (issue #239).
+///
+/// This is the pure, side-effect-free core of [`cancel_task`]:
+///
+/// - When the linked invocation was read back (always terminal after
+///   [`cancel_invocation`] runs — it either cancelled a live invocation or
+///   returned an already-finished one unchanged), the task is reconciled to the
+///   invocation's *real* terminal outcome: a cancelled invocation finalizes the
+///   task `cancelled`, while an invocation that had already `succeeded`/`failed`
+///   before the cancel reached it finalizes the task to that outcome instead of a
+///   misleading `cancelled`. The result is derived from the invocation
+///   ([`task_result_from_invocation`]) so it carries the unified `invocation_id`.
+/// - When there is no linked invocation (no id, or the invocation state was never
+///   published — e.g. the local-synchronous dispatch path), the task is finalized
+///   `cancelled` with a minimal, non-sensitive result.
+///
+/// The result is always non-sensitive (no raw process output).
+fn cancel_finalization(
+    invocation: Option<&InvocationState>,
+    task: &TaskState,
+    completed_by: &str,
+    now: String,
+) -> (&'static str, Value) {
+    match invocation {
+        Some(inv) => {
+            let state = task_state_for_invocation(&inv.state).unwrap_or(STATE_CANCELLED);
+            (
+                state,
+                task_result_from_invocation(inv, completed_by, now).into_value(),
+            )
+        }
+        None => {
+            let result = TaskResult {
+                status: STATE_CANCELLED.to_string(),
+                completed_by: completed_by.to_string(),
+                completed_at: now,
+                invocation_id: task.invocation_id.clone(),
+                action: None,
+                reason: Some("cancelled".to_string()),
+                exit_code: None,
+                summary: Some("task cancelled".to_string()),
+                artifact_mxc: None,
+                extra: Default::default(),
+            };
+            (STATE_CANCELLED, result.into_value())
+        }
+    }
+}
+
+/// Cancel a task and drive its linked remote invocation to `cancelled`,
+/// finalizing the owning task accordingly (issue #239).
+///
+/// Reads the task first: an unknown id is [`WorkspaceError::TaskNotFound`], and an
+/// already-terminal task is returned unchanged (cancelling finished work is a
+/// no-op and must never reopen a terminal task). Otherwise, when the task records
+/// an `invocation_id`, the linked invocation is cancelled through the existing
+/// signed cancel path ([`cancel_invocation`]): the daemon signs a
+/// `com.mxagent.exec.cancel.v1`, and the target agent verifies the requester's
+/// ownership/trust before terminating the process group and confirming with
+/// `com.mxagent.exec.cancelled.v1`. A missing invocation state
+/// ([`WorkspaceError::InvocationNotFound`]) is treated as benign (e.g. the
+/// local-synchronous dispatch path publishes no live invocation state) and the
+/// task is still finalized. The owning task is then finalized to the reconciled
+/// terminal state with a non-sensitive structured `result` (see
+/// [`cancel_finalization`]).
+///
+/// The cancel is privileged: the caller supplies the daemon's signing key so the
+/// target can authorize the requester. The coding agent never sees the key.
+pub async fn cancel_task(
+    client: &Client,
+    signing_key: &SigningKey,
+    key_id: &str,
+    room: &str,
+    task_id: &str,
+    reason: &str,
+) -> Result<TaskState, WorkspaceError> {
+    let resolved = sync_and_get_room(client, room).await?;
+    let (task, _event_id) = read_task_state(&resolved, task_id)
+        .await?
+        .ok_or_else(|| WorkspaceError::TaskNotFound(task_id.to_string()))?;
+
+    // Cancelling an already-finished task is a no-op; never reopen a terminal task.
+    if is_terminal(&task.state) {
+        return Ok(task);
+    }
+
+    // Drive the linked remote invocation to cancelled (signed/trust/ownership
+    // checked by the target). A task with no published invocation state is
+    // finalized cancelled without a remote cancel.
+    let invocation = match &task.invocation_id {
+        Some(invocation_id) => {
+            match cancel_invocation(client, signing_key, key_id, room, invocation_id, reason).await
+            {
+                Ok(invocation) => Some(invocation),
+                Err(WorkspaceError::InvocationNotFound(_)) => None,
+                Err(err) => return Err(err),
+            }
+        }
+        None => None,
+    };
+
+    let completed_by = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+    let (terminal, result) =
+        cancel_finalization(invocation.as_ref(), &task, &completed_by, now_rfc3339());
+
+    let options = UpdateTaskOptions {
+        room: room.to_string(),
+        task_id: task_id.to_string(),
+        state: Some(terminal.to_string()),
+        result: Some(result),
+        ..UpdateTaskOptions::default()
+    };
+    update_task(client, &options).await
+}
+
+/// Cancel a task, restoring the authenticated client from `session`.
+pub async fn cancel_task_for_session(
+    session: &StoredSession,
+    signing_key: &SigningKey,
+    key_id: &str,
+    room: &str,
+    task_id: &str,
+    reason: &str,
+) -> Result<TaskState, WorkspaceError> {
+    let client = restore_client(session).await?;
+    cancel_task(&client, signing_key, key_id, room, task_id, reason).await
+}
+
 /// Read the tasks in an already-synced `room`, applying `options`' filters and
 /// sorting by `task_id` for a stable, deterministic ordering.
 ///
@@ -918,5 +1051,79 @@ mod tests {
                 ..Default::default()
             }
         ));
+    }
+
+    fn invocation(state: &str, exit_code: Option<i32>) -> InvocationState {
+        InvocationState {
+            invocation_id: "inv_1".to_string(),
+            task_id: Some("task_a".to_string()),
+            requester: "@planner:server".to_string(),
+            target: "developer-pi".to_string(),
+            state: state.to_string(),
+            created_at: "2026-06-04T18:00:00Z".to_string(),
+            updated_at: "2026-06-04T18:00:00Z".to_string(),
+            exit_code,
+            state_rev: 2,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cancel_finalization_uses_cancelled_invocation_outcome() {
+        let task = task_with("task_a", STATE_EXECUTING, "developer-pi");
+        let inv = invocation(STATE_CANCELLED, None);
+        let (state, result) = cancel_finalization(Some(&inv), &task, "developer-pi", "now".into());
+        assert_eq!(state, STATE_CANCELLED);
+        assert_eq!(
+            result.get("status").and_then(Value::as_str),
+            Some("cancelled")
+        );
+        assert_eq!(
+            result.get("invocation_id").and_then(Value::as_str),
+            Some("inv_1")
+        );
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("cancelled")
+        );
+    }
+
+    #[test]
+    fn cancel_finalization_reconciles_already_finished_invocation() {
+        // The invocation already succeeded before the cancel reached it; reconcile
+        // the task to the real outcome rather than a misleading `cancelled`.
+        let task = task_with("task_a", STATE_EXECUTING, "developer-pi");
+        let inv = invocation(STATE_SUCCEEDED, Some(0));
+        let (state, result) = cancel_finalization(Some(&inv), &task, "developer-pi", "now".into());
+        assert_eq!(state, STATE_SUCCEEDED);
+        assert_eq!(
+            result.get("status").and_then(Value::as_str),
+            Some("succeeded")
+        );
+        assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(0));
+    }
+
+    #[test]
+    fn cancel_finalization_without_invocation_is_minimal_cancelled() {
+        let mut task = task_with("task_a", STATE_EXECUTING, "developer-pi");
+        task.invocation_id = Some("inv_x".to_string());
+        let (state, result) = cancel_finalization(None, &task, "developer-pi", "now".into());
+        assert_eq!(state, STATE_CANCELLED);
+        assert_eq!(
+            result.get("status").and_then(Value::as_str),
+            Some("cancelled")
+        );
+        assert_eq!(
+            result.get("invocation_id").and_then(Value::as_str),
+            Some("inv_x")
+        );
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("cancelled")
+        );
+        assert_eq!(
+            result.get("summary").and_then(Value::as_str),
+            Some("task cancelled")
+        );
     }
 }

@@ -38,7 +38,7 @@ use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
 use mx_agent_policy::Policy;
-use mx_agent_protocol::schema::{TaskAction, TaskState};
+use mx_agent_protocol::schema::{InvocationState, TaskAction, TaskState};
 
 use crate::approval::{
     approval_request_expiry, decision_permits_spawn, read_approval_decisions, ApprovalQueue,
@@ -204,11 +204,14 @@ where
 /// Run one scheduler tick against a task `snapshot`.
 ///
 /// This is the single tick used by both the live loop and the deterministic
-/// tests. It first performs restart recovery over `executing` tasks
-/// ([`TaskOrchestrator::recover_executing_tasks`]) — an `executing` task this
-/// daemon owns whose invocation is *not* one this run has claimed is finalized
-/// `failed` with a recovery result rather than re-run, so a restart never
-/// double-runs work. It then computes the scheduler-runnable tasks and processes
+/// tests. It first reconciles `executing` tasks against the room's invocation
+/// snapshot ([`TaskOrchestrator::reconcile_executing_tasks`]) by the unified id —
+/// an `executing` task this daemon owns whose invocation already finished is
+/// reconciled to that outcome, one still running is left alone, and a genuine
+/// orphan (no invocation, not claimed this run) is finalized `failed` rather than
+/// re-run, so a restart never double-runs work (`invocations` may be empty when
+/// no snapshot is available, matching the historical fail-the-orphan behavior).
+/// It then computes the scheduler-runnable tasks and processes
 /// each through [`TaskOrchestrator::process_one`], which authorizes
 /// (signature/trust/replay + deny-by-default policy + approval) before any claim
 /// or dispatch. Returns one [`OrchestrationOutcome`] per recovery decision and
@@ -232,10 +235,12 @@ where
 /// would be re-read as still `pending`, re-verified, and rejected by replay
 /// protection (blocking work the scheduler already ran). The in-memory tests
 /// pass a fresh set, since their store updates synchronously.
+#[allow(clippy::too_many_arguments)]
 pub fn run_scheduler_tick<S, D>(
     scheduler: &TaskScheduler,
     orchestrator: &TaskOrchestrator,
     snapshot: &[TaskState],
+    invocations: &BTreeMap<String, InvocationState>,
     claimed_invocations: &mut BTreeSet<String>,
     store: &mut S,
     dispatcher: &mut D,
@@ -245,7 +250,8 @@ where
     S: TaskStore,
     D: TaskDispatcher,
 {
-    let mut outcomes = orchestrator.recover_executing_tasks(snapshot, claimed_invocations, store);
+    let mut outcomes =
+        orchestrator.reconcile_executing_tasks(snapshot, claimed_invocations, invocations, store);
 
     let running = snapshot
         .iter()
@@ -561,6 +567,21 @@ fn scheduler_pass_for_agent(
     // as stale and the task would never reach a terminal state).
     let mut write_cache: BTreeMap<String, (TaskState, Option<String>)> = BTreeMap::new();
     let mut store = MatrixTaskStore::new(room_id.to_string(), |options: UpdateTaskOptions| {
+        // Never clobber a task another writer has already finalized — in
+        // particular an operator `task cancel` that finalized it `cancelled` while
+        // this daemon was mid-dispatch (issue #239). If the live room state shows
+        // the task terminal, refuse the write as stale so the cancelled outcome
+        // wins. A lagging non-terminal read is harmless: the write cache below
+        // still drives the claim→finalize transition (#230).
+        if let Ok(Some((latest, _))) = runtime.block_on(read_task_state(room, &options.task_id)) {
+            if crate::task::is_terminal(&latest.state) {
+                return Err(WorkspaceError::StaleTaskUpdate {
+                    task_id: options.task_id.clone(),
+                    expected: options.expected_state_rev.unwrap_or(latest.state_rev),
+                    current: latest.state_rev,
+                });
+            }
+        }
         let (current, event_id) = match write_cache.get(&options.task_id) {
             Some((state, event_id)) => (state.clone(), event_id.clone()),
             None => match runtime.block_on(read_task_state(room, &options.task_id))? {
@@ -574,6 +595,24 @@ fn scheduler_pass_for_agent(
         Ok(updated)
     });
 
+    // Restart reconciliation matches an `executing` task to its live invocation
+    // state by the unified id (issue #239): read the room's invocation snapshot so
+    // a task whose remote invocation already finished is reconciled to that real
+    // outcome, one still running is left alone, and a genuine orphan is recovered.
+    // A read failure yields an empty map (fail the orphan, the historical default).
+    let invocations: BTreeMap<String, InvocationState> = match runtime
+        .block_on(crate::invocation::read_all_invocation_states(room))
+    {
+        Ok(states) => states
+            .into_iter()
+            .map(|inv| (inv.invocation_id.clone(), inv))
+            .collect(),
+        Err(e) => {
+            tracing::debug!(error = %e, room = %room_id, "scheduler pass could not read invocation states");
+            BTreeMap::new()
+        }
+    };
+
     // Local dispatch runs the action in-process; Matrix dispatch routes it
     // through the signed Matrix `call`/`exec` transport (issue #200), so the
     // daemon's own /sync loop receives the request and runs it through the full
@@ -585,6 +624,7 @@ fn scheduler_pass_for_agent(
                 &scheduler,
                 &orchestrator,
                 snapshot,
+                &invocations,
                 claimed_invocations,
                 &mut store,
                 &mut dispatcher,
@@ -603,6 +643,7 @@ fn scheduler_pass_for_agent(
                 &scheduler,
                 &orchestrator,
                 snapshot,
+                &invocations,
                 claimed_invocations,
                 &mut store,
                 &mut dispatcher,
@@ -626,6 +667,10 @@ fn log_outcome(room_id: &str, agent_id: &str, outcome: &OrchestrationOutcome) {
         }
         OrchestrationOutcome::RecoveredStale { task_id } => tracing::warn!(
             room = %room_id, agent = %agent_id, task_id = %task_id, "scheduler recovered stale executing task"
+        ),
+        OrchestrationOutcome::ReconciledInvocation { task_id, state } => tracing::info!(
+            room = %room_id, agent = %agent_id, task_id = %task_id, state = %state,
+            "scheduler reconciled executing task with its terminal invocation"
         ),
         OrchestrationOutcome::AwaitingApproval { task_id, .. } => tracing::info!(
             room = %room_id, agent = %agent_id, task_id = %task_id, "scheduler holding task pending approval"
@@ -668,6 +713,8 @@ impl OrchestrationOutcome {
             | Self::Denied { task_id, .. }
             | Self::Completed { task_id, .. }
             | Self::RecoveredStale { task_id }
+            | Self::ReconciledInvocation { task_id, .. }
+            | Self::StillRunningInvocation { task_id }
             | Self::StaleRemoteExecuting { task_id, .. }
             | Self::AwaitingApproval { task_id, .. }
             | Self::StoreError { task_id, .. } => task_id,
@@ -829,6 +876,7 @@ allow_cwd = ["/repo"]
             &scheduler,
             &orchestrator,
             &snapshot,
+            &BTreeMap::new(),
             &mut claimed,
             &mut matrix_store,
             dispatcher,
@@ -886,6 +934,7 @@ allow_cwd = ["/repo"]
             &scheduler,
             &orchestrator,
             &snapshot,
+            &BTreeMap::new(),
             &mut claimed,
             &mut matrix_store,
             &mut dispatcher,
@@ -896,6 +945,7 @@ allow_cwd = ["/repo"]
             &scheduler,
             &orchestrator,
             &snapshot,
+            &BTreeMap::new(),
             &mut claimed,
             &mut matrix_store,
             &mut dispatcher,
@@ -1119,6 +1169,7 @@ allow_cwd = ["/repo"]
                 &scheduler,
                 &orchestrator,
                 &snapshot1,
+                &BTreeMap::new(),
                 &mut claimed,
                 &mut matrix_store,
                 &mut dispatcher,
@@ -1159,6 +1210,7 @@ allow_cwd = ["/repo"]
                 &scheduler,
                 &orchestrator,
                 &stale_snapshot,
+                &BTreeMap::new(),
                 &mut claimed,
                 &mut matrix_store,
                 &mut dispatcher,
@@ -1254,6 +1306,7 @@ requires_approval = true
             &scheduler,
             &orchestrator,
             &snapshot,
+            &BTreeMap::new(),
             &mut claimed,
             &mut matrix_store,
             dispatcher,
@@ -1367,6 +1420,7 @@ requires_approval = true
                 &scheduler,
                 &orchestrator,
                 &snapshot,
+                &BTreeMap::new(),
                 &mut claimed,
                 &mut matrix_store,
                 &mut dispatcher,
@@ -1415,6 +1469,7 @@ requires_approval = true
                 &scheduler,
                 &orchestrator,
                 &snapshot,
+                &BTreeMap::new(),
                 &mut claimed,
                 &mut matrix_store,
                 &mut dispatcher,

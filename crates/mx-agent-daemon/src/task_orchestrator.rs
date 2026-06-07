@@ -19,11 +19,15 @@ use mx_agent_policy::{CallContext, ExecContext, Outcome, Policy};
 use mx_agent_protocol::canonical_json;
 use mx_agent_protocol::id::generate_invocation_id;
 use mx_agent_protocol::schema::{
-    ApprovalRequest, Signature, TaskAction, TaskActionAuthorization, TaskResult, TaskState,
+    ApprovalRequest, InvocationState, Signature, TaskAction, TaskActionAuthorization, TaskResult,
+    TaskState,
 };
 use mx_agent_protocol::signing::{self, SignatureError};
 
 use crate::approval::{ApprovalQueue, PendingApproval};
+use crate::invocation::{
+    is_terminal as invocation_is_terminal, task_result_from_invocation, task_state_for_invocation,
+};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
@@ -254,6 +258,23 @@ pub enum OrchestrationOutcome {
     },
     /// Previously executing local work was recovered without respawning.
     RecoveredStale {
+        /// Task ID.
+        task_id: String,
+    },
+    /// On restart, an `executing` task was reconciled with its linked invocation
+    /// by the unified id: the invocation had already reached a terminal state, so
+    /// the task was finalized to that real outcome rather than blindly failed
+    /// (issue #239).
+    ReconciledInvocation {
+        /// Task ID.
+        task_id: String,
+        /// Terminal state the task was reconciled to (from the invocation).
+        state: String,
+    },
+    /// On restart, an `executing` task's linked invocation (by the unified id) was
+    /// found still running (non-terminal), so the task is left `executing` for the
+    /// remote work to finish — not recovered as a stale orphan (issue #239).
+    StillRunningInvocation {
         /// Task ID.
         task_id: String,
     },
@@ -627,6 +648,51 @@ impl TaskOrchestrator {
     where
         S: TaskStore,
     {
+        // With no invocation snapshot, every not-live executing task this agent
+        // owns is treated as a stale orphan (the historical behavior).
+        self.reconcile_executing_tasks(tasks, live_invocations, &BTreeMap::new(), store)
+    }
+
+    /// Restart-recovery entry point that reconciles each `executing` task against
+    /// the *actual* invocation state by the unified id (issue #239).
+    ///
+    /// This refines [`Self::recover_executing_tasks`]: instead of blindly failing
+    /// every not-live executing task, it looks up the task's `invocation_id` in
+    /// `invocations` (the room's `com.mxagent.invocation.v1` snapshot keyed by id)
+    /// and reconciles accordingly. Because the id is unified, a task and its remote
+    /// invocation are matched reliably across a daemon restart. For each
+    /// `executing` task:
+    ///
+    /// - **owned by another (remote) agent** — left unchanged
+    ///   ([`OrchestrationOutcome::StaleRemoteExecuting`]).
+    /// - **owned by this agent, live this run** — left unchanged
+    ///   ([`OrchestrationOutcome::NotRunnableState`]); the #230 protection, so a
+    ///   task this run already claimed/finalized is never clobbered off a stale
+    ///   snapshot.
+    /// - **owned by this agent, not live, invocation terminal** — reconciled to the
+    ///   invocation's real outcome ([`OrchestrationOutcome::ReconciledInvocation`]),
+    ///   so a remote invocation that already `succeeded`/`failed`/`cancelled` is
+    ///   surfaced onto the task rather than mislabeled `failed`.
+    /// - **owned by this agent, not live, invocation still running** — left
+    ///   `executing` ([`OrchestrationOutcome::StillRunningInvocation`]); the remote
+    ///   work may still complete and finalize.
+    /// - **owned by this agent, not live, no invocation state** — a genuine orphan
+    ///   from a previous run, recovered `failed`
+    ///   ([`Self::recover_stale_executing`]).
+    ///
+    /// An already-terminal task is never touched (only `executing` tasks are
+    /// scanned and the lifecycle guard rejects reopening), so finalized state is
+    /// never clobbered. Every decision is logged (non-sensitive).
+    pub fn reconcile_executing_tasks<S>(
+        &self,
+        tasks: &[TaskState],
+        live_invocations: &BTreeSet<String>,
+        invocations: &BTreeMap<String, InvocationState>,
+        store: &mut S,
+    ) -> Vec<OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
         let mut outcomes = Vec::new();
         for task in tasks.iter().filter(|t| t.state == STATE_EXECUTING) {
             if !self.is_assigned(task) {
@@ -658,18 +724,83 @@ impl TaskOrchestrator {
                 });
                 continue;
             }
-            let outcome = self.recover_stale_executing(task, live_invocations, store);
-            if let OrchestrationOutcome::RecoveredStale { task_id } = &outcome {
-                tracing::warn!(
-                    task_id = %task_id,
-                    invocation_id = task.invocation_id.as_deref().unwrap_or(""),
-                    decision = "recovered_stale_invocation",
-                    "restart recovery marked an orphaned local executing task failed"
-                );
+            // Not live this run: reconcile against the real invocation state by the
+            // unified id.
+            let invocation = task
+                .invocation_id
+                .as_ref()
+                .and_then(|id| invocations.get(id));
+            match invocation {
+                Some(inv) if invocation_is_terminal(&inv.state) => {
+                    outcomes.push(self.reconcile_terminal_invocation(task, inv, store));
+                }
+                Some(_) => {
+                    tracing::debug!(
+                        task_id = %task.task_id,
+                        invocation_id = task.invocation_id.as_deref().unwrap_or(""),
+                        decision = "invocation_still_running",
+                        "restart recovery left an executing task whose remote invocation is still running"
+                    );
+                    outcomes.push(OrchestrationOutcome::StillRunningInvocation {
+                        task_id: task.task_id.clone(),
+                    });
+                }
+                None => {
+                    let outcome = self.recover_stale_executing(task, live_invocations, store);
+                    if let OrchestrationOutcome::RecoveredStale { task_id } = &outcome {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            invocation_id = task.invocation_id.as_deref().unwrap_or(""),
+                            decision = "recovered_stale_invocation",
+                            "restart recovery marked an orphaned executing task failed"
+                        );
+                    }
+                    outcomes.push(outcome);
+                }
             }
-            outcomes.push(outcome);
         }
         outcomes
+    }
+
+    /// Finalize an `executing` task to the terminal outcome of its already-finished
+    /// linked invocation, deriving a non-sensitive result from the invocation.
+    fn reconcile_terminal_invocation<S>(
+        &self,
+        task: &TaskState,
+        invocation: &InvocationState,
+        store: &mut S,
+    ) -> OrchestrationOutcome
+    where
+        S: TaskStore,
+    {
+        let state = task_state_for_invocation(&invocation.state).unwrap_or(STATE_FAILED);
+        let result = task_result_from_invocation(invocation, &self.agent_id, now_rfc3339());
+        match store.finalize(UpdateTaskOptions {
+            room: String::new(),
+            task_id: task.task_id.clone(),
+            state: Some(state.to_string()),
+            result: Some(result.into_value()),
+            expected_state_rev: Some(task.state_rev),
+            ..UpdateTaskOptions::default()
+        }) {
+            Ok(finalized) => {
+                tracing::info!(
+                    task_id = %finalized.task_id,
+                    invocation_id = %invocation.invocation_id,
+                    state = %finalized.state,
+                    decision = "reconciled_invocation",
+                    "restart recovery reconciled an executing task with its terminal invocation"
+                );
+                OrchestrationOutcome::ReconciledInvocation {
+                    task_id: finalized.task_id,
+                    state: finalized.state,
+                }
+            }
+            Err(err) => OrchestrationOutcome::StoreError {
+                task_id: task.task_id.clone(),
+                reason: format_store_error(&err),
+            },
+        }
     }
 
     /// Require a trusted, signed authorization (addressed to this agent) before a
@@ -2467,5 +2598,152 @@ requires_approval = true
             matches!(&second, OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED),
             "an approved held task must run, not be replay-blocked: {second:?}"
         );
+    }
+
+    // --- restart reconciliation by unified id (issue #239) ------------------
+
+    fn executing_task(id: &str, assigned_to: &str, invocation_id: Option<&str>) -> TaskState {
+        let mut t = task(id, STATE_EXECUTING, assigned_to);
+        t.invocation_id = invocation_id.map(str::to_string);
+        t
+    }
+
+    fn invocation(invocation_id: &str, state: &str, exit_code: Option<i32>) -> InvocationState {
+        InvocationState {
+            invocation_id: invocation_id.to_string(),
+            task_id: None,
+            requester: "@planner:server".to_string(),
+            target: "agent-a".to_string(),
+            state: state.to_string(),
+            created_at: "2026-06-04T18:00:00Z".to_string(),
+            updated_at: "2026-06-04T18:00:00Z".to_string(),
+            exit_code,
+            state_rev: 1,
+            extra: Extra::default(),
+        }
+    }
+
+    #[test]
+    fn reconcile_finalizes_task_from_terminal_invocation() {
+        // An owned executing task whose remote invocation already finished is
+        // reconciled to that real outcome by the unified id, not blindly failed.
+        let t = executing_task("task-a", "agent-a", Some("inv_1"));
+        let mut invocations = BTreeMap::new();
+        invocations.insert("inv_1".to_string(), invocation("inv_1", "cancelled", None));
+        let mut store = MemoryStore::default();
+        let outcomes = TaskOrchestrator::new("agent-a").reconcile_executing_tasks(
+            std::slice::from_ref(&t),
+            &BTreeSet::new(),
+            &invocations,
+            &mut store,
+        );
+        assert!(matches!(
+            outcomes.as_slice(),
+            [OrchestrationOutcome::ReconciledInvocation { state, .. }] if state == "cancelled"
+        ));
+        assert_eq!(store.finalized_state.as_deref(), Some("cancelled"));
+        let result = store
+            .finalized_result
+            .expect("a reconciled result is recorded");
+        assert_eq!(
+            result.get("invocation_id").and_then(Value::as_str),
+            Some("inv_1")
+        );
+    }
+
+    #[test]
+    fn reconcile_leaves_task_when_invocation_still_running() {
+        // A still-running remote invocation must not be killed off on restart.
+        let t = executing_task("task-a", "agent-a", Some("inv_1"));
+        let mut invocations = BTreeMap::new();
+        invocations.insert("inv_1".to_string(), invocation("inv_1", "running", None));
+        let mut store = MemoryStore::default();
+        let outcomes = TaskOrchestrator::new("agent-a").reconcile_executing_tasks(
+            std::slice::from_ref(&t),
+            &BTreeSet::new(),
+            &invocations,
+            &mut store,
+        );
+        assert!(matches!(
+            outcomes.as_slice(),
+            [OrchestrationOutcome::StillRunningInvocation { .. }]
+        ));
+        assert!(
+            store.finalized_state.is_none(),
+            "the task must be left executing"
+        );
+    }
+
+    #[test]
+    fn reconcile_recovers_orphan_with_no_invocation_state() {
+        // No invocation state by the unified id and not claimed this run: a genuine
+        // orphan from a previous daemon run, recovered failed.
+        let t = executing_task("task-a", "agent-a", Some("inv_gone"));
+        let mut store = MemoryStore::default();
+        let outcomes = TaskOrchestrator::new("agent-a").reconcile_executing_tasks(
+            std::slice::from_ref(&t),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &mut store,
+        );
+        assert!(matches!(
+            outcomes.as_slice(),
+            [OrchestrationOutcome::RecoveredStale { .. }]
+        ));
+        assert_eq!(store.finalized_state.as_deref(), Some("failed"));
+        let result = store
+            .finalized_result
+            .expect("a recovery result is recorded");
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("recovered_stale_invocation")
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_invocation_claimed_this_run() {
+        // #230: a task this run claimed/finalized must never be clobbered, even if
+        // a stale snapshot still shows it executing and a terminal invocation
+        // exists for it.
+        let t = executing_task("task-a", "agent-a", Some("inv_1"));
+        let mut invocations = BTreeMap::new();
+        invocations.insert(
+            "inv_1".to_string(),
+            invocation("inv_1", "succeeded", Some(0)),
+        );
+        let mut live = BTreeSet::new();
+        live.insert("inv_1".to_string());
+        let mut store = MemoryStore::default();
+        let outcomes = TaskOrchestrator::new("agent-a").reconcile_executing_tasks(
+            std::slice::from_ref(&t),
+            &live,
+            &invocations,
+            &mut store,
+        );
+        assert!(matches!(
+            outcomes.as_slice(),
+            [OrchestrationOutcome::NotRunnableState { .. }]
+        ));
+        assert!(store.finalized_state.is_none());
+    }
+
+    #[test]
+    fn reconcile_leaves_remote_owned_task() {
+        // Only the owning daemon may resolve a remote-owned executing task.
+        let t = executing_task("task-a", "other-agent", Some("inv_1"));
+        let mut invocations = BTreeMap::new();
+        invocations.insert("inv_1".to_string(), invocation("inv_1", "cancelled", None));
+        let mut store = MemoryStore::default();
+        let outcomes = TaskOrchestrator::new("agent-a").reconcile_executing_tasks(
+            std::slice::from_ref(&t),
+            &BTreeSet::new(),
+            &invocations,
+            &mut store,
+        );
+        assert!(matches!(
+            outcomes.as_slice(),
+            [OrchestrationOutcome::StaleRemoteExecuting { owner, .. }] if owner == "other-agent"
+        ));
+        assert!(store.finalized_state.is_none());
     }
 }

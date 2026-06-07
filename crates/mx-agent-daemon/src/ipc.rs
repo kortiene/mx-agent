@@ -81,6 +81,19 @@ pub struct InvocationCancelParams {
     pub reason: Option<String>,
 }
 
+/// Parameters for `task.cancel`: cancel a task and drive its linked remote
+/// invocation to `cancelled` (issue #239).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCancelParams {
+    /// Room ID or alias the task lives in.
+    pub room: String,
+    /// Task identifier (state key) to cancel.
+    pub task_id: String,
+    /// Human-readable cancellation reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +123,24 @@ mod tests {
         let back: InvocationCancelParams =
             serde_json::from_value(serde_json::to_value(&cancel).unwrap()).unwrap();
         assert_eq!(cancel, back);
+
+        let task_cancel = TaskCancelParams {
+            room: "!r:server".to_string(),
+            task_id: "task_1".to_string(),
+            reason: Some("operator cancelled".to_string()),
+        };
+        let back: TaskCancelParams =
+            serde_json::from_value(serde_json::to_value(&task_cancel).unwrap()).unwrap();
+        assert_eq!(task_cancel, back);
+    }
+
+    #[test]
+    fn task_cancel_reason_defaults_to_none() {
+        let parsed: TaskCancelParams =
+            serde_json::from_value(serde_json::json!({"room":"!r:server","task_id":"task_1"}))
+                .unwrap();
+        assert_eq!(parsed.task_id, "task_1");
+        assert!(parsed.reason.is_none());
     }
 
     #[test]

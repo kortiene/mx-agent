@@ -51,7 +51,8 @@ If a box can sync with a homeserver, it can participate — even one that accept
 | Sandbox backends | ✅ Implemented (`none` fallback by default; `bubblewrap` and Docker/Podman container backends are policy-selectable, but not a standalone security boundary) |
 | E2EE privileged-event handling | ✅ Implemented for decrypting privileged events and failing safe on undecryptable events; production hardening (device verification UX, cross-signing, key backup) remains planned |
 | Large-output artifact mode | ✅ Implemented (Matrix media offload, SHA-256 integrity, optional zstd compression, tail preview); very-large-output tuning remains planned |
-| Interactive PTY over IPC/remote; tight task↔remote-invocation id unification | 🔮 Planned |
+| Unified task↔remote-invocation id: a task records the id of the invocation that runs it, and `task cancel` drives that linked invocation to `cancelled` (signed/ownership-checked) and finalizes the task | ✅ Implemented |
+| Interactive PTY over IPC/remote | 🔮 Planned |
 
 **Platform: Unix only** (Linux and macOS). Windows was intentionally dropped — the project relies on Unix-domain-socket IPC and Unix process semantics.
 

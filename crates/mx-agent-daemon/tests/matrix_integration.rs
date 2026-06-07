@@ -60,11 +60,11 @@ use serde_json::{json, Value};
 use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
-    build_signed_exec_request, create_task, decide_approval_for_session, emit_heartbeat,
-    list_agents, list_pending_approvals, list_tasks, load_or_create_signing_key, load_sync_token,
-    login_password, register_agent, restore_client, run_matrix_sync,
-    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, show_agent,
-    sign_task_action, start_call_matrix, start_exec_matrix, BackoffConfig, CallOutcome,
+    build_signed_exec_request, cancel_task_for_session, create_task, decide_approval_for_session,
+    emit_heartbeat, get_invocation, list_agents, list_pending_approvals, list_tasks,
+    load_or_create_signing_key, load_sync_token, login_password, register_agent, restore_client,
+    run_matrix_sync, run_matrix_sync_with_subscribers, run_scheduler_loop, save_session,
+    show_agent, sign_task_action, start_call_matrix, start_exec_matrix, BackoffConfig, CallOutcome,
     CallStartParams, CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome,
     ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, HeartbeatConfig,
     ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig,
@@ -526,6 +526,7 @@ allow_tools = ["run_tests"]
         agent: Some(TARGET_AGENT.to_string()),
         tool: "run_tests".to_string(),
         input: json!({ "package": "mx-agent-protocol", "name": "canonical" }),
+        invocation_id: None,
     })
     .await;
 
@@ -740,6 +741,7 @@ allow_cwd = ["{cwd}"]
             pty: false,
             task: None,
             strict_stream: false,
+            invocation_id: None,
         },
         &subscribers,
     )
@@ -771,6 +773,7 @@ allow_cwd = ["{cwd}"]
             pty: false,
             task: None,
             strict_stream: false,
+            invocation_id: None,
         },
         &subscribers,
     )
@@ -801,6 +804,7 @@ allow_cwd = ["{cwd}"]
             pty: false,
             task: None,
             strict_stream: false,
+            invocation_id: None,
         },
         &subscribers,
     )
@@ -1531,6 +1535,326 @@ requires_approval = true
         !approval_deny_sentinel.exists(),
         "denied task's command must never spawn"
     );
+}
+
+/// Live task cancel drives the linked remote invocation (issue #239).
+///
+/// This exercises the unified task↔remote-invocation id end to end without the
+/// scheduler, so it is deterministic: Bob starts a long-running signed remote
+/// `exec` against Alice under a *preset* invocation id (the new
+/// [`ExecStartParams::invocation_id`]), and a `com.mxagent.task.v1` task is
+/// published carrying that *same* id as its `invocation_id`. Once the remote
+/// invocation is live (`running`), Bob issues `cancel_task`, which:
+///
+/// - signs a `com.mxagent.exec.cancel.v1` so Alice (the target) verifies Bob's
+///   ownership, terminates the process group, and confirms `exec.cancelled`;
+/// - republishes the invocation state `cancelled`; and
+/// - finalizes the owning task `cancelled` by the unified id.
+///
+/// The test asserts the task's `invocation_id` equals the live invocation's id
+/// (unification), the task is finalized `cancelled`, and the invocation reaches
+/// `cancelled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_task_cancel_drives_remote_invocation() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login should succeed");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore should succeed");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login should succeed");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore should succeed");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent live task cancel test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let subscribers = ExecSubscriberRegistry::new();
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &alice,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    let bob_sync_paths = paths_in(data_dir.join("bob-sync"));
+    bob_sync_paths
+        .ensure_data_dir()
+        .expect("create bob sync dir");
+    let bob_sync = {
+        let bob = bob.clone();
+        let paths = bob_sync_paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &bob,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+
+    // The daemon-global session start_exec_matrix reads is Bob's.
+    save_session(&paths, &bob_session).expect("save requester session");
+
+    // The unified id: the task records it and the remote exec runs under it.
+    let invocation_id = mx_agent_protocol::id::generate_invocation_id();
+    let task_id = "task-cancel";
+
+    // Publish the task and link it to the unified invocation id in `executing`.
+    create_task(
+        &bob,
+        &CreateTaskOptions {
+            room: room_id.to_string(),
+            task_id: Some(task_id.to_string()),
+            title: task_id.to_string(),
+            description: String::new(),
+            state: None,
+            assigned_to: TARGET_AGENT.to_string(),
+            created_by: Some(requester_agent.clone()),
+            depends_on: Vec::new(),
+            blocks: Vec::new(),
+            action: None,
+        },
+    )
+    .await
+    .expect("create task");
+    mx_agent_daemon::update_task(
+        &bob,
+        &mx_agent_daemon::UpdateTaskOptions {
+            room: room_id.to_string(),
+            task_id: task_id.to_string(),
+            state: Some("executing".to_string()),
+            invocation_id: Some(invocation_id.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("link task to invocation id");
+
+    // Start a long-running remote exec under the preset (unified) invocation id.
+    let exec = {
+        let subscribers = subscribers.clone();
+        let room_id = room_id.to_string();
+        let invocation_id = invocation_id.clone();
+        tokio::spawn(async move {
+            start_exec_matrix(
+                &ExecStartParams {
+                    room: Some(room_id),
+                    agent: Some(TARGET_AGENT.to_string()),
+                    command: vec!["sh".to_string(), "-c".to_string(), "sleep 120".to_string()],
+                    cwd: Some(cwd.clone()),
+                    stdin: None,
+                    stream: true,
+                    pty: false,
+                    task: Some(task_id.to_string()),
+                    strict_stream: false,
+                    invocation_id: Some(invocation_id),
+                },
+                &subscribers,
+            )
+            .await
+        })
+    };
+
+    // Wait for the remote invocation to go live under the unified id.
+    let live_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(Some(inv)) = get_invocation(&bob, room_id.as_str(), &invocation_id).await {
+            if inv.state == "running" || inv.state == "accepted" {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < live_deadline,
+            "remote invocation {invocation_id} should go live under the unified id"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Cancel the task: drive the linked invocation to cancelled and finalize the
+    // task cancelled by the unified id.
+    let cancelled_task = cancel_task_for_session(
+        &bob_session,
+        signing.signing_key(),
+        &signing.key_id(),
+        room_id.as_str(),
+        task_id,
+        "test cancel",
+    )
+    .await
+    .expect("cancel task");
+    assert_eq!(
+        cancelled_task.invocation_id.as_deref(),
+        Some(invocation_id.as_str()),
+        "the task records the unified invocation id"
+    );
+    assert_eq!(
+        cancelled_task.state, "cancelled",
+        "task cancel finalizes the owning task cancelled"
+    );
+
+    // The linked remote invocation reaches `cancelled`.
+    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut invocation_state = String::new();
+    loop {
+        if let Ok(Some(inv)) = get_invocation(&bob, room_id.as_str(), &invocation_id).await {
+            invocation_state = inv.state.clone();
+            if inv.state == "cancelled" {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= cancel_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        invocation_state, "cancelled",
+        "task cancel must drive the linked remote invocation to cancelled"
+    );
+
+    // The remote exec returns once its process group is killed.
+    let _ = exec.await.expect("remote exec task joins");
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync task joins")
+        .expect("alice sync exits cleanly");
+    bob_sync.abort();
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
 }
 
 /// App-level agent id daemon A (Alice) advertises in the discovery test.

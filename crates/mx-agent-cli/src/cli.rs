@@ -426,6 +426,8 @@ enum TaskCommand {
     Graph(TaskGraphArgs),
     /// Watch task state changes live (Ctrl-C to stop).
     Watch(TaskWatchArgs),
+    /// Cancel a task and its linked remote invocation.
+    Cancel(TaskCancelArgs),
 }
 
 #[derive(Debug, Args)]
@@ -565,6 +567,19 @@ struct TaskWatchArgs {
     /// Only watch tasks assigned to this agent.
     #[arg(long = "assigned", value_name = "AGENT")]
     assigned: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct TaskCancelArgs {
+    /// Workspace room alias (`#name:server`) or room ID (`!id:server`).
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Task ID (state key) to cancel.
+    #[arg(value_name = "TASK_ID")]
+    task_id: String,
+    /// Human-readable reason recorded with the cancellation.
+    #[arg(long, value_name = "REASON", default_value = "cancelled by operator")]
+    reason: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1728,6 +1743,7 @@ fn handle_task(global: &GlobalArgs, cmd: &TaskCommand) -> ExitCode {
         TaskCommand::List(args) => task_list(global, args),
         TaskCommand::Graph(args) => task_graph(global, args),
         TaskCommand::Watch(args) => task_watch(global, args),
+        TaskCommand::Cancel(args) => task_cancel(global, args),
     }
 }
 
@@ -1933,6 +1949,41 @@ fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
                 );
             } else {
                 println!("mx-agent: updated task {}", task.task_id);
+                print_task(&task);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+fn task_cancel(global: &GlobalArgs, args: &TaskCancelArgs) -> ExitCode {
+    // The daemon owns the signing key and signs the linked invocation's cancel so
+    // the target agent can verify the requester before terminating the command,
+    // then finalizes the owning task `cancelled` via the unified id (issue #239).
+    let params = mx_agent_daemon::TaskCancelParams {
+        room: args.room.clone(),
+        task_id: args.task_id.clone(),
+        reason: Some(args.reason.clone()),
+    };
+    match daemon_ipc_call::<_, mx_agent_protocol::schema::TaskState>(global, "task.cancel", &params)
+    {
+        Ok(task) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else if task.state == "cancelled" {
+                println!("mx-agent: cancelled task {}", task.task_id);
+                print_task(&task);
+            } else {
+                // The task had already finished before we could cancel; its
+                // linked invocation outcome is reflected in the task state.
+                println!(
+                    "mx-agent: task {} already {}; nothing to cancel",
+                    task.task_id, task.state
+                );
                 print_task(&task);
             }
             ExitCode::SUCCESS
@@ -2927,6 +2978,7 @@ fn command_path(command: &Command) -> String {
                 TaskCommand::List(_) => "list",
                 TaskCommand::Graph(_) => "graph",
                 TaskCommand::Watch(_) => "watch",
+                TaskCommand::Cancel(_) => "cancel",
             }
         ),
         Command::Invocation(c) => format!(
@@ -3144,6 +3196,8 @@ fn cmd_call(global: &GlobalArgs, args: &CallArgs) -> ExitCode {
         agent: args.agent.clone(),
         tool,
         input,
+        // Direct CLI `call` mints a fresh invocation id in the daemon.
+        invocation_id: None,
     };
     let result: mx_agent_daemon::CallStartResult =
         match daemon_ipc_call(global, "call.start", &params) {
@@ -3277,6 +3331,8 @@ fn cmd_exec(global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
         pty: false,
         task: args.task.clone(),
         strict_stream: args.strict_stream,
+        // Direct CLI `exec` mints a fresh invocation id in the daemon.
+        invocation_id: None,
     };
     let result: mx_agent_daemon::ExecStartResult =
         match daemon_ipc_call(global, "exec.start", &params) {
@@ -4350,6 +4406,54 @@ mod tests {
             other => panic!("expected invocation cancel, got {other:?}"),
         }
         assert_eq!(command_path(&cli.command), "invocation cancel");
+    }
+
+    #[test]
+    fn task_cancel_requires_room_and_id_with_default_reason() {
+        // The room flag and the positional task id are both required.
+        assert!(
+            Cli::try_parse_from(["mx-agent", "task", "cancel", "--room", "!abc:matrix.org"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "task",
+            "cancel",
+            "--room",
+            "!abc:matrix.org",
+            "task_01HZ",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Task(TaskCommand::Cancel(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.task_id, "task_01HZ");
+                assert_eq!(args.reason, "cancelled by operator");
+            }
+            other => panic!("expected task cancel, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "task cancel");
+    }
+
+    #[test]
+    fn task_cancel_accepts_explicit_reason() {
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "task",
+            "cancel",
+            "--room",
+            "!abc:matrix.org",
+            "--reason",
+            "superseded",
+            "task_01HZ",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Task(TaskCommand::Cancel(args)) => {
+                assert_eq!(args.reason, "superseded");
+            }
+            other => panic!("expected task cancel, got {other:?}"),
+        }
     }
 
     #[test]

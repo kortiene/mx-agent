@@ -920,9 +920,14 @@ Failure, denial, and recovery results use the same object shape with
 }
 ```
 
-On restart, the daemon reconciles every `executing` task against its live local
-invocations (architecture §11.3): a task it owns whose invocation is still live
-is left running; a task it owns whose local invocation is gone is marked failed
+On restart, the daemon reconciles every `executing` task against the room's
+invocation state by the unified id (architecture §11.3): a task it owns whose
+invocation this run already claimed is left running; a task it owns whose linked
+invocation has already reached a terminal state is reconciled to that real
+outcome (so a remote invocation that finished while the daemon was down is
+surfaced onto the task rather than blindly failed); a task whose linked
+invocation is still running is left `executing` for the remote work to finish; a
+task it owns with no invocation state at all is a genuine orphan, marked failed
 with a recovery result instead of being spawned a second time; and a task owned
 by another (remote) agent is left unchanged and surfaced as a non-sensitive
 stale warning, since only the owning daemon may resolve it. Recovery decisions
@@ -944,9 +949,30 @@ Exec-backed task actions (`{"type":"exec", ...}`) run through the process runner
 once authorized (and only behind strict policy/trust checks): a denied exec
 never spawns, exit code `0` finalizes the task `succeeded`, and any other
 termination (nonzero exit, signal, or timeout) finalizes it `failed`; output
-artifacts are linked in the task `result` when present. Explicit cancellation is
-handled through the invocation cancel path (`exec.cancelled`), which finalizes
-the owning task `cancelled` via the task↔invocation linkage.
+artifacts are linked in the task `result` when present.
+
+**Unified task↔invocation id.** The `invocation_id` a task records is the id of
+the invocation that actually runs its action. For the local-synchronous dispatch
+path the action runs in-process within the claim→finalize window, so the id is
+simply the orchestrator-minted id on the task. For the Matrix-dispatched path
+(`MX_AGENT_TASK_DISPATCH=matrix`) the orchestrator-minted id is carried into the
+signed `exec.request`/`call.request`, so the published
+`com.mxagent.invocation.v1` state event and the owning task share one id rather
+than each minting its own. This unified id is what makes cancel and restart
+reconciliation reliable.
+
+**Task cancel.** `mx-agent task cancel` (IPC `task.cancel`) reads the task,
+cancels its linked invocation through the same signed cancel path as
+`invocation.cancel` (the daemon signs `com.mxagent.exec.cancel.v1`; the target
+verifies the requester's ownership/trust before terminating the process group and
+confirming `com.mxagent.exec.cancelled.v1`), and finalizes the owning task to the
+invocation's terminal outcome — `cancelled` when the invocation was cancelled, or
+the invocation's real `succeeded`/`failed` outcome when it had already finished
+before the cancel arrived. Cancelling an already-terminal task is a no-op; a task
+with no published invocation state (the local-synchronous path) is finalized
+`cancelled` directly. A daemon that is mid-dispatch when an operator cancels its
+task never clobbers the cancelled state: a finalize whose live room state already
+shows the task terminal is refused as stale.
 
 ### 9.3 Workspace State
 
@@ -1163,6 +1189,7 @@ receives the password and writes the session into the daemon-owned data dir);
 | `task.list` | `ListTasksOptions` | `TaskState[]` |
 | `task.graph` | `ListTasksOptions` | `TaskGraph` |
 | `task.watch` | `ListTasksOptions` | stream of watch event envelopes |
+| `task.cancel` | `TaskCancelParams` | `TaskState` |
 | `workspace.create` / `.attach` | `CreateWorkspaceOptions` / `AttachWorkspaceOptions` | `WorkspaceInfo` / `WorkspaceState` |
 | `workspace.join` / `.status` | `RoomParams` | `WorkspaceInfo` / `WorkspaceStatus` |
 | `workspace.watch` | `RoomParams` | stream of watch event envelopes |

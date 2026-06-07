@@ -255,7 +255,9 @@ async fn read_invocation_state(
 }
 
 /// Read every `com.mxagent.invocation.v1` state event from a room.
-async fn read_all_invocation_states(room: &Room) -> Result<Vec<InvocationState>, WorkspaceError> {
+pub(crate) async fn read_all_invocation_states(
+    room: &Room,
+) -> Result<Vec<InvocationState>, WorkspaceError> {
     use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState as RawState;
 
     let raws = room

@@ -80,6 +80,13 @@ pub struct ExecStartParams {
     /// in the CLI; carried for forward compatibility.
     #[serde(default)]
     pub strict_stream: bool,
+    /// Preset invocation id to run the exec under. `None` mints a fresh id (the
+    /// default for direct CLI `exec`); task dispatch sets it so the published
+    /// `exec.request`, the resulting `com.mxagent.invocation.v1` state, and the
+    /// owning task's recorded `invocation_id` are a single unified id (issue
+    /// #239).
+    #[serde(default)]
+    pub invocation_id: Option<String>,
 }
 
 /// One frame in the forwarded exec output stream.
@@ -383,7 +390,10 @@ pub async fn start_exec_matrix(
     params: &ExecStartParams,
     subscribers: &ExecSubscriberRegistry,
 ) -> ExecStartResult {
-    let invocation_id = generate_invocation_id();
+    let invocation_id = params
+        .invocation_id
+        .clone()
+        .unwrap_or_else(generate_invocation_id);
     let request_id = generate_request_id();
     let outcome =
         match start_exec_matrix_inner(params, subscribers, &invocation_id, &request_id).await {
@@ -562,7 +572,10 @@ pub(crate) fn rfc3339_after(offset: Duration) -> String {
 /// daemon's process runner, and packages the captured output as ordered
 /// [`ExecFrame`]s ending in a single `Finished` frame.
 pub async fn start_exec_loopback(params: &ExecStartParams) -> ExecStartResult {
-    let invocation_id = generate_invocation_id();
+    let invocation_id = params
+        .invocation_id
+        .clone()
+        .unwrap_or_else(generate_invocation_id);
     let request_id = generate_request_id();
     let outcome = run_loopback(&invocation_id, params).await;
     ExecStartResult {
@@ -671,6 +684,7 @@ mod tests {
             pty: false,
             task: None,
             strict_stream: false,
+            invocation_id: None,
         }
     }
 
@@ -689,6 +703,16 @@ mod tests {
         let result = start_exec_loopback(&params(&["true"])).await;
         assert!(validate(IdKind::Invocation, &result.invocation_id).is_ok());
         assert!(validate(IdKind::Request, &result.request_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn loopback_honors_preset_invocation_id() {
+        // Task dispatch presets the orchestrator's invocation id so the exec runs
+        // under the unified id; absence still mints a fresh one (issue #239).
+        let mut p = params(&["true"]);
+        p.invocation_id = Some("inv_preset".to_string());
+        let result = start_exec_loopback(&p).await;
+        assert_eq!(result.invocation_id, "inv_preset");
     }
 
     #[tokio::test]

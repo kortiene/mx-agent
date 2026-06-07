@@ -130,15 +130,18 @@ where
         &mut self,
         task: &TaskState,
         action: &TaskAction,
-        _invocation_id: &str,
+        invocation_id: &str,
     ) -> Result<TaskExecutionResult, TaskDispatchError> {
         match action {
             TaskAction::Tool { tool, args, .. } => {
+                // Preset the orchestrator's invocation id so the remote call runs
+                // under the same id the owning task records (issue #239).
                 let params = CallStartParams {
                     room: Some(self.room.clone()),
                     agent: Some(task.assigned_to.clone()),
                     tool: tool.clone(),
                     input: args.clone(),
+                    invocation_id: Some(invocation_id.to_string()),
                 };
                 map_call_outcome((self.run_call)(params))
             }
@@ -181,7 +184,7 @@ where
         &mut self,
         task: &TaskState,
         action: &TaskAction,
-        _invocation_id: &str,
+        invocation_id: &str,
     ) -> Result<TaskExecutionResult, TaskDispatchError> {
         match action {
             TaskAction::Exec {
@@ -190,6 +193,9 @@ where
                 stream,
                 ..
             } => {
+                // Preset the orchestrator's invocation id so the remote exec —
+                // and its `com.mxagent.invocation.v1` state — run under the same
+                // id the owning task records (issue #239).
                 let params = ExecStartParams {
                     room: Some(self.room.clone()),
                     agent: Some(task.assigned_to.clone()),
@@ -200,6 +206,7 @@ where
                     pty: false,
                     task: Some(task.task_id.clone()),
                     strict_stream: false,
+                    invocation_id: Some(invocation_id.to_string()),
                 };
                 map_exec_outcome((self.run_exec)(params))
             }
@@ -310,6 +317,9 @@ mod tests {
                 assert_eq!(params.room.as_deref(), Some("!room:server"));
                 assert_eq!(params.agent.as_deref(), Some("developer-pi"));
                 assert_eq!(params.tool, "run_tests");
+                // The orchestrator's invocation id is preset so the remote call
+                // runs under the same id the task records (issue #239).
+                assert_eq!(params.invocation_id.as_deref(), Some("inv_orch"));
                 CallStartResult {
                     invocation_id: "inv_call".to_string(),
                     request_id: "req_call".to_string(),
@@ -367,6 +377,9 @@ mod tests {
                     vec!["cargo".to_string(), "test".to_string()]
                 );
                 assert_eq!(params.cwd, Some(std::path::PathBuf::from("/repo")));
+                // The orchestrator's invocation id is preset so the remote exec —
+                // and its invocation state — run under the unified id (issue #239).
+                assert_eq!(params.invocation_id.as_deref(), Some("inv_orch"));
                 ExecStartResult {
                     invocation_id: "inv_exec".to_string(),
                     request_id: "req_exec".to_string(),
