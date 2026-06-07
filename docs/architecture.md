@@ -606,6 +606,38 @@ that cleanup, the requester also installs a handler so that a `SIGINT`,
 `128 + signum`). The local terminal is therefore never left stranded in raw mode
 after a failure.
 
+### 7.7 Terminal Resize
+
+When the requester's local terminal changes size (SIGWINCH), it sends a **signed
+control event** so the remote PTY is resized to match and full-screen programs
+re-render at the new dimensions:
+
+```json
+{
+  "type": "com.mxagent.pty.resize.v1",
+  "content": {
+    "invocation_id": "inv_01HZ...",
+    "rows": 50,
+    "cols": 132,
+    "pixel_width": 0,
+    "pixel_height": 0,
+    "created_at": "2026-06-02T12:01:00Z",
+    "nonce": "base64-random",
+    "signature": { "alg": "ed25519", "key_id": "mxagent-ed25519:abc123", "sig": "base64..." }
+  }
+}
+```
+
+`rows`/`cols` are the new character dimensions; `pixel_width`/`pixel_height` are
+advisory and `0` when the local terminal does not report them. Resize is
+authorized exactly like `exec.stdin` / `exec.cancel`: the target accepts it only
+when the signature verifies against a trusted agent key and that agent is the
+invocation requester (signature → trust → ownership). Room membership or a
+spoofed Matrix sender alone never resizes another agent's session. Resize is
+idempotent — it only sets the current window size and executes nothing — so,
+like the other live controls, it is not router replay/expiry-checked; a replayed
+resize at most re-applies the same dimensions.
+
 ---
 
 ## 8. Stream Transport Semantics

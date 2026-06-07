@@ -240,13 +240,20 @@ pub struct StreamArtifact {
     pub extra: Extra,
 }
 
-/// `com.mxagent.pty.resize.v1` content (architecture §7.1, §8.3).
+/// `com.mxagent.pty.resize.v1` content (architecture §7.7).
 ///
 /// Sent from the requesting side to the executing agent whenever the local
 /// terminal's window size changes, so the remote PTY is resized to match and
 /// full-screen programs (editors, pagers) re-render at the new dimensions. The
 /// pixel dimensions are advisory: they are `0` when the local terminal does not
 /// report them, and most consumers only need `rows`/`cols`.
+///
+/// Resize is a **signed control event**, like [`ExecStdin`] and [`ExecCancel`]:
+/// it carries `created_at`, `nonce`, and a detached [`signature`](Self::signature)
+/// so the target authorizes it against a locally trusted signing key owned by the
+/// invocation's requester (signature → trust → ownership), rather than trusting
+/// the homeserver-asserted Matrix sender. Room membership alone never resizes
+/// another agent's session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PtyResize {
     /// Invocation identifier the resize applies to.
@@ -261,6 +268,12 @@ pub struct PtyResize {
     /// New height in pixels, or `0` when unknown.
     #[serde(default)]
     pub pixel_height: u16,
+    /// Creation timestamp (RFC 3339).
+    pub created_at: String,
+    /// Random nonce (base64).
+    pub nonce: String,
+    /// Detached signature.
+    pub signature: Signature,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -863,18 +876,25 @@ mod tests {
             "rows": 40,
             "cols": 120,
             "pixel_width": 960,
-            "pixel_height": 640
+            "pixel_height": 640,
+            "created_at": "2026-06-02T12:01:00Z",
+            "nonce": "base64-random",
+            "signature": { "alg": "ed25519", "key_id": "mxagent-ed25519:abc123", "sig": "base64" }
         }));
     }
 
     #[test]
     fn pty_resize_defaults_pixels_when_absent() {
         // A minimal producer may omit the advisory pixel dimensions; they
-        // default to zero rather than failing to deserialize.
+        // default to zero rather than failing to deserialize. The signed
+        // control fields remain required.
         let parsed: PtyResize = serde_json::from_value(json!({
             "invocation_id": "inv_01HZ",
             "rows": 24,
-            "cols": 80
+            "cols": 80,
+            "created_at": "2026-06-02T12:01:00Z",
+            "nonce": "base64-random",
+            "signature": { "alg": "ed25519", "key_id": "mxagent-ed25519:abc123", "sig": "base64" }
         }))
         .expect("deserialization failed");
         assert_eq!(parsed.rows, 24);

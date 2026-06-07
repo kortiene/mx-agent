@@ -152,15 +152,27 @@ impl EventCategory {
         }
     }
 
-    /// Whether this category is a privileged request that a handler must
-    /// authorize (signature + trust + policy + approval) before acting on.
+    /// Whether this category is a privileged control a handler must authorize
+    /// (signature + trust + ownership, plus policy/approval for the ones that can
+    /// start work) before acting on.
     ///
-    /// Privileged requests are the ones that can cause a remote process to run:
-    /// `exec.request`, `exec.cancel`, and `call.request`.
+    /// `exec.request` and `call.request` can cause a remote process to run, so
+    /// they additionally carry `expires_at` and are replay/expiry-checked by the
+    /// router before dispatch. The live controls — `exec.stdin`, `exec.cancel`,
+    /// and `pty.resize` — are signed and ownership-checked in their handlers but
+    /// are **not** router-replay-checked: they are scoped to an already-running
+    /// invocation and idempotent enough that a replay is harmless (a replayed
+    /// resize re-applies the same window size; a replayed stdin/cancel acts on a
+    /// live, owner-authorized session). `pty.resize` joins this set so all live
+    /// PTY controls share one authorization model.
     pub fn is_privileged(self) -> bool {
         matches!(
             self,
-            Self::ExecRequest | Self::ExecStdin | Self::ExecCancel | Self::CallRequest
+            Self::ExecRequest
+                | Self::ExecStdin
+                | Self::ExecCancel
+                | Self::CallRequest
+                | Self::PtyResize
         )
     }
 }
@@ -808,8 +820,10 @@ mod tests {
     #[test]
     fn privileged_classification_is_correct() {
         assert!(EventCategory::ExecRequest.is_privileged());
+        assert!(EventCategory::ExecStdin.is_privileged());
         assert!(EventCategory::ExecCancel.is_privileged());
         assert!(EventCategory::CallRequest.is_privileged());
+        assert!(EventCategory::PtyResize.is_privileged());
         assert!(!EventCategory::Heartbeat.is_privileged());
         assert!(!EventCategory::Task.is_privileged());
         assert!(!EventCategory::ExecFinished.is_privileged());

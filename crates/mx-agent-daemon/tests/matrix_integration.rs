@@ -1026,9 +1026,15 @@ allow_cwd = ["{cwd}"]
 
     // Give the target time to register the live control, then resize.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    mx_agent_daemon::send_pty_resize(&room, &invocation_id, PtyWinsize::new(50, 132))
-        .await
-        .expect("send pty resize");
+    mx_agent_daemon::send_pty_resize(
+        &room,
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        PtyWinsize::new(50, 132),
+    )
+    .await
+    .expect("send pty resize");
 
     // Collect merged PTY output until the invocation finishes.
     let mut output = String::new();
