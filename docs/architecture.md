@@ -1129,7 +1129,7 @@ response. `call.request` events now have a live handler: the target daemon
 confirms the request is addressed to one of its registered agents, resolves the
 requester's published signing key, verifies signature/trust/policy, executes the
 named built-in tool, and emits `call.response`. `exec.request` events also have
-a live non-PTY handler: the target daemon verifies signature/trust/replay/policy,
+a live handler (batch and interactive `--pty`): the target daemon verifies signature/trust/replay/policy,
 emits `exec.accepted`/`exec.rejected`, publishes invocation state, spawns a
 supervised live task, emits stream/result events, and never spawns denied or
 approval-pending requests. While running, signed `exec.stdin` and `exec.cancel`

@@ -4,7 +4,7 @@ This guide takes you from nothing to your first remote-style command with mx-age
 
 We define every new term the first time it appears, explain *why* each step exists before giving the command, and end with a "Common errors & fixes" table.
 
-> **What's real in v0.1.0?** mx-agent is a public alpha. All command groups except interactive PTY run against a real Matrix homeserver through the daemon — the stateless CLI never holds a Matrix session. `call` and non-PTY `exec` support signed Matrix-backed remote dispatch (including stdin/cancel controls) when `--room`/`--agent` are provided. The live daemon scheduler loop auto-claims and runs assigned tasks from room state. CI is green and stable. Steps below are tagged ✅ (works today), 🟡 (designed, wiring in progress), or 🔮 (planned).
+> **What's real in v0.2.0?** mx-agent is a public alpha. All command groups run against a real Matrix homeserver through the daemon — the stateless CLI never holds a Matrix session. `call` and `exec` (batch and interactive `--pty`) support signed Matrix-backed remote dispatch (including stdin/resize/cancel controls) when `--room`/`--agent` are provided; `--pty` streams the daemon's pseudo-terminal over local IPC and the signed Matrix transport. The live daemon scheduler loop auto-claims and runs assigned tasks from room state. CI is green and stable. Steps below are tagged ✅ (works today), 🟡 (designed, wiring in progress), or 🔮 (planned).
 
 ---
 
@@ -249,7 +249,6 @@ local exit: 7
 | `error: unknown room '!…'` | Wrong room ID, or you haven't joined | `mx-agent workspace join '#alias:server'`; double-check the `$ROOM` value |
 | `exit 126` from an exec | **Local policy denied** the command | Allow it in `~/.config/mx-agent/policy.toml` (see [[Security & Sandboxing|Security-and-Sandboxing]]); deny-by-default is intentional |
 | `exit 127` | Agent / tool / command not found | Check `mx-agent agent list --room "$ROOM"` and that the binary exists on the target |
-| `not implemented yet` printed | You hit a 🟡/🔮 alpha stub | Expected in v0.1.0; the command's shape is final, behavior is landing |
 | `--socket` ignored / wrong path | Custom `$XDG_RUNTIME_DIR` | Pass `--socket <path>` explicitly or set `MX_AGENT_RUNTIME_DIR` |
 
 ---

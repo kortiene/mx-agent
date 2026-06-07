@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.74"
 license = "Apache-2.0"
@@ -37,12 +37,12 @@ getrandom = "0.4"
 nix = { version = "0.31", features = ["signal", "process", "user"] }
 rustix = { version = "1", default-features = false, features = ["std", "pty", "termios"] }
 signal-hook = "0.4"
-mx-agent-protocol = { path = "crates/mx-agent-protocol", version = "0.1.0" }
-mx-agent-telemetry = { path = "crates/mx-agent-telemetry", version = "0.1.0" }
-mx-agent-ipc = { path = "crates/mx-agent-ipc", version = "0.1.0" }
-mx-agent-policy = { path = "crates/mx-agent-policy", version = "0.1.0" }
-mx-agent-sandbox = { path = "crates/mx-agent-sandbox", version = "0.1.0" }
-mx-agent-daemon = { path = "crates/mx-agent-daemon", version = "0.1.0" }
+mx-agent-protocol = { path = "crates/mx-agent-protocol", version = "0.2.0" }
+mx-agent-telemetry = { path = "crates/mx-agent-telemetry", version = "0.2.0" }
+mx-agent-ipc = { path = "crates/mx-agent-ipc", version = "0.2.0" }
+mx-agent-policy = { path = "crates/mx-agent-policy", version = "0.2.0" }
+mx-agent-sandbox = { path = "crates/mx-agent-sandbox", version = "0.2.0" }
+mx-agent-daemon = { path = "crates/mx-agent-daemon", version = "0.2.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

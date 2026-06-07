@@ -7,10 +7,10 @@ machine. This guide explains how the safety controls fit together and, for each
 one, **what the safe default is and which options weaken it**.
 
 > **Alpha status.** As noted in the [user guide](user-guide.md), `call` and
-> non-PTY `exec` run a daemon-mediated local execution by default and become
-> signed Matrix-backed remote operations when `--room`/`--agent` target a
-> registered, trusted, policy-allowed remote agent; interactive `exec --pty` is
-> not yet carried over the transport. The trust, signing, policy, audit, and
+> `exec` (batch and interactive `--pty`) run a daemon-mediated local execution by
+> default and become signed Matrix-backed remote operations when `--room`/`--agent`
+> target a registered, trusted, policy-allowed remote agent, with signed
+> stdin/resize/cancel controls for live remote exec. The trust, signing, policy, audit, and
 > sandbox machinery described here is real and already enforced — on the daemon
 > that runs the command, local or remote. Replay/expiry checks are enforced for
 > request types whose schema carries nonce/expiry fields.

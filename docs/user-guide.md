@@ -8,11 +8,11 @@ other, then running a tool call and a remote-style `exec`.
 > agent-registry, task, trust, approval, context-sharing, and invocation commands
 > run against a real Matrix homeserver entirely through the daemon over local IPC
 > — the stateless CLI never reads the Matrix session or builds a Matrix client
-> itself. `call` and non-PTY `exec` run daemon-mediated locally by default and
-> use signed Matrix-backed remote dispatch when `--room`/`--agent` target a
-> registered, trusted, policy-allowed agent, with signed Matrix stdin/cancel
-> controls for live remote exec. A live daemon scheduler loop auto-drives signed,
-> assigned tasks. Treat execution commands carefully and
+> itself. `call` and `exec` (batch and interactive `--pty`) run daemon-mediated
+> locally by default and use signed Matrix-backed remote dispatch when
+> `--room`/`--agent` target a registered, trusted, policy-allowed agent, with
+> signed Matrix stdin/resize/cancel controls for live remote exec. A live daemon
+> scheduler loop auto-drives signed, assigned tasks. Treat execution commands carefully and
 > read [Security warnings](#security-warnings) before pointing mx-agent at
 > anything you do not control.
 
@@ -211,12 +211,13 @@ missing or corrupt chunk as a hard error), `--pty` (allocate a pseudo-terminal),
 
 > In this alpha, `exec` is mediated by the daemon over local IPC, so a daemon
 > must be running (`mx-agent daemon start`); otherwise `exec` exits `3`. The
-> daemon — not the CLI — runs non-PTY commands. Without `--room`/`--agent`, they
-> run on your **local** machine as a loopback; with both targeting flags, the
-> daemon sends a signed Matrix request to the remote agent, which verifies local
-> trust and policy before spawning. Remote stdin and cancellation are signed
-> Matrix control events accepted only from the invocation requester; `--pty`
-> still runs in the CLI for now.
+> daemon — not the CLI — runs the commands (batch and interactive `--pty`).
+> Without `--room`/`--agent`, they run on your **local** machine as a loopback;
+> with both targeting flags, the daemon sends a signed Matrix request to the
+> remote agent, which verifies local trust and policy before spawning. Remote
+> stdin, terminal resize, and cancellation are signed Matrix control events
+> accepted only from the invocation requester; `--pty` streams the daemon's
+> pseudo-terminal over local IPC and over the signed Matrix transport.
 
 ## Track work with tasks
 
