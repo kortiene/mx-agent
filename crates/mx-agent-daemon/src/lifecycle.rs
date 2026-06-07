@@ -1012,6 +1012,27 @@ fn dispatch_workspace_watch(
     }
 }
 
+/// Stream an interactive PTY `exec` session over the open IPC connection
+/// (issue #238). The daemon owns the pseudo-terminal (loopback) or bridges the
+/// session to a remote agent over the signed Matrix transport when `room`/`agent`
+/// are set; the CLI never spawns the process itself.
+fn dispatch_exec_pty(
+    req: &Request,
+    stream: &mut std::os::unix::net::UnixStream,
+    exec_subscribers: &crate::ExecSubscriberRegistry,
+) -> io::Result<()> {
+    let params = match parse_params::<crate::ExecPtyParams>(req) {
+        Ok(params) => params,
+        Err(response) => return write_ipc_response(stream, &response),
+    };
+    let request_id = req.id.clone();
+    if params.room.is_some() && params.agent.is_some() {
+        crate::pty_ipc::run_pty_remote(&params, stream, &request_id, exec_subscribers)
+    } else {
+        crate::run_pty_loopback(&params, stream, &request_id)
+    }
+}
+
 fn dispatch_streaming(
     req: &Request,
     stream: &mut std::os::unix::net::UnixStream,
@@ -1025,6 +1046,8 @@ fn dispatch_streaming(
         dispatch_task_watch(req, stream)
     } else if req.method == "workspace.watch" {
         dispatch_workspace_watch(req, stream)
+    } else if req.method == crate::METHOD_EXEC_PTY {
+        dispatch_exec_pty(req, stream, exec_subscribers)
     } else {
         let response = dispatch(
             req,

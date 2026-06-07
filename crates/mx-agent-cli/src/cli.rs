@@ -6,8 +6,10 @@
 //! the local Unix-socket IPC channel, and `call`/`exec` run a daemon-mediated
 //! local execution by default or a signed Matrix-backed remote operation when
 //! `--room`/`--agent` target a remote agent. The CLI never reads the Matrix
-//! session or builds a Matrix client itself. Interactive PTY `exec` and large
-//! artifacts are still landing — see the project status in `README.md`.
+//! session or builds a Matrix client itself. Interactive `exec --pty` is also
+//! daemon-mediated: the daemon allocates the pseudo-terminal and the CLI streams
+//! it over a single IPC connection (issue #238). Large artifacts are still
+//! landing — see the project status in `README.md`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -3295,14 +3297,15 @@ fn cmd_exec(global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
         },
     };
 
-    // Interactive PTY mode takes a dedicated, synchronous path: it allocates a
-    // pseudo-terminal on the (loopback) remote, mirrors the local terminal's raw
-    // mode and window size, and forwards keystrokes and resize events live
-    // (architecture §7.3, §8.3). The chunk/finished framing used by the
-    // non-interactive path does not apply: a PTY is a single live byte stream.
-    // PTY does not yet run over IPC; that is tracked as follow-up to #155.
+    // Interactive PTY mode takes a dedicated streaming IPC path: the daemon
+    // allocates the pseudo-terminal (locally, or on a remote agent over the
+    // signed Matrix transport when `--room`/`--agent` are set) and the CLI
+    // mirrors the local terminal's raw mode and window size, forwarding
+    // keystrokes and resize events live over the one connection (architecture
+    // §7.3, §7.6; issue #238). The chunk/finished framing of the non-interactive
+    // path does not apply: a PTY is a single live byte stream.
     if args.pty {
-        return cmd_exec_pty(&args.command, cwd);
+        return cmd_exec_pty(global, args, cwd);
     }
 
     // Detect piped stdin: when our standard input is not a terminal it has been
@@ -3398,41 +3401,74 @@ fn cmd_exec(global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
     }
 }
 
-/// Run a command on the (loopback) remote agent under an interactive
-/// pseudo-terminal, wiring it to the local terminal.
+/// Run a command under an interactive pseudo-terminal allocated by the daemon,
+/// wiring it to the local terminal over a streaming IPC connection (issue #238).
 ///
-/// Allocates a remote PTY for the command, puts the local terminal into raw mode
-/// so keystrokes pass straight through, forwards the program's merged output
-/// back to the local terminal, and propagates `SIGWINCH` window-size changes to
-/// the remote PTY. Returns the command's exit code (architecture §5.3, §7.3).
+/// Opens one `exec.pty` connection to the daemon (which allocates the PTY locally
+/// or, for `--room`/`--agent`, on a remote agent over the signed Matrix
+/// transport), puts the local terminal into raw mode so keystrokes pass straight
+/// through, renders the program's merged output, and forwards keystrokes and
+/// `SIGWINCH` resize events live on the same connection. Returns the command's
+/// exit code (architecture §5.3, §7.3, §7.6).
 #[cfg(unix)]
-fn cmd_exec_pty(command: &[String], cwd: PathBuf) -> ExitCode {
-    use mx_agent_daemon::{PtySession, RunError, RunSpec};
+fn cmd_exec_pty(global: &GlobalArgs, args: &ExecArgs, cwd: PathBuf) -> ExitCode {
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
 
-    let spec = RunSpec {
-        command: command.to_vec(),
-        cwd,
-        ..Default::default()
-    };
-
-    // Match the remote PTY to the local terminal up front; fall back to the
-    // conventional 24×80 when there is no local terminal (e.g. piped stdin).
-    let initial = local_winsize().unwrap_or_default();
-
-    let mut session = match PtySession::spawn(&spec, initial) {
-        Ok(session) => session,
+    let socket = daemon_socket_path(global);
+    let stream = match UnixStream::connect(&socket) {
+        Ok(stream) => stream,
         Err(e) => {
-            eprintln!("mx-agent: exec --pty failed: {e}");
-            return match e {
-                RunError::MissingCwd(_) => ExitCode::from(127),
-                RunError::Spawn(ref io) if io.kind() == std::io::ErrorKind::NotFound => {
-                    ExitCode::from(127)
-                }
-                RunError::EmptyCommand => ExitCode::from(64),
-                RunError::Spawn(_) => ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE),
-            };
+            eprintln!(
+                "mx-agent: could not contact daemon at {}: {e}; run `mx-agent daemon start`",
+                socket.display()
+            );
+            return ExitCode::from(3);
         }
     };
+
+    // Match the PTY to the local terminal up front; fall back to the conventional
+    // 24×80 when there is no local terminal (e.g. piped stdin).
+    let initial = local_winsize().unwrap_or_default();
+    let params = mx_agent_daemon::ExecPtyParams {
+        room: args.room.clone(),
+        agent: args.agent.clone(),
+        command: args.command.clone(),
+        cwd: Some(cwd),
+        rows: initial.rows,
+        cols: initial.cols,
+        task: args.task.clone(),
+    };
+    let params_value = match serde_json::to_value(&params) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("mx-agent: could not encode exec.pty request: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let read_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("mx-agent: exec --pty failed: {e}");
+            return ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE);
+        }
+    };
+    let write_stream = Arc::new(Mutex::new(stream));
+
+    // Start the session before entering raw mode so a failure prints cleanly.
+    {
+        let request = mx_agent_ipc::Request::new(
+            Value::from(1_u64),
+            mx_agent_daemon::METHOD_EXEC_PTY,
+            params_value,
+        );
+        let mut guard = write_stream.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = write_ipc_request(&mut guard, &request) {
+            eprintln!("mx-agent: daemon IPC request exec.pty failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     // Raw mode for the session: input bytes (arrow keys, control characters,
     // Ctrl-C) reach the remote PTY unmodified rather than being interpreted
@@ -3441,80 +3477,125 @@ fn cmd_exec_pty(command: &[String], cwd: PathBuf) -> ExitCode {
     // death so the local terminal is never stranded in raw mode.
     let raw = crate::terminal::RawModeGuard::activate();
 
-    // Pump the merged PTY output to the local terminal on a dedicated thread so
-    // the child never blocks on a full PTY buffer.
-    let output = match session.try_clone_reader() {
-        Ok(reader) => Some(std::thread::spawn(move || pump_pty_output(reader))),
-        Err(e) => {
-            eprintln!("mx-agent: could not read pty output: {e}");
-            None
-        }
-    };
+    // Render merged PTY output (and learn the exit code) on a dedicated thread.
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<u8>();
+    let reader = std::thread::spawn(move || pty_render_loop(read_stream, code_tx));
 
-    // Forward local stdin to the PTY on a detached thread. It blocks reading the
-    // terminal; when the command exits we stop waiting on it and process
-    // teardown reclaims it (a blocking tty read has no clean interruption).
-    if let Ok(writer) = session.try_clone_writer() {
-        std::thread::spawn(move || pump_stdin(writer));
-    }
+    // Forward local stdin as `pty.stdin` frames. Detached: a blocking tty read
+    // has no clean interruption, so teardown reclaims it when the session ends.
+    let stdin_stream = write_stream.clone();
+    std::thread::spawn(move || pty_forward_stdin(stdin_stream));
 
-    // Propagate window-size changes: on each SIGWINCH resize the remote PTY to
-    // the new local size. Detached for the session's lifetime.
-    if let Ok(resize_fd) = session.try_clone_writer() {
-        std::thread::spawn(move || forward_resizes(resize_fd));
-    }
+    // Forward `SIGWINCH` window-size changes as `pty.resize` frames.
+    let resize_stream = write_stream.clone();
+    std::thread::spawn(move || pty_forward_resizes(resize_stream));
 
-    let status = session.wait();
-
-    // Drain remaining output before restoring the terminal.
-    if let Some(output) = output {
-        let _ = output.join();
-    }
+    let code = code_rx
+        .recv()
+        .unwrap_or(crate::stream::EXIT_PROTOCOL_FAILURE);
+    let _ = reader.join();
     drop(raw);
-
-    match status {
-        Ok(status) => ExitCode::from(exit_code_from_status(&status)),
-        Err(e) => {
-            eprintln!("mx-agent: exec --pty failed waiting for command: {e}");
-            ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
-        }
-    }
+    ExitCode::from(code)
 }
 
 /// `--pty` is a Unix-only feature; report cleanly elsewhere.
 #[cfg(not(unix))]
-fn cmd_exec_pty(_command: &[String], _cwd: PathBuf) -> ExitCode {
+fn cmd_exec_pty(_global: &GlobalArgs, _args: &ExecArgs, _cwd: PathBuf) -> ExitCode {
     eprintln!("mx-agent: --pty is only supported on Unix platforms");
     ExitCode::from(64)
 }
 
-/// Copy the PTY's merged output to the local stdout until end-of-stream.
+/// Write a JSON-RPC request as a length-delimited IPC frame.
 #[cfg(unix)]
-fn pump_pty_output(mut reader: std::fs::File) {
-    use std::io::{Read as _, Write as _};
+fn write_ipc_request(
+    stream: &mut std::os::unix::net::UnixStream,
+    request: &mx_agent_ipc::Request,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(request)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    mx_agent_ipc::write_frame(stream, &bytes)
+}
 
-    let mut buf = [0u8; 8192];
+/// Render the daemon's [`PtyServerFrame`](mx_agent_daemon::PtyServerFrame) stream
+/// to the local terminal, sending the final exit code on `code_tx` when the
+/// session finishes (architecture §5.3).
+#[cfg(unix)]
+fn pty_render_loop(
+    mut stream: std::os::unix::net::UnixStream,
+    code_tx: std::sync::mpsc::Sender<u8>,
+) {
+    use base64::Engine as _;
+    use std::io::Write as _;
+
     let stdout = std::io::stdout();
-    let mut out = stdout.lock();
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if out.write_all(&buf[..n]).is_err() || out.flush().is_err() {
-                    break;
+        match mx_agent_ipc::read_frame(&mut stream) {
+            Ok(Some(bytes)) => {
+                let Ok(response) = serde_json::from_slice::<mx_agent_ipc::Response>(&bytes) else {
+                    continue;
+                };
+                if let Some(error) = response.error {
+                    eprintln!("mx-agent: exec --pty failed: {}", error.message);
+                    let _ = code_tx.send(crate::stream::EXIT_PROTOCOL_FAILURE);
+                    return;
+                }
+                let Some(result) = response.result else {
+                    continue;
+                };
+                let Ok(frame) = serde_json::from_value::<mx_agent_daemon::PtyServerFrame>(result)
+                else {
+                    continue;
+                };
+                match frame {
+                    mx_agent_daemon::PtyServerFrame::Output { data } => {
+                        if let Ok(bytes) =
+                            base64::engine::general_purpose::STANDARD.decode(data.as_bytes())
+                        {
+                            let mut out = stdout.lock();
+                            if out.write_all(&bytes).is_err() || out.flush().is_err() {
+                                let _ = code_tx.send(crate::stream::EXIT_PROTOCOL_FAILURE);
+                                return;
+                            }
+                        }
+                    }
+                    mx_agent_daemon::PtyServerFrame::Finished { exit_code, signal } => {
+                        let _ = code_tx.send(pty_exit_code(exit_code, signal));
+                        return;
+                    }
+                    mx_agent_daemon::PtyServerFrame::Error { message } => {
+                        eprintln!("mx-agent: exec --pty failed: {message}");
+                        let _ = code_tx.send(crate::stream::EXIT_PROTOCOL_FAILURE);
+                        return;
+                    }
                 }
             }
-            // A PTY master reports EIO (not EOF) once the slave is gone; treat
-            // any read error as end-of-stream.
-            Err(_) => break,
+            Ok(None) | Err(_) => {
+                let _ = code_tx.send(crate::stream::EXIT_PROTOCOL_FAILURE);
+                return;
+            }
         }
     }
 }
 
-/// Copy local stdin to the PTY until end-of-input.
+/// Map a finished PTY session's status to a local exit code, reporting signal
+/// death as `128 + signum` (architecture §5.3).
 #[cfg(unix)]
-fn pump_stdin(mut writer: std::fs::File) {
-    use std::io::{Read as _, Write as _};
+fn pty_exit_code(exit_code: Option<i32>, signal: Option<i32>) -> u8 {
+    if let Some(code) = exit_code {
+        return u8::try_from(code).unwrap_or(1);
+    }
+    if let Some(sig) = signal {
+        return u8::try_from(crate::terminal::signal_exit_code(sig))
+            .unwrap_or(crate::stream::EXIT_PROTOCOL_FAILURE);
+    }
+    crate::stream::EXIT_PROTOCOL_FAILURE
+}
+
+/// Copy local stdin to the daemon as base64 `pty.stdin` frames until end-of-input.
+#[cfg(unix)]
+fn pty_forward_stdin(stream: std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>) {
+    use base64::Engine as _;
+    use std::io::Read as _;
 
     let mut buf = [0u8; 8192];
     let stdin = std::io::stdin();
@@ -3523,7 +3604,19 @@ fn pump_stdin(mut writer: std::fs::File) {
         match input.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if writer.write_all(&buf[..n]).is_err() || writer.flush().is_err() {
+                let frame = mx_agent_daemon::PtyStdinFrame {
+                    data: base64::engine::general_purpose::STANDARD.encode(&buf[..n]),
+                };
+                let Ok(params) = serde_json::to_value(&frame) else {
+                    continue;
+                };
+                let request = mx_agent_ipc::Request::new(
+                    Value::Null,
+                    mx_agent_daemon::METHOD_PTY_STDIN,
+                    params,
+                );
+                let mut guard = stream.lock().unwrap_or_else(|e| e.into_inner());
+                if write_ipc_request(&mut guard, &request).is_err() {
                     break;
                 }
             }
@@ -3532,9 +3625,9 @@ fn pump_stdin(mut writer: std::fs::File) {
     }
 }
 
-/// Resize the remote PTY whenever the local terminal's window size changes.
+/// Forward each `SIGWINCH` window-size change as a `pty.resize` frame.
 #[cfg(unix)]
-fn forward_resizes(resize_fd: std::fs::File) {
+fn pty_forward_resizes(stream: std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>) {
     use signal_hook::consts::SIGWINCH;
     use signal_hook::iterator::Signals;
 
@@ -3543,8 +3636,23 @@ fn forward_resizes(resize_fd: std::fs::File) {
         Err(_) => return,
     };
     for _ in signals.forever() {
-        if let Some(size) = local_winsize() {
-            let _ = rustix::termios::tcsetwinsize(&resize_fd, size.into());
+        let Some(size) = local_winsize() else {
+            continue;
+        };
+        let frame = mx_agent_daemon::PtyResizeFrame {
+            rows: size.rows,
+            cols: size.cols,
+            pixel_width: size.pixel_width,
+            pixel_height: size.pixel_height,
+        };
+        let Ok(params) = serde_json::to_value(frame) else {
+            continue;
+        };
+        let request =
+            mx_agent_ipc::Request::new(Value::Null, mx_agent_daemon::METHOD_PTY_RESIZE, params);
+        let mut guard = stream.lock().unwrap_or_else(|e| e.into_inner());
+        if write_ipc_request(&mut guard, &request).is_err() {
+            break;
         }
     }
 }
@@ -3567,22 +3675,6 @@ fn local_winsize() -> Option<mx_agent_daemon::PtyWinsize> {
         }
     }
     None
-}
-
-/// Map a finished command's [`ExitStatus`] to a local exit code, reporting
-/// signal death as `128 + signum` (architecture §5.3).
-#[cfg(unix)]
-fn exit_code_from_status(status: &std::process::ExitStatus) -> u8 {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    if let Some(code) = status.code() {
-        return u8::try_from(code).unwrap_or(1);
-    }
-    if let Some(sig) = status.signal() {
-        return u8::try_from(crate::terminal::signal_exit_code(sig))
-            .unwrap_or(crate::stream::EXIT_PROTOCOL_FAILURE);
-    }
-    crate::stream::EXIT_PROTOCOL_FAILURE
 }
 
 #[cfg(test)]

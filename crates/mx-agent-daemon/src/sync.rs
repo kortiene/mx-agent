@@ -404,6 +404,9 @@ async fn handle_routed_events(
                     }
                 }
             }
+            RoutedEvent::PtyResize(event) => {
+                crate::exec::handle_live_pty_resize(&meta.sender, &event).await;
+            }
             RoutedEvent::CallRequest(request) => {
                 crate::call::handle_live_call_request(client, paths, &meta, &request).await;
             }

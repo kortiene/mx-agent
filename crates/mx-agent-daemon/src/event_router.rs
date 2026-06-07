@@ -40,7 +40,7 @@ use mx_agent_protocol::events::{state, timeline};
 use mx_agent_protocol::schema::{
     ApprovalDecision, ApprovalRequest, CallRequest, CallResponse, ExecAccepted, ExecCancel,
     ExecCancelled, ExecFinished, ExecRejected, ExecRequest, ExecStdin, Heartbeat, InvocationState,
-    StreamArtifact, StreamChunk, TaskState,
+    PtyResize, StreamArtifact, StreamChunk, TaskState,
 };
 
 use crate::replay::ReplayCache;
@@ -106,6 +106,8 @@ pub enum EventCategory {
     ExecCancel,
     /// `com.mxagent.exec.cancelled.v1`.
     ExecCancelled,
+    /// `com.mxagent.pty.resize.v1` (interactive PTY window-size hint).
+    PtyResize,
     /// `com.mxagent.call.request.v1` (privileged).
     CallRequest,
     /// `com.mxagent.call.response.v1`.
@@ -137,6 +139,7 @@ impl EventCategory {
             Self::ExecStdin => "exec.stdin",
             Self::ExecCancel => "exec.cancel",
             Self::ExecCancelled => "exec.cancelled",
+            Self::PtyResize => "pty.resize",
             Self::CallRequest => "call.request",
             Self::CallResponse => "call.response",
             Self::StreamChunk => "stream.chunk",
@@ -173,6 +176,7 @@ pub fn classify(event_type: &str) -> Option<EventCategory> {
         timeline::EXEC_STDIN => EventCategory::ExecStdin,
         timeline::EXEC_CANCEL => EventCategory::ExecCancel,
         timeline::EXEC_CANCELLED => EventCategory::ExecCancelled,
+        timeline::PTY_RESIZE => EventCategory::PtyResize,
         timeline::CALL_REQUEST => EventCategory::CallRequest,
         timeline::CALL_RESPONSE => EventCategory::CallResponse,
         timeline::STREAM_CHUNK => EventCategory::StreamChunk,
@@ -206,6 +210,8 @@ pub enum RoutedEvent {
     ExecCancel(Box<ExecCancel>),
     /// An exec invocation was cancelled.
     ExecCancelled(Box<ExecCancelled>),
+    /// A terminal window-resize for a live interactive PTY invocation.
+    PtyResize(Box<PtyResize>),
     /// A privileged named-tool call request.
     CallRequest(Box<CallRequest>),
     /// A response to a named-tool call.
@@ -237,6 +243,7 @@ impl RoutedEvent {
             Self::ExecStdin(_) => EventCategory::ExecStdin,
             Self::ExecCancel(_) => EventCategory::ExecCancel,
             Self::ExecCancelled(_) => EventCategory::ExecCancelled,
+            Self::PtyResize(_) => EventCategory::PtyResize,
             Self::CallRequest(_) => EventCategory::CallRequest,
             Self::CallResponse(_) => EventCategory::CallResponse,
             Self::StreamChunk(_) => EventCategory::StreamChunk,
@@ -360,6 +367,7 @@ fn parse_routed(category: EventCategory, content: &Value) -> Option<RoutedEvent>
         EventCategory::ExecStdin => RoutedEvent::ExecStdin(Box::new(parse(content)?)),
         EventCategory::ExecCancel => RoutedEvent::ExecCancel(Box::new(parse(content)?)),
         EventCategory::ExecCancelled => RoutedEvent::ExecCancelled(Box::new(parse(content)?)),
+        EventCategory::PtyResize => RoutedEvent::PtyResize(Box::new(parse(content)?)),
         EventCategory::CallRequest => RoutedEvent::CallRequest(Box::new(parse(content)?)),
         EventCategory::CallResponse => RoutedEvent::CallResponse(Box::new(parse(content)?)),
         EventCategory::StreamChunk => RoutedEvent::StreamChunk(Box::new(parse(content)?)),
@@ -572,13 +580,17 @@ mod tests {
         );
         assert_eq!(classify(state::TASK), Some(EventCategory::Task));
         assert_eq!(classify(state::INVOCATION), Some(EventCategory::Invocation));
+        assert_eq!(
+            classify(timeline::PTY_RESIZE),
+            Some(EventCategory::PtyResize)
+        );
         // Every routed type classifies, and the count matches the issue list.
         let routed_count = timeline::ALL
             .iter()
             .chain(state::ALL.iter())
             .filter(|ty| classify(ty).is_some())
             .count();
-        assert_eq!(routed_count, 16);
+        assert_eq!(routed_count, 17);
     }
 
     #[test]
