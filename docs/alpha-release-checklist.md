@@ -5,11 +5,11 @@ commit to decide whether it is fit to ship as a public alpha release. It exists
 so that "is this commit alpha-release ready?" has a concrete, repeatable answer
 rather than a judgement call.
 
-> **Alpha status.** `mx-agent` is pre-release software. `call` and non-PTY
-> `exec` run a daemon-mediated local execution by default and become signed
-> Matrix-backed remote operations when `--room`/`--agent` target a registered,
-> trusted, policy-allowed remote agent, and a live daemon scheduler loop
-> auto-drives signed, assigned tasks. This checklist gates an *alpha*, and is
+> **Alpha status.** `mx-agent` is pre-release software. `call` and `exec`
+> (batch and interactive `--pty`) run a daemon-mediated local execution by
+> default and become signed Matrix-backed remote operations when `--room`/`--agent`
+> target a registered, trusted, policy-allowed remote agent, and a live daemon
+> scheduler loop auto-drives signed, assigned tasks. This checklist gates an *alpha*, and is
 > deliberately scoped to what the alpha actually ships — see
 > [Known limitations](#known-limitations).
 
@@ -128,19 +128,14 @@ alpha; the gate's job is to ensure they remain the *complete, documented* set.
 If the candidate commit has a behavior gap not listed here, either fix it or add
 it here before release.
 
-- **Interactive PTY `exec` does not run over IPC/remote yet.** `call` and
-  non-PTY `exec` run daemon-mediated locally by default and over the signed
-  Matrix transport to a *remote* agent's daemon when `--room`/`--agent` are
-  given. Interactive `exec --pty` runs locally but is not yet carried over IPC or
-  the Matrix transport (follow-up #155). (See the
-  [user guide](user-guide.md#run-exec) and
-  [security hardening guide](security-hardening.md).)
 - **Live task dispatch defaults to local execution.** A running daemon's
   scheduler loop auto-claims signed, assigned, policy-allowed tasks and runs them
   via local tool/exec dispatch; routing that dispatch through the signed
   Matrix-backed `call`/`exec` transport is opt-in via `MX_AGENT_TASK_DISPATCH=matrix`.
-  An approval-required task is held (fail closed) by the gate-less scheduler loop
-  and is not auto-run.
+  An approval-required task is held (fail closed) until an operator publishes a
+  decision over IPC: the wired scheduler approval gate then auto-runs it on
+  `approve` and finalizes it `blocked` on `deny` — it is never auto-run before a
+  decision.
 - **PTY signal semantics are partial.** Controlling-tty and full Ctrl-C
   semantics for `exec --pty` are intentionally limited; the workspace forbids
   `unsafe`, so PTY/termios use the safe `rustix` path.

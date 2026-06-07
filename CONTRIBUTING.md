@@ -5,9 +5,10 @@ decentralized orchestration between autonomous coding agents. This guide covers
 how to get set up, the checks your change must pass, and how we handle issues and
 pull requests.
 
-> **Project status: public alpha (v0.1.0).** Many CLI subcommands are still
-> argument-parsing placeholders; behavior is landing across the roadmap. See the
-> [README](README.md#project-status) for what works today and the
+> **Project status: public alpha (v0.2.0).** All command groups run against a
+> real Matrix homeserver through the daemon, including signed Matrix-backed remote
+> `call` and `exec` (batch and interactive `--pty`) and a live task scheduler. See
+> the [README](README.md#project-status) for what works today and the
 > [issue backlog](docs/github-issue-backlog.md) for where help is most useful.
 
 ## Code of conduct
