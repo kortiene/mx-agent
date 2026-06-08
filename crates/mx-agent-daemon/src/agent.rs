@@ -19,6 +19,9 @@ use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::AGENT as AGENT_STATE_TYPE;
 use mx_agent_protocol::schema::{AgentLoad, AgentState, AgentWorkspace, ToolSchema};
 
+use crate::heartbeat::{
+    now_ms, read_latest_heartbeats, Liveness, LivenessConfig, HEARTBEAT_SCAN_LIMIT,
+};
 use crate::matrix::restore_client;
 use crate::session::{SessionPaths, StoredSession};
 use crate::signing::load_or_create_signing_key;
@@ -207,6 +210,22 @@ pub struct ListAgentsOptions {
     pub capabilities: Vec<String>,
 }
 
+/// An agent's durable state plus the daemon-computed liveness verdict.
+///
+/// Returned by the liveness-enriched `agent list`/`agent show` IPC handlers so
+/// the CLI stays stateless: the daemon owns the Matrix client and timeline, and
+/// computes the [`Liveness`] verdict, while the CLI only renders the precomputed
+/// envelope (architecture §9.1). The verdict combines the durable
+/// `com.mxagent.agent.v1` `last_seen_ts` with the latest
+/// `com.mxagent.heartbeat.v1` timeline event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentListing {
+    /// Durable `com.mxagent.agent.v1` state.
+    pub agent: AgentState,
+    /// Liveness verdict at the time of the query (`active`/`stale`/`offline`).
+    pub liveness: Liveness,
+}
+
 /// View of the tools an agent offers, derived from its registered
 /// [`AgentState`].
 ///
@@ -352,6 +371,72 @@ pub async fn show_agent_for_session(
 ) -> Result<Option<AgentState>, WorkspaceError> {
     let client = restore_client(session).await?;
     show_agent(&client, room, agent_id).await
+}
+
+/// Attach a daemon-computed [`Liveness`] verdict to each `agent`, using the
+/// latest heartbeat per agent in `room`.
+///
+/// The room's timeline is scanned once (up to [`HEARTBEAT_SCAN_LIMIT`] events)
+/// and the verdict is computed with [`LivenessConfig::liveness_combined`], so a
+/// healthy agent reads `active` between durable-state refreshes. A timeline read
+/// failure degrades to durable-only liveness (advisory signal, never fail the
+/// query): the verdict falls back to the durable `last_seen_ts`.
+async fn enrich_with_liveness(room: &Room, agents: Vec<AgentState>) -> Vec<AgentListing> {
+    let latest = read_latest_heartbeats(room, HEARTBEAT_SCAN_LIMIT)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "could not read heartbeats; using durable-only liveness");
+            Default::default()
+        });
+    let cfg = LivenessConfig::default();
+    let now = now_ms();
+    agents
+        .into_iter()
+        .map(|agent| {
+            let hb_ts = latest.get(&agent.agent_id).map(|h| h.ts);
+            let liveness = cfg.liveness_combined(&agent, hb_ts, now);
+            AgentListing { agent, liveness }
+        })
+        .collect()
+}
+
+/// List agents with a daemon-computed liveness verdict, restoring the
+/// authenticated client from `session`.
+///
+/// Mirrors [`list_agents`] (same room resolution, capability filtering, and
+/// `agent_id` ordering) but resolves the room once and reuses it to scan the
+/// heartbeat timeline, returning [`AgentListing`]s rather than bare
+/// [`AgentState`]s. The plain `list_agents` is left intact for the scheduler and
+/// integration tests.
+pub async fn list_agents_with_liveness_for_session(
+    session: &StoredSession,
+    options: &ListAgentsOptions,
+) -> Result<Vec<AgentListing>, WorkspaceError> {
+    let client = restore_client(session).await?;
+    let room = sync_and_get_room(&client, &options.room).await?;
+    let mut agents = read_all_agent_states(&room).await?;
+    agents.retain(|agent| matches_capabilities(agent, &options.capabilities));
+    agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    Ok(enrich_with_liveness(&room, agents).await)
+}
+
+/// Show one agent with a daemon-computed liveness verdict, restoring the
+/// authenticated client from `session`.
+///
+/// Returns `Ok(None)` when the agent has not registered, mirroring
+/// [`show_agent`]; otherwise the room is reused to scan the heartbeat timeline
+/// for the verdict.
+pub async fn show_agent_with_liveness_for_session(
+    session: &StoredSession,
+    room: &str,
+    agent_id: &str,
+) -> Result<Option<AgentListing>, WorkspaceError> {
+    let client = restore_client(session).await?;
+    let room = sync_and_get_room(&client, room).await?;
+    let Some(agent) = read_agent_state(&room, agent_id).await? else {
+        return Ok(None);
+    };
+    Ok(enrich_with_liveness(&room, vec![agent]).await.pop())
 }
 
 /// Report the tools a single agent offers, derived from its registered state.

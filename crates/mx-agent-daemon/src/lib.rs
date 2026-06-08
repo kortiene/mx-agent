@@ -47,9 +47,10 @@ pub mod watch;
 pub mod workspace;
 
 pub use agent::{
-    agent_tools, agent_tools_for_session, list_agents, list_agents_for_session, register_agent,
-    register_agent_for_session, show_agent, show_agent_for_session, AgentTools, ListAgentsOptions,
-    RegisterAgentOptions, DEFAULT_AGENT_KIND, DEFAULT_MAX_INVOCATIONS,
+    agent_tools, agent_tools_for_session, list_agents, list_agents_for_session,
+    list_agents_with_liveness_for_session, register_agent, register_agent_for_session, show_agent,
+    show_agent_for_session, show_agent_with_liveness_for_session, AgentListing, AgentTools,
+    ListAgentsOptions, RegisterAgentOptions, DEFAULT_AGENT_KIND, DEFAULT_MAX_INVOCATIONS,
 };
 pub use approval::{
     approval_decision_for, approval_request_expiry, approval_request_for,
@@ -104,8 +105,9 @@ pub use exec_subscribers::{
     ExecSubscriberRegistry, ExecSubscription, ExecSubscriptionKey, ForwardStats, ForwardedExecEvent,
 };
 pub use heartbeat::{
-    emit_heartbeat, HeartbeatConfig, Liveness, LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL,
-    DEFAULT_OFFLINE_AFTER, DEFAULT_STALE_AFTER, DEFAULT_STATE_REFRESH,
+    emit_heartbeat, read_latest_heartbeats, run_heartbeat_loop, HeartbeatConfig, Liveness,
+    LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_OFFLINE_AFTER, DEFAULT_STALE_AFTER,
+    DEFAULT_STATE_REFRESH, HEARTBEAT_SCAN_LIMIT,
 };
 pub use invocation::{
     advance_invocation, advance_invocation_for_session, cancel_invocation,

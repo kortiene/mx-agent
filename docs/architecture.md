@@ -192,10 +192,44 @@ mx-agent agent list --room '!abc123:matrix.org'
 mx-agent agent list --room '!abc123:matrix.org' --capability test --json
 ```
 
+Human output includes an `active`/`stale`/`offline` liveness verdict and a
+relative `last_seen` age computed from the most recent heartbeat event:
+
+```text
+mx-agent: 2 agent(s) in !abc123:matrix.org
+  claude-local             claude-c active   active   42s ago    plan,review
+  developer-pi             pi       active   active   28s ago    shell,test,edit
+```
+
+`--json` output wraps each agent in an `AgentListing` envelope:
+
+```json
+[
+  {
+    "agent": { "agent_id": "developer-pi", "status": "active", ... },
+    "liveness": "active"
+  }
+]
+```
+
 Show one agent:
 
 ```bash
-mx-agent agent show --room '!abc123:matrix.org' developer-pi --json
+mx-agent agent show --room '!abc123:matrix.org' --agent-id developer-pi
+mx-agent agent show --room '!abc123:matrix.org' --agent-id developer-pi --json
+```
+
+Human output includes `liveness` and `last_seen`:
+
+```text
+mx-agent: agent developer-pi
+  kind:         pi
+  status:       active
+  liveness:     active
+  last_seen:    28s ago (1780392000000 ms)
+  user:         @pi:matrix.org
+  device:       MXAGENTDEVICE01
+  ...
 ```
 
 ---
@@ -802,13 +836,38 @@ handlers decode it, verify that its SHA-256 digest matches `signing_key_id`, and
 then use the resulting Ed25519 verifying key for request signatures; the local
 trust store still decides whether the key id is authorized.
 
-Liveness should combine:
+**Liveness** combines the durable `last_seen_ts` with the most recent
+`com.mxagent.heartbeat.v1` timeline event (whichever is newer):
 
-- latest durable `agent` state
-- recent `heartbeat` event
-- room membership
-- optional Matrix presence
-- trusted signing/device key status
+- `active` — seen within the last 90 s (three missed heartbeats at the default
+  30-second interval).
+- `stale` — no heartbeat for 90–300 s; possibly unhealthy.
+- `offline` — no heartbeat for > 300 s; presumed stopped or gone.
+
+The daemon emits a `com.mxagent.heartbeat.v1` timeline event every 30 s for
+each agent it owns, and rewrites the durable `com.mxagent.agent.v1` state event
+(refreshing `last_seen_ts`) at most every 300 s so steady-state heartbeats do not
+churn room state. `agent list` / `agent show` scan the most recent 100 timeline
+events to find the latest heartbeat per agent and compute the verdict server-side;
+the CLI receives a precomputed `AgentListing { agent, liveness }` over local IPC
+and remains stateless (architecture §10).
+
+> **Planned.** The remaining liveness signals (room membership, Matrix presence,
+> key status) described in the original §9.1 aspiration are not yet implemented.
+> The heartbeat sender is not yet pinned, so a room member could spoof a heartbeat
+> to inflate a displayed verdict (liveness is advisory, never an authorization
+> input — dispatch authority remains signature → trust → policy → approval).
+
+The `com.mxagent.heartbeat.v1` timeline event carries:
+
+```json
+{
+  "agent_id": "developer-pi",
+  "status": "active",
+  "load": { "running_invocations": 1, "max_invocations": 4 },
+  "ts": 1780392000000
+}
+```
 
 ### 9.2 Task State
 

@@ -234,7 +234,7 @@ pub fn run_foreground() -> io::Result<()> {
     // task scheduler loop (architecture §9.2, issue #199).
     let sync_running = Arc::new(AtomicBool::new(true));
     let exec_subscribers = crate::ExecSubscriberRegistry::new();
-    let (sync_thread, scheduler_thread, health) =
+    let ((sync_thread, scheduler_thread, heartbeat_thread), health) =
         spawn_matrix_workers(sync_running.clone(), exec_subscribers.clone());
 
     // Serve IPC requests on a background thread. The thread is torn down when
@@ -266,12 +266,16 @@ pub fn run_foreground() -> io::Result<()> {
         tracing::info!(signal, "received shutdown signal");
     }
 
-    // Signal the sync and scheduler loops to stop and wait for them to wind down.
+    // Signal the sync, scheduler, and heartbeat loops to stop and wait for them
+    // to wind down.
     sync_running.store(false, Ordering::SeqCst);
     if let Some(handle) = sync_thread {
         let _ = handle.join();
     }
     if let Some(handle) = scheduler_thread {
+        let _ = handle.join();
+    }
+    if let Some(handle) = heartbeat_thread {
         let _ = handle.join();
     }
 
@@ -281,40 +285,43 @@ pub fn run_foreground() -> io::Result<()> {
     Ok(())
 }
 
-/// Type alias for the pair of background worker threads (sync + scheduler).
+/// Type alias for the trio of background worker threads (sync + scheduler +
+/// heartbeat).
 type WorkerThreads = (
+    Option<std::thread::JoinHandle<()>>,
     Option<std::thread::JoinHandle<()>>,
     Option<std::thread::JoinHandle<()>>,
 );
 
-/// Spawn the Matrix sync loop and the live task scheduler loop, if a session is
-/// stored, sharing one restored client between them.
+/// Spawn the Matrix sync loop, the live task scheduler loop, and the periodic
+/// heartbeat loop, if a session is stored, sharing one restored client between
+/// them.
 ///
-/// Returns `(None, None, None)` (and does nothing) when no Matrix session exists
-/// yet, so the daemon runs cleanly before login. The sync thread owns a
-/// current-thread Tokio runtime that drives [`crate::sync::run_matrix_sync`];
-/// the scheduler thread owns its own runtime and drives
-/// [`crate::run_scheduler_loop`] over the same client, so only the sync loop
-/// advances the session token while the scheduler reads task state and claims
-/// runnable assigned tasks (architecture §9.2, issue #199).
+/// Returns `((None, None, None), None)` (and does nothing) when no Matrix
+/// session exists yet, so the daemon runs cleanly before login. The sync thread
+/// owns a current-thread Tokio runtime that drives
+/// [`crate::sync::run_matrix_sync`]; the scheduler thread owns its own runtime
+/// and drives [`crate::run_scheduler_loop`]; the heartbeat thread owns its own
+/// runtime and drives [`crate::run_heartbeat_loop`]. Only the sync loop advances
+/// the session token — the scheduler and heartbeat loops read cached state and
+/// send events over the same client, so there is no token race (architecture
+/// §9.1/§9.2, issues #199/#250).
 fn spawn_matrix_workers(
     running: Arc<AtomicBool>,
     exec_subscribers: crate::ExecSubscriberRegistry,
-) -> (
-    Option<std::thread::JoinHandle<()>>,
-    Option<std::thread::JoinHandle<()>>,
-    SharedHealth,
-) {
+) -> (WorkerThreads, SharedHealth) {
     let session_paths = SessionPaths::resolve();
     let session = match load_session(&session_paths) {
         Ok(Some(session)) => session,
         Ok(None) => {
-            tracing::info!("no Matrix session stored; sync and scheduler loops not started");
-            return (None, None, None);
+            tracing::info!(
+                "no Matrix session stored; sync, scheduler, and heartbeat loops not started"
+            );
+            return ((None, None, None), None);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "could not load Matrix session; sync and scheduler loops not started");
-            return (None, None, None);
+            tracing::warn!(error = %e, "could not load Matrix session; sync, scheduler, and heartbeat loops not started");
+            return ((None, None, None), None);
         }
     };
 
@@ -369,6 +376,13 @@ fn spawn_matrix_workers(
         });
     });
 
+    // The heartbeat thread shares the same restored client (waiting on the same
+    // shared slot) and the shutdown flag, so it stops cleanly with the others and
+    // never opens a second client. Clone before the scheduler closure consumes
+    // the originals.
+    let heartbeat_client = shared_client.clone();
+    let heartbeat_running = running.clone();
+
     // Task dispatch defaults to local in-process execution; opt into the signed
     // Matrix-backed `call`/`exec` transport with `MX_AGENT_TASK_DISPATCH=matrix`
     // (issue #200). The scheduler shares the daemon's exec subscriber registry so
@@ -400,8 +414,38 @@ fn spawn_matrix_workers(
         );
     });
 
-    let threads: WorkerThreads = (Some(sync_handle), Some(scheduler_handle));
-    (threads.0, threads.1, Some(health))
+    // The heartbeat thread refreshes liveness for every agent this daemon owns at
+    // `DEFAULT_HEARTBEAT_INTERVAL`, so a long-running agent's `last_seen_ts` and
+    // heartbeat timeline event stay fresh and peers compute `active` rather than
+    // drifting to `stale`/`offline` (issue #250).
+    let heartbeat_handle = std::thread::spawn(move || {
+        let client = loop {
+            if !heartbeat_running.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(client) = heartbeat_client
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                break client;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        crate::run_heartbeat_loop(
+            client,
+            heartbeat_running,
+            crate::HeartbeatConfig::default(),
+            crate::DEFAULT_HEARTBEAT_INTERVAL,
+        );
+    });
+
+    let threads: WorkerThreads = (
+        Some(sync_handle),
+        Some(scheduler_handle),
+        Some(heartbeat_handle),
+    );
+    (threads, Some(health))
 }
 
 fn write_ipc_response(
@@ -616,13 +660,18 @@ fn dispatch(
         },
         "agent.list" => match parse_params::<crate::ListAgentsOptions>(req) {
             Ok(options) => block_on_task_response(req, |session| async move {
-                crate::list_agents_for_session(&session, &options).await
+                crate::list_agents_with_liveness_for_session(&session, &options).await
             }),
             Err(response) => *response,
         },
         "agent.show" => match parse_params::<crate::RoomAgentParams>(req) {
             Ok(params) => block_on_task_response(req, |session| async move {
-                crate::show_agent_for_session(&session, &params.room, &params.agent_id).await
+                crate::show_agent_with_liveness_for_session(
+                    &session,
+                    &params.room,
+                    &params.agent_id,
+                )
+                .await
             }),
             Err(response) => *response,
         },
