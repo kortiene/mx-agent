@@ -2,16 +2,19 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mx-agent");
 
 fn unique_runtime_dir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("mx-agent-it-{}-{}", std::process::id(), nanos))
+    // Use a monotonic counter (not just a timestamp) so parallel tests in the
+    // same process always get distinct directories regardless of clock resolution.
+    // Parallel tests share the same PID, and system clocks can have coarser-than-
+    // nanosecond resolution on some hosts, making timestamp-only paths collide.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("mx-agent-it-{}-{}", std::process::id(), n))
 }
 
 fn run(runtime_dir: &PathBuf, args: &[&str]) -> std::process::Output {

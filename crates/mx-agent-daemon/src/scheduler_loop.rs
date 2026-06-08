@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
-use mx_agent_policy::Policy;
+use mx_agent_policy::{Allowance, Policy};
 use mx_agent_protocol::schema::{InvocationState, TaskAction, TaskState};
 
 use crate::approval::{
@@ -193,10 +193,11 @@ where
         task: &TaskState,
         action: &TaskAction,
         invocation_id: &str,
+        allowance: &Allowance,
     ) -> Result<TaskExecutionResult, crate::task_orchestrator::TaskDispatchError> {
         match action {
-            TaskAction::Tool { .. } => self.tool.dispatch(task, action, invocation_id),
-            TaskAction::Exec { .. } => self.exec.dispatch(task, action, invocation_id),
+            TaskAction::Tool { .. } => self.tool.dispatch(task, action, invocation_id, allowance),
+            TaskAction::Exec { .. } => self.exec.dispatch(task, action, invocation_id, allowance),
         }
     }
 }
@@ -1003,11 +1004,11 @@ allow_cwd = ["/repo"]
         };
         let task = tool_task("task-a", "run_tests");
         assert!(dispatcher
-            .dispatch(&task, &tool, "inv-1")
+            .dispatch(&task, &tool, "inv-1", &Allowance::default())
             .unwrap()
             .is_success());
         assert!(dispatcher
-            .dispatch(&task, &exec, "inv-2")
+            .dispatch(&task, &exec, "inv-2", &Allowance::default())
             .unwrap()
             .is_success());
     }
@@ -1241,6 +1242,7 @@ allow_cwd = ["/repo"]
                 _task: &TaskState,
                 _action: &TaskAction,
                 _invocation_id: &str,
+                _allowance: &Allowance,
             ) -> Result<TaskExecutionResult, TaskDispatchError> {
                 Err(TaskDispatchError::Failed("boom".to_string()))
             }

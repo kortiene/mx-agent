@@ -28,10 +28,11 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
+use mx_agent_sandbox::{sandbox_for, Restrictions};
 use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 use rustix::termios::{tcgetwinsize, tcsetwinsize, Winsize};
 
-use crate::runner::{sanitize_env, RunError, RunSpec};
+use crate::runner::{restrictions_for, sanitize_env, RunError, RunSpec};
 
 /// A terminal window size: character grid plus optional pixel dimensions.
 ///
@@ -113,16 +114,22 @@ impl PtySession {
     /// Allocate a PTY and spawn `spec`'s command attached to its slave end at
     /// the given window `size`.
     ///
-    /// The child runs in `spec.cwd` with the same allowlist-sanitized
-    /// environment as [`crate::runner::run`] (secrets are never inherited) and
-    /// is placed in its own process group so a later cancel/timeout can signal
-    /// the whole group. Its stdin, stdout, and stderr are all wired to the PTY
-    /// slave, producing the single merged terminal stream.
+    /// The command is launched through the selected sandbox backend
+    /// ([`RunSpec::sandbox`]) exactly as [`crate::runner::run`] does, so the
+    /// configured network policy and read-only/writable binds confine the
+    /// interactive session too (architecture §13.5); the baseline `none` backend
+    /// adds no isolation. The child runs in `spec.cwd` with the same
+    /// allowlist-sanitized environment (secrets are never inherited) and is
+    /// placed in its own process group so a later cancel/timeout can signal the
+    /// whole group. Its stdin, stdout, and stderr are all wired to the PTY slave,
+    /// producing the single merged terminal stream.
     ///
     /// Returns a [`RunError`] when the command is empty, the working directory
     /// is missing, or the PTY/child could not be set up.
     pub fn spawn(spec: &RunSpec, size: PtyWinsize) -> Result<PtySession, RunError> {
-        let (program, args) = spec.command.split_first().ok_or(RunError::EmptyCommand)?;
+        if spec.command.is_empty() {
+            return Err(RunError::EmptyCommand);
+        }
         if !is_existing_dir(&spec.cwd) {
             return Err(RunError::MissingCwd(spec.cwd.clone()));
         }
@@ -136,10 +143,6 @@ impl PtySession {
         let slave_name = ptsname(&master, Vec::new()).map_err(|e| RunError::Spawn(e.into()))?;
         let master = File::from(master);
 
-        // Set the initial window size before the child starts so its first
-        // render already matches the local terminal.
-        tcsetwinsize(&master, size.into()).map_err(|e| RunError::Spawn(e.into()))?;
-
         let slave_path = OsStr::from_bytes(slave_name.as_bytes());
         let slave = OpenOptions::new()
             .read(true)
@@ -147,11 +150,27 @@ impl PtySession {
             .open(slave_path)
             .map_err(RunError::Spawn)?;
 
+        // Set the initial window size on the slave side. On macOS, TIOCSWINSZ
+        // on the master returns ENOTTY until the slave is open; the slave form
+        // is portable across Linux and macOS. The kernel PTY structure is
+        // shared, so tcgetwinsize on the master afterwards reflects this size.
+        tcsetwinsize(&slave, size.into()).map_err(|e| RunError::Spawn(e.into()))?;
+
+        // Launch through the selected sandbox backend (architecture §13.5),
+        // mirroring the non-interactive runner: the backend rewrites the argv to
+        // launch inside its wrapper (e.g. `bwrap …`) and so enforces the network
+        // policy and the read-only/writable binds. The baseline `none` backend
+        // returns the argv unchanged. Without this the sandbox/network/path
+        // fields on the spec would have no effect on the interactive path.
         let env = sanitize_env(std::env::vars(), &spec.env, &spec.env_allowlist);
+        let restrictions = restrictions_for(spec, env);
+        let prepared = sandbox_for(spec.sandbox).prepare(spec.command.clone(), restrictions);
+        let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
+        let Restrictions { cwd, env, .. } = prepared.restrictions;
         let mut command = Command::new(program);
         command
             .args(args)
-            .current_dir(&spec.cwd)
+            .current_dir(&cwd)
             .env_clear()
             .envs(env)
             // All three standard streams share the one terminal, so stdout and
@@ -337,5 +356,97 @@ mod tests {
         };
         let ws: Winsize = size.into();
         assert_eq!(PtyWinsize::from(ws), size);
+    }
+
+    // --- Sandbox routing through the interactive PTY path (issue #248) --------
+    //
+    // The interactive `--pty` path must launch through the selected sandbox
+    // backend, just like the non-interactive runner, so the configured network
+    // policy and bind paths actually confine the session. A real backend only
+    // exists on Linux (bubblewrap), so this is a behavioral integration test
+    // that skips gracefully when `bwrap` (or `/sys/class/net`) is unavailable.
+
+    /// Whether a minimal `bwrap` invocation works in this environment (mirrors
+    /// the probe in the sandbox crate's own integration tests).
+    fn bwrap_usable() -> bool {
+        Command::new("bwrap")
+            .args([
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev-bind",
+                "/dev",
+                "/dev",
+                "--",
+                "true",
+            ])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Read-only system mounts a sandboxed shell needs to run.
+    fn base_ro_paths() -> Vec<PathBuf> {
+        ["/usr", "/bin", "/lib", "/lib64", "/etc"]
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .collect()
+    }
+
+    #[test]
+    fn pty_command_runs_inside_selected_sandbox_backend() {
+        use mx_agent_sandbox::{Backend, Network};
+
+        if !bwrap_usable() {
+            eprintln!("skipping: bwrap not usable in this environment");
+            return;
+        }
+        if !PathBuf::from("/sys/class/net").exists() {
+            eprintln!("skipping: /sys/class/net absent");
+            return;
+        }
+
+        // A writable workspace bound into the sandbox so --chdir resolves.
+        let workspace =
+            std::env::temp_dir().join(format!("mx-agent-pty-sandbox-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut ro = base_ro_paths();
+        ro.push(PathBuf::from("/sys"));
+
+        // Probe the network from inside the session: under `network=Deny` the
+        // sandbox has only a down loopback, so there are no non-`lo` interfaces.
+        // If the PTY path failed to route through the backend (the #248 bug), the
+        // command would run raw on the host and see real interfaces instead.
+        let mut s = spec(&[
+            "/bin/sh",
+            "-c",
+            "n=$(ls /sys/class/net | grep -vx lo | wc -l); \
+             if [ \"$n\" -eq 0 ]; then echo PTY-SANDBOX-NET-DENIED; \
+             else echo PTY-SANDBOX-NET-OPEN; fi",
+        ]);
+        s.cwd = workspace.clone();
+        s.sandbox = Backend::Bubblewrap;
+        s.network = Network::Deny;
+        s.read_only_paths = ro;
+        s.writable_paths = vec![workspace.clone()];
+
+        let session = PtySession::spawn(&s, PtyWinsize::default()).expect("spawn pty session");
+        let (status, output) = run_and_collect(session);
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        if !status.success() {
+            eprintln!("skipping: shell failed inside sandbox: {output:?}");
+            return;
+        }
+        assert!(
+            output.contains("PTY-SANDBOX-NET-DENIED"),
+            "interactive PTY exec did not run under the network-denied sandbox: {output:?}"
+        );
+        assert!(
+            !output.contains("PTY-SANDBOX-NET-OPEN"),
+            "interactive PTY exec saw the host network — not sandboxed: {output:?}"
+        );
     }
 }

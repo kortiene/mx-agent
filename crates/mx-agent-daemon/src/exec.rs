@@ -37,7 +37,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use matrix_sdk::Room;
 use serde_json::Value;
 
-use mx_agent_policy::{Allowance, DenyReason, ExecContext, Outcome, Policy, Sandbox};
+use mx_agent_policy::{
+    Allowance, DenyReason, ExecContext, NetworkPolicy, Outcome, Policy, Sandbox,
+};
 use mx_agent_protocol::events::state::INVOCATION;
 use mx_agent_protocol::events::timeline::{
     EXEC_ACCEPTED, EXEC_CANCEL, EXEC_CANCELLED, EXEC_FINISHED, EXEC_REJECTED, EXEC_REQUEST,
@@ -945,6 +947,9 @@ async fn run_controlled_exec(
             allowance.max_runtime_ms.unwrap_or(request.timeout_ms),
         )),
         sandbox: sandbox_backend(allowance.sandbox),
+        network: network_for(allowance.network),
+        read_only_paths: allowance.read_only_paths.clone(),
+        writable_paths: allowance.writable_paths.clone(),
         ..Default::default()
     };
     let mut command = build_command(&spec)?;
@@ -1167,6 +1172,9 @@ async fn run_controlled_pty_exec(
             allowance.max_runtime_ms.unwrap_or(request.timeout_ms),
         )),
         sandbox: sandbox_backend(allowance.sandbox),
+        network: network_for(allowance.network),
+        read_only_paths: allowance.read_only_paths.clone(),
+        writable_paths: allowance.writable_paths.clone(),
         ..Default::default()
     };
     // The requester sends an initial `pty.resize` with the real terminal size
@@ -1455,11 +1463,33 @@ pub async fn handle_live_pty_resize(
     }
 }
 
-fn sandbox_backend(sandbox: Option<Sandbox>) -> mx_agent_sandbox::Backend {
+/// Map the policy sandbox selection to the sandbox-layer
+/// [`Backend`][mx_agent_sandbox::Backend].
+///
+/// The currently-unimplemented `firejail` / `chroot` policy values, and an
+/// unset selection, fall back to [`Backend::None`][mx_agent_sandbox::Backend::None]
+/// (no isolation) — pre-existing behavior. Shared with the task-dispatch path so
+/// both the direct `exec` and auto-executed task paths resolve the backend the
+/// same way (architecture §13.5).
+pub(crate) fn sandbox_backend(sandbox: Option<Sandbox>) -> mx_agent_sandbox::Backend {
     match sandbox {
         Some(Sandbox::Bubblewrap) => mx_agent_sandbox::Backend::Bubblewrap,
         Some(Sandbox::Docker | Sandbox::Podman) => mx_agent_sandbox::Backend::Container,
         _ => mx_agent_sandbox::Backend::None,
+    }
+}
+
+/// Map the policy network decision to the sandbox-layer
+/// [`Network`][mx_agent_sandbox::Network] setting,
+/// failing closed: an unset (or `deny`) policy network denies, and only an
+/// explicit `network = "allow"` removes network isolation (architecture §13.5).
+///
+/// Shared with the task-dispatch path so both the direct `exec` and
+/// auto-executed task paths resolve the network decision the same way.
+pub(crate) fn network_for(network: Option<NetworkPolicy>) -> mx_agent_sandbox::Network {
+    match network {
+        Some(NetworkPolicy::Allow) => mx_agent_sandbox::Network::Allow,
+        Some(NetworkPolicy::Deny) | None => mx_agent_sandbox::Network::Deny,
     }
 }
 
@@ -1974,6 +2004,7 @@ allow_cwd = ["/home/me/code/project"]
             network: None,
             requires_approval: false,
             env_allowlist: Vec::new(),
+            ..Allowance::default()
         };
 
         // Queue stdin and EOF before run_controlled_exec is even polled — the
@@ -2553,5 +2584,69 @@ allow_cwd = ["/home/me/code/project"]
         )
         .unwrap_err();
         assert_eq!(err, CancelRejection::InvalidSignature);
+    }
+
+    // --- network_for and sandbox_backend mapping tests (issue #248) ----------
+
+    #[test]
+    fn network_for_allow_maps_to_allow() {
+        assert_eq!(
+            network_for(Some(NetworkPolicy::Allow)),
+            mx_agent_sandbox::Network::Allow,
+            "NetworkPolicy::Allow must map to Network::Allow"
+        );
+    }
+
+    #[test]
+    fn network_for_deny_maps_to_deny() {
+        assert_eq!(
+            network_for(Some(NetworkPolicy::Deny)),
+            mx_agent_sandbox::Network::Deny,
+            "NetworkPolicy::Deny must map to Network::Deny"
+        );
+    }
+
+    #[test]
+    fn network_for_none_fails_closed() {
+        // An unset policy network must default to Deny — fail-closed means no
+        // network access unless explicitly permitted (architecture §13.5).
+        assert_eq!(
+            network_for(None),
+            mx_agent_sandbox::Network::Deny,
+            "unset network must fail closed to Network::Deny"
+        );
+    }
+
+    #[test]
+    fn sandbox_backend_maps_policy_sandbox_values() {
+        // Bubblewrap maps to the bubblewrap backend.
+        assert_eq!(
+            sandbox_backend(Some(Sandbox::Bubblewrap)),
+            mx_agent_sandbox::Backend::Bubblewrap
+        );
+        // Docker and Podman both map to the container backend.
+        assert_eq!(
+            sandbox_backend(Some(Sandbox::Docker)),
+            mx_agent_sandbox::Backend::Container
+        );
+        assert_eq!(
+            sandbox_backend(Some(Sandbox::Podman)),
+            mx_agent_sandbox::Backend::Container
+        );
+        // Unimplemented and None policy values fall back to Backend::None,
+        // preserving existing behavior (no silent widening to an isolating backend).
+        assert_eq!(
+            sandbox_backend(Some(Sandbox::None)),
+            mx_agent_sandbox::Backend::None
+        );
+        assert_eq!(
+            sandbox_backend(Some(Sandbox::Firejail)),
+            mx_agent_sandbox::Backend::None
+        );
+        assert_eq!(
+            sandbox_backend(None),
+            mx_agent_sandbox::Backend::None,
+            "unset sandbox must default to Backend::None"
+        );
     }
 }

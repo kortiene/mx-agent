@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
-use mx_agent_policy::{CallContext, ExecContext, Outcome, Policy};
+use mx_agent_policy::{Allowance, CallContext, ExecContext, Outcome, Policy};
 use mx_agent_protocol::canonical_json;
 use mx_agent_protocol::id::generate_invocation_id;
 use mx_agent_protocol::schema::{
@@ -144,11 +144,19 @@ pub trait TaskDispatcher {
     /// Implementations must perform signature/trust/policy authorization before
     /// spawning, and return [`TaskDispatchError::PolicyDenied`] without spawning
     /// when local deny-by-default policy rejects the request.
+    ///
+    /// `allowance` carries the policy-resolved isolation settings (sandbox
+    /// backend, network decision, filesystem binds, env allowlist) the local
+    /// exec path must apply so an auto-executed task DAG runs under the same
+    /// confinement as a direct `exec` (architecture §13.5). Dispatchers that do
+    /// not spawn a local process (the tool path, and the Matrix transport, which
+    /// re-resolves policy on the remote daemon) ignore it.
     fn dispatch(
         &mut self,
         task: &TaskState,
         action: &TaskAction,
         invocation_id: &str,
+        allowance: &Allowance,
     ) -> Result<TaskExecutionResult, TaskDispatchError>;
 }
 
@@ -440,12 +448,11 @@ impl TaskOrchestrator {
         {
             return outcome;
         }
-        let requires_approval =
-            match self.authorize_task_action(task, &action, &invocation_id, store) {
-                Ok(req) => req,
-                Err(outcome) => return outcome,
-            };
-        if requires_approval {
+        let allowance = match self.authorize_task_action(task, &action, &invocation_id, store) {
+            Ok(allowance) => allowance,
+            Err(outcome) => return outcome,
+        };
+        if allowance.requires_approval {
             if let Err(outcome) = self.resolve_approval(task, &action, &invocation_id, store) {
                 return outcome;
             }
@@ -482,7 +489,8 @@ impl TaskOrchestrator {
             }
         };
 
-        let (terminal, result) = match dispatcher.dispatch(&claimed, &action, &invocation_id) {
+        let dispatched = dispatcher.dispatch(&claimed, &action, &invocation_id, &allowance);
+        let (terminal, result) = match dispatched {
             Ok(output) => {
                 let state = if output.is_success() {
                     STATE_SUCCEEDED
@@ -961,21 +969,27 @@ impl TaskOrchestrator {
         }
     }
 
-    /// Authorize the action against local policy. Returns `Ok(requires_approval)`
-    /// when permitted (the bool is the policy allowance's `requires_approval`
-    /// flag), or `Err(outcome)` when denied (the task is finalized blocked).
+    /// Authorize the action against local policy. Returns `Ok(allowance)` when
+    /// permitted — carrying the policy-resolved limits and isolation settings
+    /// (`requires_approval`, sandbox backend, network decision, filesystem
+    /// binds, env allowlist) the claim/dispatch step must enforce — or
+    /// `Err(outcome)` when denied (the task is finalized blocked).
+    ///
+    /// When no policy is configured the default [`Allowance`] is returned
+    /// (`requires_approval = false`, `Backend::None`, network denied, no binds),
+    /// preserving the prior "no policy ⇒ run with no isolation" behavior.
     fn authorize_task_action<S>(
         &self,
         task: &TaskState,
         action: &TaskAction,
         invocation_id: &str,
         store: &mut S,
-    ) -> Result<bool, OrchestrationOutcome>
+    ) -> Result<Allowance, OrchestrationOutcome>
     where
         S: TaskStore,
     {
         let Some(policy) = &self.policy else {
-            return Ok(false);
+            return Ok(Allowance::default());
         };
         let Some(room_id) = &self.room_id else {
             return self
@@ -986,7 +1000,7 @@ impl TaskOrchestrator {
                     "policy_not_configured_for_room".to_string(),
                     store,
                 )
-                .map(|_| false);
+                .map(|_| Allowance::default());
         };
         let outcome = evaluate_task_action(policy, room_id, task, action);
         if let Err(err) = self.audit_policy_decision(room_id, task, action, invocation_id, &outcome)
@@ -997,10 +1011,10 @@ impl TaskOrchestrator {
             });
         }
         match outcome {
-            Outcome::Allow(allowance) => Ok(allowance.requires_approval),
+            Outcome::Allow(allowance) => Ok(allowance),
             Outcome::Deny(reason) => self
                 .block_policy_denied(task, action, invocation_id, reason.to_string(), store)
-                .map(|_| false),
+                .map(|_| Allowance::default()),
         }
     }
 
@@ -1576,6 +1590,7 @@ mod tests {
             _task: &TaskState,
             _action: &TaskAction,
             _invocation_id: &str,
+            _allowance: &Allowance,
         ) -> Result<TaskExecutionResult, TaskDispatchError> {
             self.0.clone()
         }
@@ -1589,6 +1604,7 @@ mod tests {
             _task: &TaskState,
             _action: &TaskAction,
             _invocation_id: &str,
+            _allowance: &Allowance,
         ) -> Result<TaskExecutionResult, TaskDispatchError> {
             panic!("policy-denied task must not dispatch")
         }

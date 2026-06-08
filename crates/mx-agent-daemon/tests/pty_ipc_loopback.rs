@@ -14,7 +14,6 @@ use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -36,17 +35,19 @@ fn pty_available() -> bool {
     PtySession::spawn(&spec, PtyWinsize::default()).is_ok()
 }
 
-/// A unique throwaway socket path under the temp dir.
+/// A unique throwaway socket path.
+///
+/// Uses `/tmp` directly rather than `std::env::temp_dir()` because on macOS
+/// the latter resolves to `/var/folders/…/T/` (~48 chars), and the full path
+/// would exceed the 103-char Unix socket limit (`SUN_LEN = 104` including the
+/// null terminator).  `/tmp` is always short and available on every supported
+/// Unix target.
 fn socket_path(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "mx-agent-pty-ipc-{}-{}-{}-{}.sock",
+    std::path::PathBuf::from("/tmp").join(format!(
+        "mx-{}-{}-{}.sock",
         tag,
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
         COUNTER.fetch_add(1, Ordering::Relaxed),
     ))
 }

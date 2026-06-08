@@ -10,7 +10,7 @@
 //! outcome therefore guarantees no process is started, because the engine is
 //! the gate the runner consults first. See `docs/architecture.md` §13.3.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
@@ -49,8 +49,9 @@ impl Outcome {
 ///
 /// The caller (the execution runner) must enforce these before and during the
 /// execution: clamp the wall-clock runtime to `max_runtime_ms`, cap captured
-/// output at `max_output_bytes`, apply the `sandbox` backend and `network`
-/// policy, and pause for approval when `requires_approval` is set.
+/// output at `max_output_bytes`, apply the `sandbox` backend, `network` policy,
+/// and filesystem-bind confinement (`read_only_paths` / `writable_paths`), and
+/// pause for approval when `requires_approval` is set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Allowance {
     /// Maximum wall-clock runtime in milliseconds, if capped.
@@ -68,6 +69,14 @@ pub struct Allowance {
     /// `execution.env_allowlist`; the runner still scrubs any name matching a
     /// known token variable.
     pub env_allowlist: Vec<String>,
+    /// Filesystem paths an isolating sandbox binds read-only (architecture
+    /// §13.5). Resolved from `execution.read_only_paths`. Ignored by the `none`
+    /// backend.
+    pub read_only_paths: Vec<PathBuf>,
+    /// Filesystem paths an isolating sandbox binds writable (architecture
+    /// §13.5). Resolved from `execution.writable_paths`. Ignored by the `none`
+    /// backend.
+    pub writable_paths: Vec<PathBuf>,
 }
 
 /// Machine-readable reason a request was denied.
@@ -245,6 +254,8 @@ impl Policy {
             network: agent.network.or(self.execution.network),
             requires_approval: agent.requires_approval,
             env_allowlist: self.execution.env_allowlist.clone(),
+            read_only_paths: self.execution.read_only_paths.clone(),
+            writable_paths: self.execution.writable_paths.clone(),
         }
     }
 }
@@ -622,5 +633,99 @@ allow_cwd = ["/home/me/code/project"]
                 tool: "run_tests",
             })
             .is_denied());
+    }
+
+    // --- sandbox path/network wiring (issue #248) ---
+
+    #[test]
+    fn allowance_carries_read_only_and_writable_paths() {
+        // `execution.read_only_paths`/`writable_paths` parsed in the policy file
+        // must appear on the resolved `Allowance` so the runner can bind them.
+        let toml = r#"
+[execution]
+read_only_paths = ["/usr", "/lib"]
+writable_paths = ["/work"]
+
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/work"]
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        let cmd = argv(&["cargo", "test"]);
+        let a = p
+            .evaluate_exec(&ExecContext {
+                room_id: ROOM,
+                requesting_agent: AGENT,
+                command: &cmd,
+                cwd: "/work",
+            })
+            .allowance()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            a.read_only_paths,
+            vec![PathBuf::from("/usr"), PathBuf::from("/lib")],
+            "read_only_paths must flow through allowance_for"
+        );
+        assert_eq!(
+            a.writable_paths,
+            vec![PathBuf::from("/work")],
+            "writable_paths must flow through allowance_for"
+        );
+    }
+
+    #[test]
+    fn allowance_has_empty_paths_when_not_configured() {
+        // When the policy omits read_only_paths/writable_paths the allowance must
+        // carry empty vectors so the runner applies no bind-mounts.
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let a = p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .allowance()
+            .unwrap()
+            .clone();
+        assert!(
+            a.read_only_paths.is_empty(),
+            "read_only_paths must be empty when not configured"
+        );
+        assert!(
+            a.writable_paths.is_empty(),
+            "writable_paths must be empty when not configured"
+        );
+    }
+
+    #[test]
+    fn allowance_network_resolves_agent_override_then_execution_default() {
+        // Agent-level `network` overrides the execution-level default.
+        let toml = r#"
+[execution]
+network = "deny"
+
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+network = "allow"
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        let cmd = argv(&["cargo", "test"]);
+        let a = p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .allowance()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            a.network,
+            Some(NetworkPolicy::Allow),
+            "agent-level network must override the execution default"
+        );
     }
 }

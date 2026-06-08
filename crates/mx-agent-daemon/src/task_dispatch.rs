@@ -82,6 +82,7 @@ where
         _task: &TaskState,
         action: &TaskAction,
         _invocation_id: &str,
+        _allowance: &mx_agent_policy::Allowance,
     ) -> Result<TaskExecutionResult, TaskDispatchError> {
         match action {
             TaskAction::Tool { tool, args, .. } => match (self.run_tool)(tool, args) {
@@ -102,6 +103,11 @@ where
 }
 
 /// A request to run one exec-backed task action, passed to the command runner.
+///
+/// Carries the policy-resolved isolation settings (sandbox backend, network
+/// decision, filesystem binds, env allowlist) so an auto-executed task DAG runs
+/// under the same confinement the direct `exec` path applies (architecture
+/// §13.5), rather than unsandboxed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecRunRequest {
     /// Command argv: program followed by arguments.
@@ -112,6 +118,20 @@ pub struct ExecRunRequest {
     pub env: BTreeMap<String, String>,
     /// Maximum wall-clock runtime, if any.
     pub timeout: Option<Duration>,
+    /// Sandbox backend to launch the command under, resolved from policy
+    /// (architecture §13.5). Defaults to [`Backend::None`][mx_agent_sandbox::Backend::None].
+    pub sandbox: mx_agent_sandbox::Backend,
+    /// Whether the command may reach the network, resolved from policy. Only an
+    /// isolating backend enforces this; defaults to
+    /// [`Network::Deny`][mx_agent_sandbox::Network::Deny] (fail closed).
+    pub network: mx_agent_sandbox::Network,
+    /// Paths an isolating backend binds read-only into the sandbox.
+    pub read_only_paths: Vec<PathBuf>,
+    /// Paths an isolating backend binds writable into the sandbox.
+    pub writable_paths: Vec<PathBuf>,
+    /// Extra environment variable names the child may inherit beyond the
+    /// built-in safe defaults, resolved from the policy's `env_allowlist`.
+    pub env_allowlist: Vec<String>,
 }
 
 /// A function that runs an exec request and returns the captured outcome.
@@ -120,19 +140,23 @@ type CommandRunner = fn(&ExecRunRequest) -> Result<RunOutput, RunError>;
 /// Default command runner: bridges to the async process runner.
 ///
 /// Must be called from a blocking (non-async) context, consistent with the
-/// synchronous orchestrator core. It builds a [`RunSpec`] (sanitized env,
-/// restricted cwd, timeout, baseline sandbox) and runs the command to
+/// synchronous orchestrator core. It builds a [`RunSpec`] from the request's
+/// policy-resolved settings (sanitized env, restricted cwd, timeout, sandbox
+/// backend, network decision, filesystem binds) and runs the command to
 /// completion on a temporary current-thread runtime.
 fn default_command_runner(request: &ExecRunRequest) -> Result<RunOutput, RunError> {
     let spec = RunSpec {
         command: request.command.clone(),
         cwd: request.cwd.clone(),
         env: request.env.clone(),
-        env_allowlist: Vec::new(),
+        env_allowlist: request.env_allowlist.clone(),
         stdin: None,
         timeout: request.timeout,
         grace_period: DEFAULT_GRACE_PERIOD,
-        sandbox: mx_agent_sandbox::Backend::None,
+        sandbox: request.sandbox,
+        network: request.network,
+        read_only_paths: request.read_only_paths.clone(),
+        writable_paths: request.writable_paths.clone(),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -225,6 +249,7 @@ where
         _task: &TaskState,
         action: &TaskAction,
         _invocation_id: &str,
+        allowance: &mx_agent_policy::Allowance,
     ) -> Result<TaskExecutionResult, TaskDispatchError> {
         match action {
             TaskAction::Exec {
@@ -234,11 +259,20 @@ where
                 timeout_ms,
                 ..
             } => {
+                // Honor the policy-resolved isolation for this task action rather
+                // than running it unsandboxed (architecture §13.5). The backend
+                // and network decision use the same mapping as the direct `exec`
+                // path so both stay consistent and fail closed.
                 let request = ExecRunRequest {
                     command: command.clone(),
                     cwd: PathBuf::from(cwd),
                     env: env.clone(),
                     timeout: timeout_ms.map(Duration::from_millis),
+                    sandbox: crate::exec::sandbox_backend(allowance.sandbox),
+                    network: crate::exec::network_for(allowance.network),
+                    read_only_paths: allowance.read_only_paths.clone(),
+                    writable_paths: allowance.writable_paths.clone(),
+                    env_allowlist: allowance.env_allowlist.clone(),
                 };
                 match (self.run_command)(&request) {
                     Ok(output) => Ok(exec_result_from_output(&output, None)),
@@ -486,7 +520,12 @@ allow_cwd = ["/repo"]
         };
         let task = tool_task("run_tests");
         let err = dispatcher
-            .dispatch(&task, &exec, "inv-1")
+            .dispatch(
+                &task,
+                &exec,
+                "inv-1",
+                &mx_agent_policy::Allowance::default(),
+            )
             .expect_err("exec action is not a tool");
         assert!(matches!(err, TaskDispatchError::Failed(_)));
     }
@@ -600,7 +639,12 @@ allow_cwd = ["/repo"]
         };
         let task = exec_task("true");
         let err = dispatcher
-            .dispatch(&task, &tool, "inv-1")
+            .dispatch(
+                &task,
+                &tool,
+                "inv-1",
+                &mx_agent_policy::Allowance::default(),
+            )
             .expect_err("tool action is not exec");
         assert!(matches!(err, TaskDispatchError::Failed(_)));
     }
@@ -621,5 +665,143 @@ allow_cwd = ["/repo"]
         // A timeout has no successful exit code, so the task is finalized failed.
         assert!(timed_out.exit_code != Some(0));
         assert!(timed_out.summary.contains("timed out"));
+    }
+
+    // --- allowance wiring tests (issue #248) ---------------------------------
+    //
+    // These verify that the policy-resolved `Allowance` fields (sandbox backend,
+    // network decision, filesystem paths) are correctly threaded into the
+    // `ExecRunRequest` passed to the command runner, replacing the prior
+    // hardcoded `Backend::None`.
+
+    #[test]
+    fn exec_dispatcher_carries_policy_sandbox_network_and_paths_to_runner() {
+        // An allowance with Bubblewrap + Allow + paths must produce an
+        // ExecRunRequest carrying those values so the runner builds the right bwrap
+        // argv (architecture §13.5).
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let captured: Rc<RefCell<Option<ExecRunRequest>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+
+        let t = exec_task("true");
+        let action = t.action.clone().unwrap();
+
+        let allowance = mx_agent_policy::Allowance {
+            sandbox: Some(mx_agent_policy::Sandbox::Bubblewrap),
+            network: Some(mx_agent_policy::NetworkPolicy::Allow),
+            read_only_paths: vec![PathBuf::from("/usr"), PathBuf::from("/lib")],
+            writable_paths: vec![PathBuf::from("/work")],
+            ..mx_agent_policy::Allowance::default()
+        };
+
+        let mut dispatcher = ExecTaskDispatcher::with_runner(move |req| {
+            *cap.borrow_mut() = Some(req.clone());
+            Ok(run_output(Some(0), None, false))
+        });
+
+        let _ = dispatcher.dispatch(&t, &action, "inv-1", &allowance);
+
+        let req = captured.borrow().clone().expect("runner was called");
+        assert_eq!(
+            req.sandbox,
+            mx_agent_sandbox::Backend::Bubblewrap,
+            "policy Bubblewrap must reach the runner"
+        );
+        assert_eq!(
+            req.network,
+            mx_agent_sandbox::Network::Allow,
+            "policy network=allow must reach the runner"
+        );
+        assert_eq!(
+            req.read_only_paths,
+            vec![PathBuf::from("/usr"), PathBuf::from("/lib")],
+            "read_only_paths must be threaded through"
+        );
+        assert_eq!(
+            req.writable_paths,
+            vec![PathBuf::from("/work")],
+            "writable_paths must be threaded through"
+        );
+    }
+
+    #[test]
+    fn exec_dispatcher_defaults_to_none_backend_and_deny_with_empty_allowance() {
+        // An empty (default) allowance must yield Backend::None and Network::Deny,
+        // preserving the pre-fix baseline behavior and failing closed on network.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let captured: Rc<RefCell<Option<ExecRunRequest>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+
+        let t = exec_task("true");
+        let action = t.action.clone().unwrap();
+
+        let mut dispatcher = ExecTaskDispatcher::with_runner(move |req| {
+            *cap.borrow_mut() = Some(req.clone());
+            Ok(run_output(Some(0), None, false))
+        });
+
+        let _ = dispatcher.dispatch(&t, &action, "inv-1", &mx_agent_policy::Allowance::default());
+
+        let req = captured.borrow().clone().expect("runner was called");
+        assert_eq!(
+            req.sandbox,
+            mx_agent_sandbox::Backend::None,
+            "default allowance must yield Backend::None"
+        );
+        assert_eq!(
+            req.network,
+            mx_agent_sandbox::Network::Deny,
+            "default allowance must fail closed to Network::Deny"
+        );
+        assert!(
+            req.read_only_paths.is_empty(),
+            "default allowance must yield empty read_only_paths"
+        );
+        assert!(
+            req.writable_paths.is_empty(),
+            "default allowance must yield empty writable_paths"
+        );
+    }
+
+    #[test]
+    fn exec_dispatcher_carries_container_backend_for_docker_policy() {
+        // Docker policy sandbox must map to Backend::Container in the request.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let captured: Rc<RefCell<Option<ExecRunRequest>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+
+        let t = exec_task("true");
+        let action = t.action.clone().unwrap();
+
+        let allowance = mx_agent_policy::Allowance {
+            sandbox: Some(mx_agent_policy::Sandbox::Docker),
+            network: Some(mx_agent_policy::NetworkPolicy::Deny),
+            ..mx_agent_policy::Allowance::default()
+        };
+
+        let mut dispatcher = ExecTaskDispatcher::with_runner(move |req| {
+            *cap.borrow_mut() = Some(req.clone());
+            Ok(run_output(Some(0), None, false))
+        });
+
+        let _ = dispatcher.dispatch(&t, &action, "inv-1", &allowance);
+
+        let req = captured.borrow().clone().expect("runner was called");
+        assert_eq!(
+            req.sandbox,
+            mx_agent_sandbox::Backend::Container,
+            "Docker policy sandbox must map to Backend::Container"
+        );
+        assert_eq!(
+            req.network,
+            mx_agent_sandbox::Network::Deny,
+            "policy network=deny must reach the runner"
+        );
     }
 }
