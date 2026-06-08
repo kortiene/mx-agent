@@ -44,6 +44,39 @@ def branch_prefix(labels: Sequence[str]) -> str:
     return prefix
 
 
+def derive_branch(issue: int, title: str, labels: Sequence[str], adw_id: "str | None" = None) -> str:
+    """Derive a branch name `{prefix}/{issue}-[{adw_id}-]{slug}` for a phased run.
+
+    The optional `adw_id` segment correlates the branch with its ADW run state.
+    """
+
+    mid = f"{adw_id}-" if adw_id else ""
+    return f"{branch_prefix(labels)}/{issue}-{mid}{slugify_title(title)}"
+
+
+def fetch_issue(gh_bin: "str | None", issue: int, repo: str) -> "dict | None":
+    """Fetch an issue's title/body/labels via `gh`, or `None` if unavailable.
+
+    Returns a plain dict (`title`, `body`, `labels`) for the orchestrator to
+    inject into token-less agent phases.
+    """
+
+    if not gh_bin:
+        return None
+    args = [gh_bin, "issue", "view", str(issue)]
+    if repo:
+        args += ["--repo", repo]
+    args += ["--json", "title,body,labels"]
+    data = gh_json(args)
+    if not data:
+        return None
+    return {
+        "title": data.get("title", ""),
+        "body": data.get("body", ""),
+        "labels": [label.get("name", "") for label in data.get("labels", [])],
+    }
+
+
 def slugify_title(title: str) -> str:
     """Slugify an issue title for use in a branch name.
 

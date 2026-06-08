@@ -29,8 +29,12 @@ class HelperTests(unittest.TestCase):
             issues_mod.apply_start([15, 16], 99)
 
     def test_issue_flags_forwards_set_options(self) -> None:
-        ns = mock.Mock(runner="claude", model="opus", thinking="", log_dir="")
+        ns = mock.Mock(runner="claude", model="opus", thinking="", phases="", one_shot=False, log_dir="")
         self.assertEqual(issues_mod.issue_flags(ns, True), ["--runner", "claude", "--model", "opus", "--yes"])
+
+    def test_issue_flags_forwards_phases_and_one_shot(self) -> None:
+        ns = mock.Mock(runner="", model="", thinking="", phases="plan,implement", one_shot=True, log_dir="")
+        self.assertEqual(issues_mod.issue_flags(ns, False), ["--phases", "plan,implement", "--one-shot"])
 
 
 class RenderAndDryRunTests(unittest.TestCase):
@@ -70,6 +74,8 @@ class BatchExecutionTests(unittest.TestCase):
 
         tmp = tempfile.mkdtemp()
         with mock.patch.dict(os.environ, {"TMPDIR": tmp}), mock.patch.object(
+            issues_mod, "make_adw_id", return_value="aaaaaaaa"
+        ), mock.patch.object(
             issues_mod.issue_mod, "main", side_effect=recording
         ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code = issues_mod.main(argv)
@@ -78,12 +84,15 @@ class BatchExecutionTests(unittest.TestCase):
     def test_runs_each_issue_in_order_with_forwarded_flags(self) -> None:
         code, calls = self._run(["15", "16", "--yes"], lambda a: 0)
         self.assertEqual(code, 0)
-        self.assertEqual(calls, [["15", "--yes"], ["16", "--yes"]])
+        self.assertEqual(
+            calls,
+            [["15", "--adw-id", "aaaaaaaa", "--yes"], ["16", "--adw-id", "aaaaaaaa", "--yes"]],
+        )
 
     def test_stops_on_first_failure_by_default(self) -> None:
         code, calls = self._run(["15", "16", "--yes"], lambda a: 1)
         self.assertEqual(code, 1)
-        self.assertEqual(calls, [["15", "--yes"]])
+        self.assertEqual(calls, [["15", "--adw-id", "aaaaaaaa", "--yes"]])
 
     def test_keep_going_continues_past_failure(self) -> None:
         code, calls = self._run(["15", "16", "--yes", "--keep-going"], lambda a: 1)
@@ -97,7 +106,10 @@ class BatchExecutionTests(unittest.TestCase):
             ["221", "--runner", "claude", "--yes", "--", "--dangerously-skip-permissions"], lambda a: 0
         )
         self.assertEqual(code, 0)
-        self.assertEqual(calls, [["221", "--runner", "claude", "--yes", "--", "--dangerously-skip-permissions"]])
+        self.assertEqual(
+            calls,
+            [["221", "--adw-id", "aaaaaaaa", "--runner", "claude", "--yes", "--", "--dangerously-skip-permissions"]],
+        )
 
 
 if __name__ == "__main__":

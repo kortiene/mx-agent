@@ -50,13 +50,113 @@ def confirm(prompt: str) -> bool:
     return sys.stdin.readline().strip().lower() in ("y", "yes")
 
 
+# --- issue progress comments -------------------------------------------------
+
+# Tag stamped on every ADW-authored issue comment. It marks a comment as
+# machine-authored so any future trigger (a Matrix listener, a poller) can skip
+# the tool's own comments and avoid feedback loops.
+MX_ADW_BOT_TAG = "[MX-ADW]"
+
+
+def format_progress(adw_id: str, phase: str, message: str) -> str:
+    """Format a run-tagged progress line for a GitHub issue comment.
+
+    The body is built only from the run id, phase, and a caller-supplied fixed
+    message — never runner output, environment, or secrets.
+    """
+
+    return f"{MX_ADW_BOT_TAG} {adw_id}_{phase}: {message}"
+
+
+def post_progress(
+    gh_bin: "str | None",
+    issue: "int | str",
+    repo: str,
+    adw_id: str,
+    phase: str,
+    message: str,
+) -> None:
+    """Best-effort `gh issue comment` with a run-tagged body; never raises."""
+
+    if not gh_bin:
+        return
+    args = [gh_bin, "issue", "comment", str(issue), "--body", format_progress(adw_id, phase, message)]
+    if repo:
+        args += ["--repo", repo]
+    result = capture(args)
+    if result.returncode != 0:
+        note(f"could not post progress comment for #{issue} ({phase})")
+
+
+# --- runner environment ------------------------------------------------------
+
+# Base environment variables the coding-agent runner legitimately needs. The
+# parent environment is NEVER copied wholesale: only these (plus an explicit
+# `extra_allow`, and `GH_TOKEN`/`GH_BIN` when `allow_gh_token=True`) are passed
+# through, so Matrix tokens, device keys, and unrelated secrets are withheld.
+_BASE_ENV_ALLOW = (
+    "HOME",
+    "USER",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "ANTHROPIC_API_KEY",
+    "PI_BIN",
+    "CLAUDE_BIN",
+    "CLAUDE_CODE_PATH",
+    "PI_MODEL",
+    "PI_THINKING",
+)
+
+# Never forwarded to the agent, even via extra_allow.
+_ENV_DENY_PREFIXES = ("MATRIX_", "MX_AGENT_")
+
+
+def safe_subprocess_env(*, allow_gh_token: bool, extra_allow: Sequence[str] = ()) -> "dict[str, str]":
+    """Build an allowlist environment for the coding-agent runner.
+
+    Only allowlisted variables present in the parent environment are forwarded.
+    `GH_TOKEN`/`GH_BIN` are included only when `allow_gh_token=True` (phased mode
+    keeps the GitHub token out of the agent because Python performs all `gh`
+    work; one-shot mode needs it because the agent pushes/merges). Variables
+    matching `MATRIX_`/`MX_AGENT_` prefixes are never forwarded.
+    """
+
+    allow = list(_BASE_ENV_ALLOW)
+    if allow_gh_token:
+        allow += ["GH_TOKEN", "GH_BIN"]
+    for key in extra_allow:
+        if not any(key.startswith(p) for p in _ENV_DENY_PREFIXES):
+            allow.append(key)
+
+    env: dict[str, str] = {}
+    for key in allow:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
 # --- subprocess --------------------------------------------------------------
 
 
 def capture(cmd: Sequence[str]) -> subprocess.CompletedProcess:
-    """Run a command capturing text stdout/stderr; never raises on non-zero."""
+    """Run a command capturing text stdout/stderr; never raises.
 
-    return subprocess.run(list(cmd), capture_output=True, text=True, check=False)
+    A non-zero exit yields a `CompletedProcess` as usual. A missing binary (or
+    other `OSError`) is mapped to a synthetic exit code 127 with the error text
+    on stderr, so callers can treat "command failed" and "command absent"
+    uniformly instead of crashing on an unhandled `FileNotFoundError`.
+    """
+
+    try:
+        return subprocess.run(list(cmd), capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(cmd), 127, "", str(exc))
 
 
 def run(cmd: Sequence[str]) -> int:

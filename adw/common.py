@@ -1,17 +1,23 @@
 """Shared helpers for Agent Development Workflow scripts.
 
-The ADW scripts intentionally keep `.pi/prompts/*.md` as the workflow source of
-truth. They load a prompt template, apply the same small argument substitutions
-that Pi prompt templates support, and print the rendered workflow for use by an
-agent or operator.
+Two responsibilities live here, both shared across the package:
+
+1. **Prompt rendering** — the ADW scripts intentionally keep `.pi/prompts/*.md`
+   as the workflow source of truth. These helpers load a prompt template, apply
+   the same small argument substitutions Pi prompt templates support, and render
+   it for use by an agent or operator.
+2. **Input parsing** — argv `--` partitioning, issue-selector expansion, and the
+   fence/prose-tolerant JSON parser used by the executable drivers (`issue.py`,
+   `issues.py`) and the phased orchestrator.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +116,58 @@ def render_prompt_file(path: "str | Path", args: Sequence[str]) -> str:
     return substitute_args(text, args)
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
+
+
+def parse_json(text: str, expect: "type | None" = None) -> Any:
+    """Parse JSON that may be wrapped in a Markdown code fence or surrounding prose.
+
+    Agent phase replies are free-form text that, by contract, end with a single
+    fenced ```json block. This extracts and parses that block. It accepts raw
+    JSON, a ```json fenced block, a bare ``` fenced block, or JSON embedded in
+    prose (by locating the first balanced object/array). Raises `AdwError` on
+    failure. When `expect` is `dict` or `list`, the parsed top level must be that
+    type or `AdwError` is raised.
+    """
+
+    if text is None:
+        raise AdwError("no JSON to parse: empty agent output")
+
+    # Prefer the last fenced block (agents emit the contract block last).
+    matches = _FENCE_RE.findall(text)
+    if matches:
+        candidate = matches[-1].strip()
+    else:
+        candidate = text.strip()
+
+    if not (candidate.startswith("{") or candidate.startswith("[")):
+        candidate = _extract_braced(candidate)
+
+    try:
+        result = json.loads(candidate)
+    except ValueError as exc:
+        snippet = candidate[:200]
+        raise AdwError(f"could not parse JSON from agent output: {exc} (saw: {snippet!r})") from exc
+
+    if expect is dict and not isinstance(result, dict):
+        raise AdwError(f"expected a JSON object, got {type(result).__name__}")
+    if expect is list and not isinstance(result, list):
+        raise AdwError(f"expected a JSON array, got {type(result).__name__}")
+    return result
+
+
+def _extract_braced(text: str) -> str:
+    """Return the first balanced `{...}`/`[...]` span in `text`, else `text`."""
+
+    array_start, array_end = text.find("["), text.rfind("]")
+    obj_start, obj_end = text.find("{"), text.rfind("}")
+    if obj_start != -1 and (array_start == -1 or obj_start < array_start) and obj_end != -1:
+        return text[obj_start : obj_end + 1]
+    if array_start != -1 and array_end != -1:
+        return text[array_start : array_end + 1]
+    return text
+
+
 def print_rendered(command: str, args: Sequence[str]) -> int:
     """Print a rendered prompt and return a process exit code."""
 
@@ -144,13 +202,25 @@ def wrapper_main(command: str, description: str, argv: Sequence[str] | None = No
     return print_rendered(command, ns.args)
 
 
+def partition_on_double_dash(argv: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split argv at the first `--` into `(head, tail)`; tail empty if absent.
+
+    The single primitive behind every `--` split in this package: selectors vs
+    shared notes (`split_notes`), and our flags vs verbatim runner passthrough
+    (`issue.split_passthru`, `issues.py`).
+    """
+
+    argv = list(argv)
+    if "--" not in argv:
+        return argv, []
+    index = argv.index("--")
+    return argv[:index], argv[index + 1 :]
+
+
 def split_notes(argv: Sequence[str]) -> tuple[list[str], list[str]]:
     """Split arguments into selectors and shared notes at `--`."""
 
-    if "--" not in argv:
-        return list(argv), []
-    index = list(argv).index("--")
-    return list(argv[:index]), list(argv[index + 1 :])
+    return partition_on_double_dash(argv)
 
 
 def expand_issue_selectors(selectors: Iterable[str]) -> list[int]:

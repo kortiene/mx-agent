@@ -225,16 +225,26 @@ For unattended runs, two tools drive a [pi](https://github.com/earendil-works/pi
 
 ### Single issue: `python adw/issue.py`
 
-The CLI equivalent of typing `/issue <number> [notes]` in the agent's editor. It expands the `issue.md` template (substituting `$1` and `${@:2}` exactly as pi does), then runs it via the selected runner in print mode — `pi -p` by default, or `claude -p` with `--runner claude` — so the agent implements the issue end-to-end: branch, code, test, open a PR, watch CI, and squash-merge.
+The CLI equivalent of typing `/issue <number> [notes]` in the agent's editor. **By default it now runs a phased, Python-orchestrated pipeline** (see "Phased pipeline" in `adw/README.md`): Python drives discrete agent phases (classify → plan → implement → tests → resolve → e2e? → review → patch → document?) and performs all git/GitHub work itself — branch, commit, push, PR, CI-watch, and squash-merge — while the coding agent never receives `GH_TOKEN`. It then verifies the issue is CLOSED.
+
+> **Migration note:** the previous behavior — render `.pi/prompts/issue.md` and hand the whole job to one agent call — is preserved behind `--one-shot`. Scripts relying on the old single-call flow should add `--one-shot`. `adw/issues.py` inherits the phased default.
 
 ```bash
-python adw/issue.py 15                            # implement issue #15 end-to-end
-python adw/issue.py 15 "do not continue on unmet deps"   # notes fill the ${@:2} slot
-python adw/issue.py 15 --json --model sonnet:high # JSON event stream, pick a model
-python adw/issue.py 15 --print-prompt             # expand the template only; do not run
-python adw/issue.py 15 --dry-run                  # show the exact pi invocation
-python adw/issue.py 15 -- --thinking high -nc     # pass extra flags verbatim to pi
+python adw/issue.py 15                            # phased pipeline (new default)
+python adw/issue.py 15 --dry-run                  # preview the phase plan
+python adw/issue.py 15 --phases plan,implement,tests,review   # custom phase subset
+python adw/issue.py 15 --adw-id a1b2c3d4 --resume # resume a prior run (skip done phases)
+python adw/issue.py 15 --model sonnet:high        # override the model for all phases
+python adw/issue.py 15 --test-cmd "cargo test -p mx-agent-daemon"   # narrower test gate
+python adw/issue.py 15 --one-shot                 # legacy single monolithic agent call
+python adw/issue.py 15 --one-shot --dry-run       # show the exact pi invocation
+python adw/issue.py 15 --print-prompt             # render the one-shot template only; no run
+python adw/issue.py 15 --one-shot -- --thinking high -nc   # extra flags verbatim to pi
 ```
+
+Per-run workspaces live at `agents/{adw_id}/` (git-ignored) and hold `state.json` plus
+per-phase transcripts; a failed run logged by `issues.py` can be resumed individually with
+`python adw/issue.py <n> --adw-id <id> --resume`.
 
 ```bash
 python adw/issue.py 15 --log-dir ./logs            # tee the transcript to a per-issue log
@@ -244,7 +254,7 @@ python adw/issue.py 15 --no-verify                 # skip the post-run CLOSED ch
 python adw/issue.py 15 --force                      # run even if already CLOSED
 ```
 
-By default the script refuses to start on a dirty working tree (`--allow-dirty` to override) and, when run interactively, asks for confirmation before implementing and merging (`--yes`/`MX_AGENT_YES=1` to skip; auto-skipped when stdin is not a terminal). `--timeout` aborts a stuck run.
+By default the script refuses to start on a dirty working tree (`--allow-dirty` to override) and asks for confirmation before the squash-merge (`--yes`/`MX_AGENT_YES=1` to skip). An unattended run (stdin not a terminal) without `--yes`/`MX_AGENT_YES=1` is **refused, not silently merged**. `--timeout` aborts a stuck runner call.
 
 Notes:
 
