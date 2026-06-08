@@ -6,7 +6,9 @@
 //! [`Client`] from it. No login or network round-trip is performed here; the
 //! returned client is unauthenticated and ready for a later auth phase.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use matrix_sdk::Client;
@@ -280,76 +282,100 @@ pub async fn login_password(
     username: &str,
     password: &str,
 ) -> Result<StoredSession, LoginError> {
-    // Log in on a client backed by the persistent crypto store so the device
-    // identity created at login is durable across restarts (issue #240).
-    let client = build_client_with_store(config, &SessionPaths::resolve()).await?;
+    // Each login creates a new Matrix device with a server-assigned device_id
+    // that is not known until the login response arrives. We therefore create
+    // the crypto store in a unique temporary subdirectory first, then rename it
+    // to the device_id after the login succeeds. This prevents conflicts when
+    // multiple users log in within the same process (e.g. Alice and Bob in
+    // integration tests), where each user must have its own isolated OlmMachine.
+    static LOGIN_SEQ: AtomicU32 = AtomicU32::new(0);
+    let base_paths = SessionPaths::resolve();
+    let seq = LOGIN_SEQ.fetch_add(1, Ordering::SeqCst);
+    let temp_name = format!(".login-{}-{}", std::process::id(), seq);
+    let temp_paths = SessionPaths::for_data_dir(base_paths.data_dir.join(&temp_name));
+
+    let client = build_client_with_store(config, &temp_paths).await?;
     client
         .matrix_auth()
         .login_username(username, password)
         .initial_device_display_name("mx-agent")
         .send()
         .await
-        .map_err(LoginError::Matrix)?;
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&temp_paths.data_dir);
+            LoginError::Matrix(e)
+        })?;
 
     let session = client
         .matrix_auth()
         .session()
         .ok_or(LoginError::NoSession)?;
+    let device_id = session.meta.device_id.to_string();
+
+    // Rename the temporary store to the device-specific directory.
+    let device_paths = SessionPaths::for_data_dir(base_paths.data_dir.join(&device_id));
+    if !device_paths.data_dir.exists() {
+        std::fs::rename(&temp_paths.data_dir, &device_paths.data_dir)
+            .map_err(|e| LoginError::Client(ClientError::Store(e.to_string())))?;
+    } else {
+        let _ = std::fs::remove_dir_all(&temp_paths.data_dir);
+    }
+
     Ok(StoredSession {
         homeserver: client.homeserver().to_string(),
         user_id: session.meta.user_id.to_string(),
-        device_id: session.meta.device_id.to_string(),
+        device_id,
         access_token: Secret::new(session.tokens.access_token),
         refresh_token: session.tokens.refresh_token.map(Secret::new),
     })
 }
 
-/// Process-global handle to the daemon's single long-lived Matrix [`Client`].
+/// Per-(user_id, device_id) registry of long-lived Matrix [`Client`]s.
 ///
-/// The sync loop restores exactly one store-backed client and publishes it here
-/// via [`publish_active_client`]. Per-call IPC handlers then reuse *that* client
-/// (see [`restore_client`]) instead of each opening their own store-backed
-/// client. This matters because the persistent SQLite crypto store must be
-/// driven by a single [`matrix_sdk`] `OlmMachine`: two `OlmMachine`s for the same
-/// device open on the same store race on the Olm account, one-time keys, and
-/// Megolm sessions, which can corrupt crypto state and silently lose
-/// decryptability (issue #240). matrix-sdk's `Client` is `Clone`/`Send`/`Sync`
-/// and is used the same way across the sync, scheduler, and heartbeat runtimes
-/// already (architecture §9.1/§9.2).
-static ACTIVE_CLIENT: OnceLock<RwLock<Option<Client>>> = OnceLock::new();
+/// The sync loop publishes a store-backed client here via [`publish_active_client`]
+/// so every per-call IPC handler (exec, approval, etc.) can share the *same*
+/// client rather than opening a second store-backed client that would race the
+/// sync-loop client on the SQLite OlmMachine (issue #240). Keyed by
+/// `(user_id, device_id)` so multi-user integration tests (Alice + Bob) each
+/// get their own entry and never collide.
+static ACTIVE_CLIENTS: OnceLock<RwLock<HashMap<(String, String), Client>>> = OnceLock::new();
 
-fn active_client_slot() -> &'static RwLock<Option<Client>> {
-    ACTIVE_CLIENT.get_or_init(|| RwLock::new(None))
+fn active_clients() -> &'static RwLock<HashMap<(String, String), Client>> {
+    ACTIVE_CLIENTS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Publish the daemon's long-lived client so per-call IPC handlers share it.
+/// Publish a long-lived client so per-call IPC handlers share it.
 ///
-/// Called once by the sync loop after it restores the client. Any previously
-/// published client is replaced (e.g. across an in-process restart).
+/// Keyed by the client's own `(user_id, device_id)`; a later publish for the
+/// same session replaces the previous entry (e.g. across an in-process
+/// restart). Clients with no active session are silently ignored.
 pub fn publish_active_client(client: Client) {
-    *active_client_slot()
+    let Some(meta) = client.session_meta() else {
+        return;
+    };
+    let key = (meta.user_id.to_string(), meta.device_id.to_string());
+    active_clients()
         .write()
-        .unwrap_or_else(|e| e.into_inner()) = Some(client);
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, client);
 }
 
-/// Drop the published client. Called on daemon shutdown so a later in-process
-/// run does not reuse a stale client.
+/// Remove all published clients. Called on daemon shutdown.
 pub fn clear_active_client() {
-    *active_client_slot()
+    active_clients()
         .write()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
-/// Return the published long-lived client if one exists and it matches
-/// `session` (same Matrix user and device), else `None`.
+/// Return the published client for `session` (same user and device), or `None`.
 fn active_client_for(session: &StoredSession) -> Option<Client> {
-    let guard = active_client_slot()
+    let key = (session.user_id.clone(), session.device_id.clone());
+    active_clients()
         .read()
-        .unwrap_or_else(|e| e.into_inner());
-    let client = guard.as_ref()?;
-    let meta = client.session_meta()?;
-    (meta.user_id.as_str() == session.user_id && meta.device_id.as_str() == session.device_id)
-        .then(|| client.clone())
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
 }
 
 /// Build a [`Client`] and restore a previously persisted [`StoredSession`].
@@ -384,8 +410,24 @@ pub async fn restore_client(session: &StoredSession) -> Result<Client, LoginErro
     };
     // Restore on a client backed by the same persistent crypto store so the
     // daemon resumes as the same E2EE device and keeps its Megolm sessions
-    // (issue #240). The device id below matches the one persisted in the store.
-    let client = build_client_with_store(&config, &SessionPaths::resolve()).await?;
+    // (issue #240). The device_id subdirectory isolates each user's OlmMachine
+    // so that multiple users within the same process (e.g. integration tests)
+    // each get their own crypto store and never see MismatchedAccount errors.
+    // A fallback to the legacy flat layout ("crypto-store" in the base dir)
+    // keeps existing single-user daemon deployments working without migration.
+    let base_paths = SessionPaths::resolve();
+    let device_dir = base_paths.data_dir.join(&session.device_id);
+    let paths = if device_dir.exists() {
+        // Normal path: device-specific subdirectory (created by login_password).
+        SessionPaths::for_data_dir(device_dir)
+    } else if base_paths.crypto_store_dir.exists() {
+        // Legacy layout: single crypto-store at the base path. Keep it as-is.
+        base_paths
+    } else {
+        // No existing store: create it now under the device-specific path.
+        SessionPaths::for_data_dir(device_dir)
+    };
+    let client = build_client_with_store(&config, &paths).await?;
 
     let user_id = OwnedUserId::try_from(session.user_id.as_str())
         .map_err(|e| LoginError::Matrix(matrix_sdk::Error::from(e)))?;

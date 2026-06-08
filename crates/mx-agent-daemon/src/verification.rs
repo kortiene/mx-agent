@@ -32,6 +32,7 @@ use std::sync::{Mutex, OnceLock};
 use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::encryption::recovery::RecoveryState;
 use matrix_sdk::encryption::verification::SasVerification;
+use matrix_sdk::encryption::LocalTrust;
 use matrix_sdk::ruma::{OwnedDeviceId, UserId};
 use matrix_sdk::Client;
 use serde::{Deserialize, Serialize};
@@ -270,7 +271,7 @@ pub async fn manual_verify(
     }
 
     device
-        .verify()
+        .set_local_trust(LocalTrust::Verified)
         .await
         .map_err(|e| VerificationError::Sdk(e.to_string()))?;
     Ok(device_info(&device))
