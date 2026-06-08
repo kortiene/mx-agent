@@ -2743,13 +2743,21 @@ async fn live_device_manual_verify_and_sender_verified() {
          got {pre_verified:?}"
     );
 
-    // Manually verify Bob's first device out-of-band. No fingerprint check in
-    // tests — fingerprint matching is covered by the `normalize_fingerprint`
-    // unit tests in `verification.rs`.
+    // Manually verify ALL of Bob's devices out-of-band. The homeserver returns
+    // every device a user has ever registered, and `sender_verified` requires
+    // ALL of a user's known devices to be verified before it returns
+    // `Some(true)`. Prior tests in the suite each call `login_password` for
+    // bob, accumulating devices on the fresh homeserver within a single CI run.
+    // Verifying only the first device leaves the rest unverified and
+    // `sender_verified` returns `Some(false)`. No fingerprint check in tests —
+    // fingerprint matching is covered by the `normalize_fingerprint` unit tests
+    // in `verification.rs`.
     let bob_device = bob_devices.first().expect("bob has at least one device");
-    mx_agent_daemon::manual_verify(&alice, bob_id_str, &bob_device.device_id, None)
-        .await
-        .expect("manual_verify should succeed for a known device");
+    for device in &bob_devices {
+        mx_agent_daemon::manual_verify(&alice, bob_id_str, &device.device_id, None)
+            .await
+            .expect("manual_verify should succeed for a known device");
+    }
 
     // After verification: `sender_verified` must return `Some(true)`.
     let post_verified = mx_agent_daemon::sender_verified(&alice, bob_id_str).await;
@@ -3166,10 +3174,14 @@ require_verified_device = true
     .await
     .expect("alice should see bob's devices after device-key exchange in encrypted room");
 
-    let bob_device = bob_devices.first().expect("bob has at least one device");
-    mx_agent_daemon::manual_verify(&alice, bob_id_str, &bob_device.device_id, None)
-        .await
-        .expect("manual_verify must succeed for a known device");
+    // Verify ALL of bob's known devices. Accumulated prior-test logins leave
+    // multiple devices on the homeserver; `sender_verified` requires all of
+    // a user's known devices to be verified before returning `Some(true)`.
+    for device in &bob_devices {
+        mx_agent_daemon::manual_verify(&alice, bob_id_str, &device.device_id, None)
+            .await
+            .expect("manual_verify must succeed for a known device");
+    }
 
     // `sender_verified` must now return `Some(true)` on Alice's client.
     let verified = mx_agent_daemon::sender_verified(&alice, bob_id_str).await;
