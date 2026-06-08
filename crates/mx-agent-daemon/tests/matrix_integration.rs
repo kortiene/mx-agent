@@ -2743,24 +2743,34 @@ async fn live_device_manual_verify_and_sender_verified() {
          got {pre_verified:?}"
     );
 
-    // Manually verify ALL of Bob's devices out-of-band. The homeserver returns
-    // every device a user has ever registered, and `sender_verified` requires
-    // ALL of a user's known devices to be verified before it returns
-    // `Some(true)`. Prior tests in the suite each call `login_password` for
-    // bob, accumulating devices on the fresh homeserver within a single CI run.
-    // Verifying only the first device leaves the rest unverified and
-    // `sender_verified` returns `Some(false)`. No fingerprint check in tests —
-    // fingerprint matching is covered by the `normalize_fingerprint` unit tests
-    // in `verification.rs`.
+    // Verify all of Bob's known devices in a retry loop. The background sync
+    // loop continuously downloads device keys (the homeserver accumulates one
+    // device per `login_password` call across prior tests in the same CI run),
+    // so new devices may appear between `list_devices` and `sender_verified`.
+    // Looping until `sender_verified` returns `Some(true)` is the only race-
+    // free approach: each pass re-queries the full current set and re-verifies
+    // any new arrivals before checking the combined verdict.
+    //
+    // No fingerprint check in tests — fingerprint matching is covered by the
+    // `normalize_fingerprint` unit tests in `verification.rs`.
     let bob_device = bob_devices.first().expect("bob has at least one device");
-    for device in &bob_devices {
-        mx_agent_daemon::manual_verify(&alice, bob_id_str, &device.device_id, None)
-            .await
-            .expect("manual_verify should succeed for a known device");
-    }
-
-    // After verification: `sender_verified` must return `Some(true)`.
-    let post_verified = mx_agent_daemon::sender_verified(&alice, bob_id_str).await;
+    let post_verified = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let current = mx_agent_daemon::list_devices(&alice, bob_id_str)
+                .await
+                .unwrap_or_default();
+            for device in &current {
+                let _ = mx_agent_daemon::manual_verify(&alice, bob_id_str, &device.device_id, None)
+                    .await;
+            }
+            if mx_agent_daemon::sender_verified(&alice, bob_id_str).await == Some(true) {
+                return Some(true);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or(None);
     assert_eq!(
         post_verified,
         Some(true),
@@ -3158,33 +3168,32 @@ require_verified_device = true
 
     // ---- Phase 2: manually verify Bob's device on Alice's client ----
     //
-    // Wait until Alice's crypto store has at least one of Bob's devices (the
-    // encrypted room + running sync loops ensure device key exchange). Then
-    // call `manual_verify` to mark the device as trusted in Alice's local store.
+    // Verify all of Bob's known devices in a retry loop (same race-free approach
+    // as `live_device_manual_verify_and_sender_verified`): the background sync
+    // loop may download additional devices between passes (the homeserver
+    // accumulates one device per `login_password` call across prior tests), so
+    // each pass re-queries and re-verifies the full current set before checking
+    // the combined `sender_verified` verdict. The loop also handles the case
+    // where no devices are visible yet (it waits until device key exchange
+    // completes in the encrypted room).
     let bob_id_str = bob_id.as_str();
-    let bob_devices = tokio::time::timeout(Duration::from_secs(60), async {
+    let verified = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            match mx_agent_daemon::list_devices(&alice, bob_id_str).await {
-                Ok(devs) if !devs.is_empty() => return devs,
-                _ => {}
+            let current = mx_agent_daemon::list_devices(&alice, bob_id_str)
+                .await
+                .unwrap_or_default();
+            for device in &current {
+                let _ = mx_agent_daemon::manual_verify(&alice, bob_id_str, &device.device_id, None)
+                    .await;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            if mx_agent_daemon::sender_verified(&alice, bob_id_str).await == Some(true) {
+                return Some(true);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
     .await
-    .expect("alice should see bob's devices after device-key exchange in encrypted room");
-
-    // Verify ALL of bob's known devices. Accumulated prior-test logins leave
-    // multiple devices on the homeserver; `sender_verified` requires all of
-    // a user's known devices to be verified before returning `Some(true)`.
-    for device in &bob_devices {
-        mx_agent_daemon::manual_verify(&alice, bob_id_str, &device.device_id, None)
-            .await
-            .expect("manual_verify must succeed for a known device");
-    }
-
-    // `sender_verified` must now return `Some(true)` on Alice's client.
-    let verified = mx_agent_daemon::sender_verified(&alice, bob_id_str).await;
+    .unwrap_or(None);
     assert_eq!(
         verified,
         Some(true),
