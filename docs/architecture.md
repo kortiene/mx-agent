@@ -112,9 +112,13 @@ Create a Matrix-backed workspace:
 mx-agent workspace create \
   --alias my-project \
   --name "my-project orchestration" \
-  --visibility private \
-  --e2ee on
+  --visibility private
 ```
+
+> **Note (current behavior).** In the current alpha, `workspace create` does not
+> enable end-to-end encryption — there is no `--e2ee` flag yet, and newly created
+> workspaces are unencrypted. Room-level E2EE on create is tracked alongside the
+> E2EE production-hardening work (issues #240 and #249).
 
 Join an existing workspace:
 
@@ -298,13 +302,22 @@ The local CLI should exit with the remote process exit code when possible.
 |---:|---|
 | 0 | Remote command succeeded |
 | 1-125 | Remote command exit code |
-| 126 | Local policy denied |
+| 64 | Invalid CLI usage (e.g. an empty command) |
+| 126 | Local policy denied *(planned; currently surfaces as `128`)* |
 | 127 | Agent/tool/command not found |
-| 128 | Protocol/network failure |
-| 129 | Timeout |
-| 130 | Interrupted/cancelled locally |
-| 131 | Remote rejected request |
-| 132 | Stream integrity failure |
+| 128 | Protocol/network failure — and, today, also a policy denial, a remote rejection, a remote cancellation, or a timeout (see note) |
+| 128 + signum | Process killed by a signal — e.g. `130` for SIGINT/Ctrl-C on the non-interactive path |
+| 129 | Timeout *(planned; currently surfaces as `128`)* |
+| 130 | Interrupted/cancelled locally (non-interactive path: `128 + SIGINT`) |
+| 131 | Remote rejected request *(planned; currently surfaces as `128`)* |
+| 132 | Stream integrity failure (strict mode) |
+
+> **Note (current behavior).** The daemon-mediated `exec` path does not yet
+> distinguish the finer-grained failure codes `126` (policy denied), `129`
+> (timeout), and `131` (remote rejected); each currently surfaces as `128`. A
+> process killed by a signal exits `128 + signum` (so a Ctrl-C'd command on the
+> non-interactive path exits `130`). Emitting the distinct `126`/`129`/`131`
+> codes is planned follow-up work.
 
 ---
 
@@ -682,6 +695,12 @@ mx-agent exec --strict-stream --agent developer-pi -- npm test
 ```
 
 In strict mode, missing or invalid chunks cause local exit code `132`.
+
+> **Note (current behavior).** The optional per-chunk `sha256` digest is not yet
+> populated by the daemon, so in the live path strict mode enforces
+> sequence-gap detection and base64 validity rather than cryptographic
+> per-chunk integrity. Populating and verifying per-chunk digests end-to-end is
+> planned follow-up work.
 
 ### 8.3 Backpressure
 
@@ -1435,12 +1454,18 @@ Never expose tokens through:
 
 Supported trust modes:
 
-| Mode | Description | Security |
-|---|---|---|
-| manual | user verifies signing key fingerprint | strongest operational default |
-| Matrix device verified | trust follows verified Matrix device | strong if Matrix verification is used correctly |
-| room-admin grant | trusted admin publishes trust state | convenient for teams |
-| TOFU | first key seen is trusted | convenient but vulnerable on first contact |
+| Mode | Description | Security | Status |
+|---|---|---|---|
+| manual | user verifies the signing key fingerprint via `trust approve` | strongest operational default | **Implemented** — the local trust store is the authoritative input to every live authorization |
+| room-admin grant | trusted admin publishes `com.mxagent.trust.v1` state | convenient for teams | **Partial** — `trust publish`/`trust state` publish and display room trust, but the live `exec`/`call` path authorizes only against the local store; publishing does not by itself grant a peer execution rights |
+| Matrix device verified | trust follows verified Matrix device | strong if Matrix verification is used correctly | Planned (not yet implemented) |
+| TOFU | first key seen is trusted | convenient but vulnerable on first contact | Planned (not yet implemented) |
+
+The local trust store is always the authoritative input to live authorization
+(see [Trust precedence](#trust-precedence) below). Room-published trust is
+advisory and is surfaced for inspection via `trust state`; it never overrides a
+local decision and, in the current alpha, does not on its own authorize a
+remote peer.
 
 Trust commands:
 

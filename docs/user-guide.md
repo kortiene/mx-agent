@@ -121,12 +121,17 @@ mx-agent workspace create --alias demo --name "Demo workspace"
 ```text
 mx-agent: created workspace !aBcD...:localhost
   alias:     #demo:localhost
-  encrypted: true
+  encrypted: false
   members:   1
 ```
 
 Note the room alias (`#demo:localhost`) — every later command takes it via
 `--room`. Other members join with `mx-agent workspace join '#demo:localhost'`.
+
+> **Note.** In this alpha, `workspace create` does not enable end-to-end
+> encryption (there is no `--e2ee` flag yet), so the workspace reports
+> `encrypted: false`. Room-level E2EE is still landing — see the
+> [Security warnings](#security-warnings) and the project roadmap.
 
 Optionally bind the room to a local checkout so shares and registrations carry
 repo metadata:
