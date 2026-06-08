@@ -418,7 +418,14 @@ identifiers so you can alert on them:
 deny:unknown_room        deny:untrusted_room      deny:unknown_agent
 deny:empty_command       deny:exec_not_allowed    deny:command_not_allowed
 deny:cwd_not_allowed     deny:denied_arguments    deny:tool_not_allowed
+deny:unverified_device
 ```
+
+The policy-engine reasons above are joined by `deny:unverified_device`, recorded
+when the optional `require_verified_device` gate rejects an `exec` from an
+unverified Matrix device (issue #240). That gate runs *after* the policy
+decision, so its denial is audited in addition to — not instead of — the
+policy outcome.
 
 **Secrets are redacted in the log.** Command arguments pass through a redactor
 that masks `KEY=value` pairs and `--flag value` pairs whose key looks sensitive,

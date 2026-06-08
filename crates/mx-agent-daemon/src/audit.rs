@@ -138,6 +138,40 @@ impl AuditRecord {
         }
     }
 
+    /// Build an audit record for a raw `exec` request denied by a gate that
+    /// runs *after* the policy engine — currently the verified-device gate
+    /// (issue #240).
+    ///
+    /// Policy-engine denials are recorded via [`AuditRecord::for_exec`] from the
+    /// engine's [`Outcome`]; this records a post-policy gate denial whose reason
+    /// is not a policy [`DenyReason`]. The command is redacted as for any exec
+    /// record, the decision is always [`AuditDecision::Denied`], no sandbox is
+    /// selected (nothing runs), and `deny_reason` is the gate's stable,
+    /// machine-readable reason, stored with the same `deny:` prefix as policy
+    /// denials so the log stays uniform.
+    pub fn for_exec_denied(
+        room: &str,
+        requester: &str,
+        target: &str,
+        invocation_id: Option<&str>,
+        command: &[String],
+        deny_reason: &str,
+    ) -> Self {
+        Self {
+            ts: now_rfc3339(),
+            room: room.to_string(),
+            requester: requester.to_string(),
+            target: target.to_string(),
+            invocation_id: invocation_id.map(str::to_string),
+            request: "exec",
+            command: Some(redact_command(command)),
+            tool: None,
+            decision: AuditDecision::Denied,
+            policy_rule: format!("deny:{deny_reason}"),
+            sandbox: None,
+        }
+    }
+
     /// Serialize the record to a single-line JSON string.
     pub fn to_json_line(&self) -> String {
         // The record contains only owned strings and enums, so serialization
@@ -450,6 +484,32 @@ mod tests {
         assert_eq!(record.policy_rule, "deny:command_not_allowed");
         // No invocation id is omitted from the JSON.
         assert!(!record.to_json_line().contains("invocation_id"));
+    }
+
+    #[test]
+    fn post_policy_gate_denial_is_recorded() {
+        // Issue #240: a verified-device gate denial (applied *after* the policy
+        // engine has allowed) is audited as a denial with its stable reason and
+        // no sandbox, exactly like a policy denial, so the audit trail captures
+        // every privileged denial — not only policy ones.
+        let cmd = argv(&["python", "--token", "s3cr3t"]);
+        let record = AuditRecord::for_exec_denied(
+            "!abc",
+            "@a",
+            "t",
+            Some("inv-1"),
+            &cmd,
+            "unverified_device",
+        );
+        assert_eq!(record.decision, AuditDecision::Denied);
+        assert_eq!(record.policy_rule, "deny:unverified_device");
+        assert_eq!(record.sandbox, None);
+        let json = record.to_json_line();
+        assert!(json.contains("\"request\":\"exec\""), "got {json}");
+        assert!(json.contains("\"invocation_id\":\"inv-1\""), "got {json}");
+        assert!(!json.contains("sandbox"), "got {json}");
+        // The command is redacted just like an allowed or policy-denied exec.
+        assert!(!json.contains("s3cr3t"), "secret leaked into audit: {json}");
     }
 
     #[test]

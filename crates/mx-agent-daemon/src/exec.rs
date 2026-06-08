@@ -535,13 +535,25 @@ pub async fn handle_live_exec_request(
     {
         Ok(value) => value,
         Err(rejection) => {
-            if let ExecRejection::PolicyDenied(reason) = &rejection {
-                audit_exec_decision(
+            match &rejection {
+                // Policy denials keep their detailed DenyReason via the policy
+                // Outcome path.
+                ExecRejection::PolicyDenied(reason) => audit_exec_decision(
                     paths,
                     &meta.room_id,
                     request,
                     &Outcome::Deny(reason.clone()),
-                );
+                ),
+                // The post-policy verified-device gate denial is audited too, so
+                // a require_verified_device rejection is "denied … and audited"
+                // like any other privileged denial (issue #240).
+                ExecRejection::UnverifiedDevice => {
+                    audit_exec_rejection(paths, &meta.room_id, request, &rejection)
+                }
+                // Pre-policy authentication failures (unsigned, bad signature,
+                // wrong target, untrusted key, malformed) are not attributable
+                // to a trusted requester and are intentionally not audited.
+                _ => {}
             }
             if let Err(e) =
                 emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await
@@ -1566,11 +1578,6 @@ fn audit_exec_decision(
     request: &ExecRequest,
     outcome: &Outcome,
 ) {
-    let Some(path) = AuditLog::default_path()
-        .or_else(|| Some(paths.data_dir.join(crate::audit::AUDIT_FILE_NAME)))
-    else {
-        return;
-    };
     let record = AuditRecord::for_exec(
         room_id,
         &request.requesting_agent,
@@ -1579,8 +1586,46 @@ fn audit_exec_decision(
         &request.command,
         outcome,
     );
+    append_exec_audit(paths, &request.invocation_id, record);
+}
+
+/// Audit an exec rejection from a gate that runs *after* the policy engine —
+/// currently only the verified-device gate (issue #240).
+///
+/// Policy denials carry a richer [`DenyReason`] and are audited via
+/// [`audit_exec_decision`] with the policy [`Outcome`]; routing one here would
+/// flatten it to `"policy_denied"`. This is reserved for post-policy gate
+/// denials whose reason is not a policy decision, so the audit trail records
+/// *every* privileged denial (issue #240 spec: "denied … and audited"), not
+/// just policy ones.
+fn audit_exec_rejection(
+    paths: &crate::SessionPaths,
+    room_id: &str,
+    request: &ExecRequest,
+    rejection: &ExecRejection,
+) {
+    let record = AuditRecord::for_exec_denied(
+        room_id,
+        &request.requesting_agent,
+        &request.target_agent,
+        Some(&request.invocation_id),
+        &request.command,
+        &rejection.reason(),
+    );
+    append_exec_audit(paths, &request.invocation_id, record);
+}
+
+/// Append a prepared exec [`AuditRecord`] to the local audit log, resolving the
+/// default config-dir path and falling back to the data dir. A failed append is
+/// logged and swallowed: auditing must never block or fail a decision.
+fn append_exec_audit(paths: &crate::SessionPaths, invocation_id: &str, record: AuditRecord) {
+    let Some(path) = AuditLog::default_path()
+        .or_else(|| Some(paths.data_dir.join(crate::audit::AUDIT_FILE_NAME)))
+    else {
+        return;
+    };
     if let Err(e) = AuditLog::new(path).append(&record) {
-        tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to append exec audit record");
+        tracing::warn!(error = %e, invocation_id = %invocation_id, "failed to append exec audit record");
     }
 }
 
