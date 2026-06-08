@@ -131,6 +131,10 @@ where
         task: &TaskState,
         action: &TaskAction,
         invocation_id: &str,
+        // The remote daemon re-resolves policy and applies isolation through its
+        // own `exec`/`runner` pipeline, so the local transport does not consume
+        // the allowance (architecture §13.5).
+        _allowance: &mx_agent_policy::Allowance,
     ) -> Result<TaskExecutionResult, TaskDispatchError> {
         match action {
             TaskAction::Tool { tool, args, .. } => {
@@ -185,6 +189,10 @@ where
         task: &TaskState,
         action: &TaskAction,
         invocation_id: &str,
+        // The remote daemon re-resolves policy and applies isolation through its
+        // own `exec`/`runner` pipeline, so the local transport does not consume
+        // the allowance (architecture §13.5).
+        _allowance: &mx_agent_policy::Allowance,
     ) -> Result<TaskExecutionResult, TaskDispatchError> {
         match action {
             TaskAction::Exec {
@@ -225,6 +233,12 @@ mod tests {
     use mx_agent_protocol::schema::{ExecFinished, StreamChunk};
     use mx_agent_protocol::schema::{Extra, StreamArtifact, StreamKind};
     use serde_json::json;
+
+    /// A default allowance: the Matrix transport ignores it (the remote daemon
+    /// re-resolves policy), so tests just need a value to pass.
+    fn allowance() -> mx_agent_policy::Allowance {
+        mx_agent_policy::Allowance::default()
+    }
 
     fn tool_task() -> TaskState {
         base_task(Some(TaskAction::Tool {
@@ -331,7 +345,9 @@ mod tests {
             });
         let task = tool_task();
         let action = task.action.clone().unwrap();
-        let result = dispatcher.dispatch(&task, &action, "inv_orch").unwrap();
+        let result = dispatcher
+            .dispatch(&task, &action, "inv_orch", &allowance())
+            .unwrap();
         assert_eq!(result.exit_code, Some(0));
         assert!(result.summary.contains("tests passed"));
         assert!(result.summary.contains("inv_call"));
@@ -350,7 +366,9 @@ mod tests {
         });
         let task = tool_task();
         let action = task.action.clone().unwrap();
-        let err = dispatcher.dispatch(&task, &action, "inv_orch").unwrap_err();
+        let err = dispatcher
+            .dispatch(&task, &action, "inv_orch", &allowance())
+            .unwrap_err();
         assert!(matches!(err, TaskDispatchError::Failed(m) if m.contains("policy denied tool")));
     }
 
@@ -362,7 +380,7 @@ mod tests {
         let task = exec_task();
         let action = task.action.clone().unwrap();
         assert!(matches!(
-            dispatcher.dispatch(&task, &action, "inv_orch"),
+            dispatcher.dispatch(&task, &action, "inv_orch", &allowance()),
             Err(TaskDispatchError::Failed(_))
         ));
     }
@@ -394,7 +412,9 @@ mod tests {
             });
         let task = exec_task();
         let action = task.action.clone().unwrap();
-        let result = dispatcher.dispatch(&task, &action, "inv_orch").unwrap();
+        let result = dispatcher
+            .dispatch(&task, &action, "inv_orch", &allowance())
+            .unwrap();
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.artifact_mxc.as_deref(), Some("mxc://server/log"));
         assert!(result.summary.contains("inv_exec"));
@@ -411,7 +431,9 @@ mod tests {
         });
         let task = exec_task();
         let action = task.action.clone().unwrap();
-        let result = nonzero.dispatch(&task, &action, "inv_orch").unwrap();
+        let result = nonzero
+            .dispatch(&task, &action, "inv_orch", &allowance())
+            .unwrap();
         assert_eq!(result.exit_code, Some(2));
         assert!(!result.is_success());
 
@@ -422,7 +444,9 @@ mod tests {
                 frames: vec![finished_frame(None, Some("SIGKILL"))],
             },
         });
-        let result = signalled.dispatch(&task, &action, "inv_orch").unwrap();
+        let result = signalled
+            .dispatch(&task, &action, "inv_orch", &allowance())
+            .unwrap();
         assert_eq!(result.exit_code, None);
         assert!(!result.is_success());
         assert!(result.summary.contains("SIGKILL"));
@@ -441,7 +465,7 @@ mod tests {
         let task = exec_task();
         let action = task.action.clone().unwrap();
         assert!(matches!(
-            dispatcher.dispatch(&task, &action, "inv_orch"),
+            dispatcher.dispatch(&task, &action, "inv_orch", &allowance()),
             Err(TaskDispatchError::Failed(m)) if m.contains("remote rejected")
         ));
 
@@ -449,7 +473,7 @@ mod tests {
         let tool = tool_task();
         let tool_action = tool.action.clone().unwrap();
         assert!(matches!(
-            dispatcher.dispatch(&tool, &tool_action, "inv_orch"),
+            dispatcher.dispatch(&tool, &tool_action, "inv_orch", &allowance()),
             Err(TaskDispatchError::Failed(_))
         ));
     }

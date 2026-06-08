@@ -404,3 +404,204 @@ fn daemon_drives_tasks_through_policy_dependencies_and_denial() {
     std::env::remove_var("GITHUB_TOKEN");
     let _ = std::fs::remove_dir_all(&workspace);
 }
+
+// --- issue #248: sandbox policy settings flow end to end --------------------
+
+/// Whether a minimal `bwrap` invocation works in this environment.
+///
+/// Returns `false` on any error — absent binary, kernel without user-namespace
+/// support, CI sandbox, macOS — so bubblewrap tests skip gracefully. Mirrors
+/// the check in `mx-agent-sandbox/src/lib.rs`.
+fn bwrap_usable() -> bool {
+    use std::process::Command;
+    match Command::new("bwrap")
+        .args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+            "--",
+            "true",
+        ])
+        .output()
+    {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// System paths that a bubblewrap sandbox needs bound read-only for `sh` and
+/// basic utilities to be resolvable inside the container.
+fn base_ro_paths_for_bwrap() -> Vec<std::path::PathBuf> {
+    ["/usr", "/bin", "/lib", "/lib64", "/etc"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Verify that policy sandbox settings (read_only_paths / writable_paths /
+/// network / default_sandbox) flow through the full task orchestration stack
+/// and reach the runner end to end (issue #248).
+///
+/// **Part 1 — Backend::None (always runs):**  A policy with `read_only_paths`,
+/// `writable_paths`, and `network = "deny"` but no `default_sandbox` resolves
+/// to the `none` backend.  The `none` backend ignores those settings by design,
+/// so the command runs normally.  This proves the orchestration chain correctly
+/// threads the allowance (carrying paths/network) without breaking backward
+/// compatibility when no isolating backend is selected.
+///
+/// **Part 2 — Backend::Bubblewrap (skips when bwrap is unavailable):**  A
+/// policy with `default_sandbox = "bubblewrap"` and correctly configured path
+/// binds runs the command inside `bwrap`.  The sentinel file appears in the
+/// writable workspace, proving that the configured paths flow all the way from
+/// the policy engine through the allowance, the dispatcher, the RunSpec, and
+/// into the real `bwrap` argv — and that `bwrap` actually bound the filesystem
+/// as configured.
+#[test]
+fn sandbox_policy_settings_flow_through_task_orchestration() {
+    static SANDBOX_COUNTER: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    // --- Part 1: Backend::None with path/network settings in policy. ---------
+    //
+    // The orchestration chain must resolve the allowance (with read_only_paths,
+    // writable_paths, and network) and thread it into the dispatcher even when
+    // the backend is `none`.  The `none` backend ignores the confinement — the
+    // command runs normally.
+    let workspace = std::env::temp_dir().join(format!(
+        "mx-agent-sandbox-e2e-none-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        SANDBOX_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let cwd = workspace.to_string_lossy().into_owned();
+    let sentinel = workspace.join("ran");
+
+    // Policy has path/network settings but no default_sandbox → Backend::None.
+    let policy_none = Policy::parse(&format!(
+        r#"
+[execution]
+network = "deny"
+read_only_paths = ["{cwd}"]
+writable_paths = ["{cwd}"]
+
+[rooms."{ROOM_ID}"]
+trusted = true
+raw_exec_default = "deny"
+
+[rooms."{ROOM_ID}".agents."{PLANNER}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+"#
+    ))
+    .expect("none-backend policy parses");
+
+    let cmd_none = format!("touch {}", sentinel.display());
+    let mut store = RoomTaskStore::default();
+    store.insert(task("task-none", &["sh", "-c", &cmd_none], &cwd));
+
+    let scheduler = TaskScheduler::new(LOCAL_AGENT, 4);
+    let orchestrator = TaskOrchestrator::new(LOCAL_AGENT)
+        .with_room_id(ROOM_ID)
+        .with_policy(policy_none);
+    let mut dispatcher = ExecTaskDispatcher::new();
+    tick(&scheduler, &orchestrator, &mut store, &mut dispatcher);
+
+    assert_eq!(
+        store.get("task-none").state,
+        STATE_SUCCEEDED,
+        "backend=none must not confine the command; policy path/network settings are ignored"
+    );
+    assert!(
+        sentinel.exists(),
+        "command must have run and created the sentinel (backend=none exec)"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    // --- Part 2: Backend::Bubblewrap with real confinement. ------------------
+    //
+    // Skip gracefully when bwrap is absent or unprivileged user namespaces are
+    // blocked (macOS, some CI sandboxes).
+    if !bwrap_usable() {
+        eprintln!(
+            "skipping sandbox_policy_settings_flow_through_task_orchestration (bubblewrap part): \
+            bwrap not usable in this environment (macOS, absent binary, or no user-namespaces)"
+        );
+        return;
+    }
+
+    let workspace_bwrap = std::env::temp_dir().join(format!(
+        "mx-agent-sandbox-e2e-bwrap-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        SANDBOX_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&workspace_bwrap).expect("create bwrap workspace");
+    let cwd_bwrap = workspace_bwrap.to_string_lossy().into_owned();
+    let sentinel_bwrap = workspace_bwrap.join("ran-bwrap");
+
+    // Build the TOML read_only_paths array from the system paths sh needs.
+    let ro_toml = base_ro_paths_for_bwrap()
+        .iter()
+        .map(|p| format!("\"{}\"", p.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Policy selects bubblewrap + network=allow + filesystem binds so the
+    // command can run inside the sandbox and write to the writable workspace.
+    let policy_bwrap = Policy::parse(&format!(
+        r#"
+[execution]
+default_sandbox = "bubblewrap"
+network = "allow"
+read_only_paths = [{ro_toml}]
+writable_paths = ["{cwd_bwrap}"]
+
+[rooms."{ROOM_ID}"]
+trusted = true
+raw_exec_default = "deny"
+
+[rooms."{ROOM_ID}".agents."{PLANNER}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd_bwrap}"]
+"#
+    ))
+    .expect("bubblewrap policy parses");
+
+    let cmd_bwrap = format!("touch {}", sentinel_bwrap.display());
+    let mut store_bwrap = RoomTaskStore::default();
+    store_bwrap.insert(task("task-bwrap", &["sh", "-c", &cmd_bwrap], &cwd_bwrap));
+
+    let scheduler_bwrap = TaskScheduler::new(LOCAL_AGENT, 4);
+    let orchestrator_bwrap = TaskOrchestrator::new(LOCAL_AGENT)
+        .with_room_id(ROOM_ID)
+        .with_policy(policy_bwrap);
+    let mut dispatcher_bwrap = ExecTaskDispatcher::new();
+    tick(
+        &scheduler_bwrap,
+        &orchestrator_bwrap,
+        &mut store_bwrap,
+        &mut dispatcher_bwrap,
+    );
+
+    assert_eq!(
+        store_bwrap.get("task-bwrap").state,
+        STATE_SUCCEEDED,
+        "bubblewrap-sandboxed task must succeed when paths are correctly configured \
+        (read_only_paths covers system binaries, writable_paths covers the workspace)"
+    );
+    assert!(
+        sentinel_bwrap.exists(),
+        "bwrap must have bound the workspace writable end to end through the policy pipeline"
+    );
+    let _ = std::fs::remove_dir_all(&workspace_bwrap);
+}

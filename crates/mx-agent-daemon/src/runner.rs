@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use mx_agent_sandbox::{sandbox_for, Backend, Restrictions};
+use mx_agent_sandbox::{sandbox_for, Backend, Network, Restrictions};
 use tokio::process::Command;
 
 /// Default grace period between the SIGTERM and the SIGKILL escalation when a
@@ -188,6 +188,20 @@ pub struct RunSpec {
     /// from policy (`execution.default_sandbox` / the agent override); defaults
     /// to [`Backend::None`].
     pub sandbox: Backend,
+    /// Whether the command may reach the network (architecture §13.5).
+    ///
+    /// Only an isolating backend enforces this; the [`Backend::None`] backend
+    /// ignores it. Resolved from the policy network decision and defaults to
+    /// [`Network::Deny`] (fail closed) so an unset policy never widens access.
+    pub network: Network,
+    /// Filesystem paths an isolating backend binds read-only into the sandbox
+    /// (architecture §13.5). Ignored by [`Backend::None`]. Resolved from the
+    /// policy's `execution.read_only_paths`; defaults to empty.
+    pub read_only_paths: Vec<PathBuf>,
+    /// Filesystem paths an isolating backend binds writable into the sandbox
+    /// (architecture §13.5). Ignored by [`Backend::None`]. Resolved from the
+    /// policy's `execution.writable_paths`; defaults to empty.
+    pub writable_paths: Vec<PathBuf>,
 }
 
 impl Default for RunSpec {
@@ -201,6 +215,9 @@ impl Default for RunSpec {
             timeout: None,
             grace_period: DEFAULT_GRACE_PERIOD,
             sandbox: Backend::None,
+            network: Network::default(),
+            read_only_paths: Vec::new(),
+            writable_paths: Vec::new(),
         }
     }
 }
@@ -263,6 +280,32 @@ impl std::error::Error for RunError {
     }
 }
 
+/// Build the centralized [`Restrictions`] for a [`RunSpec`] and its already
+/// sanitized environment.
+///
+/// This is the single place that maps a [`RunSpec`]'s sandbox-layer settings
+/// (network decision and the read-only / writable bind paths) onto the
+/// [`Restrictions`] every backend consumes, so an isolating backend confines
+/// exactly what policy configured (architecture §13.5). Output capping is
+/// enforced by the capture stage rather than the spawn, so `max_output_bytes`
+/// is left `None` here.
+///
+/// Kept as a pure function so tests can assert the prepared argv for a given
+/// spec — `sandbox_for(spec.sandbox).prepare(spec.command.clone(),
+/// restrictions_for(spec, env))` — without spawning anything.
+pub(crate) fn restrictions_for(spec: &RunSpec, env: BTreeMap<String, String>) -> Restrictions {
+    Restrictions {
+        cwd: spec.cwd.clone(),
+        env,
+        timeout: spec.timeout,
+        // Output capping is enforced by the capture stage, not the spawn.
+        max_output_bytes: None,
+        network: spec.network,
+        read_only_paths: spec.read_only_paths.clone(),
+        writable_paths: spec.writable_paths.clone(),
+    }
+}
+
 /// Build a configured [`Command`] from a [`RunSpec`].
 ///
 /// Validates the argv and cwd, applies the sanitized environment, sets the
@@ -289,17 +332,7 @@ pub(crate) fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
     // and returns the argv to actually spawn plus the controls to enforce. The
     // baseline `none` backend returns both unchanged; stronger backends rewrite
     // the argv to launch the command inside their wrapper.
-    let restrictions = Restrictions {
-        cwd: spec.cwd.clone(),
-        env,
-        timeout: spec.timeout,
-        // Output capping is enforced by the capture stage, not the spawn.
-        max_output_bytes: None,
-        // Network and path isolation are consumed only by isolating backends;
-        // threading them from policy into the runner is a later step, so for now
-        // the baseline path leaves them at their (deny / empty) defaults.
-        ..Default::default()
-    };
+    let restrictions = restrictions_for(spec, env);
     let prepared = sandbox_for(spec.sandbox).prepare(spec.command.clone(), restrictions);
     let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
     let Restrictions { cwd, env, .. } = prepared.restrictions;
@@ -938,6 +971,141 @@ mod tests {
         };
         let out = run(&spec).await.expect("runs");
         assert!(out.is_success());
+    }
+
+    // --- restrictions_for / sandbox wiring tests (issue #248) ----------------
+    //
+    // These tests verify the pure `restrictions_for` → `sandbox.prepare` wiring
+    // without spawning anything: a `RunSpec` with network/path settings must
+    // produce the expected argv for each backend.
+
+    #[test]
+    fn restrictions_for_threads_network_deny_and_paths_to_bubblewrap_argv() {
+        // A bubblewrap spec with network=Deny and ro/rw paths must produce a
+        // bwrap argv containing --unshare-net, --ro-bind, and --bind entries.
+        let spec = RunSpec {
+            command: vec!["echo".to_string(), "hi".to_string()],
+            cwd: PathBuf::from("/work"),
+            sandbox: Backend::Bubblewrap,
+            network: Network::Deny,
+            read_only_paths: vec![PathBuf::from("/usr"), PathBuf::from("/lib")],
+            writable_paths: vec![PathBuf::from("/work")],
+            ..RunSpec::default()
+        };
+        let restrictions = restrictions_for(&spec, BTreeMap::new());
+        let prepared = sandbox_for(Backend::Bubblewrap).prepare(spec.command.clone(), restrictions);
+        let argv = prepared.argv.join(" ");
+        assert!(
+            argv.contains("--ro-bind /usr /usr"),
+            "expected --ro-bind /usr /usr in: {argv}"
+        );
+        assert!(
+            argv.contains("--ro-bind /lib /lib"),
+            "expected --ro-bind /lib /lib in: {argv}"
+        );
+        assert!(
+            argv.contains("--bind /work /work"),
+            "expected --bind /work /work in: {argv}"
+        );
+        assert!(
+            argv.contains("--unshare-net"),
+            "expected --unshare-net (network=Deny) in: {argv}"
+        );
+        assert!(
+            argv.contains("--chdir /work"),
+            "expected --chdir /work in: {argv}"
+        );
+    }
+
+    #[test]
+    fn restrictions_for_network_allow_omits_unshare_net_from_bubblewrap_argv() {
+        // network=Allow must produce no --unshare-net flag so the sandbox keeps
+        // the daemon's network access (architecture §13.5).
+        let spec = RunSpec {
+            command: vec!["true".to_string()],
+            cwd: PathBuf::from("/work"),
+            sandbox: Backend::Bubblewrap,
+            network: Network::Allow,
+            ..RunSpec::default()
+        };
+        let restrictions = restrictions_for(&spec, BTreeMap::new());
+        let prepared = sandbox_for(Backend::Bubblewrap).prepare(spec.command.clone(), restrictions);
+        let argv = prepared.argv.join(" ");
+        assert!(
+            !argv.contains("--unshare-net"),
+            "expected no --unshare-net (network=Allow) in: {argv}"
+        );
+    }
+
+    #[test]
+    fn restrictions_for_none_backend_ignores_paths_and_network() {
+        // The `none` backend must not modify the argv regardless of network/path
+        // settings — it adds no isolation and passes the argv through unchanged.
+        let spec = RunSpec {
+            command: vec!["echo".to_string(), "hi".to_string()],
+            cwd: std::env::temp_dir(),
+            sandbox: Backend::None,
+            network: Network::Deny,
+            read_only_paths: vec![PathBuf::from("/usr")],
+            writable_paths: vec![PathBuf::from("/work")],
+            ..RunSpec::default()
+        };
+        let restrictions = restrictions_for(&spec, BTreeMap::new());
+        let prepared = sandbox_for(Backend::None).prepare(spec.command.clone(), restrictions);
+        assert_eq!(
+            prepared.argv,
+            vec!["echo", "hi"],
+            "none backend must not wrap the argv"
+        );
+    }
+
+    #[test]
+    fn restrictions_for_container_backend_deny_includes_network_none_and_volumes() {
+        // Container backend + network=Deny must add --network none and volume
+        // mounts for the configured paths (architecture §13.5).
+        let spec = RunSpec {
+            command: vec!["echo".to_string()],
+            cwd: PathBuf::from("/work"),
+            sandbox: Backend::Container,
+            network: Network::Deny,
+            read_only_paths: vec![PathBuf::from("/usr")],
+            writable_paths: vec![PathBuf::from("/work")],
+            ..RunSpec::default()
+        };
+        let restrictions = restrictions_for(&spec, BTreeMap::new());
+        let prepared = sandbox_for(Backend::Container).prepare(spec.command.clone(), restrictions);
+        let argv = prepared.argv.join(" ");
+        assert!(
+            argv.contains("--network none"),
+            "expected --network none (deny) in: {argv}"
+        );
+        assert!(
+            argv.contains("/usr:/usr:ro"),
+            "expected ro volume for /usr in: {argv}"
+        );
+        assert!(
+            argv.contains("/work:/work"),
+            "expected rw volume for /work in: {argv}"
+        );
+    }
+
+    #[test]
+    fn restrictions_for_container_backend_allow_omits_network_none() {
+        // Container backend + network=Allow must not add --network none.
+        let spec = RunSpec {
+            command: vec!["echo".to_string()],
+            cwd: PathBuf::from("/work"),
+            sandbox: Backend::Container,
+            network: Network::Allow,
+            ..RunSpec::default()
+        };
+        let restrictions = restrictions_for(&spec, BTreeMap::new());
+        let prepared = sandbox_for(Backend::Container).prepare(spec.command.clone(), restrictions);
+        let argv = prepared.argv.join(" ");
+        assert!(
+            !argv.contains("--network none"),
+            "expected no --network none (allow) in: {argv}"
+        );
     }
 
     #[tokio::test]

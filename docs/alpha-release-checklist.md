@@ -147,12 +147,17 @@ it here before release.
   production hardening includes device verification UX, cross-signing, and key
   backup; remaining artifact work is tuning for very large outputs.
 - **Sandbox is not a security boundary on its own.** The `none`, `bubblewrap`,
-  and Docker/Podman container backends are implemented and policy-selectable,
-  but there is no seccomp filtering, rlimit capping, or UID/GID remapping;
-  commands run as the daemon's user. The built-in fallback backend is `none`
-  (zero isolation) — operators must choose `bubblewrap`/`docker`/`podman`. Bound
-  the blast radius with policy (cwd, env scrub, runtime/output caps) and a real
-  sandbox backend.
+  and Docker/Podman container backends are implemented and policy-selectable.
+  `read_only_paths` / `writable_paths` filesystem-bind confinement and `network`
+  policy are wired end-to-end from the policy engine to the runner — including
+  for auto-executed task DAGs. However there is no seccomp filtering, rlimit
+  capping, or UID/GID remapping; commands run as the daemon's user. The built-in
+  fallback backend is `none` (zero isolation) — operators must choose
+  `bubblewrap`/`docker`/`podman`. Bound the blast radius with policy (cwd, env
+  scrub, network, path-bind confinement, runtime/output caps) and a real sandbox
+  backend. Interactive `exec --pty` does not route through the sandbox backend;
+  only the baseline controls (env scrub, cwd, timeout, output cap) apply to the
+  PTY path.
 - **Bundled homeserver is dev-only.** The Tuwunel homeserver in `dev/matrix`
   binds to loopback, disables federation, and is for local testing only — never
   for production identities or data.
