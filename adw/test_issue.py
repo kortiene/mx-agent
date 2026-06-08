@@ -106,13 +106,27 @@ class MainPrintPromptTests(unittest.TestCase):
         code, _ = self._run(["15", "--runner", "bogus", "--print-prompt"])
         self.assertEqual(code, 1)
 
-    def test_dry_run_prints_command_without_executing(self) -> None:
+    def test_one_shot_dry_run_prints_command_without_executing(self) -> None:
         with mock.patch.dict("os.environ", {"PI_BIN": "/usr/bin/true"}, clear=False):
-            code, out = self._run(["15", "--dry-run"])
+            code, out = self._run(["15", "--one-shot", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertIn("[dry-run]", out)
         self.assertIn("/usr/bin/true", out)
         self.assertIn("-p", out)
+
+    def test_phased_dry_run_prints_plan(self) -> None:
+        code, out = self._run(["15", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("[dry-run]", out)
+        self.assertIn("phased run for issue #15", out)
+        # Phase chain and the token-withholding posture are shown.
+        self.assertIn("classify", out)
+        self.assertIn("GH_TOKEN withheld", out)
+
+    def test_phased_dry_run_custom_phases(self) -> None:
+        code, out = self._run(["15", "--dry-run", "--phases", "plan,implement,tests"])
+        self.assertEqual(code, 0)
+        self.assertIn("plan -> implement -> tests", out)
 
 
 if __name__ == "__main__":

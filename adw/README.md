@@ -51,17 +51,80 @@ must be run deliberately: each gates on a confirmation prompt (`--yes` /
 | Script | Purpose |
 |---|---|
 | `python adw/work_issue.py <n>` | Bootstrap one issue: fetch it, derive a branch, switch to it from an up-to-date base, assign it, and move its board card to In Progress. The `/issue` workflow runs `--print` for context, then this to set up. Needs `gh` + `git`. |
-| `python adw/issue.py <n> [notes]` | **The `/issue` executor.** Expand the template and drive a coding-agent runner (`pi` default, or `claude`) end to end, then verify the issue is CLOSED on GitHub. Renders the `.claude/commands` variant for `--runner claude`. |
+| `python adw/issue.py <n> [notes]` | **The `/issue` executor.** Runs the **phased pipeline** by default (see below): Python drives discrete agent phases and owns all git/GitHub work, then verifies the issue is CLOSED. `--one-shot` runs the legacy single monolithic agent call instead. |
 | `python adw/issues.py <spec...>` | Deliver several issues in order via `issue.py`, one fully completing (CI + merge) before the next starts. Accepts single IDs and `N-M` / `N..M` ranges; resumable, serialized by a lock file. |
 
 ```bash
 python adw/work_issue.py 15 --print                # show issue context, change nothing
-python adw/issue.py 15                             # implement issue #15 end-to-end
-python adw/issue.py 15 --print-prompt              # render the workflow only (no run)
-python adw/issue.py 15 --runner claude -- --permission-mode acceptEdits
+python adw/issue.py 15                             # phased pipeline (new default)
+python adw/issue.py 15 --dry-run                   # preview the phase plan
+python adw/issue.py 15 --phases plan,implement,tests,review   # custom phase subset
+python adw/issue.py 15 --one-shot                  # legacy single monolithic agent call
+python adw/issue.py 15 --adw-id a1b2c3d4 --resume  # resume a prior run, skipping done phases
+python adw/issue.py 15 --print-prompt              # render the one-shot template only (no run)
 python adw/issues.py 15-22 --keep-going            # a range, continue past failures
 python adw/issues.py 15 16 18-20 --dry-run         # preview the batch plan
 ```
+
+## Phased pipeline (default)
+
+`python adw/issue.py <n>` now runs a **Python-orchestrated phased pipeline**. Instead
+of one monolithic agent call, Python drives a sequence of discrete, single-purpose
+agent phases and performs all git/GitHub mechanics itself:
+
+```
+[Python] setup     fetch issue, branch from origin/main, assign, board → In Progress
+[agent ] classify  cheap model → issue type
+[agent ] plan      create a spec in specs/ when warranted
+[agent ] implement make the change
+[agent ] tests     add focused coverage
+[Python] resolve*  run the test gate; on failure ask the agent to fix; rerun (bounded)
+[agent ] e2e?      only if the change crosses CLI/daemon/Matrix/signing/sandbox flows
+[agent ] review    self-review → findings (blocker/tech_debt/skippable) + commit/PR text
+[agent ] patch*    fix blocker findings only (bounded)
+[agent ] document? only if user-visible/API/docs surface changed
+[Python] finalize  run gates; commit (agent-authored msg); push; open PR (agent-authored body)
+[Python] ci-fix*   watch CI; on red, re-invoke the agent to fix (bounded)
+[Python] merge     confirm, then squash-merge --delete-branch; verify issue CLOSED
+```
+
+Key properties:
+
+- **Run identity + resume.** Each run gets an 8-char `adw_id` and a workspace at
+  `agents/{adw_id}/` (git-ignored) holding `state.json` and per-phase transcripts.
+  Re-run with `--adw-id <id> --resume` to skip already-completed phases.
+- **Python owns git; the agent never sees `GH_TOKEN`.** All branch/commit/push/PR/
+  CI-watch/merge work runs in Python. The agent only *authors* the commit message and
+  PR body; the runner is launched with an env allowlist that withholds `GH_TOKEN`,
+  Matrix tokens, and other secrets. The squash-merge is gated in Python behind an
+  explicit confirmation (a non-interactive run must pass `--yes`/`MX_AGENT_YES=1`).
+- **Per-phase model routing.** Cheap model for `classify`, capable for
+  `implement`/`review`/`patch`. Override with `--model` (all phases) or
+  `MX_AGENT_MODEL_<PHASE>` (one phase). An exported `PI_MODEL` does *not* override
+  routing (it would defeat the point); pass `--model` to do so explicitly.
+- **`--phases <csv>`** runs a custom subset/order; `--max-resolve` / `--max-patch` /
+  `--max-ci-fix` bound the self-healing loops; `--test-cmd` overrides only the *test*
+  gate (default `cargo test --all`) — `cargo fmt --check`, clippy, and build still run
+  before merge; `--no-progress` silences the `[MX-ADW]` issue comments. Resume
+  (`--adw-id <id> --resume`) tolerates the prior run's uncommitted edits and skips the
+  clean-tree precondition.
+- **Prompt composition.** The reused phase templates
+  (`plan`/`implement`/`tests`/`e2e_tests`) are wrapped at render time with a shared preamble
+  (Python owns git/gh; the agent has no GitHub access this phase) and a per-phase JSON output
+  contract, so those interactive templates stay unedited and serve all three consumers
+  (render-only wrappers, one-shot `issue.md`, and the orchestrator). The `review` phase uses a
+  dedicated working-tree template, `review_phase.md` (the PR-oriented `review.md` stays for
+  interactive/`--one-shot` use). The contract lives in
+  `adw/_phases.py` (one source of truth, kept in sync with the result parsers); a mock-free
+  self-test (`adw/test_phase_contracts.py`) asserts every composed phase prompt carries it.
+  Free-form text (the commit message and PR body) is authored to
+  `agents/{adw_id}/commit_message.txt` and `pr_body.md` and read back by Python — kept out of
+  the parsed JSON so multiline prose can't break parsing.
+
+`--one-shot` restores the previous behavior: render the monolithic `.pi/prompts/issue.md`
+template and hand the whole pipeline to a single agent call. That mode necessarily gives
+the agent `GH_TOKEN` (it pushes/merges itself), so it is **less isolated**; prefer the
+phased default unless you specifically need the old flow.
 
 ## `/issues` selectors
 
@@ -101,8 +164,12 @@ Neither tier bypasses repository safety constraints. The render-only wrappers
 never execute anything; the executable delivery drivers (`issue.py`, `issues.py`,
 `work_issue.py`) act only after an explicit confirmation (`--yes` /
 `MX_AGENT_YES=1` to skip in unattended runs) and support `--dry-run` /
-`--print-prompt` previews. The rendered workflows they drive continue to
-require:
+`--print-prompt` previews. In phased mode the coding-agent runner is launched
+with an environment allowlist (`adw/_exec.py:safe_subprocess_env`) that withholds
+`GH_TOKEN`, Matrix tokens, device keys, and other secrets — Python performs all
+`gh`/`git` work itself — and the irreversible squash-merge is gated in Python
+(an unattended run without `--yes`/`MX_AGENT_YES=1` is refused, not silently
+merged). The rendered workflows they drive continue to require:
 
 - stateless CLI / daemon-owned long-lived state
 - no Matrix tokens or device keys exposed to coding agents
@@ -116,9 +183,11 @@ require:
 
 ## Tests
 
-Helper tests use the Python standard library and never invoke pi, claude, or gh
-(execution paths are covered only through `--dry-run` / `--print-prompt` and by
-mocking the runner):
+Helper tests use the Python standard library and never invoke pi, claude, gh,
+git, or cargo (execution paths are covered only through `--dry-run` /
+`--print-prompt` and by mocking the runner, git, and gh layers; phase workspaces
+are written under a temporary `AGENTS_DIR`). They run in CI via the `adw` job in
+`.github/workflows/ci.yml`:
 
 ```bash
 python -m unittest discover -s adw -p 'test_*.py'

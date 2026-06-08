@@ -26,6 +26,19 @@ jobs:
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck scripts/*.sh
 
+  adw:
+    # Runs the Agent Development Workflow helper unit tests (adw/). They are
+    # stdlib-only and never invoke pi/claude/gh/git/cargo (everything is mocked
+    # or exercised via --dry-run/--print-prompt), so no extra setup is needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: ADW Python unit tests
+        run: python -m unittest discover -s adw -p 'test_*.py'
+
   rust:
     runs-on: ubuntu-latest
     steps:

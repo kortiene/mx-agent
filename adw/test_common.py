@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import unittest
 
-from adw.common import AdwError, expand_issue_selectors, render_prompt, split_notes, strip_frontmatter
+from adw.common import (
+    AdwError,
+    expand_issue_selectors,
+    parse_json,
+    partition_on_double_dash,
+    render_prompt,
+    split_notes,
+    strip_frontmatter,
+)
 from adw.issues import render_args
 
 
@@ -57,6 +65,21 @@ class IssueSelectorTests(unittest.TestCase):
         self.assertEqual(selectors, ["12", "13-14"])
         self.assertEqual(notes, ["shared", "notes"])
 
+
+class PartitionOnDoubleDashTests(unittest.TestCase):
+    """Tests for the shared `--` argv partition primitive."""
+
+    def test_no_separator_returns_all_as_head(self) -> None:
+        self.assertEqual(partition_on_double_dash(["15", "note"]), (["15", "note"], []))
+
+    def test_splits_at_first_separator(self) -> None:
+        head, tail = partition_on_double_dash(["15", "--json", "--", "--model", "x"])
+        self.assertEqual(head, ["15", "--json"])
+        self.assertEqual(tail, ["--model", "x"])
+
+    def test_trailing_separator_yields_empty_tail(self) -> None:
+        self.assertEqual(partition_on_double_dash(["a", "--"]), (["a"], []))
+
     def test_issues_render_args_normalizes_selectors_and_notes(self) -> None:
         self.assertEqual(
             render_args(["10", "12-13", "12", "--", "shared", "notes"]),
@@ -66,6 +89,41 @@ class IssueSelectorTests(unittest.TestCase):
     def test_issues_render_args_requires_selector(self) -> None:
         with self.assertRaises(AdwError):
             render_args([])
+
+
+class ParseJsonTests(unittest.TestCase):
+    """Tests for the fence/prose-tolerant JSON parser."""
+
+    def test_raw_object(self) -> None:
+        self.assertEqual(parse_json('{"a": 1}'), {"a": 1})
+
+    def test_json_fence(self) -> None:
+        text = "Here is my answer:\n```json\n{\"resolved\": 2}\n```"
+        self.assertEqual(parse_json(text), {"resolved": 2})
+
+    def test_bare_fence(self) -> None:
+        text = "```\n[1, 2, 3]\n```"
+        self.assertEqual(parse_json(text), [1, 2, 3])
+
+    def test_prose_wrapped_object(self) -> None:
+        text = "blah blah {\"k\": \"v\"} trailing words"
+        self.assertEqual(parse_json(text), {"k": "v"})
+
+    def test_uses_last_fenced_block(self) -> None:
+        text = "```json\n{\"first\": 1}\n```\nthen\n```json\n{\"final\": 2}\n```"
+        self.assertEqual(parse_json(text), {"final": 2})
+
+    def test_garbage_raises(self) -> None:
+        with self.assertRaises(AdwError):
+            parse_json("no json here at all")
+
+    def test_expect_dict_mismatch_raises(self) -> None:
+        with self.assertRaises(AdwError):
+            parse_json("[1, 2]", expect=dict)
+
+    def test_expect_list_mismatch_raises(self) -> None:
+        with self.assertRaises(AdwError):
+            parse_json('{"a": 1}', expect=list)
 
 
 if __name__ == "__main__":

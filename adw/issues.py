@@ -27,8 +27,9 @@ from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from adw.common import AdwError, expand_issue_selectors, print_rendered, split_notes
+from adw.common import AdwError, expand_issue_selectors, partition_on_double_dash, print_rendered, split_notes
 from adw._exec import assume_yes, confirm, note
+from adw._state import make_adw_id
 from adw import issue as issue_mod
 
 
@@ -44,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runner", help="forward --runner to issue.py (pi|claude)")
     parser.add_argument("--model", help="forward --model to issue.py")
     parser.add_argument("--thinking", help="forward --thinking to issue.py")
+    parser.add_argument("--phases", help="forward --phases to issue.py (phased mode subset)")
+    parser.add_argument("--one-shot", dest="one_shot", action="store_true", help="forward --one-shot to issue.py (legacy)")
     parser.add_argument("--log-dir", help="forward --log-dir to issue.py so each run is captured")
     parser.add_argument("--start", type=int, default=0, help="resume at the first occurrence of this issue")
     parser.add_argument("--delay", type=int, default=0, help="sleep this many seconds between issues")
@@ -89,6 +92,10 @@ def issue_flags(args: argparse.Namespace, yes: bool) -> list[str]:
         flags += ["--model", args.model]
     if args.thinking:
         flags += ["--thinking", args.thinking]
+    if getattr(args, "phases", None):
+        flags += ["--phases", args.phases]
+    if getattr(args, "one_shot", False):
+        flags += ["--one-shot"]
     if args.log_dir:
         flags += ["--log-dir", args.log_dir]
     if yes:
@@ -140,10 +147,13 @@ def run_batch(args: argparse.Namespace, issues: list[int], tail: Sequence[str]) 
     try:
         for index, number in enumerate(issues, start=1):
             print(file=sys.stderr)
-            note(f"[{index}/{total}] === issue #{number} ===")
+            # A per-run id is assigned up front so a failed run can be resumed
+            # individually with `issue.py --adw-id <id> --resume`.
+            adw_id = make_adw_id()
+            note(f"[{index}/{total}] === issue #{number} (adw_id {adw_id}) ===")
             # Re-insert `--` so issue.py forwards the tail to the runner rather
             # than parsing it as its own flags.
-            argv = [str(number), *flags] + (["--", *tail] if tail else [])
+            argv = [str(number), "--adw-id", adw_id, *flags] + (["--", *tail] if tail else [])
 
             if args.dry_run:
                 print("[dry-run] python adw/issue.py " + " ".join(argv))
@@ -176,16 +186,6 @@ def run_batch(args: argparse.Namespace, issues: list[int], tail: Sequence[str]) 
     return 1 if failed else 0
 
 
-def _split_tail(argv: Sequence[str]) -> "tuple[list[str], list[str]]":
-    """Split argv at the first `--` into our args and the forwarded tail."""
-
-    argv = list(argv)
-    if "--" in argv:
-        index = argv.index("--")
-        return argv[:index], argv[index + 1 :]
-    return argv, []
-
-
 def main(argv: "Sequence[str] | None" = None) -> int:
     """Execute the batch, or render the `/issues` prompt with `--print-prompt`."""
 
@@ -194,7 +194,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         build_parser().parse_args(["--help"])
         return 0
 
-    head, tail = _split_tail(raw)
+    head, tail = partition_on_double_dash(raw)
     args = build_parser().parse_args(head)
 
     # Reuse the batch summary on SIGTERM by funneling it through KeyboardInterrupt.
