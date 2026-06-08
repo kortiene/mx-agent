@@ -125,6 +125,11 @@ pub enum ExecRejection {
     },
     /// The local policy denied the requested command for this room/agent.
     PolicyDenied(DenyReason),
+    /// Policy required a verified sending device (`require_verified_device`) but
+    /// the originating Matrix device is not verified (issue #240). This gate is
+    /// applied *after* the authoritative signature → trust → policy checks pass;
+    /// it can only add a denial, never authorize execution.
+    UnverifiedDevice,
 }
 
 impl ExecRejection {
@@ -137,6 +142,7 @@ impl ExecRejection {
             Self::WrongTarget { .. } => "wrong_target".to_string(),
             Self::UntrustedKey { .. } => "untrusted_key".to_string(),
             Self::PolicyDenied(_) => "policy_denied".to_string(),
+            Self::UnverifiedDevice => "unverified_device".to_string(),
         }
     }
 }
@@ -154,11 +160,34 @@ impl std::fmt::Display for ExecRejection {
                 write!(f, "signing key {key_id:?} is not trusted")
             }
             Self::PolicyDenied(reason) => write!(f, "policy denied exec: {reason}"),
+            Self::UnverifiedDevice => {
+                write!(f, "policy requires a verified sending device")
+            }
         }
     }
 }
 
 impl std::error::Error for ExecRejection {}
+
+/// Additive verified-device gate, applied *after* the signature → trust →
+/// policy execution gate (issue #240).
+///
+/// When `allowance.require_verified_device` is set, the request executes only if
+/// the originating Matrix device is known to be verified (`device_verified ==
+/// Some(true)`). An unverified device (`Some(false)`) or an indeterminate one
+/// (`None`, e.g. the crypto store has not yet seen the device) is denied with
+/// [`ExecRejection::UnverifiedDevice`]. When the knob is off this is a no-op, so
+/// the default behaviour — authority derives solely from signing + trust +
+/// policy — is unchanged. This function can only *deny*; it never grants.
+pub fn enforce_verified_device(
+    allowance: &Allowance,
+    device_verified: Option<bool>,
+) -> Result<(), ExecRejection> {
+    if allowance.require_verified_device && device_verified != Some(true) {
+        return Err(ExecRejection::UnverifiedDevice);
+    }
+    Ok(())
+}
 
 /// Read the detached [`Signature`] embedded in `content`, if present and
 /// well-formed. Returns `None` when there is no `signature` field at all
@@ -843,7 +872,7 @@ async fn authorize_live_exec(
     let policy = Policy::default_path()
         .and_then(|path| Policy::load(path).ok())
         .unwrap_or_default();
-    authorize_exec_request_with_allowance(
+    let (request, allowance) = authorize_exec_request_with_allowance(
         content,
         &verifying_key,
         &trust,
@@ -851,7 +880,26 @@ async fn authorize_live_exec(
         room_id,
         &request.requesting_agent,
         &request.target_agent,
-    )
+    )?;
+
+    // Two-trust-layer interaction (architecture §1.2, issue #240): the execution
+    // gate above (signature → trust → policy) is authoritative. The optional
+    // `require_verified_device` knob layers an *additive* transport check on top:
+    // when set, the originating Matrix device must be verified. By default the
+    // knob is off, so a trusted-but-unverified device still executes (TOFU on the
+    // device; authority comes from the signing key) — we only log an advisory.
+    let device_verified =
+        crate::verification::sender_verified(&room.client(), &requester.matrix_user_id).await;
+    if allowance.require_verified_device {
+        enforce_verified_device(&allowance, device_verified)?;
+    } else if device_verified == Some(false) {
+        tracing::info!(
+            invocation_id = %request.invocation_id,
+            requesting_agent = %request.requesting_agent,
+            "executing privileged request from an unverified Matrix device (authority from signing key; require_verified_device is off)"
+        );
+    }
+    Ok((request, allowance))
 }
 
 async fn emit_output_events(
@@ -2647,6 +2695,68 @@ allow_cwd = ["/home/me/code/project"]
             sandbox_backend(None),
             mx_agent_sandbox::Backend::None,
             "unset sandbox must default to Backend::None"
+        );
+    }
+
+    // --- enforce_verified_device (issue #240) ---
+
+    #[test]
+    fn enforce_verified_device_off_allows_any_device_status() {
+        // When require_verified_device is false (the default), device verification
+        // status never affects the outcome — authority comes from signing+trust+policy.
+        let off = Allowance {
+            require_verified_device: false,
+            ..Allowance::default()
+        };
+        assert!(enforce_verified_device(&off, None).is_ok());
+        assert!(enforce_verified_device(&off, Some(false)).is_ok());
+        assert!(enforce_verified_device(&off, Some(true)).is_ok());
+    }
+
+    #[test]
+    fn enforce_verified_device_on_allows_verified_device() {
+        let on = Allowance {
+            require_verified_device: true,
+            ..Allowance::default()
+        };
+        assert!(
+            enforce_verified_device(&on, Some(true)).is_ok(),
+            "a verified device must be allowed when the knob is on"
+        );
+    }
+
+    #[test]
+    fn enforce_verified_device_on_denies_unverified_device() {
+        let on = Allowance {
+            require_verified_device: true,
+            ..Allowance::default()
+        };
+        let err = enforce_verified_device(&on, Some(false)).unwrap_err();
+        assert_eq!(err, ExecRejection::UnverifiedDevice);
+        assert_eq!(err.reason(), "unverified_device");
+    }
+
+    #[test]
+    fn enforce_verified_device_on_denies_indeterminate_status() {
+        // None means the crypto store has not yet seen the device — treated as
+        // unverified so the gate fails safe rather than open.
+        let on = Allowance {
+            require_verified_device: true,
+            ..Allowance::default()
+        };
+        let err = enforce_verified_device(&on, None).unwrap_err();
+        assert_eq!(err, ExecRejection::UnverifiedDevice);
+        assert_eq!(err.reason(), "unverified_device");
+    }
+
+    #[test]
+    fn unverified_device_rejection_has_stable_reason_and_message() {
+        let rejection = ExecRejection::UnverifiedDevice;
+        assert_eq!(rejection.reason(), "unverified_device");
+        let msg = rejection.to_string();
+        assert!(
+            msg.contains("verified"),
+            "display should mention 'verified': {msg}"
         );
     }
 }

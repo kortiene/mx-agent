@@ -233,11 +233,7 @@ const TARGET_AGENT: &str = "developer-pi";
 /// sync-token and signing-key state isolated even when the `#[ignore]`d tests
 /// run concurrently in the same binary.
 fn paths_in(dir: std::path::PathBuf) -> SessionPaths {
-    SessionPaths {
-        session_file: dir.join("session.json"),
-        sync_token_file: dir.join("sync_token"),
-        data_dir: dir,
-    }
+    SessionPaths::for_data_dir(dir)
 }
 
 /// A receive-side policy that trusts `room_id` and permits the requester to run
@@ -2634,4 +2630,595 @@ async fn two_daemons_discover_each_other_and_compute_liveness() {
     assert_stable_agent_json(alice_seen_by_bob, &alice_signing.key_id());
     assert_stable_agent_listing_json(&bob_after_hb, Liveness::Active, &bob_signing.key_id());
     assert_stable_agent_listing_json(alice_seen_by_bob, Liveness::Active, &alice_signing.key_id());
+}
+
+/// Device verification e2e coverage (issue #240).
+///
+/// Proves that [`mx_agent_daemon::sender_verified`] returns something other
+/// than `Some(true)` for an unverified peer, and `Some(true)` after
+/// [`mx_agent_daemon::manual_verify`], against the daemon's real Matrix SDK
+/// crypto store and a live homeserver. Combined with the
+/// `enforce_verified_device` unit tests in `exec.rs`, this pins the
+/// `require_verified_device` exec gate end-to-end:
+///
+/// - the SDK correctly tracks peer device verification status in the local
+///   crypto store, and
+/// - [`mx_agent_daemon::list_devices`] reflects the updated status immediately
+///   after a successful manual verify.
+///
+/// Uses an encrypted room so device keys are automatically exchanged during
+/// the sync loop's Megolm key negotiation, ensuring peer devices are visible
+/// in Alice's local crypto store before `sender_verified` is called.
+///
+/// Run via `scripts/matrix_integration_test.sh` alongside the rest of the
+/// Matrix integration suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_device_manual_verify_and_sender_verified() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    // Fully isolated state: both sync token and crypto store go to a unique
+    // throwaway dir (same pattern as live_matrix_backed_remote_exec_*).
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+
+    // Both sync loops must run so device keys are uploaded and shared.
+    let running = Arc::new(AtomicBool::new(true));
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+    // Bob's sync loop drives Megolm key sharing with Alice's device.
+    let bob_sync = {
+        let bob = bob.clone();
+        tokio::spawn(async move {
+            let _ = bob.sync(SyncSettings::default()).await;
+        })
+    };
+
+    // An encrypted room ensures the SDK exchanges device keys between users,
+    // populating Alice's local crypto store with Bob's device information.
+    let room = create_encrypted_room(&bob, "mx-agent device verify e2e").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins encrypted room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    let bob_id = bob.user_id().expect("bob user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+
+    // Wait for Alice's crypto store to see Bob's devices. In a shared encrypted
+    // room the SDK tracks peer device lists automatically during sync.
+    let bob_id_str = bob_id.as_str();
+    let bob_devices = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match mx_agent_daemon::list_devices(&alice, bob_id_str).await {
+                Ok(devs) if !devs.is_empty() => return devs,
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("alice should see bob's devices after device-key exchange in encrypted room");
+
+    // Before manual verification: all of Bob's devices should be unverified.
+    assert!(
+        bob_devices.iter().all(|d| !d.verified),
+        "bob's devices must start unverified; got {bob_devices:?}"
+    );
+
+    // `sender_verified` must return None or Some(false) before any verification.
+    // Either value causes `enforce_verified_device` to reject the exec when
+    // `require_verified_device = true` is set in policy.
+    let pre_verified = mx_agent_daemon::sender_verified(&alice, bob_id_str).await;
+    assert!(
+        pre_verified != Some(true),
+        "`sender_verified` must return None or Some(false) before `manual_verify`; \
+         got {pre_verified:?}"
+    );
+
+    // Manually verify Bob's first device out-of-band. No fingerprint check in
+    // tests — fingerprint matching is covered by the `normalize_fingerprint`
+    // unit tests in `verification.rs`.
+    let bob_device = bob_devices.first().expect("bob has at least one device");
+    mx_agent_daemon::manual_verify(&alice, bob_id_str, &bob_device.device_id, None)
+        .await
+        .expect("manual_verify should succeed for a known device");
+
+    // After verification: `sender_verified` must return `Some(true)`.
+    let post_verified = mx_agent_daemon::sender_verified(&alice, bob_id_str).await;
+    assert_eq!(
+        post_verified,
+        Some(true),
+        "`sender_verified` must return `Some(true)` after `manual_verify`; \
+         got {post_verified:?}"
+    );
+
+    // `list_devices` must reflect the new verified status immediately.
+    let after_devices = mx_agent_daemon::list_devices(&alice, bob_id_str)
+        .await
+        .expect("list devices after verify");
+    assert!(
+        after_devices
+            .iter()
+            .find(|d| d.device_id == bob_device.device_id)
+            .is_some_and(|d| d.verified),
+        "device must be marked verified in list after manual_verify; got {after_devices:?}"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    bob_sync.abort();
+    std::env::remove_var(ENV_DATA_DIR);
+}
+
+/// Server-side key backup / recovery e2e coverage (issue #240).
+///
+/// Provisions SSSS + server-side key backup via `enable_recovery` against a
+/// live homeserver and asserts `recovery_status` reports `"enabled"` with an
+/// active backup. Also checks the recovery key is redacted in `Debug` output
+/// (exercising the [`crate::session::Secret`] wrapper on the IPC surface).
+///
+/// The full "restore across daemon restart" scenario — wipe the local crypto
+/// store, then call `recover` with the one-time key on a fresh client — is a
+/// chaos-test-style extension left for a follow-up: it requires either a
+/// second login (a different device, so the backup has keys to restore) or
+/// exposing the key out of `Secret` specifically for tests. The enable +
+/// status path tested here proves the provisioning path works end-to-end with
+/// a real homeserver; the `recover` round-trip is covered by unit tests in
+/// `verification.rs`.
+///
+/// Run via `scripts/matrix_integration_test.sh` alongside the rest of the
+/// Matrix integration suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_recovery_enable_and_status() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+
+    // Drive the sync loop so device keys are uploaded to the homeserver before
+    // enabling SSSS — key backup requires a live E2EE session on the server.
+    let running = Arc::new(AtomicBool::new(true));
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    // Wait for at least one successful sync: device keys must be on the server.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            {
+                let h = health.lock().unwrap();
+                if h.state == SyncState::Healthy && h.total_syncs > 0 {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("sync loop must reach Healthy before enabling recovery");
+
+    // Bootstrap cross-signing before SSSS; idempotent if already set up.
+    let cs_status = mx_agent_daemon::bootstrap_cross_signing(&alice)
+        .await
+        .expect("cross-signing bootstrap should succeed before enabling recovery");
+    // All three cross-signing keys must be present after a successful bootstrap.
+    assert!(
+        cs_status.has_master,
+        "bootstrap_cross_signing must provision a master key; status: {cs_status:?}"
+    );
+    assert!(
+        cs_status.complete,
+        "cross-signing identity must be complete after bootstrap; status: {cs_status:?}"
+    );
+    // `cross_signing_status` must report the same state on a second call.
+    let cs_status2 = mx_agent_daemon::cross_signing_status(&alice).await;
+    assert!(
+        cs_status2.has_master,
+        "cross_signing_status must see the master key after bootstrap; got {cs_status2:?}"
+    );
+    assert_eq!(
+        cs_status2.complete, cs_status.complete,
+        "cross_signing_status must be consistent with bootstrap result; \
+         bootstrap: {cs_status:?}, status: {cs_status2:?}"
+    );
+
+    // Provision SSSS + server-side key backup.
+    let result = mx_agent_daemon::enable_recovery(&alice)
+        .await
+        .expect("enable_recovery should succeed against a live homeserver");
+
+    // Status must report enabled with an active key backup.
+    assert_eq!(
+        result.status.state, "enabled",
+        "recovery state after enable must be 'enabled'; got {:?}",
+        result.status
+    );
+    assert!(
+        result.status.backup_enabled,
+        "key backup must be enabled after enable_recovery; got {:?}",
+        result.status
+    );
+
+    // The recovery key must be redacted in Debug (Secret wrapper): only
+    // `***redacted***` should appear, not the actual key material.
+    let key_debug = format!("{:?}", result.recovery_key);
+    assert!(
+        key_debug.contains("***redacted***"),
+        "recovery key must be redacted in Debug output; got: {key_debug}"
+    );
+
+    // `recovery_status` returns the same state without re-enabling.
+    let status2 = mx_agent_daemon::recovery_status(&alice).await;
+    assert_eq!(
+        status2.state, "enabled",
+        "recovery_status must still report 'enabled'; got {status2:?}"
+    );
+    assert!(
+        status2.backup_enabled,
+        "key backup must remain enabled on a repeated status check; got {status2:?}"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+}
+
+/// `require_verified_device` exec gate end-to-end coverage (issue #240).
+///
+/// Proves the full verified-device happy path and unverified-device rejection
+/// path through the live Matrix exec pipeline:
+///
+/// 1. **Unverified-device rejection**: Alice's daemon runs with policy
+///    `require_verified_device = true` for Bob. Bob sends a signed exec request.
+///    Alice's `handle_live_exec_request` calls `sender_verified` (Bob's device is
+///    not yet verified) and rejects the request with `"unverified_device"`.
+///
+/// 2. **Verified-device happy path**: Alice manually verifies Bob's device via
+///    `manual_verify`. The same exec request from Bob is now accepted and runs to
+///    completion.
+///
+/// Combined with the `enforce_verified_device` unit tests in `exec.rs` and
+/// `live_device_manual_verify_and_sender_verified`, this closes the e2e gap for
+/// issue #240 §5 (verified-device happy path; unverified-device handling).
+///
+/// Run via `scripts/matrix_integration_test.sh` alongside the rest of the Matrix
+/// integration suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_require_verified_device_gate() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let bob_id = bob.user_id().expect("bob user id").to_owned();
+
+    // An encrypted room ensures device keys are exchanged between Alice and Bob:
+    // without E2EE, Alice's crypto store never learns Bob's device, and
+    // `sender_verified` returns `None` (indeterminate) rather than `Some(false)`.
+    // Both `None` and `Some(false)` trigger rejection when `require_verified_device`
+    // is set, so the test is valid either way, but the encrypted room makes the
+    // verified phase more realistic.
+    let room = create_encrypted_room(&bob, "mx-agent require-verified-device e2e").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins encrypted room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    // Trust Bob's signing key; policy has `require_verified_device = true` so
+    // Alice's daemon will reject exec requests from an unverified Matrix device
+    // even when the signing key and policy otherwise permit the command.
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+require_verified_device = true
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let subscribers = ExecSubscriberRegistry::new();
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &alice,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    let bob_sync_paths = paths_in(data_dir.join("bob-sync"));
+    bob_sync_paths.ensure_data_dir().expect("bob sync dir");
+    let bob_sync = {
+        let bob = bob.clone();
+        let paths = bob_sync_paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &bob,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+
+    save_session(&paths, &bob_session).expect("save requester session");
+
+    // ---- Phase 1: exec from an unverified device must be rejected ----
+    //
+    // Bob's device is not (yet) verified in Alice's crypto store. Alice's
+    // `handle_live_exec_request` calls `sender_verified` (which returns either
+    // `None` or `Some(false)`) and then `enforce_verified_device` rejects with
+    // `ExecRejection::UnverifiedDevice`, surfaced as reason `"unverified_device"`.
+    let rejected = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            cwd: Some(cwd.clone()),
+            stdin: None,
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+            invocation_id: None,
+        },
+        &subscribers,
+    )
+    .await;
+    match &rejected.outcome {
+        ExecOutcome::Error { message, .. } => {
+            assert!(
+                message.contains("unverified_device"),
+                "exec from unverified device must be rejected with 'unverified_device' reason; \
+                 got: {message:?}"
+            );
+        }
+        other => panic!("expected exec rejection for unverified device; got {other:?}"),
+    }
+
+    // ---- Phase 2: manually verify Bob's device on Alice's client ----
+    //
+    // Wait until Alice's crypto store has at least one of Bob's devices (the
+    // encrypted room + running sync loops ensure device key exchange). Then
+    // call `manual_verify` to mark the device as trusted in Alice's local store.
+    let bob_id_str = bob_id.as_str();
+    let bob_devices = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match mx_agent_daemon::list_devices(&alice, bob_id_str).await {
+                Ok(devs) if !devs.is_empty() => return devs,
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("alice should see bob's devices after device-key exchange in encrypted room");
+
+    let bob_device = bob_devices.first().expect("bob has at least one device");
+    mx_agent_daemon::manual_verify(&alice, bob_id_str, &bob_device.device_id, None)
+        .await
+        .expect("manual_verify must succeed for a known device");
+
+    // `sender_verified` must now return `Some(true)` on Alice's client.
+    let verified = mx_agent_daemon::sender_verified(&alice, bob_id_str).await;
+    assert_eq!(
+        verified,
+        Some(true),
+        "`sender_verified` must return `Some(true)` after manual_verify; got {verified:?}"
+    );
+
+    // ---- Phase 3: exec from the now-verified device must succeed ----
+    //
+    // Alice's `handle_live_exec_request` calls `sender_verified` again; this time
+    // it returns `Some(true)` because Bob's device was manually verified above.
+    // `enforce_verified_device` passes, the exec runs, and the outcome is `Ok`.
+    let accepted = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            cwd: Some(cwd.clone()),
+            stdin: None,
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+            invocation_id: None,
+        },
+        &subscribers,
+    )
+    .await;
+    match &accepted.outcome {
+        ExecOutcome::Ok { frames } => {
+            assert!(
+                matches!(frames.last(), Some(ExecFrame::Finished(f)) if f.exit_code == Some(0)),
+                "exec from verified device must succeed with exit 0; frames: {frames:?}"
+            );
+        }
+        other => panic!("expected exec to succeed after device verification; got {other:?}"),
+    }
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    bob_sync
+        .await
+        .expect("bob sync joins")
+        .expect("bob sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
 }

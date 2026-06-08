@@ -185,6 +185,18 @@ pub struct AgentPolicy {
     /// Network policy overriding the execution default.
     #[serde(default)]
     pub network: Option<NetworkPolicy>,
+    /// Require the sending Matrix device to be verified before a privileged
+    /// request from this agent executes (issue #240).
+    ///
+    /// This is an **additive transport check layered after** the authoritative
+    /// signature → trust → policy execution gate: when `true`, an otherwise
+    /// allowed request is denied (`unverified_device`) unless the originating
+    /// Matrix device is verified (directly or via cross-signing). It can only
+    /// *deny*, never *grant*; device verification never substitutes for
+    /// signing+trust+policy. Default `false`, so existing deployments are
+    /// unaffected and older policy files parse unchanged.
+    #[serde(default)]
+    pub require_verified_device: bool,
 }
 
 /// Policy for a single Matrix room.
@@ -197,6 +209,15 @@ pub struct RoomPolicy {
     /// Default behaviour for raw `exec` in this room.
     #[serde(default)]
     pub raw_exec_default: Option<RawExecDefault>,
+    /// Require verified sending devices for every agent in this room (issue
+    /// #240).
+    ///
+    /// Room-level default for [`AgentPolicy::require_verified_device`]: when
+    /// `true`, the verified-device check applies to every agent in the room even
+    /// if their individual rule leaves it `false`. Additive (deny-only) and
+    /// default `false`. See [`AgentPolicy::require_verified_device`].
+    #[serde(default)]
+    pub require_verified_device: bool,
     /// Per-agent rules keyed by Matrix user ID.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentPolicy>,

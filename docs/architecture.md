@@ -73,6 +73,30 @@ room membership
 + optional human approval
 ```
 
+#### Two trust layers: transport vs. execution
+
+The Matrix device/E2EE identity and the mx-agent Ed25519 signing identity are
+**distinct keys with different fingerprints** and govern **different things**.
+They must not be conflated (issue #240):
+
+- **Matrix device verification** establishes *who you share Megolm keys with and
+  who can read or inject encrypted transport*. It protects the
+  **confidentiality and integrity of the channel**. The device key is shown as
+  `ed25519:<base64>`.
+- **mx-agent Ed25519 signing + the local trust store + local policy** establish
+  *who may cause a privileged action to execute*. The signing key id is
+  `mxagent-ed25519:<sha256-b64>` and its fingerprint is `SHA256:<base64>`.
+
+For a privileged action delivered over E2EE, **both must hold**: the event must
+decrypt (transport), *and* it must carry a valid Ed25519 signature from a
+locally-trusted signing key that policy permits (execution). **Neither room
+membership, device presence, nor device verification ever substitutes for
+signing + trust + policy.** Device verification is layered *after* the execution
+gate and can only add a denial (the optional `require_verified_device` knob,
+§13.2), never a grant. By default a request from a trusted signing key whose
+sending device is unverified still executes (TOFU on the device; authority comes
+from the signing key) and the daemon logs a non-sensitive advisory.
+
 ---
 
 ## 2. CLI Command Surface
@@ -98,8 +122,10 @@ mx-agent task ...
 mx-agent invocation ...
 mx-agent approval ...
 mx-agent daemon ...
-mx-agent auth ...
+mx-agent auth ...           # incl. `auth cross-signing bootstrap|status`
 mx-agent trust ...
+mx-agent device ...         # list | show | verify  (Matrix device verification)
+mx-agent recovery ...       # enable | status | recover  (server-side key backup)
 ```
 
 ---
@@ -1311,6 +1337,14 @@ receives the password and writes the session into the daemon-owned data dir);
 | `share.list` / `.get` | `ListSharesOptions` / `FetchContextOptions` | `ContextShare[]` / `FetchedContext` |
 | `invocation.list` / `.get` | `ListInvocationsOptions` / `RoomInvocationParams` | `InvocationState[]` / `InvocationState?` |
 | `invocation.cancel` / `.artifact` | `InvocationCancelParams` / `RetrieveArtifactOptions` | `InvocationState` / `RetrievedArtifact` |
+| `device.list` / `device.show` | `DeviceListParams` / `DeviceShowParams` | `DeviceInfo[]` / `DeviceInfo?` |
+| `device.verify.manual` | `DeviceVerifyManualParams` | `DeviceInfo` |
+| `device.verify.start` | `DeviceVerifyStartParams` | stream of `DeviceVerifyFrame` (`started → emoji-ready → confirmed/cancelled`) |
+| `device.verify.confirm` / `device.verify.cancel` | `VerifyFlowParams` | `VerificationActionResult` |
+| `cross_signing.bootstrap` / `cross_signing.status` | (none) | `CrossSigningStatusInfo` |
+| `recovery.enable` | (none) | `RecoveryEnableResult` (recovery key surfaced once, never logged) |
+| `recovery.status` | (none) | `RecoveryStatusInfo` |
+| `recovery.recover` | `RecoverParams` | `RecoveryStatusInfo` |
 
 `task.watch` keeps the Unix-socket connection open and sends one JSON-RPC
 response frame per event using the original request id. Event envelopes carry
@@ -1479,25 +1513,36 @@ Approval decision event:
 Daemon-owned paths on Linux:
 
 ```text
-~/.local/share/mx-agent/session.db
-~/.local/share/mx-agent/crypto-store/
-~/.local/share/mx-agent/signing-keys/
+~/.local/share/mx-agent/session.json
+~/.local/share/mx-agent/crypto-store/        # SQLite crypto/state store (created; issue #240)
+~/.local/share/mx-agent/crypto-store-key     # Secret-wrapped store passphrase (created; issue #240)
+~/.local/share/mx-agent/signing_key.ed25519
 ~/.config/mx-agent/config.toml
 ~/.config/mx-agent/policy.toml
 $XDG_RUNTIME_DIR/mx-agent/daemon.sock
 ```
 
+The crypto store and its passphrase are **now actually created** (issue #240):
+the daemon builds its Matrix client with a persistent SQLite crypto/state store
+encrypted at rest by a generated, daemon-owned passphrase, so the daemon's E2EE
+device identity and Megolm sessions survive a restart instead of being
+regenerated in memory. The passphrase is wrapped in `Secret`, written `0600`, and
+never logged. The recovery key for server-side key backup (§13.2) is **not**
+persisted in clear — it is surfaced to the operator exactly once.
+
 Permissions:
 
 ```bash
 chmod 0700 ~/.local/share/mx-agent
-chmod 0600 ~/.local/share/mx-agent/session.db
+chmod 0600 ~/.local/share/mx-agent/session.json
 chmod 0700 ~/.local/share/mx-agent/crypto-store
-chmod 0700 ~/.local/share/mx-agent/signing-keys
+chmod 0600 ~/.local/share/mx-agent/crypto-store-key
+chmod 0600 ~/.local/share/mx-agent/signing_key.ed25519
 chmod 0600 ~/.config/mx-agent/policy.toml
 ```
 
-macOS should use Keychain for tokens. Windows should use Credential Manager or DPAPI.
+The coding agent never reads any of these; all crypto, the store passphrase, and
+the recovery key stay inside the daemon. (Unix only; no Keychain/DPAPI.)
 
 Never expose tokens through:
 
@@ -1517,7 +1562,7 @@ Supported trust modes:
 |---|---|---|---|
 | manual | user verifies the signing key fingerprint via `trust approve` | strongest operational default | **Implemented** — the local trust store is the authoritative input to every live authorization |
 | room-admin grant | trusted admin publishes `com.mxagent.trust.v1` state | convenient for teams | **Partial** — `trust publish`/`trust state` publish and display room trust, but the live `exec`/`call` path authorizes only against the local store; publishing does not by itself grant a peer execution rights |
-| Matrix device verified | trust follows verified Matrix device | strong if Matrix verification is used correctly | Planned (not yet implemented) |
+| Matrix device verified | the sending Matrix **device** is verified (emoji/SAS, out-of-band fingerprint, or cross-signing) | protects transport confidentiality/integrity | **Implemented as an advisory transport signal** — `device list`/`device verify`/`auth cross-signing` surface and establish device verification, but it is **not** an execution grant. It only gates execution when the optional `require_verified_device` policy knob is set, and then only to *add* a denial (issue #240) |
 | TOFU | first key seen is trusted | convenient but vulnerable on first contact | Planned (not yet implemented) |
 
 The local trust store is always the authoritative input to live authorization
@@ -1525,6 +1570,16 @@ The local trust store is always the authoritative input to live authorization
 advisory and is surfaced for inspection via `trust state`; it never overrides a
 local decision and, in the current alpha, does not on its own authorize a
 remote peer.
+
+**`require_verified_device` (optional, additive deny).** Policy may set
+`require_verified_device` per-room or per-agent (default `false`). When `true`,
+the privileged `exec`/`call` handlers, *after* the authoritative signature →
+trust → policy gate passes, additionally require that the sending Matrix device
+is verified (directly or via cross-signing); otherwise the request is denied with
+the stable reason `unverified_device` and a non-sensitive advisory is logged.
+This is **strictly additive** — it can only deny, never grant — so device
+verification governs transport while signing + trust + policy remain the only
+path to execution (§1.2). Default behaviour is unchanged.
 
 Trust commands:
 

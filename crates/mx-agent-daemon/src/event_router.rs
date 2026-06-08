@@ -487,11 +487,7 @@ mod tests {
         }
 
         fn paths(&self) -> SessionPaths {
-            SessionPaths {
-                session_file: self.dir.join("session.json"),
-                sync_token_file: self.dir.join("sync_token"),
-                data_dir: self.dir.clone(),
-            }
+            SessionPaths::for_data_dir(self.dir.clone())
         }
     }
 

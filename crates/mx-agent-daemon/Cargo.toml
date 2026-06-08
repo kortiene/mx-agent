@@ -22,7 +22,13 @@ rustix = { workspace = true }
 signal-hook = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }
-matrix-sdk = { workspace = true }
+# The daemon ships the matrix-sdk crypto stack in production builds (issue #240):
+# `e2e-encryption` compiles end-to-end encryption (device keys, Megolm sessions,
+# verification, cross-signing, key backup) and `bundled-sqlite` provides the
+# vendored SQLite backend for the persistent, daemon-owned crypto store at
+# `~/.local/share/mx-agent/crypto-store/`. Identity and sessions therefore
+# survive a daemon restart instead of being regenerated in memory.
+matrix-sdk = { workspace = true, features = ["e2e-encryption", "bundled-sqlite"] }
 mime = { workspace = true }
 tokio = { workspace = true, features = ["process", "io-util"] }
 ed25519-dalek = { workspace = true }
@@ -33,17 +39,12 @@ getrandom = { workspace = true }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "test-util"] }
-# Used by the local Matrix integration test (tests/matrix_integration.rs) to
-# create rooms and send events against a live homeserver. The integration test
-# is `#[ignore]`d by default; see scripts/matrix_integration_test.sh.
+# The local Matrix integration test (tests/matrix_integration.rs) creates rooms
+# and sends events against a live homeserver. It is `#[ignore]`d by default; see
+# scripts/matrix_integration_test.sh. The crypto stack it needs
+# (`e2e-encryption`) now ships in the production dependency above (issue #240),
+# so no test-only feature override is required here.
 #
-# `e2e-encryption` is enabled here (test builds only) so the E2EE integration
-# test (issue #61) exercises the daemon's real client through end-to-end
-# encrypted rooms — encrypting sends and decrypting receives. Because this lives
-# under `[dev-dependencies]`, Cargo unifies the feature into the daemon library
-# only when building tests; `cargo build --all` (no dev-deps) leaves production
-# builds free of the crypto stack.
-matrix-sdk = { workspace = true, features = ["e2e-encryption"] }
 # The E2EE integration test feeds decrypted privileged events through the real
 # receive-side authorization pipeline, which needs the policy engine and the
 # protocol event-type constants.

@@ -278,6 +278,8 @@ pub fn run_foreground() -> io::Result<()> {
     if let Some(handle) = heartbeat_thread {
         let _ = handle.join();
     }
+    // Drop the shared client so a later in-process run restores a fresh one.
+    crate::matrix::clear_active_client();
 
     remove_status_file(&paths);
     drop(socket);
@@ -361,6 +363,10 @@ fn spawn_matrix_workers(
                 }
             };
             *publish_client.lock().unwrap_or_else(|e| e.into_inner()) = Some(client.clone());
+            // Publish the one restored client process-wide so per-call IPC
+            // handlers reuse it (one OlmMachine on the persistent crypto store)
+            // instead of each opening a second store-backed client (issue #240).
+            crate::matrix::publish_active_client(client.clone());
             if let Err(e) = crate::sync::run_matrix_sync_with_subscribers(
                 &client,
                 &SessionPaths::resolve(),
@@ -512,6 +518,39 @@ where
         }
     };
     match runtime.block_on(f(session)) {
+        Ok(value) => match serde_json::to_value(value) {
+            Ok(value) => Response::result(req.id.clone(), value),
+            Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+        },
+        Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+    }
+}
+
+/// Run a session-less async handler on a fresh runtime and serialize its result.
+///
+/// Unlike [`block_on_task_response`], this loads no Matrix session — used by
+/// methods that operate purely on in-process daemon state (e.g. the verification
+/// flow registry for `device.verify.confirm` / `.cancel`).
+fn block_on_response<F, Fut, T>(req: &Request, f: F) -> Response
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, crate::WorkspaceError>>,
+    T: serde::Serialize,
+{
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return Response::error(
+                req.id.clone(),
+                INTERNAL_ERROR,
+                format!("could not start async runtime: {e}"),
+            )
+        }
+    };
+    match runtime.block_on(f()) {
         Ok(value) => match serde_json::to_value(value) {
             Ok(value) => Response::result(req.id.clone(), value),
             Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
@@ -781,7 +820,70 @@ fn dispatch(
             }),
             Err(response) => *response,
         },
+        // --- device verification + cross-signing (issue #240) ---
+        "device.list" => match parse_params::<crate::DeviceListParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::list_devices_for_session(&session, &params).await
+            }),
+            Err(response) => *response,
+        },
+        "device.show" => match parse_params::<crate::DeviceShowParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::show_device_for_session(&session, &params).await
+            }),
+            Err(response) => *response,
+        },
+        "device.verify.manual" => match parse_params::<crate::DeviceVerifyManualParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::manual_verify_for_session(&session, &params).await
+            }),
+            Err(response) => *response,
+        },
+        // confirm/cancel act on the in-process verification registry and need no
+        // Matrix session of their own.
+        "device.verify.confirm" => match parse_params::<crate::VerifyFlowParams>(req) {
+            Ok(params) => {
+                block_on_response(
+                    req,
+                    move || async move { crate::confirm_verify(&params).await },
+                )
+            }
+            Err(response) => *response,
+        },
+        "device.verify.cancel" => match parse_params::<crate::VerifyFlowParams>(req) {
+            Ok(params) => {
+                block_on_response(
+                    req,
+                    move || async move { crate::cancel_verify(&params).await },
+                )
+            }
+            Err(response) => *response,
+        },
+        "cross_signing.bootstrap" => block_on_task_response(req, |session| async move {
+            crate::bootstrap_cross_signing_for_session(&session).await
+        }),
+        "cross_signing.status" => block_on_task_response(req, |session| async move {
+            crate::cross_signing_status_for_session(&session).await
+        }),
+        // --- key backup / recovery (issue #240) ---
+        "recovery.enable" => block_on_task_response(req, |session| async move {
+            crate::enable_recovery_for_session(&session).await
+        }),
+        "recovery.status" => block_on_task_response(req, |session| async move {
+            crate::recovery_status_for_session(&session).await
+        }),
+        "recovery.recover" => match parse_params::<crate::RecoverParams>(req) {
+            Ok(params) => block_on_task_response(req, |session| async move {
+                crate::recover_for_session(&session, &params).await
+            }),
+            Err(response) => *response,
+        },
         "task.watch" | "workspace.watch" => Response::error(
+            req.id.clone(),
+            METHOD_NOT_FOUND,
+            "this method requires a streaming IPC connection",
+        ),
+        m if m == crate::METHOD_DEVICE_VERIFY_START => Response::error(
             req.id.clone(),
             METHOD_NOT_FOUND,
             "this method requires a streaming IPC connection",
@@ -1082,6 +1184,86 @@ fn dispatch_exec_pty(
     }
 }
 
+/// Stream an interactive device verification (`device.verify.start`) over the
+/// open IPC connection (issue #240), mirroring [`dispatch_task_watch`]. The
+/// daemon owns the verification flow; the CLI receives only flow frames
+/// (`started` → `emoji-ready` → `confirmed`/`cancelled`) and never key material.
+fn dispatch_device_verify(
+    req: &Request,
+    stream: &mut std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    let params = match parse_params::<crate::DeviceVerifyStartParams>(req) {
+        Ok(params) => params,
+        Err(response) => return write_ipc_response(stream, &response),
+    };
+    let session = match load_daemon_session_response(req) {
+        Ok(session) => session,
+        Err(response) => return write_ipc_response(stream, &response),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return write_ipc_response(
+                stream,
+                &Response::error(
+                    req.id.clone(),
+                    INTERNAL_ERROR,
+                    format!("could not start async runtime: {e}"),
+                ),
+            )
+        }
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
+    let write_failed = Arc::new(AtomicBool::new(false));
+    let stream_cell = std::cell::RefCell::new(stream);
+    let request_id = req.id.clone();
+    let running_for_callback = running.clone();
+    let write_failed_for_callback = write_failed.clone();
+    let frame = |frame: crate::DeviceVerifyFrame| {
+        let payload = serde_json::to_value(&frame).unwrap_or(Value::Null);
+        let response = Response::result(request_id.clone(), payload);
+        if write_ipc_response(&mut stream_cell.borrow_mut(), &response).is_err() {
+            write_failed_for_callback.store(true, Ordering::SeqCst);
+            running_for_callback.store(false, Ordering::SeqCst);
+        }
+    };
+    // The operator's confirm/cancel arrives as a control frame on this same
+    // connection (the IPC server is single-threaded). A `cancel` method, EOF, or
+    // any read error fails safe to a cancel — never an unintended confirm.
+    let wait_decision = || {
+        let mut guard = stream_cell.borrow_mut();
+        match mx_agent_ipc::read_frame(&mut **guard) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<Request>(&bytes) {
+                Ok(control) if control.method == "confirm" => crate::VerifyDecision::Confirm,
+                _ => crate::VerifyDecision::Cancel,
+            },
+            _ => crate::VerifyDecision::Cancel,
+        }
+    };
+
+    let result = runtime.block_on(crate::run_device_verify(
+        &session,
+        &params,
+        &running,
+        frame,
+        wait_decision,
+    ));
+    if write_failed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => write_ipc_response(
+            &mut stream_cell.borrow_mut(),
+            &Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+        ),
+    }
+}
+
 fn dispatch_streaming(
     req: &Request,
     stream: &mut std::os::unix::net::UnixStream,
@@ -1097,6 +1279,8 @@ fn dispatch_streaming(
         dispatch_workspace_watch(req, stream)
     } else if req.method == crate::METHOD_EXEC_PTY {
         dispatch_exec_pty(req, stream, exec_subscribers)
+    } else if req.method == crate::METHOD_DEVICE_VERIFY_START {
+        dispatch_device_verify(req, stream)
     } else {
         let response = dispatch(
             req,

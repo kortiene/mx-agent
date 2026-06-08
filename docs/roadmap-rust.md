@@ -579,6 +579,14 @@ Deliverables:
 
 - integration test harness with local Matrix server.
 - E2EE test coverage.
+- **E2EE production hardening (issue #240) — delivered:** persistent
+  daemon-owned crypto store (device identity + Megolm sessions survive restart),
+  device verification UX (`device list`/`show`/`verify`, out-of-band fingerprint
+  and interactive emoji/SAS), cross-signing bootstrap/observe (`auth
+  cross-signing`), server-side key backup/recovery (`recovery
+  enable`/`status`/`recover`), and the optional additive `require_verified_device`
+  policy gate. The Matrix-device-trust vs. Ed25519-signing-trust interaction is
+  documented (architecture §1.2/§13.2, security hardening guide).
 - reconnect and rate-limit tests.
 - security review checklist.
 - packaging.

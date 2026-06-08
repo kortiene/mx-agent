@@ -130,6 +130,14 @@ pub struct SessionPaths {
     pub session_file: PathBuf,
     /// Plain-text file storing the latest Matrix `/sync` batch token.
     pub sync_token_file: PathBuf,
+    /// Directory holding the persistent, daemon-owned matrix-sdk crypto/state
+    /// store (`0700`). It contains device keys and Megolm sessions and is never
+    /// agent-readable (architecture §13.1, issue #240).
+    pub crypto_store_dir: PathBuf,
+    /// File holding the [`Secret`]-wrapped passphrase that encrypts the crypto
+    /// store at rest (`0600`). Generated once on first use and reused across
+    /// restarts so the daemon resumes as the same E2EE device.
+    pub crypto_store_key_file: PathBuf,
 }
 
 impl SessionPaths {
@@ -147,9 +155,19 @@ impl SessionPaths {
         } else {
             std::env::temp_dir().join("mx-agent")
         };
+        Self::for_data_dir(data_dir)
+    }
+
+    /// Resolve all paths rooted at an explicit `data_dir`.
+    ///
+    /// [`resolve`](Self::resolve) is this applied to the environment-derived data
+    /// directory; tests and tooling can build paths under an arbitrary directory.
+    pub fn for_data_dir(data_dir: PathBuf) -> Self {
         Self {
             session_file: data_dir.join("session.json"),
             sync_token_file: data_dir.join("sync_token"),
+            crypto_store_dir: data_dir.join("crypto-store"),
+            crypto_store_key_file: data_dir.join("crypto-store-key"),
             data_dir,
         }
     }
@@ -161,6 +179,64 @@ impl SessionPaths {
             fs::set_permissions(&self.data_dir, fs::Permissions::from_mode(0o700))?;
         }
         Ok(())
+    }
+
+    /// Ensure the crypto-store directory exists with `0700` permissions.
+    ///
+    /// The crypto store holds the daemon's Matrix device keys and Megolm
+    /// sessions; it is daemon-owned and never readable by the coding agent
+    /// (architecture §13.1, issue #240).
+    pub fn ensure_crypto_store_dir(&self) -> io::Result<()> {
+        self.ensure_data_dir()?;
+        if !self.crypto_store_dir.exists() {
+            fs::create_dir_all(&self.crypto_store_dir)?;
+            fs::set_permissions(&self.crypto_store_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    /// Load the crypto-store passphrase, generating and persisting it once on
+    /// first use.
+    ///
+    /// The passphrase encrypts the SQLite crypto store at rest. It is a daemon
+    /// secret: wrapped in [`Secret`] so it never appears in logs, written
+    /// `0600`, and reused on every restart so the persistent store (and thus the
+    /// daemon's E2EE device identity and Megolm sessions) can be reopened. A
+    /// fresh 256-bit key is generated with [`getrandom`] and base64-encoded for
+    /// storage.
+    pub fn load_or_create_crypto_store_key(&self) -> io::Result<Secret> {
+        match fs::read_to_string(&self.crypto_store_key_file) {
+            Ok(contents) => {
+                let trimmed = contents.trim();
+                if trimmed.is_empty() {
+                    // An empty key file is unusable; regenerate.
+                    self.generate_crypto_store_key()
+                } else {
+                    Ok(Secret::new(trimmed.to_string()))
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.generate_crypto_store_key(),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Generate, persist (`0600`), and return a fresh crypto-store passphrase.
+    fn generate_crypto_store_key(&self) -> io::Result<Secret> {
+        use base64::Engine as _;
+        self.ensure_data_dir()?;
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
+        let key = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+        let tmp = self.crypto_store_key_file.with_extension("tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            f.write_all(key.as_bytes())?;
+            f.flush()?;
+        }
+        fs::rename(&tmp, &self.crypto_store_key_file)?;
+        Ok(Secret::new(key))
     }
 }
 
@@ -431,6 +507,42 @@ mod tests {
         save_sync_token(&paths, "s_batch_token_123").unwrap();
         clear_sync_token(&paths).unwrap();
         assert!(load_sync_token(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn crypto_store_key_is_created_private_and_reused() {
+        let _data = TempData::new("cryptokey");
+        let paths = SessionPaths::resolve();
+        // Resolves under the data dir.
+        assert_eq!(paths.crypto_store_dir, paths.data_dir.join("crypto-store"));
+
+        let key = paths.load_or_create_crypto_store_key().unwrap();
+        assert!(!key.expose().is_empty(), "a key must be generated");
+
+        let mode = fs::metadata(&paths.crypto_store_key_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "crypto store key file must be private");
+
+        // A second load returns the same key (so the persistent store reopens
+        // and the daemon resumes as the same device after a restart).
+        let again = paths.load_or_create_crypto_store_key().unwrap();
+        assert_eq!(again.expose(), key.expose());
+    }
+
+    #[test]
+    fn crypto_store_dir_is_created_private() {
+        let _data = TempData::new("cryptodir");
+        let paths = SessionPaths::resolve();
+        paths.ensure_crypto_store_dir().unwrap();
+        let mode = fs::metadata(&paths.crypto_store_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "crypto store dir must be private");
     }
 
     #[test]

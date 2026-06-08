@@ -77,6 +77,14 @@ pub struct Allowance {
     /// §13.5). Resolved from `execution.writable_paths`. Ignored by the `none`
     /// backend.
     pub writable_paths: Vec<PathBuf>,
+    /// Whether the request additionally requires the sending Matrix device to be
+    /// verified before it may execute (issue #240).
+    ///
+    /// Resolved as the room-level default OR the agent rule. This is an additive
+    /// transport check the caller applies *after* the (authoritative) execution
+    /// gate; it can only deny, never grant. See
+    /// [`AgentPolicy::require_verified_device`](crate::AgentPolicy::require_verified_device).
+    pub require_verified_device: bool,
 }
 
 /// Machine-readable reason a request was denied.
@@ -210,7 +218,7 @@ impl Policy {
             return Outcome::Deny(DenyReason::DeniedArguments { pattern });
         }
 
-        Outcome::Allow(self.allowance_for(agent))
+        Outcome::Allow(self.allowance_for(room, agent))
     }
 
     /// Evaluate a `call` (named tool) request.
@@ -218,7 +226,7 @@ impl Policy {
     /// A tool is permitted only when it appears in the agent's `allow_tools`
     /// list for the requesting room.
     pub fn evaluate_call(&self, ctx: &CallContext<'_>) -> Outcome {
-        let (_room, agent) = match self.lookup(ctx.room_id, ctx.requesting_agent) {
+        let (room, agent) = match self.lookup(ctx.room_id, ctx.requesting_agent) {
             Ok(pair) => pair,
             Err(reason) => return Outcome::Deny(reason),
         };
@@ -229,7 +237,7 @@ impl Policy {
             });
         }
 
-        Outcome::Allow(self.allowance_for(agent))
+        Outcome::Allow(self.allowance_for(room, agent))
     }
 
     /// Resolve the room/agent rule pair, mapping missing entries to a deny
@@ -246,7 +254,7 @@ impl Policy {
 
     /// Resolve the effective limits for a permitted request, applying execution
     /// defaults where the agent rule does not override them.
-    fn allowance_for(&self, agent: &AgentPolicy) -> Allowance {
+    fn allowance_for(&self, room: &RoomPolicy, agent: &AgentPolicy) -> Allowance {
         Allowance {
             max_runtime_ms: agent.max_runtime_ms,
             max_output_bytes: agent.max_output_bytes,
@@ -256,6 +264,9 @@ impl Policy {
             env_allowlist: self.execution.env_allowlist.clone(),
             read_only_paths: self.execution.read_only_paths.clone(),
             writable_paths: self.execution.writable_paths.clone(),
+            // The verified-device requirement applies if either the room default
+            // or the agent rule sets it (issue #240).
+            require_verified_device: room.require_verified_device || agent.require_verified_device,
         }
     }
 }
@@ -696,6 +707,67 @@ allow_cwd = ["/work"]
         assert!(
             a.writable_paths.is_empty(),
             "writable_paths must be empty when not configured"
+        );
+    }
+
+    // --- require_verified_device (issue #240) ---
+
+    #[test]
+    fn require_verified_device_defaults_false_and_is_backward_compatible() {
+        // policy() sets no require_verified_device anywhere, and the sample is a
+        // pre-existing policy file shape, so it must parse and resolve `false`.
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let a = p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .allowance()
+            .unwrap()
+            .clone();
+        assert!(
+            !a.require_verified_device,
+            "verified-device requirement must default off"
+        );
+    }
+
+    #[test]
+    fn require_verified_device_resolves_from_agent_or_room() {
+        // Agent-level opt-in.
+        let agent_toml = r#"
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+require_verified_device = true
+"#;
+        let p = Policy::parse(agent_toml).expect("policy parses");
+        let cmd = argv(&["cargo", "test"]);
+        assert!(
+            p.evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+                .allowance()
+                .unwrap()
+                .require_verified_device
+        );
+
+        // Room-level default applies even when the agent rule omits it.
+        let room_toml = r#"
+[rooms."!abc:matrix.org"]
+trusted = true
+require_verified_device = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+"#;
+        let p = Policy::parse(room_toml).expect("policy parses");
+        assert!(
+            p.evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+                .allowance()
+                .unwrap()
+                .require_verified_device
         );
     }
 

@@ -2,7 +2,7 @@
 
 A hardening guide for deploying mx-agent in environments where remote agents can run commands on your machines. mx-agent's security posture is **zero-trust and deny-by-default**: room membership grants nothing; every privileged action must independently pass cryptographic and policy checks on the machine that would execute it.
 
-> **Implementation status.** The IPC peer-credential check, the deny-by-default policy engine (parser + validator), Ed25519 signing/verification, allowlist-based environment scrubbing, audit-log structure, and `none`/`bubblewrap`/container sandbox backends are **✅ implemented**. Policy `read_only_paths` / `writable_paths` filesystem-bind confinement and `network` enforcement are wired end-to-end from the policy engine through `Allowance` into the runner's `Restrictions` — including for auto-executed task DAGs (previously hardcoded to `Backend::None`). The sandbox backend applies to **batch exec only**; interactive `exec --pty` does not route through the sandbox backend (only the baseline controls — env scrub, cwd, timeout, output cap — apply to the PTY path). `none` is the built-in fallback and provides zero isolation; `bubblewrap` and Docker/Podman container backends are policy-selectable but are not a standalone security boundary (no seccomp, rlimit caps, or UID/GID remap). No canonical `policy.toml` ships in-repo yet; the schema below is the one the engine parses. The whole workspace **forbids `unsafe` Rust** (`unsafe_code = "forbid"`) and uses `rustix`/`nix` for syscalls.
+> **Implementation status.** The IPC peer-credential check, the deny-by-default policy engine (parser + validator), Ed25519 signing/verification, allowlist-based environment scrubbing, audit-log structure, and `none`/`bubblewrap`/container sandbox backends are **✅ implemented**. Policy `read_only_paths` / `writable_paths` filesystem-bind confinement and `network` enforcement are wired end-to-end from the policy engine through `Allowance` into the runner's `Restrictions` — including for auto-executed task DAGs (previously hardcoded to `Backend::None`). The sandbox backend applies to **batch exec only**; interactive `exec --pty` does not route through the sandbox backend (only the baseline controls — env scrub, cwd, timeout, output cap — apply to the PTY path). `none` is the built-in fallback and provides zero isolation; `bubblewrap` and Docker/Podman container backends are policy-selectable but are not a standalone security boundary (no seccomp, rlimit caps, or UID/GID remap). E2EE production hardening (issue #240) is **✅ implemented**: persistent daemon-owned crypto store, device verification UX (`device list`/`show`/`verify`), cross-signing bootstrap (`auth cross-signing`), server-side key backup/recovery (`recovery enable`/`status`/`recover`), and the optional additive `require_verified_device` policy gate. No canonical `policy.toml` ships in-repo yet; the schema below is the one the engine parses. The whole workspace **forbids `unsafe` Rust** (`unsafe_code = "forbid"`) and uses `rustix`/`nix` for syscalls.
 
 ---
 
@@ -31,14 +31,23 @@ A single agent is pinned by three separate cryptographic facts, so compromising 
 
 When E2EE is enabled, message *contents* are encrypted between daemons (Olm for 1:1 to-device signaling, Megolm for room streams); the homeserver relays ciphertext only. E2EE protects confidentiality and binds the device identity — but note it is **orthogonal to authorization**: a correctly decrypted request from a trusted device is *still* rejected if its Ed25519 signature, local policy, or any schema-provided nonce/expiry check fails. Encryption answers "did this really come from that device, privately?"; policy answers "is that device allowed to do this here?".
 
+### Two distinct trust roots — transport vs. execution
+
+**Matrix device verification** and **mx-agent Ed25519 signing** are separate trust roots for separate purposes. Conflating them is a security mistake:
+
+- The **Matrix device key** (`ed25519:<base64>`) is the E2EE *transport* identity. Verifying it establishes who you share Megolm keys with and protects confidentiality. It is shown by `mx-agent device list`.
+- The **mx-agent signing key** (`mxagent-ed25519:…`, fingerprint `SHA256:…`) authorizes *execution*. This is what `trust approve` records and what the daemon checks before running any privileged action.
+
+For a privileged action delivered over E2EE, **both must hold**: the event must decrypt (transport) *and* carry a valid Ed25519 signature from a locally-trusted signing key that policy permits (execution). Device verification is layered *after* the execution gate via the optional `require_verified_device` policy knob (additive deny only; default `false`). See the [security hardening guide](../docs/security-hardening.md) for details.
+
 ### Trust bootstrap modes (architecture §13.2)
 
-| Mode | How a key becomes trusted | Posture |
-|---|---|---|
-| **manual** | You verify the Ed25519 fingerprint out-of-band and `trust approve` it | Strongest — the recommended default |
-| **Matrix device verified** | Trust follows a verified Matrix device | Strong *if* device verification is done properly |
-| **room-admin grant** | An admin publishes `com.mxagent.trust.v1` state | Convenient for teams; advisory only |
-| **TOFU** | First key seen is trusted | Convenient, but vulnerable on first contact |
+| Mode | How a key becomes trusted | Posture | Status |
+|---|---|---|---|
+| **manual** | Verify the Ed25519 fingerprint out-of-band and `trust approve` it | Strongest — the recommended default | ✅ Implemented |
+| **Matrix device verified** | Transport advisory signal; optionally adds a denial via `require_verified_device` | Additive-deny only; never a grant | ✅ Implemented |
+| **room-admin grant** | An admin publishes `com.mxagent.trust.v1` state | Advisory only; never overrides local store | ✅ Partial |
+| **TOFU** | First key seen is trusted | Convenient, but vulnerable on first contact | Planned |
 
 **Trust precedence — the local store is final authority.** Room-published trust state is purely advisory and is consulted *only* when the local store has no record for an `(agent_id, key_id)` pair. A **local revocation always wins** and can never be undone by a room admin:
 
@@ -182,13 +191,43 @@ The daemon owns all secrets; the coding agent sees none of them. On Linux:
 
 ```bash
 chmod 0700 ~/.local/share/mx-agent
-chmod 0600 ~/.local/share/mx-agent/session.db        # Matrix token
-chmod 0700 ~/.local/share/mx-agent/crypto-store      # E2EE keys
-chmod 0700 ~/.local/share/mx-agent/signing-keys      # Ed25519 signing identity
+chmod 0600 ~/.local/share/mx-agent/session.json      # Matrix access/refresh token
+chmod 0700 ~/.local/share/mx-agent/crypto-store      # E2EE device keys and Megolm sessions (SQLite)
+chmod 0600 ~/.local/share/mx-agent/crypto-store-key  # Daemon-generated store passphrase (Secret-wrapped)
+chmod 0600 ~/.local/share/mx-agent/signing_key.ed25519  # mx-agent Ed25519 signing identity
+chmod 0600 ~/.local/share/mx-agent/trust.json        # Local trusted-key store
 chmod 0600 ~/.config/mx-agent/policy.toml
 ```
 
+The crypto store and its passphrase are created once on first authenticated startup and reused across restarts — the daemon resumes as the same E2EE device with its Megolm sessions without generating a new identity. The recovery key for server-side key backup (`mx-agent recovery enable`) is surfaced to the operator exactly once and is never persisted in clear or logged.
+
 Tokens must **never** appear in environment variables, command arguments, logs, shell history, stdout/stderr, Matrix messages, or agent-readable config. (macOS should back tokens with Keychain; the project targets Unix — there is no Windows path.)
+
+### E2EE device verification and key backup
+
+```bash
+# List peer devices with fingerprints and verification status
+mx-agent device list --room '!workspace:matrix.org'
+
+# Verify a peer device out-of-band (confirm fingerprint first)
+mx-agent device verify --user @peer:hs --device DEVICEID \
+  --manual --fingerprint 'ed25519:BASE64...'
+
+# Interactive emoji/SAS (operator-attended)
+mx-agent device verify --user @peer:hs --device DEVICEID
+
+# Bootstrap cross-signing identity (idempotent)
+mx-agent auth cross-signing bootstrap
+
+# Enable server-side key backup — prints the recovery key ONCE; store it safely
+mx-agent recovery enable
+mx-agent recovery status
+
+# After a re-provision: re-import keys
+mx-agent recovery recover --recovery-key 'EsTL ...'
+```
+
+Device verification is advisory by default. To additionally require a verified sending device for execution, set `require_verified_device = true` in policy (per-room or per-agent). This can only *deny*, never grant — the signature → trust → policy gate remains the sole execution authority.
 
 ---
 

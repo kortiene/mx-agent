@@ -7,12 +7,13 @@
 //! returned client is unauthenticated and ready for a later auth phase.
 
 use std::fmt;
+use std::sync::{OnceLock, RwLock};
 
 use matrix_sdk::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::session::{Secret, StoredSession};
+use crate::session::{Secret, SessionPaths, StoredSession};
 
 /// Daemon Matrix configuration, typically loaded from `config.toml`.
 ///
@@ -132,6 +133,9 @@ pub enum ClientError {
     Config(ConfigError),
     /// The matrix-sdk client builder failed.
     Build(matrix_sdk::ClientBuildError),
+    /// The persistent crypto store could not be prepared (e.g. the store
+    /// directory or its passphrase file could not be created).
+    Store(String),
 }
 
 impl fmt::Display for ClientError {
@@ -139,6 +143,7 @@ impl fmt::Display for ClientError {
         match self {
             ClientError::Config(e) => write!(f, "{e}"),
             ClientError::Build(e) => write!(f, "failed to build Matrix client: {e}"),
+            ClientError::Store(e) => write!(f, "failed to prepare crypto store: {e}"),
         }
     }
 }
@@ -148,6 +153,7 @@ impl std::error::Error for ClientError {
         match self {
             ClientError::Config(e) => Some(e),
             ClientError::Build(e) => Some(e),
+            ClientError::Store(_) => None,
         }
     }
 }
@@ -164,18 +170,61 @@ impl From<ConfigError> for ClientError {
 /// at the configured homeserver. This performs no login; the returned client
 /// has no active session ([`Client::session_meta`] is `None`).
 pub async fn build_client(config: &MatrixConfig) -> Result<Client, ClientError> {
-    config.validate()?;
-    let url = Url::parse(config.homeserver_url.trim()).map_err(|source| {
-        ClientError::Config(ConfigError::InvalidHomeserverUrl {
-            value: config.homeserver_url.trim().to_string(),
-            source,
-        })
-    })?;
+    let url = validated_url(config)?;
     Client::builder()
         .homeserver_url(url)
         .build()
         .await
         .map_err(ClientError::Build)
+}
+
+/// Build a [`Client`] backed by the persistent, daemon-owned SQLite crypto
+/// store (issue #240).
+///
+/// Unlike [`build_client`], this configures matrix-sdk with a SQLite-backed
+/// crypto/state store at [`SessionPaths::crypto_store_dir`] (`0700`), encrypted
+/// at rest with the daemon's [`SessionPaths::load_or_create_crypto_store_key`]
+/// passphrase (`0600`). The store persists the daemon's Matrix device identity
+/// and Megolm sessions, so a restart resumes as the same E2EE device and retains
+/// the ability to decrypt history rather than regenerating in-memory state. The
+/// passphrase is a [`Secret`] and is never logged.
+///
+/// This is used by [`login_password`] and [`restore_client`]; the unauthenticated
+/// [`build_client`] stays store-less so it has no filesystem side effects.
+pub async fn build_client_with_store(
+    config: &MatrixConfig,
+    paths: &SessionPaths,
+) -> Result<Client, ClientError> {
+    let url = validated_url(config)?;
+    paths
+        .ensure_crypto_store_dir()
+        .map_err(|e| ClientError::Store(e.to_string()))?;
+    let passphrase = paths
+        .load_or_create_crypto_store_key()
+        .map_err(|e| ClientError::Store(e.to_string()))?;
+    Client::builder()
+        .homeserver_url(url)
+        .sqlite_store(&paths.crypto_store_dir, Some(passphrase.expose()))
+        .build()
+        .await
+        .map_err(ClientError::Build)
+}
+
+/// Validate the config and parse its homeserver URL.
+///
+/// Returns the large `ClientError` for consistency with `build_client` and the
+/// other client constructors (the variant carries matrix-sdk's
+/// `ClientBuildError`); boxing only this helper's error would make the callers
+/// inconsistent for no benefit.
+#[allow(clippy::result_large_err)]
+fn validated_url(config: &MatrixConfig) -> Result<Url, ClientError> {
+    config.validate()?;
+    Url::parse(config.homeserver_url.trim()).map_err(|source| {
+        ClientError::Config(ConfigError::InvalidHomeserverUrl {
+            value: config.homeserver_url.trim().to_string(),
+            source,
+        })
+    })
 }
 
 /// Error returned when a Matrix login attempt fails.
@@ -231,7 +280,9 @@ pub async fn login_password(
     username: &str,
     password: &str,
 ) -> Result<StoredSession, LoginError> {
-    let client = build_client(config).await?;
+    // Log in on a client backed by the persistent crypto store so the device
+    // identity created at login is durable across restarts (issue #240).
+    let client = build_client_with_store(config, &SessionPaths::resolve()).await?;
     client
         .matrix_auth()
         .login_username(username, password)
@@ -253,7 +304,64 @@ pub async fn login_password(
     })
 }
 
+/// Process-global handle to the daemon's single long-lived Matrix [`Client`].
+///
+/// The sync loop restores exactly one store-backed client and publishes it here
+/// via [`publish_active_client`]. Per-call IPC handlers then reuse *that* client
+/// (see [`restore_client`]) instead of each opening their own store-backed
+/// client. This matters because the persistent SQLite crypto store must be
+/// driven by a single [`matrix_sdk`] `OlmMachine`: two `OlmMachine`s for the same
+/// device open on the same store race on the Olm account, one-time keys, and
+/// Megolm sessions, which can corrupt crypto state and silently lose
+/// decryptability (issue #240). matrix-sdk's `Client` is `Clone`/`Send`/`Sync`
+/// and is used the same way across the sync, scheduler, and heartbeat runtimes
+/// already (architecture §9.1/§9.2).
+static ACTIVE_CLIENT: OnceLock<RwLock<Option<Client>>> = OnceLock::new();
+
+fn active_client_slot() -> &'static RwLock<Option<Client>> {
+    ACTIVE_CLIENT.get_or_init(|| RwLock::new(None))
+}
+
+/// Publish the daemon's long-lived client so per-call IPC handlers share it.
+///
+/// Called once by the sync loop after it restores the client. Any previously
+/// published client is replaced (e.g. across an in-process restart).
+pub fn publish_active_client(client: Client) {
+    *active_client_slot()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(client);
+}
+
+/// Drop the published client. Called on daemon shutdown so a later in-process
+/// run does not reuse a stale client.
+pub fn clear_active_client() {
+    *active_client_slot()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Return the published long-lived client if one exists and it matches
+/// `session` (same Matrix user and device), else `None`.
+fn active_client_for(session: &StoredSession) -> Option<Client> {
+    let guard = active_client_slot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let client = guard.as_ref()?;
+    let meta = client.session_meta()?;
+    (meta.user_id.as_str() == session.user_id && meta.device_id.as_str() == session.device_id)
+        .then(|| client.clone())
+}
+
 /// Build a [`Client`] and restore a previously persisted [`StoredSession`].
+///
+/// When the daemon's long-lived sync loop has already restored and published a
+/// client for this session (the normal running case), that *same* client is
+/// returned, so every per-call IPC handler shares one `OlmMachine` and one
+/// handle to the persistent crypto store rather than opening a second one that
+/// would race the sync-loop client on the store (issue #240; see
+/// [`ACTIVE_CLIENT`]). Only when no client has been published yet — login
+/// bootstrap, tests, or the sync loop's own first restore — is a fresh
+/// store-backed client built.
 ///
 /// The client is pointed at the session's homeserver and the stored tokens are
 /// re-imported so the daemon resumes as the same device after a restart. No
@@ -265,10 +373,19 @@ pub async fn restore_client(session: &StoredSession) -> Result<Client, LoginErro
     use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
     use matrix_sdk::SessionMeta;
 
+    // Reuse the daemon's single long-lived client when one has been published
+    // for this session, so the whole daemon drives exactly one OlmMachine.
+    if let Some(client) = active_client_for(session) {
+        return Ok(client);
+    }
+
     let config = MatrixConfig {
         homeserver_url: session.homeserver.clone(),
     };
-    let client = build_client(&config).await?;
+    // Restore on a client backed by the same persistent crypto store so the
+    // daemon resumes as the same E2EE device and keeps its Megolm sessions
+    // (issue #240). The device id below matches the one persisted in the store.
+    let client = build_client_with_store(&config, &SessionPaths::resolve()).await?;
 
     let user_id = OwnedUserId::try_from(session.user_id.as_str())
         .map_err(|e| LoginError::Matrix(matrix_sdk::Error::from(e)))?;
@@ -381,5 +498,51 @@ mod tests {
             err,
             ClientError::Config(ConfigError::EmptyHomeserverUrl)
         ));
+    }
+
+    fn sample_session() -> StoredSession {
+        StoredSession {
+            homeserver: "https://matrix.org".to_string(),
+            user_id: "@daemon:matrix.org".to_string(),
+            device_id: "DAEMONDEV".to_string(),
+            access_token: Secret::new("token".to_string()),
+            refresh_token: None,
+        }
+    }
+
+    // The shared-client registry must never hand a handler a client whose
+    // session does not match — otherwise a handler could operate on the wrong
+    // device. The positive sharing path (a published, session-matching client is
+    // reused) is exercised by the `matrix-integration` suite, which needs a live
+    // homeserver to mint a real session. Here we lock in the guard: an empty
+    // registry, and a published client with no session, both yield `None`
+    // (issue #240). Run serially because the registry is process-global.
+    #[tokio::test]
+    async fn active_client_registry_guards_against_session_mismatch() {
+        clear_active_client();
+        let session = sample_session();
+        assert!(
+            active_client_for(&session).is_none(),
+            "empty registry must not yield a client"
+        );
+
+        // A store-less client has no session_meta, so it can never match a
+        // restored session and must not be returned.
+        let cfg = MatrixConfig {
+            homeserver_url: "https://matrix.org".to_string(),
+        };
+        let client = build_client(&cfg).await.expect("client should build");
+        assert!(client.session_meta().is_none());
+        publish_active_client(client);
+        assert!(
+            active_client_for(&session).is_none(),
+            "a published client whose session does not match must not be returned"
+        );
+
+        clear_active_client();
+        assert!(
+            active_client_for(&session).is_none(),
+            "cleared registry must not yield a client"
+        );
     }
 }
