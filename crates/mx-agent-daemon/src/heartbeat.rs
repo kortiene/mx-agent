@@ -15,14 +15,19 @@
 //! [`HeartbeatConfig::state_refresh`] interval, so steady-state heartbeats do
 //! not produce excessive state-event updates.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use matrix_sdk::Room;
+use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::AGENT as AGENT_STATE_TYPE;
 use mx_agent_protocol::events::timeline::HEARTBEAT as HEARTBEAT_EVENT_TYPE;
 use mx_agent_protocol::schema::{AgentLoad, AgentState, Heartbeat};
 
-use crate::agent::read_agent_state;
+use crate::agent::{read_agent_state, read_all_agent_states};
+use crate::scheduler_loop::sleep_interruptible;
 use crate::workspace::WorkspaceError;
 
 /// Default interval between emitted heartbeats.
@@ -40,8 +45,22 @@ pub const DEFAULT_OFFLINE_AFTER: Duration = Duration::from_secs(300);
 /// refreshed even when the status has not changed.
 pub const DEFAULT_STATE_REFRESH: Duration = Duration::from_secs(300);
 
+/// Upper bound on recent timeline events scanned per room when resolving the
+/// latest heartbeat per agent. Bounds the cost of a liveness query, consistent
+/// with the approval-decision scan limit.
+pub const HEARTBEAT_SCAN_LIMIT: u32 = 100;
+
+/// Upper bound on the per-agent durable-refresh timestamps tracked by
+/// [`run_heartbeat_loop`] before the map is cleared, bounding memory on a
+/// long-running daemon (mirrors the scheduler loop's tracking cap).
+const MAX_TRACKED_AGENTS: usize = 50_000;
+
 /// Liveness verdict for an agent, derived from heartbeat recency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes to/from a stable lowercase string (`"active"`/`"stale"`/
+/// `"offline"`) so it can travel over IPC and appear in `--json` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Liveness {
     /// Seen within the heartbeat window: actively running.
     Active,
@@ -108,6 +127,27 @@ impl LivenessConfig {
     pub fn liveness_of(&self, state: &AgentState, now_ms: u64) -> Liveness {
         self.liveness(state.last_seen_ts, now_ms)
     }
+
+    /// Compute the [`Liveness`] verdict by combining the durable agent state's
+    /// `last_seen_ts` with the most recent heartbeat timeline event (architecture
+    /// §9.1, "Liveness should combine … recent heartbeat event").
+    ///
+    /// The verdict is taken from whichever of the two is newer, so a healthy
+    /// agent emitting timeline heartbeats every
+    /// [`DEFAULT_HEARTBEAT_INTERVAL`] reads [`Liveness::Active`] between the
+    /// rarer durable-state refreshes (the durable `last_seen_ts` is only
+    /// rewritten every [`HeartbeatConfig::state_refresh`]). A `None`
+    /// `latest_heartbeat_ts` falls back to [`Self::liveness_of`]. Future
+    /// timestamps (clock skew) are clamped to "just seen" by [`Self::liveness`].
+    pub fn liveness_combined(
+        &self,
+        state: &AgentState,
+        latest_heartbeat_ts: Option<u64>,
+        now_ms: u64,
+    ) -> Liveness {
+        let last_seen = state.last_seen_ts.max(latest_heartbeat_ts.unwrap_or(0));
+        self.liveness(last_seen, now_ms)
+    }
 }
 
 /// Configuration for periodic heartbeat emission.
@@ -150,7 +190,7 @@ impl HeartbeatConfig {
 }
 
 /// Current epoch time in milliseconds.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -216,6 +256,159 @@ pub async fn emit_heartbeat(
     } else {
         // No durable state to refresh; the timeline heartbeat still went out.
         Ok(false)
+    }
+}
+
+/// Read the most recent `com.mxagent.heartbeat.v1` timeline event per agent in
+/// `room`.
+///
+/// Scans up to `limit` recent timeline events newest-first and keeps the **first
+/// (newest)** heartbeat seen per `agent_id`, mirroring
+/// [`crate::approval::read_approval_decisions`]. The returned timestamps feed
+/// [`LivenessConfig::liveness_combined`] so a liveness verdict reflects the 30s
+/// timeline heartbeat cadence rather than the slower durable-state refresh.
+pub async fn read_latest_heartbeats(
+    room: &Room,
+    limit: u32,
+) -> Result<HashMap<String, Heartbeat>, WorkspaceError> {
+    let mut request = MessagesOptions::backward();
+    request.limit = matrix_sdk::ruma::UInt::from(limit);
+    let messages = room.messages(request).await.map_err(WorkspaceError::from)?;
+
+    let mut latest: HashMap<String, Heartbeat> = HashMap::new();
+    for event in messages.chunk {
+        let raw = event.raw();
+        let is_heartbeat =
+            raw.get_field::<String>("type").ok().flatten().as_deref() == Some(HEARTBEAT_EVENT_TYPE);
+        if !is_heartbeat {
+            continue;
+        }
+        if let Ok(Some(heartbeat)) = raw.get_field::<Heartbeat>("content") {
+            // Newest-first scan: the first occurrence per agent_id wins.
+            latest
+                .entry(heartbeat.agent_id.clone())
+                .or_insert(heartbeat);
+        }
+    }
+    Ok(latest)
+}
+
+/// Return the agents in `agents` owned by `local_user` (those whose
+/// `matrix_user_id` matches), in input order.
+///
+/// Room membership never implies ownership: the heartbeat loop only refreshes
+/// liveness for agents this daemon's Matrix user published, so it never
+/// impersonates another daemon's agent.
+fn owned_agents<'a>(agents: &'a [AgentState], local_user: &str) -> Vec<&'a AgentState> {
+    agents
+        .iter()
+        .filter(|agent| agent.matrix_user_id == local_user)
+        .collect()
+}
+
+/// Return the durable-refresh timestamp the loop should pass to
+/// [`emit_heartbeat`] for an agent, seeding a first sighting from the agent's
+/// discovered `last_seen_ts`.
+///
+/// Seeding from `last_seen_ts` (rather than `0`) means a freshly registered
+/// agent is not forced into an immediate extra durable-state write on the loop's
+/// first pass: [`HeartbeatConfig::should_refresh_state`] only fires once
+/// `state_refresh` has elapsed since that stamp.
+fn stored_last_state_ms(
+    tracked: &mut HashMap<(String, String), u64>,
+    key: (String, String),
+    discovered_last_seen_ts: u64,
+) -> u64 {
+    *tracked.entry(key).or_insert(discovered_last_seen_ts)
+}
+
+/// Run the live heartbeat loop until `running` is cleared.
+///
+/// On its own dedicated thread (the caller spawns it), this builds a
+/// current-thread Tokio runtime, then repeatedly — every `interval` — emits a
+/// heartbeat for every agent this daemon owns in every joined room. It shares
+/// the daemon's Matrix `client` and never runs its own `/sync`, so it reads room
+/// state populated by the main sync loop and only sends events; only the main
+/// loop owns the session token (mirroring [`crate::run_scheduler_loop`]). All
+/// Matrix and store errors are logged and skipped so a transient failure never
+/// stops the loop or panics the daemon.
+pub fn run_heartbeat_loop(
+    client: Client,
+    running: Arc<AtomicBool>,
+    config: HeartbeatConfig,
+    interval: Duration,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build heartbeat runtime; heartbeat loop not started");
+            return;
+        }
+    };
+    // Per-agent last durable state-refresh time, keyed by `(room_id, agent_id)`,
+    // so each agent's `state_refresh` cadence is honored across ticks. Capped to
+    // bound memory on a long-lived daemon.
+    let mut last_state_ms: HashMap<(String, String), u64> = HashMap::new();
+    tracing::info!(interval_secs = interval.as_secs(), "heartbeat loop started");
+    while running.load(Ordering::SeqCst) {
+        if last_state_ms.len() > MAX_TRACKED_AGENTS {
+            last_state_ms.clear();
+        }
+        heartbeat_pass(&runtime, &client, &config, &mut last_state_ms);
+        sleep_interruptible(interval, &running);
+    }
+    tracing::info!("heartbeat loop stopped");
+}
+
+/// Perform one heartbeat pass over every joined room.
+///
+/// For each room, reads the published agent states, filters to agents this
+/// daemon owns, and emits a heartbeat for each. A `true` return from
+/// [`emit_heartbeat`] (the durable state was refreshed) advances the agent's
+/// tracked `last_state_ms` to now so the next refresh is one `state_refresh`
+/// away.
+fn heartbeat_pass(
+    runtime: &tokio::runtime::Runtime,
+    client: &Client,
+    config: &HeartbeatConfig,
+    last_state_ms: &mut HashMap<(String, String), u64>,
+) {
+    let local_user = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+    if local_user.is_empty() {
+        return;
+    }
+
+    for room in client.joined_rooms() {
+        let room_id = room.room_id().to_string();
+        let agents = match runtime.block_on(read_all_agent_states(&room)) {
+            Ok(agents) => agents,
+            Err(e) => {
+                tracing::debug!(error = %e, room = %room_id, "heartbeat pass could not read agent states");
+                continue;
+            }
+        };
+        for agent in owned_agents(&agents, &local_user) {
+            let key = (room_id.clone(), agent.agent_id.clone());
+            let stored = stored_last_state_ms(last_state_ms, key.clone(), agent.last_seen_ts);
+            match runtime.block_on(emit_heartbeat(
+                &room,
+                &agent.agent_id,
+                &agent.status,
+                config,
+                stored,
+            )) {
+                Ok(true) => {
+                    last_state_ms.insert(key, now_ms());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, room = %room_id, agent = %agent.agent_id, "heartbeat emit failed");
+                }
+            }
+        }
     }
 }
 
@@ -337,5 +530,145 @@ mod tests {
         let lv = LivenessConfig::default();
         assert!(lv.stale_after < lv.offline_after);
         assert!(DEFAULT_HEARTBEAT_INTERVAL < DEFAULT_STALE_AFTER);
+    }
+
+    #[test]
+    fn liveness_combined_prefers_recent_heartbeat_over_stale_durable_state() {
+        let cfg = LivenessConfig::default();
+        let now = 1_000_000;
+        // Durable state alone would be offline (well past 300s)...
+        let state = agent_state(now - DEFAULT_OFFLINE_AFTER.as_millis() as u64 - 1, "active");
+        assert_eq!(cfg.liveness_of(&state, now), Liveness::Offline);
+        // ...but a heartbeat one interval ago keeps the agent active.
+        let hb_ts = now - DEFAULT_HEARTBEAT_INTERVAL.as_millis() as u64;
+        assert_eq!(
+            cfg.liveness_combined(&state, Some(hb_ts), now),
+            Liveness::Active
+        );
+    }
+
+    #[test]
+    fn liveness_combined_without_heartbeat_falls_back_to_durable_state() {
+        let cfg = LivenessConfig::default();
+        let now = 1_000_000;
+        let gone = agent_state(now - DEFAULT_OFFLINE_AFTER.as_millis() as u64 - 1, "active");
+        assert_eq!(
+            cfg.liveness_combined(&gone, None, now),
+            cfg.liveness_of(&gone, now)
+        );
+        assert_eq!(cfg.liveness_combined(&gone, None, now), Liveness::Offline);
+    }
+
+    #[test]
+    fn liveness_combined_offline_when_both_signals_stale() {
+        let cfg = LivenessConfig::default();
+        let now = 1_000_000;
+        let state = agent_state(now - DEFAULT_OFFLINE_AFTER.as_millis() as u64 - 1, "active");
+        let hb_ts = now - DEFAULT_OFFLINE_AFTER.as_millis() as u64 - 1;
+        assert_eq!(
+            cfg.liveness_combined(&state, Some(hb_ts), now),
+            Liveness::Offline
+        );
+    }
+
+    #[test]
+    fn liveness_combined_clamps_future_heartbeat_to_active() {
+        let cfg = LivenessConfig::default();
+        let state = agent_state(0, "active");
+        // A heartbeat "in the future" (clock skew) clamps to just-seen -> active.
+        assert_eq!(
+            cfg.liveness_combined(&state, Some(2_000_000), 1_000_000),
+            Liveness::Active
+        );
+    }
+
+    #[test]
+    fn liveness_serde_roundtrips_as_lowercase() {
+        for (variant, text) in [
+            (Liveness::Active, "\"active\""),
+            (Liveness::Stale, "\"stale\""),
+            (Liveness::Offline, "\"offline\""),
+        ] {
+            let encoded = serde_json::to_string(&variant).unwrap();
+            assert_eq!(encoded, text);
+            let decoded: Liveness = serde_json::from_str(text).unwrap();
+            assert_eq!(decoded, variant);
+        }
+    }
+
+    #[test]
+    fn owned_agents_returns_only_local_user_agents() {
+        let mine = {
+            let mut a = agent_state(0, "active");
+            a.agent_id = "mine".to_string();
+            a.matrix_user_id = "@me:server".to_string();
+            a
+        };
+        let theirs = {
+            let mut a = agent_state(0, "active");
+            a.agent_id = "theirs".to_string();
+            a.matrix_user_id = "@other:server".to_string();
+            a
+        };
+        let agents = vec![mine, theirs];
+        let owned: Vec<&str> = owned_agents(&agents, "@me:server")
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        assert_eq!(owned, vec!["mine"]);
+        assert!(owned_agents(&agents, "@nobody:server").is_empty());
+    }
+
+    #[test]
+    fn stored_last_state_ms_seeds_then_advances() {
+        let mut tracked: HashMap<(String, String), u64> = HashMap::new();
+        let key = ("!room:server".to_string(), "agent-a".to_string());
+        // First sight seeds from the discovered last_seen_ts (no forced refresh).
+        assert_eq!(
+            stored_last_state_ms(&mut tracked, key.clone(), 1_234),
+            1_234
+        );
+        // A `true` emit_heartbeat return advances the stored value to "now".
+        tracked.insert(key.clone(), 9_999);
+        // The advanced value is now returned, not the original seed.
+        assert_eq!(stored_last_state_ms(&mut tracked, key, 1_234), 9_999);
+    }
+
+    #[test]
+    fn liveness_combined_stale_heartbeat_produces_stale_verdict() {
+        let cfg = LivenessConfig::default();
+        let now = 1_000_000;
+        // Durable state is offline (elapsed >> 300s)...
+        let state = agent_state(now - DEFAULT_OFFLINE_AFTER.as_millis() as u64 - 1, "active");
+        assert_eq!(cfg.liveness_of(&state, now), Liveness::Offline);
+        // ...but a heartbeat within the stale window (past stale threshold, before offline threshold)
+        // means the combined verdict is Stale, not Offline.
+        let hb_ts = now - (DEFAULT_STALE_AFTER.as_millis() as u64 + 1_000);
+        assert!(
+            hb_ts > now - DEFAULT_OFFLINE_AFTER.as_millis() as u64,
+            "heartbeat is in the stale window"
+        );
+        assert_eq!(
+            cfg.liveness_combined(&state, Some(hb_ts), now),
+            Liveness::Stale
+        );
+    }
+
+    #[test]
+    fn liveness_combined_active_heartbeat_overrides_stale_durable_state() {
+        // A heartbeat within the active window keeps the verdict Active even when
+        // the durable state alone would be Stale (common during normal operation
+        // between the slower durable-state refresh cadence).
+        let cfg = LivenessConfig::default();
+        let now = 1_000_000;
+        // Durable state is just past the stale threshold.
+        let state = agent_state(now - DEFAULT_STALE_AFTER.as_millis() as u64 - 1, "active");
+        assert_eq!(cfg.liveness_of(&state, now), Liveness::Stale);
+        // A heartbeat one interval ago (well within the stale window) lifts to Active.
+        let hb_ts = now - DEFAULT_HEARTBEAT_INTERVAL.as_millis() as u64;
+        assert_eq!(
+            cfg.liveness_combined(&state, Some(hb_ts), now),
+            Liveness::Active
+        );
     }
 }

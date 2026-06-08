@@ -1531,35 +1531,58 @@ fn handle_agent(global: &GlobalArgs, cmd: &AgentCommand) -> ExitCode {
     }
 }
 
+/// Render `last_seen_ts` (epoch ms) as a short relative age token, e.g.
+/// `42s ago`, `3m ago`, `2h ago`. A zero stamp (never seen) reads `never`.
+/// Plain integer arithmetic on epoch-ms — no time-formatting dependency.
+fn format_last_seen(last_seen_ts: u64) -> String {
+    if last_seen_ts == 0 {
+        return "never".to_string();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let secs = now.saturating_sub(last_seen_ts) / 1000;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
 fn agent_list(global: &GlobalArgs, args: &AgentListArgs) -> ExitCode {
     let options = mx_agent_daemon::ListAgentsOptions {
         room: args.room.clone(),
         capabilities: args.capabilities.clone(),
     };
-    match daemon_ipc_call::<_, Vec<mx_agent_protocol::schema::AgentState>>(
-        global,
-        "agent.list",
-        &options,
-    ) {
-        Ok(agents) => {
+    match daemon_ipc_call::<_, Vec<mx_agent_daemon::AgentListing>>(global, "agent.list", &options) {
+        Ok(listings) => {
             if global.json {
                 println!(
                     "{}",
-                    serde_json::to_string(&agents).unwrap_or_else(|_| "[]".to_string())
+                    serde_json::to_string(&listings).unwrap_or_else(|_| "[]".to_string())
                 );
-            } else if agents.is_empty() {
+            } else if listings.is_empty() {
                 println!("mx-agent: no agents registered in {}", args.room);
             } else {
-                println!("mx-agent: {} agent(s) in {}", agents.len(), args.room);
-                for agent in &agents {
+                println!("mx-agent: {} agent(s) in {}", listings.len(), args.room);
+                for listing in &listings {
+                    let agent = &listing.agent;
                     let caps = if agent.capabilities.is_empty() {
                         "-".to_string()
                     } else {
                         agent.capabilities.join(",")
                     };
                     println!(
-                        "  {:<24} {:<8} {:<8} {}",
-                        agent.agent_id, agent.kind, agent.status, caps
+                        "  {:<24} {:<8} {:<8} {:<8} {:<10} {}",
+                        agent.agent_id,
+                        agent.kind,
+                        agent.status,
+                        listing.liveness,
+                        format_last_seen(agent.last_seen_ts),
+                        caps
                     );
                 }
             }
@@ -1574,21 +1597,25 @@ fn agent_show(global: &GlobalArgs, args: &AgentShowArgs) -> ExitCode {
         room: args.room.clone(),
         agent_id: args.agent_id.clone(),
     };
-    match daemon_ipc_call::<_, Option<mx_agent_protocol::schema::AgentState>>(
-        global,
-        "agent.show",
-        &params,
-    ) {
-        Ok(Some(state)) => {
+    match daemon_ipc_call::<_, Option<mx_agent_daemon::AgentListing>>(global, "agent.show", &params)
+    {
+        Ok(Some(listing)) => {
             if global.json {
                 println!(
                     "{}",
-                    serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string(&listing).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
+                let state = &listing.agent;
                 println!("mx-agent: agent {}", state.agent_id);
                 println!("  kind:         {}", state.kind);
                 println!("  status:       {}", state.status);
+                println!("  liveness:     {}", listing.liveness);
+                println!(
+                    "  last_seen:    {} ({} ms)",
+                    format_last_seen(state.last_seen_ts),
+                    state.last_seen_ts
+                );
                 println!("  user:         {}", state.matrix_user_id);
                 println!("  device:       {}", state.device_id);
                 println!("  cwd:          {}", state.workspace.cwd);
@@ -4675,5 +4702,101 @@ mod tests {
     fn unknown_command_is_rejected() {
         let err = Cli::try_parse_from(["mx-agent", "definitely-not-a-command"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    // --- format_last_seen tests (issue #250) ---
+
+    #[test]
+    fn format_last_seen_zero_returns_never() {
+        assert_eq!(format_last_seen(0), "never");
+    }
+
+    #[test]
+    fn format_last_seen_relative_age_units() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // Under 60s → "Xs ago".
+        assert!(
+            format_last_seen(now_ms - 30_000).ends_with("s ago"),
+            "30s ago should render as seconds"
+        );
+        // 60s–3599s → "Xm ago".
+        assert!(
+            format_last_seen(now_ms - 300_000).ends_with("m ago"),
+            "5m ago should render as minutes"
+        );
+        // ≥ 3600s → "Xh ago".
+        assert!(
+            format_last_seen(now_ms - 7_200_000).ends_with("h ago"),
+            "2h ago should render as hours"
+        );
+        // A near-epoch timestamp (1ms) is at least 50 years old — always hours.
+        assert!(
+            format_last_seen(1).ends_with("h ago"),
+            "epoch-ms 1 should render as hours ago"
+        );
+    }
+
+    /// Verifies the `AgentListing` IPC envelope shape: `{"agent": {...},
+    /// "liveness": "active"|"stale"|"offline"}`. The `liveness` field must be a
+    /// lowercase string and agent fields must be nested under `"agent"`, not at
+    /// the top level (issue #250).
+    #[test]
+    fn agent_listing_json_shape_has_envelope_and_lowercase_liveness() {
+        use mx_agent_protocol::schema::{AgentLoad, AgentState, AgentWorkspace};
+        let state = AgentState {
+            agent_id: "dev-pi".to_string(),
+            kind: "pi".to_string(),
+            matrix_user_id: "@pi:matrix.org".to_string(),
+            device_id: "DEV".to_string(),
+            signing_key_id: String::new(),
+            signing_public_key: None,
+            status: "active".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            workspace: AgentWorkspace {
+                cwd: "/tmp".to_string(),
+                project_id: String::new(),
+                git_commit: String::new(),
+            },
+            load: AgentLoad {
+                running_invocations: 0,
+                max_invocations: 1,
+            },
+            last_seen_ts: 1_700_000_000_000,
+            state_rev: 1,
+            extra: Default::default(),
+        };
+        for (verdict, expected) in [
+            (mx_agent_daemon::Liveness::Active, "active"),
+            (mx_agent_daemon::Liveness::Stale, "stale"),
+            (mx_agent_daemon::Liveness::Offline, "offline"),
+        ] {
+            let listing = mx_agent_daemon::AgentListing {
+                agent: state.clone(),
+                liveness: verdict,
+            };
+            let json = serde_json::to_value(&listing).unwrap();
+            assert_eq!(
+                json["liveness"].as_str(),
+                Some(expected),
+                "liveness must serialize as lowercase \"{expected}\""
+            );
+            assert!(
+                json["agent"].is_object(),
+                "agent state must be nested under the 'agent' key"
+            );
+            assert_eq!(
+                json["agent"]["agent_id"].as_str(),
+                Some("dev-pi"),
+                "agent fields must be accessible under 'agent'"
+            );
+            assert!(
+                json.get("agent_id").is_none(),
+                "agent_id must not appear at the envelope top level"
+            );
+        }
     }
 }

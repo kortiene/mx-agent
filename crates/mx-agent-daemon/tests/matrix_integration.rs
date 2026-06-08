@@ -20,12 +20,16 @@
 //! over IPC (approve → runs to `succeeded`; deny → `blocked`, never spawned) —
 //! so none of those spawn a process they should not.
 //!
-//! [`two_daemons_discover_each_other_and_compute_liveness`] (issue #227) adds a
-//! focused two-daemon discovery + liveness contract test: two independent
+//! [`two_daemons_discover_each_other_and_compute_liveness`] (issues #227, #250)
+//! adds a focused two-daemon discovery + liveness contract test: two independent
 //! daemons (distinct signing identities) register in one room, each discovers
 //! the other's `com.mxagent.agent.v1` state, a real heartbeat refreshes the
 //! durable liveness state, and the `LivenessConfig` thresholds drive the
 //! Active → Stale → Offline transition deterministically off an injected clock.
+//! Issue #250 extends this: `read_latest_heartbeats` is exercised against the
+//! live timeline, `liveness_combined` is verified to lift Offline to Active via
+//! a fresh timeline heartbeat, and the new `AgentListing` IPC envelope shape
+//! (`{ "agent": AgentState, "liveness": "active"|"stale"|"offline" }`) is pinned.
 //!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
@@ -64,14 +68,15 @@ use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
     build_signed_exec_request, cancel_task_for_session, create_task, decide_approval_for_session,
     emit_heartbeat, get_invocation, list_agents, list_pending_approvals, list_tasks,
-    load_or_create_signing_key, load_sync_token, login_password, register_agent, restore_client,
-    run_matrix_sync, run_matrix_sync_with_subscribers, run_scheduler_loop, save_session,
-    show_agent, sign_task_action, start_call_matrix, start_exec_matrix, BackoffConfig, CallOutcome,
-    CallStartParams, CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome,
-    ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey,
-    ForwardedExecEvent, HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness,
-    LivenessConfig, MatrixConfig, PtyWinsize, RegisterAgentOptions, SessionPaths, SyncHealth,
-    SyncState, TaskDispatchMode, TrustStore, DECISION_APPROVED, DECISION_DENIED,
+    load_or_create_signing_key, load_sync_token, login_password, read_latest_heartbeats,
+    register_agent, restore_client, run_matrix_sync, run_matrix_sync_with_subscribers,
+    run_scheduler_loop, save_session, show_agent, sign_task_action, start_call_matrix,
+    start_exec_matrix, AgentListing, BackoffConfig, CallOutcome, CallStartParams,
+    CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
+    ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent,
+    HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig,
+    PtyWinsize, RegisterAgentOptions, SessionPaths, SyncHealth, SyncState, TaskDispatchMode,
+    TrustStore, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -2211,6 +2216,81 @@ fn assert_stable_agent_json(state: &AgentState, expected_key_id: &str) {
     }
 }
 
+/// Pin the stable `--json` shape of the liveness-enriched envelope (issue #250).
+///
+/// `mx-agent agent list --json` and `agent show --json` now return
+/// `AgentListing` (`{ "agent": AgentState, "liveness": "active"|"stale"|"offline" }`)
+/// rather than bare `AgentState`. Automation must read fields under `.[].agent`
+/// rather than at the top level. Assert the documented envelope shape including
+/// the lowercase `liveness` string and nested `agent` object with all stable keys.
+fn assert_stable_agent_listing_json(state: &AgentState, liveness: Liveness, expected_key_id: &str) {
+    let listing = AgentListing {
+        agent: state.clone(),
+        liveness,
+    };
+    let v = serde_json::to_value(&listing).expect("AgentListing serializes to json");
+    let obj = v.as_object().expect("AgentListing --json is an object");
+
+    // Envelope-level keys must be exactly "agent" and "liveness".
+    assert!(
+        obj.contains_key("liveness"),
+        "AgentListing --json must have 'liveness' field: {v}"
+    );
+    assert!(
+        obj.contains_key("agent"),
+        "AgentListing --json must have 'agent' field: {v}"
+    );
+    let liveness_str = obj["liveness"]
+        .as_str()
+        .expect("liveness field must be a string");
+    assert!(
+        ["active", "stale", "offline"].contains(&liveness_str),
+        "liveness must be 'active', 'stale', or 'offline': got {liveness_str:?}"
+    );
+    assert!(
+        obj.get("agent_id").is_none(),
+        "agent_id must not appear at the envelope top level; it must live under 'agent'"
+    );
+
+    // The inner AgentState must carry all documented keys under "agent".
+    let agent_obj = obj["agent"]
+        .as_object()
+        .expect("'agent' must be a JSON object");
+    for key in [
+        "agent_id",
+        "kind",
+        "matrix_user_id",
+        "device_id",
+        "signing_key_id",
+        "signing_public_key",
+        "status",
+        "capabilities",
+        "tools",
+        "workspace",
+        "load",
+        "last_seen_ts",
+        "state_rev",
+    ] {
+        assert!(
+            agent_obj.contains_key(key),
+            "AgentListing --json 'agent' must have '{key}' field: {v}"
+        );
+    }
+    assert_eq!(
+        agent_obj["signing_key_id"],
+        json!(expected_key_id),
+        "discovered signing_key_id must round-trip the publishing daemon's key"
+    );
+    assert!(
+        agent_obj["last_seen_ts"].is_u64(),
+        "last_seen_ts must be a JSON number"
+    );
+    assert!(
+        agent_obj["state_rev"].is_u64(),
+        "state_rev must be a JSON number"
+    );
+}
+
 /// Two-daemon agent discovery + liveness coverage (issue #227).
 ///
 /// Two independent daemons — two Matrix users, each with its **own** data dir and
@@ -2489,7 +2569,69 @@ async fn two_daemons_discover_each_other_and_compute_liveness() {
         "past the offline threshold the agent is offline"
     );
 
+    // ---- Criterion: read_latest_heartbeats returns the emitted heartbeat. ----
+    // This is the first end-to-end coverage of `read_latest_heartbeats` against a
+    // real Matrix homeserver timeline (issue #250). The heartbeat was emitted via
+    // `emit_heartbeat`, which sends a `com.mxagent.heartbeat.v1` timeline event.
+    // `read_latest_heartbeats` paginates `/messages` backward and must find it.
+    let latest = read_latest_heartbeats(&room, HEARTBEAT_SCAN_LIMIT)
+        .await
+        .expect("read_latest_heartbeats must succeed against the live homeserver");
+    assert!(
+        latest.contains_key(BOB_AGENT),
+        "emitted heartbeat must appear in the timeline scan for agent {BOB_AGENT}: found {:?}",
+        latest.keys().collect::<Vec<_>>()
+    );
+    let hb = &latest[BOB_AGENT];
+    assert_eq!(
+        hb.agent_id, BOB_AGENT,
+        "heartbeat agent_id must match the emitting agent"
+    );
+    assert!(
+        hb.ts >= initial_last_seen,
+        "heartbeat ts ({}) must not predate the initial last_seen_ts ({})",
+        hb.ts,
+        initial_last_seen
+    );
+
+    // ---- Criterion: liveness_combined lifts Offline to Active via timeline. ----
+    // With short injected thresholds and a `now` far past the durable
+    // `last_seen_ts`, durable-only liveness is Offline. The timeline heartbeat
+    // ts (just emitted) makes the combined verdict Active — the core correctness
+    // property of issue #250: a healthy agent emitting 30s heartbeats stays
+    // Active between the slower 300s durable-state refreshes.
+    let tight_cfg = LivenessConfig {
+        stale_after: Duration::from_secs(1),
+        offline_after: Duration::from_secs(5),
+    };
+    // Simulate durable state being 10 minutes old.
+    let far_future = bob_after_hb.last_seen_ts + 600_000;
+    assert_eq!(
+        tight_cfg.liveness_of(&bob_after_hb, far_future),
+        Liveness::Offline,
+        "durable-only verdict must be Offline under tight thresholds at 10m future"
+    );
+    // A just-emitted timeline heartbeat (ts ≈ now) lifts the verdict to Active.
+    let hb_ts = hb.ts;
+    let just_after_hb = hb_ts + 500; // 0.5 s after the heartbeat
+    assert_eq!(
+        tight_cfg.liveness_combined(&bob_after_hb, Some(hb_ts), just_after_hb),
+        Liveness::Active,
+        "timeline heartbeat must lift combined verdict to Active (issue #250)"
+    );
+    // When the heartbeat itself is old enough, combined verdict follows it down.
+    let long_after_hb = hb_ts + 10_000; // 10 s after the heartbeat (past 5 s offline threshold)
+    assert_eq!(
+        tight_cfg.liveness_combined(&bob_after_hb, Some(hb_ts), long_after_hb),
+        Liveness::Offline,
+        "stale timeline heartbeat must not prevent Offline verdict"
+    );
+
     // ---- Criterion: the `--json` agent output shape is stable. ----
+    // Check both the legacy `AgentState` shape (used by integration helpers)
+    // and the new `AgentListing` envelope shape (used by `agent list/show --json`).
     assert_stable_agent_json(&bob_after_hb, &bob_signing.key_id());
     assert_stable_agent_json(alice_seen_by_bob, &alice_signing.key_id());
+    assert_stable_agent_listing_json(&bob_after_hb, Liveness::Active, &bob_signing.key_id());
+    assert_stable_agent_listing_json(alice_seen_by_bob, Liveness::Active, &alice_signing.key_id());
 }

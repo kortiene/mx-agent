@@ -164,6 +164,30 @@ mx-agent agent show  --room '#demo:localhost' --agent-id alice-agent
 mx-agent agent tools --room '#demo:localhost' --agent-id alice-agent
 ```
 
+`agent list` shows a liveness verdict (`active`/`stale`/`offline`) and a relative
+`last_seen` age derived from the agent's most recent heartbeat:
+
+```text
+mx-agent: 1 agent(s) in #demo:localhost
+  alice-agent              generic  active   active   12s ago    shell,test
+```
+
+`agent show` includes the same fields in detail:
+
+```text
+mx-agent: agent alice-agent
+  kind:         generic
+  status:       active
+  liveness:     active
+  last_seen:    12s ago (1780392000000 ms)
+  ...
+```
+
+The daemon emits a heartbeat for each agent it owns every 30 seconds. An agent
+with no heartbeat for more than 90 seconds shows `stale`; after 300 seconds it
+shows `offline`. Use `--json` to get the full `AgentListing` envelope
+(`{ "agent": {...}, "liveness": "active" }`).
+
 The default `--kind` is `generic` and the default `--max-invocations` is `1`.
 
 ## Run a tool call

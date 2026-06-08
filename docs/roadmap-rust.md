@@ -147,7 +147,7 @@ Acceptance criteria:
 
 ---
 
-## Phase 4 — Agent Registration and Discovery
+## Phase 4 — Agent Registration and Discovery ✅ Delivered
 
 Goal: agents can advertise themselves and discover peers.
 
@@ -168,16 +168,19 @@ com.mxagent.heartbeat.v1
 
 Deliverables:
 
-- durable agent state event.
-- periodic heartbeat event.
-- liveness calculation.
-- capability and tool advertisement.
+- durable agent state event. ✅
+- periodic heartbeat event — daemon emits `com.mxagent.heartbeat.v1` every
+  30 s per owned agent; durable state refreshed at most every 300 s. ✅
+- liveness calculation — `active`/`stale`/`offline` verdict from durable
+  `last_seen_ts` + latest heartbeat event; surfaced in `agent list` /
+  `agent show` (human + `--json`) as `AgentListing { agent, liveness }`. ✅
+- capability and tool advertisement. ✅
 
 Acceptance criteria:
 
-- two daemons in the same room can discover each other.
-- inactive agents become stale after timeout.
-- `--json` output is stable and agent-friendly.
+- two daemons in the same room can discover each other. ✅
+- inactive agents become stale after timeout. ✅
+- `--json` output is stable and agent-friendly. ✅
 
 ---
 

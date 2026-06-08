@@ -360,7 +360,10 @@ pub fn run_scheduler_loop(
 const MAX_ATTEMPTED_TRACKED: usize = 50_000;
 
 /// Sleep for `delay`, waking early when `running` is cleared.
-fn sleep_interruptible(delay: Duration, running: &AtomicBool) {
+///
+/// Shared by the scheduler and heartbeat loops so both wind down promptly on
+/// daemon shutdown rather than blocking a full interval.
+pub(crate) fn sleep_interruptible(delay: Duration, running: &AtomicBool) {
     let step = Duration::from_millis(100);
     let mut remaining = delay;
     while remaining > Duration::ZERO && running.load(Ordering::SeqCst) {
@@ -1516,6 +1519,27 @@ requires_approval = true
         assert!(
             queue.borrow().get("approval:task-a").is_none(),
             "a denied request is removed from the queue"
+        );
+    }
+
+    /// `sleep_interruptible` must wake early when the `running` flag is cleared
+    /// by another thread. This covers the shutdown path shared by both the
+    /// scheduler loop and the heartbeat loop (issue #250).
+    #[test]
+    fn sleep_interruptible_exits_early_when_flag_cleared() {
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flag.store(false, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        // Would block for 10 full seconds if it ignored the flag.
+        sleep_interruptible(Duration::from_secs(10), &running);
+        handle.join().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "sleep_interruptible must wake within ~150ms of the flag clear, not after the full 10s"
         );
     }
 }
