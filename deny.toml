@@ -22,7 +22,16 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 # Specific advisory IDs to temporarily ignore must be listed here with a
 # justification comment. Keep this empty by default.
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0173: `proc-macro-error2` is unmaintained (an "unmaintained"
+    # advisory, not a security vulnerability). It is a build-time proc-macro
+    # crate pulled in only transitively by matrix-sdk 0.18 (via `aquamarine`)
+    # and matrix-sdk-crypto (via `matrix-pickle-derive` -> `matrix-pickle` ->
+    # `vodozemac`); mx-agent does not depend on it directly and there is no safe
+    # upgrade available from our tree. Re-evaluate / remove this entry when a
+    # matrix-sdk release drops the dependency.
+    "RUSTSEC-2026-0173",
+]
 
 # ----------------------------------------------------------------------------
 # License policy. Only the licenses listed below are permitted. Anything else
