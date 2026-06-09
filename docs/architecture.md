@@ -1352,6 +1352,25 @@ response frame per event using the original request id. Event envelopes carry
 the task snapshots/diff metadata needed by the CLI to preserve human and
 `--json` output compatibility.
 
+The IPC server serves each accepted connection on its own detached worker thread
+(after the `SO_PEERCRED` gate, which stays on the accept thread). This means a
+long-lived or parked streaming connection — `task.watch`, `workspace.watch`,
+`exec.pty`, or an interactive `device.verify.start` awaiting an operator
+decision — cannot starve unrelated methods (`status`, `exec`, `approval`,
+`task`, heartbeat) on other connections (issue #258). Restored Matrix clients are
+shared `Arc`-backed `matrix_sdk::Client` clones that synchronize access to the
+crypto/state store internally, so concurrent handlers are safe.
+
+`device.verify.start` multiplexes the operator's confirm/cancel decision onto the
+same single connection that streams its `DeviceVerifyFrame`s (the CLI writes a
+`confirm`/`cancel` control frame back). All three phases of the flow are bounded
+by the same ~300 s deadline: the two `/sync`-driven phases and the operator
+decision wait. The decision wait fails safe to **cancel** — a `confirm` control
+frame received before the deadline is the only path to confirmation; a `cancel`,
+any other method, a malformed frame, EOF, a read error, or the deadline elapsing
+all cancel the verification and emit the `cancelled` frame. So an operator who
+never answers can no longer hang the verification (issue #258).
+
 Stream from daemon to CLI:
 
 ```json

@@ -279,7 +279,13 @@ pub async fn cross_signing_status_for_session(
 
 /// Maximum wall-clock time to wait for an interactive verification step before
 /// the streaming handler gives up and tears the flow down.
-const VERIFY_DEADLINE: Duration = Duration::from_secs(300);
+///
+/// This bounds all three phases of an interactive verify: the two `/sync`-driven
+/// phases (via [`drive_until`]) and the operator-decision wait (via
+/// [`read_verify_decision`]). Without a bound on the decision wait, a stalled
+/// operator or hung client would block the single-threaded IPC dispatch
+/// indefinitely (issue #258).
+pub const VERIFY_DEADLINE: Duration = Duration::from_secs(300);
 
 /// The operator's decision after comparing the short-authentication string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +294,41 @@ pub enum VerifyDecision {
     Confirm,
     /// The strings did not match, or the operator aborted — cancel.
     Cancel,
+}
+
+/// Read the operator's confirm/cancel control frame from `stream`, waiting at
+/// most `timeout`.
+///
+/// Returns [`VerifyDecision::Confirm`] **only** for an explicit, well-formed
+/// `confirm` control frame received before the deadline. A `cancel`, any other
+/// method, a malformed frame, a clean EOF, a read error, **or the timeout
+/// elapsing** all yield [`VerifyDecision::Cancel`]. This is the single
+/// fail-safe classification point: the lone path to `Confirm` is a deliberate
+/// operator confirmation, so a stalled, abandoned, or hung client can never be
+/// mistaken for approval (issue #258).
+///
+/// The wait is bounded by setting a read timeout on the socket: a blocking read
+/// that receives no data returns an error after `timeout`, which the
+/// classification above maps to `Cancel`. The stream's prior read timeout is
+/// saved and restored (best effort) before returning, because the same
+/// connection is reused for the phase-3 result frame and connection teardown.
+pub fn read_verify_decision(
+    stream: &mut std::os::unix::net::UnixStream,
+    timeout: Duration,
+) -> VerifyDecision {
+    let prior = stream.read_timeout().ok().flatten();
+    let _ = stream.set_read_timeout(Some(timeout));
+    let decision = match mx_agent_ipc::read_frame(stream) {
+        Ok(Some(bytes)) => match serde_json::from_slice::<mx_agent_ipc::Request>(&bytes) {
+            Ok(control) if control.method == "confirm" => VerifyDecision::Confirm,
+            _ => VerifyDecision::Cancel,
+        },
+        _ => VerifyDecision::Cancel,
+    };
+    // Restore the prior timeout (best effort) so phase-3 framing/teardown on
+    // this same connection is unaffected.
+    let _ = stream.set_read_timeout(prior);
+    decision
 }
 
 /// Drive an interactive SAS verification over a single held-open connection.
@@ -459,6 +500,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Write a well-formed JSON-RPC request frame with the given method to `stream`.
+    fn write_control_frame(stream: &mut std::os::unix::net::UnixStream, method: &str) {
+        let req =
+            mx_agent_ipc::Request::new(serde_json::json!(1u64), method, serde_json::Value::Null);
+        let bytes = serde_json::to_vec(&req).unwrap();
+        mx_agent_ipc::write_frame(stream, &bytes).unwrap();
+    }
 
     #[test]
     fn device_verify_frames_serialize_with_event_tag() {
@@ -666,5 +715,121 @@ mod tests {
         let json = serde_json::to_string(&params).unwrap();
         let back: DeviceVerifyStartParams = serde_json::from_str(&json).unwrap();
         assert_eq!(back, params);
+    }
+
+    // === Issue #258: read_verify_decision fail-safe semantics ===
+
+    #[test]
+    fn verify_deadline_is_300_seconds() {
+        // The decision wait must use the same ~300 s budget as the SAS phases.
+        assert_eq!(VERIFY_DEADLINE, std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn read_verify_decision_confirm_returns_confirm() {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        write_control_frame(&mut writer, "confirm");
+        drop(writer);
+        assert_eq!(
+            read_verify_decision(&mut reader, std::time::Duration::from_secs(5)),
+            VerifyDecision::Confirm,
+        );
+    }
+
+    #[test]
+    fn read_verify_decision_cancel_method_returns_cancel() {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        write_control_frame(&mut writer, "cancel");
+        drop(writer);
+        assert_eq!(
+            read_verify_decision(&mut reader, std::time::Duration::from_secs(5)),
+            VerifyDecision::Cancel,
+        );
+    }
+
+    #[test]
+    fn read_verify_decision_unknown_method_returns_cancel() {
+        // "device.verify.confirm" is not the bare "confirm" control frame.
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        write_control_frame(&mut writer, "device.verify.confirm");
+        drop(writer);
+        assert_eq!(
+            read_verify_decision(&mut reader, std::time::Duration::from_secs(5)),
+            VerifyDecision::Cancel,
+        );
+    }
+
+    #[test]
+    fn read_verify_decision_malformed_json_returns_cancel() {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        mx_agent_ipc::write_frame(&mut writer, b"{not valid json}").unwrap();
+        drop(writer);
+        assert_eq!(
+            read_verify_decision(&mut reader, std::time::Duration::from_secs(5)),
+            VerifyDecision::Cancel,
+        );
+    }
+
+    #[test]
+    fn read_verify_decision_eof_returns_cancel() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(writer); // immediate EOF — no frame
+        assert_eq!(
+            read_verify_decision(&mut reader, std::time::Duration::from_secs(5)),
+            VerifyDecision::Cancel,
+        );
+    }
+
+    #[test]
+    fn read_verify_decision_timeout_returns_cancel() {
+        let (mut reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // _writer stays open so the reader never sees EOF; the deadline must fire.
+        assert_eq!(
+            read_verify_decision(&mut reader, std::time::Duration::from_millis(20)),
+            VerifyDecision::Cancel,
+        );
+    }
+
+    #[test]
+    fn read_verify_decision_restores_prior_timeout() {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Set a recognisable pre-existing timeout that differs from VERIFY_DEADLINE.
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(42)))
+            .unwrap();
+        write_control_frame(&mut writer, "confirm");
+        drop(writer);
+        let _ = read_verify_decision(&mut reader, std::time::Duration::from_secs(5));
+        // The original timeout must survive the call (same connection is reused).
+        assert_eq!(
+            reader.read_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(42)),
+            "read_verify_decision must restore the prior socket read timeout",
+        );
+    }
+
+    #[test]
+    fn read_verify_decision_only_exact_confirm_is_confirm() {
+        // Fail-safe regression (issue #258): only the bare "confirm" method may
+        // yield Confirm; all other strings must yield Cancel.
+        let non_confirm = [
+            "CONFIRM",
+            "Confirm",
+            "cancel",
+            "device.verify.confirm",
+            "confirm.sas",
+            "",
+        ];
+        for method in &non_confirm {
+            let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+            write_control_frame(&mut writer, method);
+            drop(writer);
+            assert_eq!(
+                read_verify_decision(&mut reader, std::time::Duration::from_secs(5)),
+                VerifyDecision::Cancel,
+                "method {:?} must yield Cancel, not Confirm",
+                method,
+            );
+        }
     }
 }

@@ -1232,17 +1232,14 @@ fn dispatch_device_verify(
         }
     };
     // The operator's confirm/cancel arrives as a control frame on this same
-    // connection (the IPC server is single-threaded). A `cancel` method, EOF, or
-    // any read error fails safe to a cancel — never an unintended confirm.
+    // connection. The wait is bounded by `VERIFY_DEADLINE`: a stalled operator or
+    // hung client cannot park the dispatch thread forever. A `cancel` method,
+    // EOF, any read error, or the deadline elapsing all fail safe to a cancel —
+    // never an unintended confirm (issue #258). Classification lives entirely in
+    // `read_verify_decision`.
     let wait_decision = || {
         let mut guard = stream_cell.borrow_mut();
-        match mx_agent_ipc::read_frame(&mut **guard) {
-            Ok(Some(bytes)) => match serde_json::from_slice::<Request>(&bytes) {
-                Ok(control) if control.method == "confirm" => crate::VerifyDecision::Confirm,
-                _ => crate::VerifyDecision::Cancel,
-            },
-            _ => crate::VerifyDecision::Cancel,
-        }
+        crate::read_verify_decision(&mut guard, crate::VERIFY_DEADLINE)
     };
 
     let result = runtime.block_on(crate::run_device_verify(

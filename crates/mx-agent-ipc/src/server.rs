@@ -2,6 +2,7 @@
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -59,7 +60,7 @@ where
 /// and does not stop the server.
 pub fn serve<F>(listener: &UnixListener, handler: F) -> io::Result<()>
 where
-    F: Fn(&Request) -> Response,
+    F: Fn(&Request) -> Response + Send + Sync + 'static,
 {
     serve_streaming(listener, move |request, stream| {
         let response = handler(request);
@@ -73,10 +74,18 @@ where
 /// This preserves the normal request/one-response behavior for most methods and
 /// allows long-lived streaming methods such as `task.watch` to send an initial
 /// response followed by change responses on the same Unix-socket connection.
+///
+/// Each accepted connection is served on its own detached worker thread, so a
+/// long-lived or parked connection (e.g. an interactive `device.verify.start`
+/// awaiting an operator decision, or a `task.watch`/`exec.pty` stream) cannot
+/// starve unrelated IPC methods on other connections (issue #258). The
+/// peer-credential gate ([`verify_peer`]) stays on the accept thread, before any
+/// worker is spawned, so concurrency does not weaken the UID check.
 pub fn serve_streaming<F>(listener: &UnixListener, handler: F) -> io::Result<()>
 where
-    F: Fn(&Request, &mut UnixStream) -> io::Result<()>,
+    F: Fn(&Request, &mut UnixStream) -> io::Result<()> + Send + Sync + 'static,
 {
+    let handler = Arc::new(handler);
     let mut warned_unsupported = false;
     for stream in listener.incoming() {
         match stream {
@@ -107,9 +116,15 @@ where
                         }
                     }
                 }
-                if let Err(e) = serve_streaming_connection(&mut stream, &handler) {
-                    tracing::debug!(error = %e, "ipc connection ended with error");
-                }
+                // Serve this connection on a detached worker so a long-held or
+                // parked connection cannot block the accept loop or starve other
+                // connections.
+                let handler = Arc::clone(&handler);
+                std::thread::spawn(move || {
+                    if let Err(e) = serve_streaming_connection(&mut stream, &*handler) {
+                        tracing::debug!(error = %e, "ipc connection ended with error");
+                    }
+                });
             }
             Err(e) => {
                 tracing::warn!(error = %e, "ipc accept failed");
@@ -152,5 +167,93 @@ mod tests {
         let bytes = serde_json::to_vec(&Request::new(json!(1), "nope", Value::Null)).unwrap();
         let resp = handle_message(&bytes, &handler);
         assert_eq!(resp.error.unwrap().code, crate::rpc::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn serve_streaming_concurrent_connections_do_not_block() {
+        // Regression test for issue #258: a parked connection on one worker thread
+        // must not prevent a second connection from being served.
+        use crate::frame::{read_frame, write_frame};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        static CTR: AtomicUsize = AtomicUsize::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let socket_path =
+            std::env::temp_dir().join(format!("mx_ipc_conc_{}_{}.sock", std::process::id(), n));
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).ok();
+        }
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server_listener = listener.try_clone().unwrap();
+
+        let handler_started = Arc::new(AtomicBool::new(false));
+        let handler_released = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&handler_started);
+        let released = Arc::clone(&handler_released);
+
+        std::thread::spawn(move || {
+            serve_streaming(&server_listener, move |req, stream| {
+                if req.method == "slow" {
+                    started.store(true, Ordering::SeqCst);
+                    while !released.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                let resp = Response::result(req.id.clone(), Value::Null);
+                let bytes = serde_json::to_vec(&resp).unwrap();
+                write_frame(stream, &bytes)?;
+                Ok(())
+            })
+            .ok();
+        });
+
+        // Connection 1: parks its worker thread with a "slow" request.
+        let mut conn1 = UnixStream::connect(&socket_path).unwrap();
+        let req1 = Request::new(json!(1), "slow", Value::Null);
+        write_frame(&mut conn1, &serde_json::to_vec(&req1).unwrap()).unwrap();
+
+        // Wait until connection 1's handler has actually started.
+        while !handler_started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Connection 2: must be served while connection 1 is still parked.
+        let mut conn2 = UnixStream::connect(&socket_path).unwrap();
+        let req2 = Request::new(json!(2), "fast", Value::Null);
+        write_frame(&mut conn2, &serde_json::to_vec(&req2).unwrap()).unwrap();
+        conn2
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let frame2 = read_frame(&mut conn2)
+            .expect("read error on connection 2")
+            .expect(
+                "connection 2 got EOF — concurrent connections must not be blocked (issue #258)",
+            );
+        let resp2: Response = serde_json::from_slice(&frame2).unwrap();
+        assert!(
+            !resp2.is_error(),
+            "connection 2 response must not be an error"
+        );
+
+        // Release connection 1 and confirm it also completes.
+        handler_released.store(true, Ordering::SeqCst);
+        conn1
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let frame1 = read_frame(&mut conn1)
+            .expect("read error on connection 1")
+            .expect("connection 1 must complete after release");
+        let resp1: Response = serde_json::from_slice(&frame1).unwrap();
+        assert!(
+            !resp1.is_error(),
+            "connection 1 response must not be an error"
+        );
+
+        std::fs::remove_file(&socket_path).ok();
     }
 }
