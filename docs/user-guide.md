@@ -419,8 +419,8 @@ mx-agent agent register --room '#demo:localhost' \
 # 4. Both agents are now discoverable in the workspace.
 mx-agent agent list --room '#demo:localhost'
 #   mx-agent: 2 agent(s) in #demo:localhost
-#     alice-agent  generic  online  shell,test
-#     bob-agent    generic  online  shell
+#     alice-agent              generic  active   active   8s ago     shell,test
+#     bob-agent                generic  active   active   3s ago     shell
 
 # 5. Run a tool call and an exec. Both are daemon-mediated over local IPC, so a
 #    daemon must be running (start it once; it stays up in the background).

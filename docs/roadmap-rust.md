@@ -380,9 +380,10 @@ Goal: implement distributed workflow tracking.
 > invocation/task linkage, `state_rev` revisions, and stale-update detection. A
 > daemon **task-orchestration engine** (scheduler, optimistic claiming, tool/exec
 > dispatch, policy + trust/signature + approval enforcement, restart recovery,
-> and DAG diagnostics) is implemented and tested. Remaining work: wiring that
-> engine into a live `/sync` scheduler loop so a running daemon auto-executes
-> tasks, plus the signed Matrix transport for remote `exec` (tracked by #155).
+> and DAG diagnostics) is implemented and tested. The engine is wired into a live
+> `/sync` scheduler loop, so a running daemon auto-executes ready tasks
+> (`run_scheduler_loop`), and the signed Matrix transport for remote `exec` is
+> delivered (#199/#200/#196/#155, all closed).
 
 Commands:
 
