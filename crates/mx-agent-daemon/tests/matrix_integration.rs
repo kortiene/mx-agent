@@ -2817,12 +2817,37 @@ async fn live_device_manual_verify_and_sender_verified() {
 ///
 /// Run via `scripts/matrix_integration_test.sh` alongside the rest of the
 /// Matrix integration suite.
+///
+/// ## Isolation: this test needs a pristine cross-signing identity
+///
+/// Unlike the other live tests, this one calls `bootstrap_cross_signing` and
+/// asserts the device ends up holding the **private** master key. That only
+/// happens when the account has *no* cross-signing identity on the server yet:
+/// `bootstrap_cross_signing_if_needed` correctly **no-ops** when the server
+/// already advertises one (the documented re-provision path is then `recover`
+/// with the backup key, not a re-bootstrap). Because a Matrix account keeps its
+/// cross-signing identity server-side, reusing the shared `MX_AGENT_TEST_USER`
+/// makes this test pass on a pristine homeserver but fail on every subsequent
+/// run. It therefore logs in as a **dedicated, freshly-registered user**
+/// (`MX_AGENT_TEST_RECOVERY_USER`, provisioned per run by the harness) so each
+/// run starts from a clean cross-signing state. Do not collapse this back onto
+/// the shared user — that reintroduces the cross-run flake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_recovery_enable_and_status() {
+    // Enable logging so CI captures daemon decisions on failure (--nocapture).
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
-    let alice_user = required_env("MX_AGENT_TEST_USER");
-    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    // Prefer the per-run recovery user (pristine cross-signing state); fall back
+    // to the shared user so a direct `cargo test` invocation still runs (it is
+    // only hermetic against a freshly-reset homeserver — see the doc comment).
+    let alice_user = std::env::var("MX_AGENT_TEST_RECOVERY_USER")
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_USER"));
+    let alice_pass = std::env::var("MX_AGENT_TEST_RECOVERY_PASSWORD")
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_PASSWORD"));
 
     let data_dir = throwaway_data_dir();
     std::env::set_var(ENV_DATA_DIR, &data_dir);
