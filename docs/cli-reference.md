@@ -334,7 +334,7 @@ mx-agent [GLOBAL] auth login --homeserver <URL> --user <USER>
 | `--user` | `<USER>` | yes | — | Matrix user localpart or full user ID |
 
 **Behavior**
-Checks the `MX_AGENT_PASSWORD` environment variable for a password; if not set, prompts on stderr with `Matrix password:` (not echoed). Performs interactive password authentication against the homeserver, obtains a session token, and persists it in the data directory (not readable by agents). Session includes device ID and access token (wrapped as `Secret` so never logged). The daemon automatically re-syncs and E2EE-registers the device on first restart. In human mode, prints `mx-agent: logged in as {user_id}` followed by indented `device: {device_id}`; in `--json`, outputs an `AuthStatus` object with keys `logged_in`, `user_id`, `device_id`, `homeserver`.
+Checks the `MX_AGENT_PASSWORD` environment variable for a password; if not set, prompts on stderr with `Matrix password:` (echo suppressed on TTY stdin via an RAII guard; transparent for non-TTY input such as pipes or CI harnesses). Performs interactive password authentication against the homeserver, obtains a session token, and persists it in the data directory (not readable by agents). Session includes device ID and access token (wrapped as `Secret` so never logged). The daemon automatically re-syncs and E2EE-registers the device on first restart. In human mode, prints `mx-agent: logged in as {user_id}` followed by indented `device: {device_id}`; in `--json`, outputs an `AuthStatus` object with keys `logged_in`, `user_id`, `device_id`, `homeserver`.
 
 **Exit codes**
 
@@ -358,7 +358,7 @@ mx-agent --json auth login --homeserver https://matrix.org --user alice
 
 **Notes**
 
-- The password is never echoed, logged, or passed as a command-line argument (safe for shell history).
+- The password is never echoed, logged, or passed as a command-line argument (safe for shell history). When stdin is a TTY, an RAII guard clears terminal echo (`ECHO`/`ECHONL`) for the duration of the interactive read and restores it unconditionally on return, early error, or panic unwind — typed characters do not appear on screen or land in terminal scrollback. Non-TTY stdin (pipe, here-doc, CI harness) is handled transparently without echo manipulation.
 - The `MX_AGENT_PASSWORD` env var must be set or the CLI prompts on stderr.
 - The daemon does not require a running instance to login; it runs standalone. Session is read by the daemon on next start.
 - The session token is never exposed to the CLI or agents; only the daemon accesses it.

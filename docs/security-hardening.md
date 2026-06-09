@@ -111,7 +111,10 @@ command runs, its environment is built from scratch:
 `signing_key.ed25519` can act as you. Never copy them off-box, never commit
 them, and never pass a password as a flag — use the `MX_AGENT_PASSWORD`
 environment variable or the interactive prompt so it stays out of shell history
-and `ps`.
+and `ps`. The interactive `Matrix password:` prompt suppresses terminal echo
+(`ECHO`/`ECHONL`) for the duration of the read, restored unconditionally on
+return or error — typed characters do not appear on screen or persist in
+scrollback.
 
 ## Trust bootstrap
 
@@ -456,7 +459,8 @@ to structured fields here.
 - [ ] `env_allowlist` short; rely on the built-in secret scrub.
 - [ ] Peer fingerprints verified out-of-band before `trust approve`.
 - [ ] `session.json` / `signing_key.ed25519` kept `0600`, never copied or
-      committed; passwords passed via `MX_AGENT_PASSWORD`, not flags.
+      committed; passwords passed via `MX_AGENT_PASSWORD` or the interactive
+      prompt, never as flags; the interactive prompt suppresses terminal echo.
 - [ ] `crypto-store/` (`0700`) and `crypto-store-key` (`0600`) left daemon-owned; never copied off-box.
 - [ ] `recovery enable` run once per daemon identity; recovery key stored safely offline (shown once, never logged or persisted in clear).
 - [ ] After a re-provision onto a new host, `recovery recover` run before accepting privileged events so history remains decryptable.

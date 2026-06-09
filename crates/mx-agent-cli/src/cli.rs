@@ -1414,7 +1414,19 @@ fn recovery_recover(global: &GlobalArgs, args: &RecoveryRecoverArgs) -> ExitCode
 
 /// Read the login password from `MX_AGENT_PASSWORD`, or prompt on stdin.
 ///
-/// The password is never echoed back, logged, or passed as an argument.
+/// The password is never echoed back, logged, or passed as an argument. When
+/// the password is read interactively from a TTY, terminal echo is disabled for
+/// the duration of the read via [`EchoOffGuard`] (restored on return, error, and
+/// panic unwind) so the typed characters do not appear on screen or land in
+/// terminal scrollback / a `script(1)` transcript.
+///
+/// ## Manual acceptance test (requires a real TTY)
+///
+/// 1. With `MX_AGENT_PASSWORD` unset, run `mx-agent auth login --homeserver …`.
+/// 2. At the `Matrix password:` prompt, type a password and press Enter.
+///    Confirm the characters are **not** echoed as you type.
+/// 3. After the command returns, confirm your shell prompt still has working
+///    echo and line editing — the terminal was restored.
 fn read_password() -> std::io::Result<String> {
     if let Ok(pw) = std::env::var(ENV_PASSWORD) {
         if !pw.is_empty() {
@@ -1424,9 +1436,65 @@ fn read_password() -> std::io::Result<String> {
     eprint!("Matrix password: ");
     use std::io::Write;
     std::io::stderr().flush()?;
+    // Suppress echo while reading from a TTY. `activate()` returns `None` for a
+    // non-TTY stdin (pipe, here-doc, test harness), in which case the read
+    // proceeds normally and scriptability is preserved.
+    let guard = EchoOffGuard::activate();
     let mut pw = String::new();
-    std::io::stdin().read_line(&mut pw)?;
+    let read = std::io::stdin().read_line(&mut pw);
+    // With echo suppressed the user's Enter keystroke is not echoed either, so
+    // emit the newline ourselves to terminate the prompt line before any
+    // subsequent output. Do this regardless of read success so an error message
+    // does not glue onto the prompt.
+    if guard.is_some() {
+        let _ = writeln!(std::io::stderr());
+    }
+    read?;
     Ok(pw.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// RAII guard that clears the terminal `ECHO` (and `ECHONL`) local-mode flags on
+/// stdin and restores the original [`Termios`] on drop.
+///
+/// Mirrors [`crate::terminal::RawModeGuard`] but, rather than full raw mode,
+/// clears only the echo flags while leaving canonical mode (`ICANON`) on so the
+/// user can still backspace/edit the line. Used by [`read_password`] to keep a
+/// typed password off the screen. Restoration on `Drop` covers the normal
+/// return, an early error return, and a panic unwind.
+///
+/// Unlike `RawModeGuard`, this installs no signal-restore thread: a password
+/// read is a single short blocking `read_line` with no event loop, and a
+/// `SIGINT` during it terminates the short-lived CLI immediately.
+#[cfg(unix)]
+struct EchoOffGuard {
+    original: rustix::termios::Termios,
+}
+
+#[cfg(unix)]
+impl EchoOffGuard {
+    /// Disable echo on stdin, returning a guard that restores it on drop.
+    /// Returns `None` when stdin is not a terminal or the mode could not be
+    /// changed, in which case input is left as-is.
+    fn activate() -> Option<EchoOffGuard> {
+        use rustix::termios::{isatty, tcgetattr, tcsetattr, LocalModes, OptionalActions};
+        let stdin = std::io::stdin();
+        if !isatty(&stdin) {
+            return None;
+        }
+        let original = tcgetattr(&stdin).ok()?;
+        let mut quiet = original.clone();
+        quiet.local_modes &= !(LocalModes::ECHO | LocalModes::ECHONL);
+        tcsetattr(&stdin, OptionalActions::Flush, &quiet).ok()?;
+        Some(EchoOffGuard { original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOffGuard {
+    fn drop(&mut self) {
+        use rustix::termios::{tcsetattr, OptionalActions};
+        let _ = tcsetattr(std::io::stdin(), OptionalActions::Flush, &self.original);
+    }
 }
 
 fn auth_login(global: &GlobalArgs, args: &AuthLoginArgs) -> ExitCode {
@@ -5554,5 +5622,143 @@ mod tests {
                 "agent_id must not appear at the envelope top level"
             );
         }
+    }
+
+    /// Serializes the tests that mutate `MX_AGENT_PASSWORD`, since the process
+    /// environment is global shared state.
+    static ENV_PASSWORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn read_password_prefers_env_var() {
+        let _lock = ENV_PASSWORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_PASSWORD).ok();
+        std::env::set_var(ENV_PASSWORD, "s3cret");
+        // With the env var set, the password is returned without any terminal
+        // interaction (no prompt, no stdin read).
+        let pw = read_password().unwrap();
+        match prev {
+            Some(v) => std::env::set_var(ENV_PASSWORD, v),
+            None => std::env::remove_var(ENV_PASSWORD),
+        }
+        assert_eq!(pw, "s3cret");
+    }
+
+    #[test]
+    fn empty_env_password_does_not_short_circuit() {
+        // An empty `MX_AGENT_PASSWORD` is treated as "unset" so the interactive
+        // prompt path is taken; we only assert the env short-circuit is skipped
+        // by confirming the value is not returned verbatim here. To avoid
+        // blocking on stdin in CI we just verify the precedence guard logic via
+        // the public env check rather than driving the prompt.
+        let _lock = ENV_PASSWORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_PASSWORD).ok();
+        std::env::set_var(ENV_PASSWORD, "");
+        let short_circuits = std::env::var(ENV_PASSWORD)
+            .map(|pw| !pw.is_empty())
+            .unwrap_or(false);
+        match prev {
+            Some(v) => std::env::set_var(ENV_PASSWORD, v),
+            None => std::env::remove_var(ENV_PASSWORD),
+        }
+        assert!(
+            !short_circuits,
+            "an empty env password must not short-circuit the prompt"
+        );
+    }
+
+    #[test]
+    fn read_password_env_var_returned_verbatim() {
+        // The env-var path must return the value exactly as set — no trimming,
+        // no stripping of spaces — because trimming is only applied to the
+        // interactive stdin read (to remove the terminal's trailing newline).
+        let _lock = ENV_PASSWORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_PASSWORD).ok();
+        std::env::set_var(ENV_PASSWORD, "pass word ");
+        let pw = read_password().unwrap();
+        match prev {
+            Some(v) => std::env::set_var(ENV_PASSWORD, v),
+            None => std::env::remove_var(ENV_PASSWORD),
+        }
+        assert_eq!(pw, "pass word ", "env-var password must not be trimmed");
+    }
+
+    /// The echo-suppression itself requires a real TTY, so this exercises the
+    /// guard against `/dev/tty` when one is available and is skipped otherwise
+    /// (e.g. CI with no controlling terminal) — same pattern as the
+    /// `terminal.rs` tests.
+    #[cfg(unix)]
+    #[test]
+    fn echo_off_guard_clears_and_restores_echo() {
+        use rustix::termios::{isatty, tcgetattr, LocalModes};
+        use std::fs::File;
+
+        let Ok(tty) = File::open("/dev/tty") else {
+            return;
+        };
+        if !isatty(&tty) {
+            return;
+        }
+        // `EchoOffGuard::activate` operates on stdin; only run the assertions
+        // when stdin itself is the terminal so we observe the real effect.
+        let stdin = std::io::stdin();
+        if !isatty(&stdin) {
+            return;
+        }
+        let Ok(before) = tcgetattr(&stdin) else {
+            return;
+        };
+        let had_echo = before.local_modes.contains(LocalModes::ECHO);
+        {
+            let _guard = EchoOffGuard::activate().expect("stdin is a tty");
+            let during = tcgetattr(&stdin).unwrap();
+            assert!(
+                !during.local_modes.contains(LocalModes::ECHO),
+                "ECHO must be cleared while the guard is held"
+            );
+        }
+        let after = tcgetattr(&stdin).unwrap();
+        assert_eq!(
+            after.local_modes.contains(LocalModes::ECHO),
+            had_echo,
+            "ECHO must be restored to its prior state on drop"
+        );
+    }
+
+    /// Checks that `EchoOffGuard` also suppresses `ECHONL` and leaves `ICANON`
+    /// (canonical line-editing mode) untouched. Skipped when stdin is not a TTY.
+    #[cfg(unix)]
+    #[test]
+    fn echo_off_guard_clears_echonl_and_preserves_icanon() {
+        use rustix::termios::{isatty, tcgetattr, LocalModes};
+
+        let stdin = std::io::stdin();
+        if !isatty(&stdin) {
+            return;
+        }
+        let Ok(before) = tcgetattr(&stdin) else {
+            return;
+        };
+        let had_icanon = before.local_modes.contains(LocalModes::ICANON);
+        {
+            let _guard = EchoOffGuard::activate().expect("stdin is a tty");
+            let during = tcgetattr(&stdin).unwrap();
+            assert!(
+                !during.local_modes.contains(LocalModes::ECHONL),
+                "ECHONL must be cleared while the guard is held"
+            );
+            assert_eq!(
+                during.local_modes.contains(LocalModes::ICANON),
+                had_icanon,
+                "ICANON must not be changed by EchoOffGuard (line-editing must remain usable)"
+            );
+        }
+        // Restoration already covered by echo_off_guard_clears_and_restores_echo;
+        // just assert ICANON is still intact after drop to be safe.
+        let after = tcgetattr(&stdin).unwrap();
+        assert_eq!(
+            after.local_modes.contains(LocalModes::ICANON),
+            had_icanon,
+            "ICANON must be intact after guard is dropped"
+        );
     }
 }

@@ -108,6 +108,8 @@ Every **privileged** timeline event (`exec.request`, `exec.cancel`, `call.reques
 
 The verifying daemon recomputes canonical JSON, checks the signature against the trusted `key_id` (see [[Security & Sandboxing|Security-and-Sandboxing]]), then validates `nonce`/`expires_at` before any routing or policy decision for request types whose schema carries those fields.
 
+**Canonical JSON contract.** The canonical JSON encoder follows the Matrix spec exactly: object keys sorted lexicographically, no insignificant whitespace, standard JSON string escaping, arrays in insertion order. **Floating-point numbers are rejected** — the encoder returns `CanonicalJsonError::NonIntegerNumber` rather than producing bytes a strict Matrix peer would compute differently. All fields appearing in signed events must be integers, strings, booleans, nulls, arrays, or objects; a payload containing a float cannot be signed or verified and will fail at the signing step. Integer encoding is unchanged (plain decimal string, no coercion), so existing signatures remain valid.
+
 ---
 
 ## Concrete Wire Specs

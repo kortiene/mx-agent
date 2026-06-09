@@ -146,6 +146,52 @@ fn call_uses_daemon_ipc_path() {
     let _ = std::fs::remove_dir_all(&runtime_dir);
 }
 
+/// `mx-agent auth login` reads the password from `MX_AGENT_PASSWORD` rather
+/// than hanging on an interactive TTY prompt (issue #273). When the env var is
+/// set the binary must attempt the login (failing at the network level for an
+/// unreachable homeserver) rather than printing "no password provided".
+///
+/// Using `127.0.0.1:1` as the homeserver guarantees an immediate connection
+/// failure with no external dependency. The assertion boundary is: the env-var
+/// read path works in the compiled binary, not that login itself succeeds.
+#[test]
+fn auth_login_reads_password_from_env_not_stdin() {
+    let runtime_dir = unique_runtime_dir();
+    let out = Command::new(BIN)
+        .args([
+            "auth",
+            "login",
+            "--homeserver",
+            "https://127.0.0.1:1",
+            "--user",
+            "@test:localhost",
+        ])
+        .env("MX_AGENT_RUNTIME_DIR", &runtime_dir)
+        .env("MX_AGENT_LOG", "off")
+        .env("MX_AGENT_PASSWORD", "hunter2")
+        .output()
+        .expect("failed to run mx-agent");
+
+    assert!(!out.status.success(), "login to port 1 must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The env-var path was taken: we must NOT see the "no password provided"
+    // message that would appear when the password is empty or unset.
+    assert!(
+        !stderr.contains("no password provided"),
+        "env-var password must bypass the 'no password' guard: {stderr}"
+    );
+    // The failure must be a network / login error, not a password-reading error.
+    // Any of the expected phrases confirm the login was attempted.
+    let attempted = stderr.contains("login failed")
+        || stderr.contains("could not")
+        || stderr.contains("error")
+        || stderr.contains("failed");
+    assert!(
+        attempted,
+        "expected a login/network error in stderr: {stderr}"
+    );
+}
+
 /// `mx-agent exec` runs through the daemon IPC path (issue #155): it fails
 /// clearly when no daemon is running, and otherwise the daemon — not the CLI —
 /// runs the command and returns the output frames the CLI renders.

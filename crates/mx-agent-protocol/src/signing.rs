@@ -47,6 +47,11 @@ pub enum SignatureError {
     MalformedSignature,
     /// The signature did not verify against the provided key and payload.
     Invalid,
+    /// The content could not be encoded as canonical JSON (e.g. it carries a
+    /// floating-point number, which Matrix canonical JSON forbids). Failing
+    /// closed here prevents signing over bytes a strict Matrix peer would
+    /// compute differently.
+    NonCanonical(canonical_json::CanonicalJsonError),
 }
 
 impl std::fmt::Display for SignatureError {
@@ -57,6 +62,7 @@ impl std::fmt::Display for SignatureError {
             Self::UnsupportedAlg(alg) => write!(f, "unsupported signature algorithm: {alg}"),
             Self::MalformedSignature => write!(f, "signature is malformed"),
             Self::Invalid => write!(f, "signature verification failed"),
+            Self::NonCanonical(e) => write!(f, "content is not canonicalizable: {e}"),
         }
     }
 }
@@ -81,7 +87,8 @@ pub fn signing_bytes(content: &Value) -> Result<Vec<u8>, SignatureError> {
             unsigned.insert(key.clone(), value.clone());
         }
     }
-    Ok(canonical_json::to_canonical_bytes(&Value::Object(unsigned)))
+    canonical_json::to_canonical_bytes(&Value::Object(unsigned))
+        .map_err(SignatureError::NonCanonical)
 }
 
 /// Sign `content` with `signing_key`, returning the detached [`Signature`].
@@ -345,6 +352,79 @@ mod tests {
         assert_eq!(
             signing_bytes(&json!([1, 2, 3])),
             Err(SignatureError::NotAnObject)
+        );
+    }
+
+    #[test]
+    fn signing_error_display() {
+        // Verify every `SignatureError` variant formats to a non-empty message
+        // and that `NonCanonical` forwards the inner `CanonicalJsonError` text.
+        use canonical_json::CanonicalJsonError;
+        assert!(!SignatureError::NotAnObject.to_string().is_empty());
+        assert!(!SignatureError::MissingSignature.to_string().is_empty());
+        assert!(!SignatureError::UnsupportedAlg("hmac".to_string())
+            .to_string()
+            .is_empty());
+        assert!(SignatureError::UnsupportedAlg("hmac".to_string())
+            .to_string()
+            .contains("hmac"));
+        assert!(!SignatureError::MalformedSignature.to_string().is_empty());
+        assert!(!SignatureError::Invalid.to_string().is_empty());
+        let inner = CanonicalJsonError::NonIntegerNumber;
+        let wrapped = SignatureError::NonCanonical(inner.clone());
+        assert!(
+            wrapped.to_string().contains(&inner.to_string()),
+            "NonCanonical display must embed the inner error message"
+        );
+    }
+
+    #[test]
+    fn verify_with_float_content_fails() {
+        // `verify` must reject float-bearing content at the `signing_bytes` step,
+        // returning `NonCanonical` rather than `Invalid`. This exercises the path
+        // that `float_content_fails_to_sign` does not cover.
+        let key = test_key();
+        let mut content = sample_content();
+        sign_into(&key, "mxagent-ed25519:test", &mut content).unwrap();
+        // Inject a float field after the signature was embedded.
+        content
+            .as_object_mut()
+            .unwrap()
+            .insert("rate".to_string(), serde_json::json!(0.5));
+        assert_eq!(
+            verify(&key.verifying_key(), &content),
+            Err(SignatureError::NonCanonical(
+                canonical_json::CanonicalJsonError::NonIntegerNumber
+            )),
+            "verify must fail with NonCanonical, not Invalid, for float-bearing content"
+        );
+    }
+
+    #[test]
+    fn float_content_fails_to_sign() {
+        // Matrix canonical JSON forbids floats; a float-bearing field must fail
+        // closed at the signing boundary rather than be signed over
+        // non-canonical bytes.
+        let key = test_key();
+        let content = json!({ "amount": 1.5 });
+        assert_eq!(
+            signing_bytes(&content),
+            Err(SignatureError::NonCanonical(
+                canonical_json::CanonicalJsonError::NonIntegerNumber
+            ))
+        );
+        assert_eq!(
+            sign(&key, "mxagent-ed25519:test", &content),
+            Err(SignatureError::NonCanonical(
+                canonical_json::CanonicalJsonError::NonIntegerNumber
+            ))
+        );
+        let mut to_embed = content.clone();
+        assert_eq!(
+            sign_into(&key, "mxagent-ed25519:test", &mut to_embed),
+            Err(SignatureError::NonCanonical(
+                canonical_json::CanonicalJsonError::NonIntegerNumber
+            ))
         );
     }
 }
