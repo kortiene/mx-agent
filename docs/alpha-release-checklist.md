@@ -139,13 +139,14 @@ it here before release.
 - **PTY signal semantics are partial.** Controlling-tty and full Ctrl-C
   semantics for `exec --pty` are intentionally limited; the workspace forbids
   `unsafe`, so PTY/termios use the safe `rustix` path.
-- **Very-large-output tuning and production E2EE hardening are still landing.**
-  Large-output artifact mode already ships: streams that exceed the timeline
-  budget can be uploaded as Matrix media with SHA-256 integrity, optional zstd
-  compression, and a tail preview. E2EE privileged-event decryption and
-  fail-safe handling for undecryptable events also ship today. Remaining E2EE
-  production hardening includes device verification UX, cross-signing, and key
-  backup; remaining artifact work is tuning for very large outputs.
+- **Very-large-output tuning is still landing.** Large-output artifact mode
+  already ships: streams that exceed the timeline budget can be uploaded as
+  Matrix media with SHA-256 integrity, optional zstd compression, and a tail
+  preview; remaining artifact work is tuning for very large outputs. E2EE
+  privileged-event decryption and fail-safe handling for undecryptable events
+  ship today, and **production E2EE hardening shipped** (#240/#256): device
+  verification UX, cross-signing, and server-side key backup/recovery — see
+  `README.md` and roadmap Phase 12.
 - **Sandbox is not a security boundary on its own.** The `none`, `bubblewrap`,
   and Docker/Podman container backends are implemented and policy-selectable.
   `read_only_paths` / `writable_paths` filesystem-bind confinement and `network`

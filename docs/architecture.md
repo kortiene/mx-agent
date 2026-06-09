@@ -1434,9 +1434,10 @@ Daemon behavior:
 On daemon startup or reconnect:
 
 1. Resume Matrix sync from stored sync token.
-2. Load active invocations from local store.
+2. Load the executing-task snapshot from `com.mxagent.task.v1` room state.
 3. Fetch room state for agent/task/invocation snapshots.
-4. Reconcile local process table with invocation state.
+4. Reconcile executing tasks against the `com.mxagent.invocation.v1` snapshot
+   and the live-invocation id set (no OS process table is consulted).
 5. Emit recovery updates for orphaned, failed, or completed invocations.
 6. Rebuild stream cursors per `(invocation_id, stream)`.
 

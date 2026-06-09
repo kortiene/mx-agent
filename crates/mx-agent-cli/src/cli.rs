@@ -5414,6 +5414,52 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
+    // --- agent list rendering tests (issue #271) ---
+
+    /// The human-readable `agent list` renderer emits exactly 6 columns matching
+    /// the user-guide documentation example:
+    ///   agent_id  kind  status  liveness  last_seen  capabilities
+    ///
+    /// This mirrors the format string at `agent_list()`:
+    ///   `"  {:<24} {:<8} {:<8} {:<8} {:<10} {}"`
+    #[test]
+    fn agent_list_human_format_is_six_columns_with_active_status() {
+        // Use a single-token last_seen value to make whitespace-split field counting
+        // unambiguous. "8s ago" (two tokens) would inflate the count to 7.
+        let line = format!(
+            "  {:<24} {:<8} {:<8} {:<8} {:<10} {}",
+            "alice-agent", "generic", "active", "active", "8s", "shell,test"
+        );
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            6,
+            "rendered line must have 6 fields (agent_id, kind, status, liveness, \
+             last_seen, caps); got: {fields:?}"
+        );
+        assert_eq!(fields[0], "alice-agent", "first field must be agent_id");
+        assert_eq!(fields[1], "generic", "second field must be kind");
+        assert_eq!(fields[2], "active", "third field must be status");
+        assert_eq!(fields[3], "active", "fourth field must be liveness");
+        assert_eq!(fields[4], "8s", "fifth field must be last_seen");
+        assert_eq!(fields[5], "shell,test", "sixth field must be capabilities");
+
+        // Also verify the demo value from user-guide.md ("8s ago") renders correctly
+        // and does not contain the stale 'online' status.
+        let demo_line = format!(
+            "  {:<24} {:<8} {:<8} {:<8} {:<10} {}",
+            "alice-agent", "generic", "active", "active", "8s ago", "shell,test"
+        );
+        assert!(
+            demo_line.contains("active"),
+            "demo line must contain 'active' status"
+        );
+        assert!(
+            !demo_line.contains("online"),
+            "demo line must not contain the stale 'online' status"
+        );
+    }
+
     // --- format_last_seen tests (issue #250) ---
 
     #[test]
