@@ -98,6 +98,14 @@ enum Command {
     /// Manage trusted agent signing keys.
     #[command(subcommand)]
     Trust(TrustCommand),
+
+    /// Inspect and verify peer Matrix devices (E2EE transport identity).
+    #[command(subcommand)]
+    Device(DeviceCommand),
+
+    /// Manage server-side key backup and recovery.
+    #[command(subcommand)]
+    Recovery(RecoveryCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -125,6 +133,9 @@ enum AuthCommand {
     Status,
     /// Log out and clear the local session.
     Logout,
+    /// Manage the daemon's cross-signing identity.
+    #[command(subcommand, name = "cross-signing")]
+    CrossSigning(CrossSigningCommand),
 }
 
 #[derive(Debug, Args)]
@@ -135,6 +146,81 @@ struct AuthLoginArgs {
     /// Matrix user localpart or full user ID.
     #[arg(long, value_name = "USER")]
     user: String,
+}
+
+/// `auth cross-signing` subcommands.
+#[derive(Debug, Subcommand)]
+enum CrossSigningCommand {
+    /// Create and publish the daemon's cross-signing identity (idempotent).
+    Bootstrap,
+    /// Show cross-signing identity status.
+    Status,
+}
+
+/// `device` subcommands (Matrix E2EE device verification).
+#[derive(Debug, Subcommand)]
+enum DeviceCommand {
+    /// List devices with verification status and fingerprints.
+    List(DeviceListArgs),
+    /// Show one device's details.
+    Show(DeviceShowArgs),
+    /// Verify a peer device (interactive emoji/SAS, or out-of-band fingerprint).
+    Verify(DeviceVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct DeviceListArgs {
+    /// Workspace room whose joined members' devices to list.
+    #[arg(long, value_name = "ROOM")]
+    room: Option<String>,
+    /// Specific user whose devices to list (defaults to the daemon's own user).
+    #[arg(long, value_name = "USER")]
+    user: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DeviceShowArgs {
+    /// Owning Matrix user id.
+    #[arg(long, value_name = "USER")]
+    user: String,
+    /// Matrix device id.
+    #[arg(long, value_name = "DEVICE")]
+    device: String,
+}
+
+#[derive(Debug, Args)]
+struct DeviceVerifyArgs {
+    /// Peer Matrix user id to verify with.
+    #[arg(long, value_name = "USER")]
+    user: String,
+    /// Peer Matrix device id to verify.
+    #[arg(long, value_name = "DEVICE")]
+    device: String,
+    /// Verify out-of-band by fingerprint instead of an interactive SAS.
+    #[arg(long)]
+    manual: bool,
+    /// Expected `ed25519:<base64>` device fingerprint (with `--manual`).
+    #[arg(long, value_name = "FINGERPRINT")]
+    fingerprint: Option<String>,
+}
+
+/// `recovery` subcommands (server-side key backup).
+#[derive(Debug, Subcommand)]
+enum RecoveryCommand {
+    /// Provision Secure Secret Storage + key backup; prints the recovery key ONCE.
+    Enable,
+    /// Show recovery/key-backup status.
+    Status,
+    /// Re-import keys from server-side backup using a recovery key.
+    Recover(RecoveryRecoverArgs),
+}
+
+#[derive(Debug, Args)]
+struct RecoveryRecoverArgs {
+    /// Recovery key recorded when recovery was enabled. If omitted, it is read
+    /// from `MX_AGENT_RECOVERY_KEY` or prompted on stdin.
+    #[arg(long = "recovery-key", value_name = "KEY")]
+    recovery_key: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -826,6 +912,8 @@ pub fn run() -> ExitCode {
         Command::Share(cmd) => handle_share(g, cmd),
         Command::Call(args) => cmd_call(g, args),
         Command::Exec(args) => cmd_exec(g, args),
+        Command::Device(cmd) => handle_device(g, cmd),
+        Command::Recovery(cmd) => handle_recovery(g, cmd),
     }
 }
 
@@ -839,6 +927,424 @@ fn handle_auth(global: &GlobalArgs, cmd: &AuthCommand) -> ExitCode {
         AuthCommand::Login(args) => auth_login(global, args),
         AuthCommand::Status => auth_status(global),
         AuthCommand::Logout => auth_logout(global),
+        AuthCommand::CrossSigning(cmd) => handle_cross_signing(global, cmd),
+    }
+}
+
+/// Environment variable used to pass a recovery key without exposing it on the
+/// command line.
+const ENV_RECOVERY_KEY: &str = "MX_AGENT_RECOVERY_KEY";
+
+/// Handle the `auth cross-signing` subgroup (issue #240).
+fn handle_cross_signing(global: &GlobalArgs, cmd: &CrossSigningCommand) -> ExitCode {
+    let (method, label) = match cmd {
+        CrossSigningCommand::Bootstrap => ("cross_signing.bootstrap", "bootstrap"),
+        CrossSigningCommand::Status => ("cross_signing.status", "status"),
+    };
+    match daemon_ipc_call::<_, mx_agent_daemon::CrossSigningStatusInfo>(
+        global,
+        method,
+        &serde_json::json!({}),
+    ) {
+        Ok(status) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: cross-signing {label}");
+                println!("  complete:     {}", status.complete);
+                println!("  master:       {}", status.has_master);
+                println!("  self-signing: {}", status.has_self_signing);
+                println!("  user-signing: {}", status.has_user_signing);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+/// Handle the `device` command group (issue #240).
+fn handle_device(global: &GlobalArgs, cmd: &DeviceCommand) -> ExitCode {
+    match cmd {
+        DeviceCommand::List(args) => device_list(global, args),
+        DeviceCommand::Show(args) => device_show(global, args),
+        DeviceCommand::Verify(args) => device_verify(global, args),
+    }
+}
+
+/// Render one device's non-secret status line(s).
+fn print_device(device: &mx_agent_daemon::DeviceInfo) {
+    let status = if device.blacklisted {
+        "blacklisted"
+    } else if device.cross_signed {
+        "verified (cross-signed)"
+    } else if device.verified {
+        "verified"
+    } else {
+        "unverified"
+    };
+    println!("{} {}  [{status}]", device.user_id, device.device_id);
+    if let Some(name) = &device.display_name {
+        println!("  name:        {name}");
+    }
+    if let Some(fingerprint) = &device.ed25519_fingerprint {
+        println!("  fingerprint: {fingerprint}");
+    }
+}
+
+fn device_list(global: &GlobalArgs, args: &DeviceListArgs) -> ExitCode {
+    let params = mx_agent_daemon::DeviceListParams {
+        room: args.room.clone(),
+        user: args.user.clone(),
+    };
+    match daemon_ipc_call::<_, Vec<mx_agent_daemon::DeviceInfo>>(global, "device.list", &params) {
+        Ok(devices) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&devices).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else if devices.is_empty() {
+                println!("mx-agent: no devices found");
+            } else {
+                for device in &devices {
+                    print_device(device);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+fn device_show(global: &GlobalArgs, args: &DeviceShowArgs) -> ExitCode {
+    let params = mx_agent_daemon::DeviceShowParams {
+        user: args.user.clone(),
+        device: args.device.clone(),
+    };
+    match daemon_ipc_call::<_, Option<mx_agent_daemon::DeviceInfo>>(global, "device.show", &params)
+    {
+        Ok(Some(device)) => {
+            if global.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&device).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                print_device(&device);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            if global.json {
+                println!("null");
+            } else {
+                eprintln!(
+                    "mx-agent: device {} for {} not found",
+                    args.device, args.user
+                );
+            }
+            ExitCode::from(3)
+        }
+        Err(code) => code,
+    }
+}
+
+fn device_verify(global: &GlobalArgs, args: &DeviceVerifyArgs) -> ExitCode {
+    if args.manual {
+        let params = mx_agent_daemon::DeviceVerifyManualParams {
+            user: args.user.clone(),
+            device: args.device.clone(),
+            fingerprint: args.fingerprint.clone(),
+        };
+        return match daemon_ipc_call::<_, mx_agent_daemon::DeviceInfo>(
+            global,
+            "device.verify.manual",
+            &params,
+        ) {
+            Ok(device) => {
+                if global.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&device).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("mx-agent: device verified");
+                    print_device(&device);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(code) => code,
+        };
+    }
+    device_verify_interactive(global, args)
+}
+
+/// Print a SAS short-authentication string for out-of-band comparison.
+fn print_sas(emoji: &Option<Vec<mx_agent_daemon::EmojiPair>>, decimals: &Option<(u16, u16, u16)>) {
+    eprintln!("mx-agent: compare this short authentication string with the peer device:");
+    if let Some(emoji) = emoji {
+        let rendered: Vec<String> = emoji
+            .iter()
+            .map(|e| format!("{} ({})", e.symbol, e.description))
+            .collect();
+        eprintln!("  emoji:   {}", rendered.join("  "));
+    }
+    if let Some((a, b, c)) = decimals {
+        eprintln!("  decimal: {a}-{b}-{c}");
+    }
+}
+
+/// Prompt the operator for a yes/no answer on stderr (default no).
+fn prompt_yes_no(question: &str) -> bool {
+    use std::io::Write as _;
+    eprint!("{question} [y/N]: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Drive an interactive emoji/SAS device verification, streaming flow frames
+/// over a single held-open IPC connection (the operator's confirm/cancel is sent
+/// back on the same connection).
+fn device_verify_interactive(global: &GlobalArgs, args: &DeviceVerifyArgs) -> ExitCode {
+    use mx_agent_daemon::DeviceVerifyFrame as Frame;
+
+    let params = mx_agent_daemon::DeviceVerifyStartParams {
+        user: args.user.clone(),
+        device: args.device.clone(),
+    };
+    let payload = match serde_json::to_value(&params) {
+        Ok(payload) => payload,
+        Err(e) => {
+            eprintln!("mx-agent: could not encode device.verify.start request: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let socket = daemon_socket_path(global);
+    let mut client = match mx_agent_ipc::Client::connect(&socket) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!(
+                "mx-agent: could not contact daemon at {}: {e}; run `mx-agent daemon start`",
+                socket.display()
+            );
+            return ExitCode::from(3);
+        }
+    };
+    let request = mx_agent_ipc::Request::new(
+        Value::from(1_u64),
+        mx_agent_daemon::METHOD_DEVICE_VERIFY_START,
+        payload,
+    );
+    if let Err(e) = client.send(&request) {
+        eprintln!("mx-agent: daemon IPC request device.verify.start failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    loop {
+        let response = match client.recv() {
+            Ok(response) => response,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                eprintln!("mx-agent: verification connection closed before completing");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("mx-agent: daemon IPC request device.verify.start failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Some(error) = response.error {
+            eprintln!(
+                "mx-agent: daemon rejected device.verify.start: {}",
+                error.message
+            );
+            return ExitCode::FAILURE;
+        }
+        let payload = response.result.unwrap_or(Value::Null);
+        let frame: Frame = match serde_json::from_value(payload) {
+            Ok(frame) => frame,
+            Err(e) => {
+                eprintln!("mx-agent: daemon returned invalid device.verify.start response: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if global.json {
+            println!(
+                "{}",
+                serde_json::to_string(&frame).unwrap_or_else(|_| "{}".to_string())
+            );
+        }
+        match frame {
+            Frame::Started { flow_id } => {
+                if !global.json {
+                    eprintln!(
+                        "mx-agent: verification requested (flow {flow_id}); \
+                         waiting for the peer to accept…"
+                    );
+                }
+            }
+            Frame::EmojiReady {
+                emoji, decimals, ..
+            } => {
+                if !global.json {
+                    print_sas(&emoji, &decimals);
+                }
+                let confirm = prompt_yes_no("Do these match on the peer device?");
+                let method = if confirm { "confirm" } else { "cancel" };
+                // Send the decision back on the same connection.
+                if let Err(e) = client.send(&mx_agent_ipc::Request::new(
+                    Value::from(2_u64),
+                    method,
+                    Value::Null,
+                )) {
+                    eprintln!("mx-agent: could not send verification decision: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            Frame::Confirmed { .. } => {
+                if !global.json {
+                    println!("mx-agent: device verified");
+                }
+                return ExitCode::SUCCESS;
+            }
+            Frame::Cancelled { .. } => {
+                if !global.json {
+                    eprintln!("mx-agent: verification cancelled");
+                }
+                return ExitCode::FAILURE;
+            }
+            Frame::Error { message } => {
+                eprintln!("mx-agent: verification failed: {message}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+}
+
+/// Handle the `recovery` command group (issue #240).
+fn handle_recovery(global: &GlobalArgs, cmd: &RecoveryCommand) -> ExitCode {
+    match cmd {
+        RecoveryCommand::Enable => recovery_enable(global),
+        RecoveryCommand::Status => recovery_status(global),
+        RecoveryCommand::Recover(args) => recovery_recover(global, args),
+    }
+}
+
+/// Print recovery/key-backup status.
+fn print_recovery_status(global: &GlobalArgs, status: &mx_agent_daemon::RecoveryStatusInfo) {
+    if global.json {
+        println!(
+            "{}",
+            serde_json::to_string(status).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("mx-agent: recovery status");
+        println!("  state:                  {}", status.state);
+        println!("  backup enabled:         {}", status.backup_enabled);
+        println!(
+            "  backup exists on server: {}",
+            status.backup_exists_on_server
+        );
+    }
+}
+
+fn recovery_enable(global: &GlobalArgs) -> ExitCode {
+    match daemon_ipc_call::<_, mx_agent_daemon::RecoveryEnableResult>(
+        global,
+        "recovery.enable",
+        &serde_json::json!({}),
+    ) {
+        Ok(result) => {
+            if global.json {
+                // The recovery key is surfaced once for the operator to capture;
+                // it is never logged. `--json` includes it for automation.
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("mx-agent: server-side key backup enabled.");
+                println!();
+                println!("  RECOVERY KEY — store this now; it is shown only once:");
+                println!("    {}", result.recovery_key.expose());
+                println!();
+                println!("  If you lose it, history backed up under it is unrecoverable.");
+                println!("  state: {}", result.status.state);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+fn recovery_status(global: &GlobalArgs) -> ExitCode {
+    match daemon_ipc_call::<_, mx_agent_daemon::RecoveryStatusInfo>(
+        global,
+        "recovery.status",
+        &serde_json::json!({}),
+    ) {
+        Ok(status) => {
+            print_recovery_status(global, &status);
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+/// Resolve the recovery key from `--recovery-key`, the environment, or a prompt.
+fn resolve_recovery_key(args: &RecoveryRecoverArgs) -> Result<String, ExitCode> {
+    if let Some(key) = &args.recovery_key {
+        if !key.is_empty() {
+            return Ok(key.clone());
+        }
+    }
+    if let Ok(key) = std::env::var(ENV_RECOVERY_KEY) {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    use std::io::Write as _;
+    eprint!("Recovery key: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        eprintln!("mx-agent: could not read recovery key");
+        return Err(ExitCode::FAILURE);
+    }
+    let key = line.trim().to_string();
+    if key.is_empty() {
+        eprintln!(
+            "mx-agent: no recovery key provided; set {ENV_RECOVERY_KEY} or enter it when prompted"
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(key)
+}
+
+fn recovery_recover(global: &GlobalArgs, args: &RecoveryRecoverArgs) -> ExitCode {
+    let recovery_key = match resolve_recovery_key(args) {
+        Ok(key) => key,
+        Err(code) => return code,
+    };
+    let params = mx_agent_daemon::RecoverParams { recovery_key };
+    match daemon_ipc_call::<_, mx_agent_daemon::RecoveryStatusInfo>(
+        global,
+        "recovery.recover",
+        &params,
+    ) {
+        Ok(status) => {
+            if !global.json {
+                println!("mx-agent: keys re-imported from server-side backup");
+            }
+            print_recovery_status(global, &status);
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
     }
 }
 
@@ -2967,6 +3473,10 @@ fn command_path(command: &Command) -> String {
                 AuthCommand::Login(_) => "login",
                 AuthCommand::Status => "status",
                 AuthCommand::Logout => "logout",
+                AuthCommand::CrossSigning(c) => match c {
+                    CrossSigningCommand::Bootstrap => "cross-signing bootstrap",
+                    CrossSigningCommand::Status => "cross-signing status",
+                },
             }
         ),
         Command::Workspace(c) => format!(
@@ -3037,6 +3547,22 @@ fn command_path(command: &Command) -> String {
                 TrustCommand::Revoke(_) => "revoke",
                 TrustCommand::Publish(_) => "publish",
                 TrustCommand::State(_) => "state",
+            }
+        ),
+        Command::Device(c) => format!(
+            "device {}",
+            match c {
+                DeviceCommand::List(_) => "list",
+                DeviceCommand::Show(_) => "show",
+                DeviceCommand::Verify(_) => "verify",
+            }
+        ),
+        Command::Recovery(c) => format!(
+            "recovery {}",
+            match c {
+                RecoveryCommand::Enable => "enable",
+                RecoveryCommand::Status => "status",
+                RecoveryCommand::Recover(_) => "recover",
             }
         ),
     }

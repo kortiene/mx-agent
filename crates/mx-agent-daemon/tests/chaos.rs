@@ -62,11 +62,7 @@ fn throwaway_paths(tag: &str) -> SessionPaths {
         nanos,
         COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
-    SessionPaths {
-        session_file: dir.join("session.json"),
-        sync_token_file: dir.join("sync_token"),
-        data_dir: dir,
-    }
+    SessionPaths::for_data_dir(dir)
 }
 
 /// A receive-side policy that trusts `ROOM_ID` and permits the requester to run

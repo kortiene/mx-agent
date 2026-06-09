@@ -14,7 +14,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +130,14 @@ pub struct SessionPaths {
     pub session_file: PathBuf,
     /// Plain-text file storing the latest Matrix `/sync` batch token.
     pub sync_token_file: PathBuf,
+    /// Directory holding the persistent, daemon-owned matrix-sdk crypto/state
+    /// store (`0700`). It contains device keys and Megolm sessions and is never
+    /// agent-readable (architecture §13.1, issue #240).
+    pub crypto_store_dir: PathBuf,
+    /// File holding the [`Secret`]-wrapped passphrase that encrypts the crypto
+    /// store at rest (`0600`). Generated once on first use and reused across
+    /// restarts so the daemon resumes as the same E2EE device.
+    pub crypto_store_key_file: PathBuf,
 }
 
 impl SessionPaths {
@@ -147,9 +155,19 @@ impl SessionPaths {
         } else {
             std::env::temp_dir().join("mx-agent")
         };
+        Self::for_data_dir(data_dir)
+    }
+
+    /// Resolve all paths rooted at an explicit `data_dir`.
+    ///
+    /// [`resolve`](Self::resolve) is this applied to the environment-derived data
+    /// directory; tests and tooling can build paths under an arbitrary directory.
+    pub fn for_data_dir(data_dir: PathBuf) -> Self {
         Self {
             session_file: data_dir.join("session.json"),
             sync_token_file: data_dir.join("sync_token"),
+            crypto_store_dir: data_dir.join("crypto-store"),
+            crypto_store_key_file: data_dir.join("crypto-store-key"),
             data_dir,
         }
     }
@@ -161,6 +179,64 @@ impl SessionPaths {
             fs::set_permissions(&self.data_dir, fs::Permissions::from_mode(0o700))?;
         }
         Ok(())
+    }
+
+    /// Ensure the crypto-store directory exists with `0700` permissions.
+    ///
+    /// The crypto store holds the daemon's Matrix device keys and Megolm
+    /// sessions; it is daemon-owned and never readable by the coding agent
+    /// (architecture §13.1, issue #240).
+    pub fn ensure_crypto_store_dir(&self) -> io::Result<()> {
+        self.ensure_data_dir()?;
+        if !self.crypto_store_dir.exists() {
+            fs::create_dir_all(&self.crypto_store_dir)?;
+            fs::set_permissions(&self.crypto_store_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    /// Load the crypto-store passphrase, generating and persisting it once on
+    /// first use.
+    ///
+    /// The passphrase encrypts the SQLite crypto store at rest. It is a daemon
+    /// secret: wrapped in [`Secret`] so it never appears in logs, written
+    /// `0600`, and reused on every restart so the persistent store (and thus the
+    /// daemon's E2EE device identity and Megolm sessions) can be reopened. A
+    /// fresh 256-bit key is generated with [`getrandom`] and base64-encoded for
+    /// storage.
+    pub fn load_or_create_crypto_store_key(&self) -> io::Result<Secret> {
+        match fs::read_to_string(&self.crypto_store_key_file) {
+            Ok(contents) => {
+                let trimmed = contents.trim();
+                if trimmed.is_empty() {
+                    // An empty key file is unusable; regenerate.
+                    self.generate_crypto_store_key()
+                } else {
+                    Ok(Secret::new(trimmed.to_string()))
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.generate_crypto_store_key(),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Generate, persist (`0600`), and return a fresh crypto-store passphrase.
+    fn generate_crypto_store_key(&self) -> io::Result<Secret> {
+        use base64::Engine as _;
+        self.ensure_data_dir()?;
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
+        let key = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+        let tmp = self.crypto_store_key_file.with_extension("tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            f.write_all(key.as_bytes())?;
+            f.flush()?;
+        }
+        fs::rename(&tmp, &self.crypto_store_key_file)?;
+        Ok(Secret::new(key))
     }
 }
 
@@ -196,13 +272,61 @@ pub fn load_session(paths: &SessionPaths) -> io::Result<Option<StoredSession>> {
     }
 }
 
-/// Remove any persisted session (logout). Missing files are not an error.
+/// Remove the persisted session and the daemon's E2EE crypto store (logout).
+///
+/// Deletes the access token (`session.json`) **and** the persistent crypto
+/// store so logging out actually relinquishes the daemon's E2EE device identity
+/// and Megolm sessions instead of leaving them on disk for a later login to
+/// reuse (issue #240). The crypto store lives in a subdirectory named by the
+/// session's device id (see [`crate::matrix::login_password`] /
+/// [`crate::matrix::restore_client`]); the session is read first to locate it,
+/// and the legacy flat-layout store (`crypto-store/` directly under the data
+/// dir) is cleared too. Missing files are not an error, so logout is idempotent.
 pub fn clear_session(paths: &SessionPaths) -> io::Result<()> {
-    match fs::remove_file(&paths.session_file) {
+    // Remove the device-specific crypto store before deleting the session that
+    // names it. A device id that is not a single path component is ignored so
+    // the recursive removal can never escape the data directory (the id is
+    // server-assigned and otherwise untrusted).
+    if let Ok(Some(session)) = load_session(paths) {
+        if is_plain_path_component(&session.device_id) {
+            remove_dir_if_present(&paths.data_dir.join(&session.device_id))?;
+        }
+    }
+    // Legacy single-user flat layout (crypto store directly under the data dir).
+    remove_dir_if_present(&paths.crypto_store_dir)?;
+    remove_file_if_present(&paths.crypto_store_key_file)?;
+    remove_file_if_present(&paths.session_file)
+}
+
+/// Recursively remove a directory, treating "already gone" as success.
+fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Remove a file, treating "already gone" as success.
+fn remove_file_if_present(file: &Path) -> io::Result<()> {
+    match fs::remove_file(file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `name` is a single, non-escaping path component, safe to `join` onto
+/// the data dir and recursively remove. Rejects empty, `.`/`..`, and any value
+/// containing a path separator so a hostile device id cannot direct the
+/// crypto-store removal outside the data dir.
+fn is_plain_path_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 /// Persist the latest Matrix `/sync` batch token to daemon-owned storage.
@@ -434,6 +558,42 @@ mod tests {
     }
 
     #[test]
+    fn crypto_store_key_is_created_private_and_reused() {
+        let _data = TempData::new("cryptokey");
+        let paths = SessionPaths::resolve();
+        // Resolves under the data dir.
+        assert_eq!(paths.crypto_store_dir, paths.data_dir.join("crypto-store"));
+
+        let key = paths.load_or_create_crypto_store_key().unwrap();
+        assert!(!key.expose().is_empty(), "a key must be generated");
+
+        let mode = fs::metadata(&paths.crypto_store_key_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "crypto store key file must be private");
+
+        // A second load returns the same key (so the persistent store reopens
+        // and the daemon resumes as the same device after a restart).
+        let again = paths.load_or_create_crypto_store_key().unwrap();
+        assert_eq!(again.expose(), key.expose());
+    }
+
+    #[test]
+    fn crypto_store_dir_is_created_private() {
+        let _data = TempData::new("cryptodir");
+        let paths = SessionPaths::resolve();
+        paths.ensure_crypto_store_dir().unwrap();
+        let mode = fs::metadata(&paths.crypto_store_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "crypto store dir must be private");
+    }
+
+    #[test]
     fn clear_session_is_idempotent() {
         let _data = TempData::new("clear");
         let paths = SessionPaths::resolve();
@@ -441,5 +601,46 @@ mod tests {
         save_session(&paths, &sample()).unwrap();
         clear_session(&paths).unwrap();
         assert!(load_session(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_session_removes_crypto_store() {
+        // Issue #240: logout must wipe the persistent crypto store, not just the
+        // access token, so the daemon's E2EE device identity and Megolm sessions
+        // do not linger on disk for a later login to reuse.
+        let _data = TempData::new("clear-crypto");
+        let paths = SessionPaths::resolve();
+        let session = sample();
+        save_session(&paths, &session).unwrap();
+
+        // Device-specific store (current layout) plus a legacy flat-layout store.
+        let device_dir = paths.data_dir.join(&session.device_id);
+        fs::create_dir_all(device_dir.join("crypto-store")).unwrap();
+        fs::write(device_dir.join("crypto-store-key"), b"key").unwrap();
+        fs::create_dir_all(&paths.crypto_store_dir).unwrap();
+        fs::write(&paths.crypto_store_key_file, b"key").unwrap();
+
+        clear_session(&paths).unwrap();
+
+        assert!(load_session(&paths).unwrap().is_none(), "session cleared");
+        assert!(!device_dir.exists(), "device crypto store removed");
+        assert!(
+            !paths.crypto_store_dir.exists(),
+            "legacy crypto store removed"
+        );
+        assert!(
+            !paths.crypto_store_key_file.exists(),
+            "legacy crypto store key removed"
+        );
+    }
+
+    #[test]
+    fn is_plain_path_component_rejects_traversal() {
+        // A hostile or garbage device id must never escape the data dir when its
+        // crypto store is removed on logout (issue #240).
+        assert!(is_plain_path_component("MXAGENTDEVICE01"));
+        for bad in ["", ".", "..", "../evil", "a/b", "a\\b", "x\0y"] {
+            assert!(!is_plain_path_component(bad), "must reject {bad:?}");
+        }
     }
 }

@@ -277,6 +277,11 @@ pub async fn run_matrix_sync_with_subscribers(
 ) -> std::io::Result<()> {
     use matrix_sdk::config::SyncSettings;
 
+    // Register this client in the process-global map so per-call IPC handlers
+    // (exec, approval) reuse the same store-backed client rather than opening
+    // a second one that would race the SQLite OlmMachine (issue #240).
+    crate::matrix::publish_active_client(client.clone());
+
     // The event router observes mx-agent events on each sync (architecture
     // §10.1, issue #192). Replay protection for privileged requests is
     // essential, so if the replay cache cannot be loaded we log and route

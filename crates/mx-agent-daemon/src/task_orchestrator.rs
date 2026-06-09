@@ -2320,11 +2320,7 @@ requires_approval = true
             now_rfc3339().replace([':', '-'], "")
         ));
         std::fs::create_dir_all(&dir).expect("create replay dir");
-        let paths = SessionPaths {
-            session_file: dir.join("session.json"),
-            sync_token_file: dir.join("sync_token"),
-            data_dir: dir.clone(),
-        };
+        let paths = SessionPaths::for_data_dir(dir.clone());
         let cache = ReplayCache::load_with_capacity(&paths, 64).expect("replay cache loads");
         (cache, dir)
     }

@@ -13,6 +13,7 @@ pub mod audit;
 pub mod call;
 pub mod call_ipc;
 pub mod context;
+pub mod device_ipc;
 pub mod event_router;
 pub mod exec;
 pub mod exec_ipc;
@@ -25,6 +26,7 @@ pub mod matrix;
 #[cfg(unix)]
 pub mod pty;
 pub mod pty_ipc;
+pub mod recovery_ipc;
 pub mod replay;
 pub mod runner;
 pub mod scheduler;
@@ -43,6 +45,7 @@ pub mod tool_exec;
 pub mod tools;
 pub mod trust;
 pub mod trust_state;
+pub mod verification;
 pub mod watch;
 pub mod workspace;
 
@@ -81,6 +84,13 @@ pub use context::{
     share_env_for_session, FetchContextOptions, FetchedContext, ListSharesOptions,
     ShareContextOptions, ShareDiffOptions, ShareEnvOptions, DEFAULT_ENV_INCLUDE,
     DEFAULT_FETCH_SCAN_LIMIT, DIFF_MIME_TYPE, ENV_MIME_TYPE, MAX_INLINE_BYTES,
+};
+pub use device_ipc::{
+    bootstrap_cross_signing_for_session, cancel_verify, confirm_verify,
+    cross_signing_status_for_session, list_devices_for_session, manual_verify_for_session,
+    run_device_verify, show_device_for_session, DeviceListParams, DeviceShowParams,
+    DeviceVerifyFrame, DeviceVerifyManualParams, DeviceVerifyStartParams, VerificationActionResult,
+    VerifyDecision, VerifyFlowParams, METHOD_DEVICE_VERIFY_START,
 };
 pub use event_router::{
     classify as classify_event, events_from_sync_response, EventCategory, EventMeta, EventRouter,
@@ -132,6 +142,9 @@ pub use pty::{PtySession, PtyWinsize};
 pub use pty_ipc::{
     run_pty_loopback, ExecPtyParams, PtyResizeFrame, PtyServerFrame, PtyStdinFrame,
     METHOD_EXEC_PTY, METHOD_PTY_RESIZE, METHOD_PTY_STDIN,
+};
+pub use recovery_ipc::{
+    enable_recovery_for_session, recover_for_session, recovery_status_for_session, RecoverParams,
 };
 pub use replay::{ReplayCache, ReplayError, DEFAULT_CAPACITY};
 pub use runner::{
@@ -185,6 +198,12 @@ pub use trust_state::{
     effective_trust, effective_trust_table, list_trust_states, list_trust_states_for_session,
     publish_trust_state, publish_trust_state_for_session, trust_state_from_entry, trust_state_key,
     EffectiveTrust, TrustSource,
+};
+pub use verification::{
+    advance_sas, bootstrap_cross_signing, cancel_sas, confirm_sas, cross_signing_status,
+    enable_recovery, forget_sas, list_devices, manual_verify, recover, recovery_status,
+    sender_verified, show_device, start_sas, CrossSigningStatusInfo, DeviceInfo, EmojiPair,
+    RecoveryEnableResult, RecoveryStatusInfo, SasAdvance, VerificationError,
 };
 pub use watch::{
     diff_tasks, watch_tasks_for_session, watch_workspace_status_for_session, TaskChange,

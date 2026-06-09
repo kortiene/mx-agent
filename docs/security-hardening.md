@@ -170,6 +170,86 @@ order: signature valid → request routed to this agent → key trusted → repl
 freshness → policy. A tool `call` is the same minus the routing check. Any
 failure denies the request, and the denial is recorded in the audit log.
 
+## Device verification, cross-signing, and key backup (E2EE)
+
+There are **two distinct trust roots**, and conflating them is a mistake:
+
+- The **mx-agent signing key** (`mxagent-ed25519:…`, fingerprint `SHA256:…`)
+  authorizes *execution* — see [Trust bootstrap](#trust-bootstrap) above.
+- The **Matrix device key** (`ed25519:<base64>`) is a *transport* identity: it
+  decides who you share Megolm keys with and who can read or inject encrypted
+  traffic. It is a **different key with a different fingerprint** and **never**
+  authorizes execution on its own.
+
+The daemon owns all crypto state in a persistent, encrypted SQLite store
+(`~/.local/share/mx-agent/crypto-store/`, `0700`); the coding agent and the
+stateless CLI never see device keys. The CLI receives only fingerprints, the SAS
+emoji/decimal, and verification status.
+
+**Listing and verifying peer devices.**
+
+```bash
+mx-agent device list   --room '!workspace:matrix.org'          # devices + status + fingerprints
+mx-agent device show   --user @peer:hs --device DEVICEID
+
+# Out-of-band: confirm the device fingerprint over a channel you trust, then:
+mx-agent device verify --user @peer:hs --device DEVICEID \
+  --manual --fingerprint 'ed25519:BASE64...'
+
+# Interactive emoji/SAS (operator-attended): compare the emoji with the peer,
+# then answer the prompt. The confirm/cancel travels over the same connection.
+mx-agent device verify --user @peer:hs --device DEVICEID
+```
+
+A headless/unattended daemon should use the out-of-band `--manual --fingerprint`
+path (or pre-seeded cross-signing); the interactive SAS expects an operator.
+
+**Cross-signing.** Bootstrap the daemon's own cross-signing identity so verifying
+a user's identity marks their cross-signed devices verified:
+
+```bash
+mx-agent auth cross-signing bootstrap    # idempotent
+mx-agent auth cross-signing status
+```
+
+**Key backup / recovery.** Enable secure server-side key backup so a restart or
+re-provision does not silently lose the ability to decrypt history:
+
+```bash
+mx-agent recovery enable     # provisions SSSS + key backup; prints the recovery key ONCE
+mx-agent recovery status
+mx-agent recovery recover    # after a re-provision: re-import keys (prompts for the recovery key)
+```
+
+> **Recovery-key handling.** `recovery enable` surfaces the recovery key exactly
+> once. Store it somewhere safe immediately. It is never logged and never
+> persisted in clear; **if you lose it, history backed up under it is
+> unrecoverable** — there is no escrow.
+
+**Restart vs. re-provision.**
+
+- A **restart on the same host** recovers transparently from the persistent
+  crypto store — no recovery key needed.
+- A **re-provision onto a fresh host** (or a wiped store) recovers history via
+  `mx-agent recovery recover` plus the recovery key.
+
+Both paths end with the daemon able to decrypt prior privileged events.
+
+**Optionally requiring verified devices.** By default, device verification is
+*advisory*: a request from a trusted signing key whose sending device is
+unverified still executes (authority comes from the signing key), and the daemon
+logs a non-sensitive advisory. To additionally require a verified sending device,
+set `require_verified_device` in policy (per-room or per-agent). It is **strictly
+additive**: after the signature → trust → policy gate passes, an unverified
+device is denied with reason `unverified_device`. It can only *deny*, never grant
+— so it cannot be used to widen access, only to tighten it.
+
+```toml
+[rooms."!workspace:matrix.org"]
+trusted = true
+require_verified_device = true     # every agent in this room must send from a verified device
+```
+
 ## Policy examples
 
 Policy lives in `policy.toml`, resolved in this order:
@@ -238,6 +318,7 @@ network = "deny"
 |---|---|---|
 | `trusted` | `false` | Raw `exec` is only ever evaluated for trusted rooms. |
 | `raw_exec_default` | none | `allow` / `deny` room-wide default for raw exec. |
+| `require_verified_device` | `false` | Room-wide default for the additive verified-device gate (deny-only; see [Device verification](#device-verification-cross-signing-and-key-backup-e2ee)). |
 
 `[rooms."<room>".agents."<agent>"]`:
 
@@ -252,6 +333,7 @@ network = "deny"
 | `max_output_bytes` | none | Captured-output cap; unset ⇒ unbounded. |
 | `requires_approval` | `false` | Hold the request for human sign-off. |
 | `sandbox` / `network` | none | Per-agent overrides. |
+| `require_verified_device` | `false` | Per-agent verified-device gate (deny-only; OR-ed with the room default). |
 
 ### Unsafe options to use deliberately, if ever
 
@@ -336,7 +418,14 @@ identifiers so you can alert on them:
 deny:unknown_room        deny:untrusted_room      deny:unknown_agent
 deny:empty_command       deny:exec_not_allowed    deny:command_not_allowed
 deny:cwd_not_allowed     deny:denied_arguments    deny:tool_not_allowed
+deny:unverified_device
 ```
+
+The policy-engine reasons above are joined by `deny:unverified_device`, recorded
+when the optional `require_verified_device` gate rejects an `exec` from an
+unverified Matrix device (issue #240). That gate runs *after* the policy
+decision, so its denial is audited in addition to — not instead of — the
+policy outcome.
 
 **Secrets are redacted in the log.** Command arguments pass through a redactor
 that masks `KEY=value` pairs and `--flag value` pairs whose key looks sensitive,
@@ -368,6 +457,11 @@ to structured fields here.
 - [ ] Peer fingerprints verified out-of-band before `trust approve`.
 - [ ] `session.json` / `signing_key.ed25519` kept `0600`, never copied or
       committed; passwords passed via `MX_AGENT_PASSWORD`, not flags.
+- [ ] `crypto-store/` (`0700`) and `crypto-store-key` (`0600`) left daemon-owned; never copied off-box.
+- [ ] `recovery enable` run once per daemon identity; recovery key stored safely offline (shown once, never logged or persisted in clear).
+- [ ] After a re-provision onto a new host, `recovery recover` run before accepting privileged events so history remains decryptable.
+- [ ] If peer device verification is required, `require_verified_device = true` set *after* verifying peer devices via `mx-agent device verify`; the flag is additive-deny only and does not relax execution policy.
+- [ ] Interactive SAS (`mx-agent device verify`) treated as operator-attended; headless daemons use `--manual --fingerprint` or pre-seeded cross-signing instead.
 - [ ] Audit log monitored and shipped off-box if you need non-repudiation.
 
 See also: [`SECURITY.md`](../SECURITY.md) for reporting vulnerabilities, and the

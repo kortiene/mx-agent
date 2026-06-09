@@ -533,11 +533,7 @@ mod tests {
     }
 
     fn paths_in(dir: &std::path::Path) -> SessionPaths {
-        SessionPaths {
-            data_dir: dir.to_path_buf(),
-            session_file: dir.join("session.json"),
-            sync_token_file: dir.join("sync_token"),
-        }
+        SessionPaths::for_data_dir(dir.to_path_buf())
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {

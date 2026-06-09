@@ -62,6 +62,10 @@ pub enum CallRejection {
     },
     /// The local policy denied the requested tool for this room/agent.
     PolicyDenied(DenyReason),
+    /// Policy required a verified sending device (`require_verified_device`) but
+    /// the originating Matrix device is not verified (issue #240). Layered after
+    /// the authoritative signature → trust → policy gate; can only add a denial.
+    UnverifiedDevice,
 }
 
 impl CallRejection {
@@ -73,6 +77,7 @@ impl CallRejection {
             Self::InvalidSignature => "invalid_signature".to_string(),
             Self::UntrustedKey { .. } => "untrusted_key".to_string(),
             Self::PolicyDenied(_) => "policy_denied".to_string(),
+            Self::UnverifiedDevice => "unverified_device".to_string(),
         }
     }
 }
@@ -87,6 +92,7 @@ impl std::fmt::Display for CallRejection {
                 write!(f, "signing key {key_id:?} is not trusted")
             }
             Self::PolicyDenied(reason) => write!(f, "policy denied call: {reason}"),
+            Self::UnverifiedDevice => write!(f, "policy requires a verified sending device"),
         }
     }
 }
@@ -246,6 +252,33 @@ pub fn authorize_call_request(
     room_id: &str,
     requesting_agent: &str,
 ) -> Result<CallRequest, CallRejection> {
+    authorize_call_request_with_allowance(
+        content,
+        verifying_key,
+        trust,
+        policy,
+        room_id,
+        requesting_agent,
+    )
+    .map(|(request, _allowance)| request)
+}
+
+/// Like [`authorize_call_request`] but also returns the resolved
+/// [`Allowance`](mx_agent_policy::Allowance).
+///
+/// The allowance carries the per-room/per-agent limits, including the
+/// `require_verified_device` flag the caller consults (via
+/// [`enforce_verified_device_call`]) to layer the optional verified-device
+/// transport check *after* this authoritative signature → trust → policy gate
+/// (issue #240). Authorizing a request never executes the tool.
+pub fn authorize_call_request_with_allowance(
+    content: &Value,
+    verifying_key: &VerifyingKey,
+    trust: &TrustStore,
+    policy: &Policy,
+    room_id: &str,
+    requesting_agent: &str,
+) -> Result<(CallRequest, mx_agent_policy::Allowance), CallRejection> {
     // 1. Signature must be present and valid.
     let signature = read_signature(content)?.ok_or(CallRejection::Unsigned)?;
     signing::verify(verifying_key, content).map_err(|e| match e {
@@ -270,11 +303,27 @@ pub fn authorize_call_request(
         requesting_agent,
         tool: &request.tool,
     });
-    if let Some(reason) = outcome.deny_reason() {
-        return Err(CallRejection::PolicyDenied(reason));
+    match outcome {
+        mx_agent_policy::Outcome::Allow(allowance) => Ok((request, allowance)),
+        mx_agent_policy::Outcome::Deny(reason) => Err(CallRejection::PolicyDenied(reason)),
     }
+}
 
-    Ok(request)
+/// Additive verified-device gate for `call`, applied *after* the signature →
+/// trust → policy gate (issue #240). Mirrors
+/// [`crate::exec::enforce_verified_device`]: when
+/// `allowance.require_verified_device` is set, an otherwise-authorized call is
+/// denied ([`CallRejection::UnverifiedDevice`]) unless the originating Matrix
+/// device is verified (`device_verified == Some(true)`). A no-op when the knob
+/// is off; it can only deny, never grant.
+pub fn enforce_verified_device_call(
+    allowance: &mx_agent_policy::Allowance,
+    device_verified: Option<bool>,
+) -> Result<(), CallRejection> {
+    if allowance.require_verified_device && device_verified != Some(true) {
+        return Err(CallRejection::UnverifiedDevice);
+    }
+    Ok(())
 }
 
 /// Build a successful [`CallResponse`] carrying `result` for `request_id`.
@@ -333,20 +382,6 @@ pub async fn emit_call_response(
         .await
         .map_err(WorkspaceError::from)?;
     Ok(())
-}
-
-// `Outcome` does not expose its deny reason directly; provide a small helper.
-trait OutcomeExt {
-    fn deny_reason(&self) -> Option<DenyReason>;
-}
-
-impl OutcomeExt for mx_agent_policy::Outcome {
-    fn deny_reason(&self) -> Option<DenyReason> {
-        match self {
-            mx_agent_policy::Outcome::Allow(_) => None,
-            mx_agent_policy::Outcome::Deny(reason) => Some(reason.clone()),
-        }
-    }
 }
 
 /// Resolve a Matrix-published agent signing public key and verify it matches
@@ -611,14 +646,31 @@ async fn authorize_live_call(
     let verifying_key = verifying_key_from_agent_state(&requester)?;
     let trust = TrustStore::load(paths).unwrap_or_default();
     let policy = policy_for_live_call();
-    authorize_call_request(
+    let (request, allowance) = authorize_call_request_with_allowance(
         content,
         &verifying_key,
         &trust,
         &policy,
         room_id,
         requesting_agent,
-    )
+    )?;
+
+    // Authoritative gate (signature → trust → policy) has passed. Layer the
+    // optional, additive verified-device transport check (issue #240): with the
+    // knob off (default) a trusted-but-unverified device is still served, with
+    // only an advisory log; with it on, an unverified device is denied.
+    let device_verified =
+        crate::verification::sender_verified(&room.client(), &requester.matrix_user_id).await;
+    if allowance.require_verified_device {
+        enforce_verified_device_call(&allowance, device_verified)?;
+    } else if device_verified == Some(false) {
+        tracing::info!(
+            request_id = %request.request_id,
+            requesting_agent = %requesting_agent,
+            "executing privileged call from an unverified Matrix device (authority from signing key; require_verified_device is off)"
+        );
+    }
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -1051,5 +1103,67 @@ allow_tools = ["run_tests", "lint"]
         )
         .unwrap_err();
         assert_eq!(err, CallRejection::Malformed);
+    }
+
+    // --- enforce_verified_device_call (issue #240) ---
+
+    #[test]
+    fn enforce_verified_device_call_off_allows_any_device_status() {
+        // When require_verified_device is false (the default), device verification
+        // status never affects the outcome — authority comes from signing+trust+policy.
+        let off = mx_agent_policy::Allowance {
+            require_verified_device: false,
+            ..Default::default()
+        };
+        assert!(enforce_verified_device_call(&off, None).is_ok());
+        assert!(enforce_verified_device_call(&off, Some(false)).is_ok());
+        assert!(enforce_verified_device_call(&off, Some(true)).is_ok());
+    }
+
+    #[test]
+    fn enforce_verified_device_call_on_allows_verified_device() {
+        let on = mx_agent_policy::Allowance {
+            require_verified_device: true,
+            ..Default::default()
+        };
+        assert!(
+            enforce_verified_device_call(&on, Some(true)).is_ok(),
+            "a verified device must be allowed when the knob is on"
+        );
+    }
+
+    #[test]
+    fn enforce_verified_device_call_on_denies_unverified_device() {
+        let on = mx_agent_policy::Allowance {
+            require_verified_device: true,
+            ..Default::default()
+        };
+        let err = enforce_verified_device_call(&on, Some(false)).unwrap_err();
+        assert_eq!(err, CallRejection::UnverifiedDevice);
+        assert_eq!(err.reason(), "unverified_device");
+    }
+
+    #[test]
+    fn enforce_verified_device_call_on_denies_indeterminate_status() {
+        // None means the crypto store has not yet seen the device — treated as
+        // unverified so the gate fails safe rather than open.
+        let on = mx_agent_policy::Allowance {
+            require_verified_device: true,
+            ..Default::default()
+        };
+        let err = enforce_verified_device_call(&on, None).unwrap_err();
+        assert_eq!(err, CallRejection::UnverifiedDevice);
+        assert_eq!(err.reason(), "unverified_device");
+    }
+
+    #[test]
+    fn call_unverified_device_rejection_has_stable_reason_and_message() {
+        let rejection = CallRejection::UnverifiedDevice;
+        assert_eq!(rejection.reason(), "unverified_device");
+        let msg = rejection.to_string();
+        assert!(
+            msg.contains("verified"),
+            "display should mention 'verified': {msg}"
+        );
     }
 }
