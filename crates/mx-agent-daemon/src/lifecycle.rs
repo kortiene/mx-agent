@@ -526,39 +526,6 @@ where
     }
 }
 
-/// Run a session-less async handler on a fresh runtime and serialize its result.
-///
-/// Unlike [`block_on_task_response`], this loads no Matrix session — used by
-/// methods that operate purely on in-process daemon state (e.g. the verification
-/// flow registry for `device.verify.confirm` / `.cancel`).
-fn block_on_response<F, Fut, T>(req: &Request, f: F) -> Response
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, crate::WorkspaceError>>,
-    T: serde::Serialize,
-{
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            return Response::error(
-                req.id.clone(),
-                INTERNAL_ERROR,
-                format!("could not start async runtime: {e}"),
-            )
-        }
-    };
-    match runtime.block_on(f()) {
-        Ok(value) => match serde_json::to_value(value) {
-            Ok(value) => Response::result(req.id.clone(), value),
-            Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
-        },
-        Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
-    }
-}
-
 /// Dispatch a single-response IPC request against the running daemon.
 fn dispatch(
     req: &Request,
@@ -839,26 +806,9 @@ fn dispatch(
             }),
             Err(response) => *response,
         },
-        // confirm/cancel act on the in-process verification registry and need no
-        // Matrix session of their own.
-        "device.verify.confirm" => match parse_params::<crate::VerifyFlowParams>(req) {
-            Ok(params) => {
-                block_on_response(
-                    req,
-                    move || async move { crate::confirm_verify(&params).await },
-                )
-            }
-            Err(response) => *response,
-        },
-        "device.verify.cancel" => match parse_params::<crate::VerifyFlowParams>(req) {
-            Ok(params) => {
-                block_on_response(
-                    req,
-                    move || async move { crate::cancel_verify(&params).await },
-                )
-            }
-            Err(response) => *response,
-        },
+        // The interactive SAS decision (confirm/cancel) is delivered in-band as a
+        // control frame on the held-open `device.verify.start` connection (see
+        // `read_verify_decision`), not as standalone IPC methods.
         "cross_signing.bootstrap" => block_on_task_response(req, |session| async move {
             crate::bootstrap_cross_signing_for_session(&session).await
         }),
@@ -1534,13 +1484,40 @@ mod tests {
     /// non-streaming caller gets a clear error instead of a hang.
     #[test]
     fn streaming_methods_require_streaming_connection() {
-        for method in ["task.watch", "workspace.watch"] {
+        for method in [
+            "task.watch",
+            "workspace.watch",
+            crate::METHOD_DEVICE_VERIFY_START,
+        ] {
             let req = Request::new(json!(1), method, json!({"room":"!abc:matrix.org"}));
             let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
             let error = response
                 .error
                 .expect("streaming method on single-response path");
             assert_eq!(error.code, METHOD_NOT_FOUND, "{method}");
+            assert!(
+                error.message.contains("streaming"),
+                "{method}: expected streaming-connection message; got: {}",
+                error.message,
+            );
+        }
+    }
+
+    /// The interactive SAS decision is delivered in-band on the held-open
+    /// `device.verify.start` connection (issue #259), so the formerly-registered
+    /// out-of-band `device.verify.confirm` / `.cancel` methods are gone and now
+    /// fall through to the unknown-method arm.
+    #[test]
+    fn removed_device_verify_confirm_cancel_methods_are_unknown() {
+        for method in ["device.verify.confirm", "device.verify.cancel"] {
+            let req = Request::new(json!(1), method, json!({"flow_id":"flow_abc"}));
+            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("{method}: removed method should error"));
+            assert_eq!(error.code, METHOD_NOT_FOUND, "{method}");
+            assert!(error.message.contains("unknown method"), "{method}");
+            assert!(error.message.contains(method), "{method}");
         }
     }
 

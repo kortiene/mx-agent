@@ -1339,8 +1339,7 @@ receives the password and writes the session into the daemon-owned data dir);
 | `invocation.cancel` / `.artifact` | `InvocationCancelParams` / `RetrieveArtifactOptions` | `InvocationState` / `RetrievedArtifact` |
 | `device.list` / `device.show` | `DeviceListParams` / `DeviceShowParams` | `DeviceInfo[]` / `DeviceInfo?` |
 | `device.verify.manual` | `DeviceVerifyManualParams` | `DeviceInfo` |
-| `device.verify.start` | `DeviceVerifyStartParams` | stream of `DeviceVerifyFrame` (`started → emoji-ready → confirmed/cancelled`) |
-| `device.verify.confirm` / `device.verify.cancel` | `VerifyFlowParams` | `VerificationActionResult` |
+| `device.verify.start` | `DeviceVerifyStartParams` | stream of `DeviceVerifyFrame` (`started → emoji-ready → confirmed/cancelled`); the operator's confirm/cancel decision is sent **in-band** as a bare `confirm`/`cancel` control frame on the same held-open connection (no separate method) |
 | `cross_signing.bootstrap` / `cross_signing.status` | (none) | `CrossSigningStatusInfo` |
 | `recovery.enable` | (none) | `RecoveryEnableResult` (recovery key surfaced once, never logged) |
 | `recovery.status` | (none) | `RecoveryStatusInfo` |

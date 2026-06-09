@@ -6,12 +6,14 @@
 //! CLI receives only fingerprints, SAS emoji/decimal, and verification status.
 //!
 //! Single-response methods (`device.list`, `device.show`,
-//! `device.verify.manual`, `device.verify.confirm`, `device.verify.cancel`,
-//! `cross_signing.bootstrap`, `cross_signing.status`) restore a client from the
-//! stored session and call the [`crate::verification`] manager. The interactive
-//! `device.verify.start` is streaming (see [`run_device_verify`]), following the
-//! `task.watch` convention: one response frame per flow update over a held-open
-//! socket.
+//! `device.verify.manual`, `cross_signing.bootstrap`, `cross_signing.status`)
+//! restore a client from the stored session and call the [`crate::verification`]
+//! manager. The interactive `device.verify.start` is streaming (see
+//! [`run_device_verify`]), following the `task.watch` convention: one response
+//! frame per flow update over a held-open socket. Its confirm/cancel decision is
+//! delivered **in-band** as a bare `confirm` / `cancel` control frame on that
+//! same held-open connection (see [`read_verify_decision`]); there are no
+//! standalone `device.verify.confirm` / `.cancel` IPC methods.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -75,22 +77,6 @@ pub struct DeviceVerifyStartParams {
     pub user: String,
     /// Peer device id to verify.
     pub device: String,
-}
-
-/// Parameters for `device.verify.confirm` / `device.verify.cancel`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifyFlowParams {
-    /// The flow id returned by `device.verify.start`.
-    pub flow_id: String,
-}
-
-/// Result of a `device.verify.confirm` / `.cancel` action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerificationActionResult {
-    /// The flow id acted on.
-    pub flow_id: String,
-    /// The resulting state: `confirm_sent` or `cancelled`.
-    pub state: String,
 }
 
 /// A single streamed update of an interactive `device.verify.start` flow.
@@ -223,32 +209,6 @@ pub async fn manual_verify_for_session(
     )
     .await
     .map_err(verr)
-}
-
-/// Handle `device.verify.confirm`.
-pub async fn confirm_verify(
-    params: &VerifyFlowParams,
-) -> Result<VerificationActionResult, WorkspaceError> {
-    verification::confirm_sas(&params.flow_id)
-        .await
-        .map_err(verr)?;
-    Ok(VerificationActionResult {
-        flow_id: params.flow_id.clone(),
-        state: "confirm_sent".to_string(),
-    })
-}
-
-/// Handle `device.verify.cancel`.
-pub async fn cancel_verify(
-    params: &VerifyFlowParams,
-) -> Result<VerificationActionResult, WorkspaceError> {
-    verification::cancel_sas(&params.flow_id)
-        .await
-        .map_err(verr)?;
-    Ok(VerificationActionResult {
-        flow_id: params.flow_id.clone(),
-        state: "cancelled".to_string(),
-    })
 }
 
 /// Handle `cross_signing.bootstrap`.
@@ -655,28 +615,6 @@ mod tests {
     // --- IPC parameter type round-trips ---
 
     #[test]
-    fn verify_flow_params_round_trips() {
-        let params = VerifyFlowParams {
-            flow_id: "flow_abc".to_string(),
-        };
-        let json = serde_json::to_string(&params).unwrap();
-        let back: VerifyFlowParams = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, params);
-    }
-
-    #[test]
-    fn verification_action_result_round_trips() {
-        let result = VerificationActionResult {
-            flow_id: "flow_abc".to_string(),
-            state: "confirm_sent".to_string(),
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        let back: VerificationActionResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, result);
-        assert!(json.contains("\"state\":\"confirm_sent\""), "got {json}");
-    }
-
-    #[test]
     fn device_show_params_round_trips() {
         let params = DeviceShowParams {
             user: "@user:hs".to_string(),
@@ -829,6 +767,110 @@ mod tests {
                 VerifyDecision::Cancel,
                 "method {:?} must yield Cancel, not Confirm",
                 method,
+            );
+        }
+    }
+
+    // --- EmojiReady serialization: skip_serializing_if on absent fields ---
+
+    #[test]
+    fn emoji_ready_decimals_only_omits_emoji_field() {
+        // When emoji is None the "emoji" key must be absent from the JSON
+        // (skip_serializing_if = "Option::is_none"), so the CLI can tell the
+        // peer only provided a decimal SAS rather than confusing it with
+        // an explicit null emoji list.
+        let frame = DeviceVerifyFrame::EmojiReady {
+            flow_id: "flow_dec".to_string(),
+            emoji: None,
+            decimals: Some((1234, 5678, 9012)),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"event\":\"emoji-ready\""), "got {json}");
+        assert!(
+            !json.contains("\"emoji\""),
+            "emoji field must be absent when None; got {json}",
+        );
+        assert!(
+            json.contains("\"decimals\""),
+            "decimals must be present; got {json}"
+        );
+        assert!(json.contains("1234"), "got {json}");
+    }
+
+    #[test]
+    fn emoji_ready_emoji_only_omits_decimals_field() {
+        // Mirror of the decimals-only case: when decimals is None the key
+        // must be absent (matching the existing test in
+        // device_verify_frames_serialize_with_event_tag, verified here
+        // via a dedicated assertion).
+        let frame = DeviceVerifyFrame::EmojiReady {
+            flow_id: "flow_emj".to_string(),
+            emoji: Some(vec![EmojiPair {
+                symbol: "🐱".to_string(),
+                description: "Cat".to_string(),
+            }]),
+            decimals: None,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(
+            !json.contains("\"decimals\""),
+            "decimals field must be absent when None; got {json}",
+        );
+        assert!(
+            json.contains("\"emoji\""),
+            "emoji must be present; got {json}"
+        );
+    }
+
+    // --- DeviceVerifyFrame round-trip deserialization (issue #259 schema contract) ---
+
+    #[test]
+    fn device_verify_frame_all_variants_round_trip() {
+        // Every variant that the daemon streams to the CLI must be
+        // deserializable back from its own JSON form.  This guards
+        // the streaming IPC schema against accidental breakage: a
+        // change that breaks deserialization would prevent the CLI
+        // from parsing responses.
+        let cases: Vec<DeviceVerifyFrame> = vec![
+            DeviceVerifyFrame::Started {
+                flow_id: "rt_1".to_string(),
+            },
+            DeviceVerifyFrame::EmojiReady {
+                flow_id: "rt_2".to_string(),
+                emoji: Some(vec![EmojiPair {
+                    symbol: "🐶".to_string(),
+                    description: "Dog".to_string(),
+                }]),
+                decimals: Some((111, 222, 333)),
+            },
+            DeviceVerifyFrame::EmojiReady {
+                flow_id: "rt_3".to_string(),
+                emoji: None,
+                decimals: Some((444, 555, 666)),
+            },
+            DeviceVerifyFrame::EmojiReady {
+                flow_id: "rt_4".to_string(),
+                emoji: Some(vec![]),
+                decimals: None,
+            },
+            DeviceVerifyFrame::Confirmed {
+                flow_id: "rt_5".to_string(),
+            },
+            DeviceVerifyFrame::Cancelled {
+                flow_id: "rt_6".to_string(),
+            },
+            DeviceVerifyFrame::Error {
+                message: "round-trip error msg".to_string(),
+            },
+        ];
+        for case in &cases {
+            let json = serde_json::to_string(case)
+                .unwrap_or_else(|e| panic!("serialize failed for {case:?}: {e}"));
+            let back: DeviceVerifyFrame = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("deserialize failed for {case:?}: {e}\njson: {json}"));
+            assert_eq!(
+                &back, case,
+                "round-trip mismatch for {case:?}\njson: {json}"
             );
         }
     }
