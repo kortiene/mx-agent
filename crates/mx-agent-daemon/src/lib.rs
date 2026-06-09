@@ -86,11 +86,10 @@ pub use context::{
     DEFAULT_FETCH_SCAN_LIMIT, DIFF_MIME_TYPE, ENV_MIME_TYPE, MAX_INLINE_BYTES,
 };
 pub use device_ipc::{
-    bootstrap_cross_signing_for_session, cancel_verify, confirm_verify,
-    cross_signing_status_for_session, list_devices_for_session, manual_verify_for_session,
-    read_verify_decision, run_device_verify, show_device_for_session, DeviceListParams,
-    DeviceShowParams, DeviceVerifyFrame, DeviceVerifyManualParams, DeviceVerifyStartParams,
-    VerificationActionResult, VerifyDecision, VerifyFlowParams, METHOD_DEVICE_VERIFY_START,
+    bootstrap_cross_signing_for_session, cross_signing_status_for_session,
+    list_devices_for_session, manual_verify_for_session, read_verify_decision, run_device_verify,
+    show_device_for_session, DeviceListParams, DeviceShowParams, DeviceVerifyFrame,
+    DeviceVerifyManualParams, DeviceVerifyStartParams, VerifyDecision, METHOD_DEVICE_VERIFY_START,
     VERIFY_DEADLINE,
 };
 pub use event_router::{
