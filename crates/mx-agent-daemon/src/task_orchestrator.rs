@@ -1211,7 +1211,7 @@ fn verify_task_action_signature(
     auth: &TaskActionAuthorization,
 ) -> Result<(), SignatureError> {
     let value = task_action_signing_value(task_id, action, auth);
-    let bytes = canonical_json::to_canonical_bytes(&value);
+    let bytes = canonical_json::to_canonical_bytes(&value).map_err(SignatureError::NonCanonical)?;
     signing::verify_signature(verifying_key, &auth.signature, &bytes)
 }
 
