@@ -61,6 +61,9 @@ jobs:
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/${bin}${ext}" "$staging/"
           cp README.md "$staging/" 2>/dev/null || true
+          # Ship shell completions and man pages, generated from the freshly
+          # built (runner-native) binary so downloads include them.
+          scripts/gen-cli-artifacts.sh "$staging" "target/${{ matrix.target }}/release/${bin}${ext}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             asset="${staging}.zip"
             7z a "$asset" "$staging" >/dev/null
