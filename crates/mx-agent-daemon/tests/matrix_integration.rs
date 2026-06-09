@@ -59,24 +59,25 @@ use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::events::room::message::{
     OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
-use matrix_sdk::ruma::{EventId, UserId};
+use matrix_sdk::ruma::{EventId, OwnedRoomId, UserId};
 use matrix_sdk::{Client, Room};
 use serde_json::{json, Value};
 
 use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
-    build_signed_exec_request, cancel_task_for_session, create_task, decide_approval_for_session,
-    emit_heartbeat, get_invocation, list_agents, list_pending_approvals, list_tasks,
-    load_or_create_signing_key, load_sync_token, login_password, read_latest_heartbeats,
-    register_agent, restore_client, run_matrix_sync, run_matrix_sync_with_subscribers,
-    run_scheduler_loop, save_session, show_agent, sign_task_action, start_call_matrix,
-    start_exec_matrix, AgentListing, BackoffConfig, CallOutcome, CallStartParams,
-    CreateTaskOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
-    ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent,
-    HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig,
-    PtyWinsize, RegisterAgentOptions, SessionPaths, SyncHealth, SyncState, TaskDispatchMode,
-    TrustStore, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
+    build_signed_exec_request, cancel_task_for_session, create_task, create_workspace,
+    decide_approval_for_session, emit_heartbeat, get_invocation, list_agents,
+    list_pending_approvals, list_tasks, load_or_create_signing_key, load_sync_token,
+    login_password, read_latest_heartbeats, register_agent, restore_client, run_matrix_sync,
+    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, show_agent,
+    sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, BackoffConfig,
+    CallOutcome, CallStartParams, CreateTaskOptions, CreateWorkspaceOptions, DaemonSigningKey,
+    ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry,
+    ExecSubscriptionKey, ForwardedExecEvent, HeartbeatConfig, ListAgentsOptions, ListTasksOptions,
+    Liveness, LivenessConfig, MatrixConfig, PtyWinsize, RegisterAgentOptions, SessionPaths,
+    SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceVisibility, DECISION_APPROVED,
+    DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -3267,4 +3268,147 @@ require_verified_device = true
         .expect("bob sync exits cleanly");
     std::env::remove_var(ENV_DATA_DIR);
     std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
+/// Workspace rooms are created without E2EE — regression guard for #270 / #249.
+///
+/// Pins the security invariant that [`create_workspace`] does NOT enable
+/// room-level encryption. Remote `exec`/`call`/`share` events sent into
+/// workspace rooms are therefore **cleartext timeline events** readable by
+/// the homeserver operator in this alpha. The documentation in
+/// `docs/cli-reference.md` (corrected by #270) correctly reflects this:
+/// operations are Ed25519-**signed** for authenticity but NOT
+/// end-to-end encrypted.
+///
+/// This test guards against a silent regression: if `create_workspace` were
+/// ever to accidentally enable `m.room.encryption`, the over-claim in the
+/// docs would become factually true and the doc-lint guard in
+/// `scripts/check-doc-claims.sh` would become incorrect in the opposite
+/// direction. Both would need updating if workspace E2EE actually lands
+/// (issue #249).
+///
+/// Two scenarios:
+/// 1. **Both private and public workspaces report `encrypted = false`** via the
+///    [`WorkspaceInfo`] summary, which reads `room.encryption_state()`.
+/// 2. **An observer (Bob) can read an exec-typed event as cleartext** from the
+///    public workspace: the event has no `encryption_info()` wrapper, which
+///    is what `m.room.encrypted` events would carry.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn workspace_room_is_created_without_encryption() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login should succeed");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore should succeed");
+    // Bob is the homeserver-operator stand-in: he must be able to read Alice's
+    // workspace events as plaintext without any decryption step.
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login should succeed");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore should succeed");
+
+    // ── Criterion 1: private workspace room must NOT be E2EE encrypted ────────
+    let private_ws = create_workspace(
+        &alice,
+        &CreateWorkspaceOptions {
+            name: Some("it-privacy-private".to_string()),
+            topic: None,
+            alias: None,
+            visibility: WorkspaceVisibility::Private,
+        },
+    )
+    .await
+    .expect("create private workspace");
+
+    assert!(
+        !private_ws.encrypted,
+        "private workspace must NOT have E2EE enabled (exec/call traffic is signed \
+         but cleartext in this alpha — see #249 / #270)"
+    );
+
+    // ── Criterion 1 (cont.): public workspace room must NOT be E2EE encrypted ─
+    let public_ws = create_workspace(
+        &alice,
+        &CreateWorkspaceOptions {
+            name: Some("it-privacy-public".to_string()),
+            topic: None,
+            alias: None,
+            visibility: WorkspaceVisibility::Public,
+        },
+    )
+    .await
+    .expect("create public workspace");
+
+    assert!(
+        !public_ws.encrypted,
+        "public workspace must NOT have E2EE enabled (exec/call traffic is signed \
+         but cleartext in this alpha — see #249 / #270)"
+    );
+
+    // ── Criterion 2: an observer reads an exec event as cleartext ─────────────
+    //
+    // Alice sends a synthetic `com.mxagent.exec.request.v1` marker into the
+    // public workspace room (the exact event type the remote exec path uses).
+    // Bob joins and fetches the event; it must carry no `encryption_info()` —
+    // a homeserver operator can read the full payload.
+    let pub_room_id: OwnedRoomId = public_ws.room_id.parse().expect("valid room id");
+    let alice_room = alice
+        .get_room(&pub_room_id)
+        .expect("alice should own the public workspace room");
+
+    let event_id = alice_room
+        .send_raw(
+            timeline::EXEC_REQUEST,
+            json!({ "_test": "cleartext-marker-270" }),
+        )
+        .await
+        .expect("send marker event")
+        .response
+        .event_id;
+
+    bob.join_room_by_id(&pub_room_id)
+        .await
+        .expect("bob joins public workspace room");
+    let bob_room = bob
+        .get_room(&pub_room_id)
+        .expect("bob sees the public workspace room");
+
+    let observed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(ev) = bob_room.event(&event_id, None).await {
+                return ev;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("bob should fetch the timeline event within 30 s");
+
+    assert!(
+        observed.encryption_info().is_none(),
+        "exec request sent to a workspace room must be a cleartext timeline event \
+         with no encryption wrapper — the homeserver operator can read it (#270)"
+    );
+
+    std::env::remove_var(ENV_DATA_DIR);
 }

@@ -70,7 +70,7 @@ mx-agent agent register --room '#my-project:example.org' \
 # 5. Run a command locally (daemon-mediated loopback)...
 mx-agent exec -- cargo test
 
-# 6. ...or on a trusted remote agent (signed + E2EE over Matrix).
+# 6. ...or on a trusted remote agent (Ed25519-signed over Matrix; alpha rooms are unencrypted).
 mx-agent exec --room '#my-project:example.org' --agent '@peer:example.org' -- uname -a
 ```
 
@@ -97,7 +97,7 @@ EXCEPTIONS/nuance:
 
 - `mx-agent daemon start/status/stop` manage the daemon process itself (not over IPC for start).
 - `auth login` is CLI-initiated only to receive the password and hand the new session to the daemon.
-- `call` and `exec` run daemon-mediated LOCAL loopback execution by DEFAULT; they become signed, E2EE Matrix-backed REMOTE operations when BOTH `--room` and `--agent` target a registered remote agent.
+- `call` and `exec` run daemon-mediated LOCAL loopback execution by DEFAULT; they become signed, Matrix-backed REMOTE operations when BOTH `--room` and `--agent` target a registered remote agent (Ed25519-signed; the workspace room is unencrypted in this alpha, so traffic is readable by the homeserver — see #249).
 - Privileged remote requests run the receiver-side pipeline: verify(Ed25519 signature) → local trust store → deny-by-default policy.toml → optional require_verified_device gate → optional approval gate → sandbox runner. Room membership alone grants NOTHING.
 
 ## Conventions
@@ -116,8 +116,9 @@ EXCEPTIONS/nuance:
   so its own flags are not parsed by `mx-agent` (e.g. `exec -- ls -la`).
 
 - **Local vs remote.** `call` and `exec` run locally through the daemon by default; supplying
-  **both** `--room` and `--agent` turns them into signed, end-to-end-encrypted remote operations
-  that the target daemon authorizes independently.
+  **both** `--room` and `--agent` turns them into signed remote operations (Ed25519-signed and
+  authorized by the target daemon; not end-to-end encrypted in this alpha) that the target daemon
+  authorizes independently.
 
 Commands are grouped below. Each group lists its subcommands, then documents every option, behavior, exit codes, and examples.
 
@@ -1178,7 +1179,7 @@ echo '{"package":"api","coverage":true}' | mx-agent call \
 
 ## `exec` — Run a command on a remote agent
 
-Executes a command on a local or remote agent, capturing its output as a structured stream of stdout/stderr chunks ending with a terminal frame carrying the exit status. Local execution is the default; with `--room` and `--agent`, the command becomes a signed, E2EE Matrix-backed remote operation routed through the trust and approval pipeline. The daemon (not the CLI) owns process supervision, policy enforcement, and the Matrix client.
+Executes a command on a local or remote agent, capturing its output as a structured stream of stdout/stderr chunks ending with a terminal frame carrying the exit status. Local execution is the default; with `--room` and `--agent`, the command becomes a signed, Matrix-backed remote operation routed through the trust and approval pipeline. The daemon (not the CLI) owns process supervision, policy enforcement, and the Matrix client.
 
 | Subcommand | Purpose |
 |---|---|
@@ -1268,14 +1269,14 @@ mx-agent exec --cwd /tmp -- python3 -c "import sys; print(sys.stdin.read())" < i
 - **Large output:** Exec output larger than 256 KiB is automatically uploaded to a Matrix media artifact; the CLI receives a reference URI and a 4 KiB tail for preview.
 - **Strict mode:** `--strict-stream` is useful for audit trails (e.g., build logs); degraded output (default) is suitable for interactive use.
 - **Task integration:** `--task` links the invocation to a scheduled task's DAG; the daemon records the invocation ID on the task state and can thus trace execution lineage.
-- **E2EE:** Remote exec is end-to-end encrypted by the Matrix client; the command, stdin, and output are encrypted at rest and in flight. Only the specified agent can decrypt and execute.
+- **Confidentiality:** Remote exec is **Ed25519-signed** for integrity and authenticity, and the receiver authorizes it (verify → trust store → deny-by-default policy → optional verified-device and approval gates). It is **not** end-to-end encrypted in this alpha: the workspace room is created with encryption disabled (see [`workspace create`](#mx-agent-workspace-create) above), so the command line, stdin, and captured output transit as cleartext Matrix timeline events **readable by the homeserver operator**. Confidentiality from the homeserver is not provided until workspace E2EE lands (#249; see [`docs/architecture.md`](architecture.md)).
 - **Restart durability:** a command held for approval survives a daemon restart — the approval queue is persisted (`approvals.json`). In-flight output of a running command is not guaranteed to survive a restart.
 - **Policy enforcement:** Remote exec checks `policy.toml` (`allow_commands` glob and `deny_args_regex`), optional verified-device gates, and optional approval before spawning.
 - **Stdin detection:** In non-PTY mode, stdin is auto-detected from `IsTerminal`; piped input is buffered and forwarded automatically. The `--stdin` flag is reserved for future use.
 
 ## `share` — Broadcast context (diffs, environment, files)
 
-Share files, diffs, and environment metadata with a workspace room. The daemon broadcasts the payload as encrypted room state (E2EE) or media. Requires authentication and a joined workspace room. All share operations are daemon-mediated over IPC.
+Share files, diffs, and environment metadata with a workspace room. The daemon broadcasts the payload as a Matrix timeline event (or media for large payloads). Requires authentication and a joined workspace room. All share operations are daemon-mediated over IPC.
 
 | Subcommand | Purpose |
 |---|---|
@@ -1304,7 +1305,7 @@ mx-agent [GLOBAL] share file --room <ROOM> [--type <MIME>] --name <NAME>
 | `--name` | `<NAME>` | Yes | — | Object name to record with the share (e.g. `plan.json`, `output.txt`). |
 
 **Behavior**
-Reads the payload from stdin (pipe or redirect). If stdin is a terminal and not redirected, exits with code 64 ("no input"). The daemon encrypts and uploads the payload to the room as either inline state (small payloads) or Matrix media (large payloads > 256 KiB). On success, prints the context share in human-readable format (name, context_id, MIME type, size, SHA-256 digest) or as a JSON `ContextShare` object under `--json`.
+Reads the payload from stdin (pipe or redirect). If stdin is a terminal and not redirected, exits with code 64 ("no input"). The daemon uploads the payload to the room as either inline state (small payloads) or Matrix media (large payloads > 256 KiB). On success, prints the context share in human-readable format (name, context_id, MIME type, size, SHA-256 digest) or as a JSON `ContextShare` object under `--json`.
 
 **Exit codes**
 
@@ -1331,7 +1332,7 @@ echo '{"status":"complete"}' | mx-agent share file --room '#work:example.com' --
 **Notes**
 
 - Payloads over 256 KiB are automatically offloaded to Matrix media (mxc://) to avoid bloating room state.
-- All shares are E2EE; encryption depends on room-wide E2EE enablement and device verification for cross-signed trust.
+- Shares transit an **unencrypted** workspace room in this alpha and are readable by the homeserver operator; room-wide E2EE is tracked by #249 (see [`docs/architecture.md`](architecture.md)). Payloads are integrity-checked via their recorded SHA-256 digest.
 - The context_id is sortable (ulid format, e.g. `ctx_01HZ...`) and can be used with `share get` to retrieve the artifact later.
 
 ---
