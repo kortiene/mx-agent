@@ -40,6 +40,15 @@ USER2="mxagent_it_bob"
 PASS1="${USER1}-pass"
 PASS2="${USER2}-pass"
 
+# The recovery test asserts a freshly bootstrapped cross-signing identity, which
+# only holds when the account has no server-side cross-signing identity yet
+# (`bootstrap_cross_signing_if_needed` no-ops once one exists). A Matrix account
+# keeps that identity server-side, so reusing USER1 makes the test pass once and
+# fail on every re-run. Give it a unique, freshly-registered user per run so it
+# always starts from a pristine cross-signing state.
+USER_REC="mxagent_it_recovery_$$_${RANDOM}"
+PASS_REC="${USER_REC}-pass"
+
 # Register a user if needed; fall back to login so re-runs (where the user
 # already exists) still succeed. Both paths confirm the credentials work.
 ensure_user() {
@@ -60,6 +69,8 @@ HOMESERVER="$("$MATRIX_DEV" url)"
 
 ensure_user "$USER1" "$PASS1"
 ensure_user "$USER2" "$PASS2"
+# Fresh per run, so the unique name always registers cleanly (never reused).
+ensure_user "$USER_REC" "$PASS_REC"
 
 note "running integration test against $HOMESERVER"
 set +e
@@ -70,6 +81,8 @@ set +e
   MX_AGENT_TEST_PASSWORD="$PASS1" \
   MX_AGENT_TEST_USER2="$USER2" \
   MX_AGENT_TEST_PASSWORD2="$PASS2" \
+  MX_AGENT_TEST_RECOVERY_USER="$USER_REC" \
+  MX_AGENT_TEST_RECOVERY_PASSWORD="$PASS_REC" \
     cargo test -p mx-agent-daemon --test matrix_integration -- --ignored --nocapture --test-threads=1
 )
 status=$?
