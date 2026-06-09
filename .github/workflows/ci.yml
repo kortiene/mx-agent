@@ -16,6 +16,10 @@ jobs:
           test -f docs/architecture.md
           test -f docs/roadmap-rust.md
           test -f docs/alpha-release-checklist.md
+      - name: Check docs for E2EE confidentiality over-claims
+        # Pure grep/bash, no toolchain — fails fast if the docs re-introduce the
+        # exec/call/share/workspace confidentiality over-claim (#270/#252/#249).
+        run: scripts/check-doc-claims.sh
 
   shell:
     runs-on: ubuntu-latest
@@ -25,6 +29,13 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck scripts/*.sh
+      - name: Test doc-claims lint script
+        # Runs scripts/test_check_doc_claims.sh, which exercises
+        # check-doc-claims.sh against fixture files: forbidden phrases must
+        # trigger exit 1 + file:line output; legitimate E2EE mentions (advisory
+        # signal, "disabled", #249 references) must not cause false positives;
+        # and the real project docs must pass (#270 regression guard).
+        run: bash scripts/test_check_doc_claims.sh
 
   adw:
     # Runs the Agent Development Workflow helper unit tests (adw/). They are
@@ -65,6 +76,13 @@ jobs:
       - name: cargo test
         if: steps.cargo.outputs.present == 'true'
         run: cargo test --all
+      - name: CLI artifact generation smoke check
+        # Confirms the clap command tree still generates completions + man pages
+        # cleanly, so the CLI reference cannot silently drift from the binary.
+        if: steps.cargo.outputs.present == 'true'
+        run: |
+          cargo build --release -p mx-agent-cli
+          scripts/gen-cli-artifacts.sh "$RUNNER_TEMP/cli-artifacts" target/release/mx-agent
 
   cargo-deny:
     # Enforces the dependency policy in deny.toml: security advisories, the

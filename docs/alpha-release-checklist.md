@@ -158,6 +158,15 @@ it here before release.
   backend. Interactive `exec --pty` does not route through the sandbox backend;
   only the baseline controls (env scrub, cwd, timeout, output cap) apply to the
   PTY path.
+- **Workspace rooms are unencrypted; exec/call/share traffic is homeserver-readable.**
+  `workspace create` does not enable room-level E2EE (`create_workspace()` never
+  adds an `m.room.encryption` initial-state event). Every `EXEC_REQUEST`,
+  `EXEC_FINISHED`, `STREAM_CHUNK`, `CALL_REQUEST`, `CALL_RESPONSE`, and `share`
+  payload travels as a cleartext Matrix timeline event readable by the homeserver
+  operator. Requests are **Ed25519-signed** (integrity/authenticity guaranteed),
+  but **not end-to-end encrypted**. Do not send commands, stdin, or payloads you
+  need to keep confidential from the homeserver operator until workspace E2EE
+  lands (#249).
 - **Bundled homeserver is dev-only.** The Tuwunel homeserver in `dev/matrix`
   binds to loopback, disables federation, and is for local testing only — never
   for production identities or data.
