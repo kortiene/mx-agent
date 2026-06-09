@@ -201,11 +201,16 @@ mx-agent device verify --user @peer:hs --device DEVICEID \
 
 # Interactive emoji/SAS (operator-attended): compare the emoji with the peer,
 # then answer the prompt. The confirm/cancel travels over the same connection.
+# The entire flow — including the decision wait — is bounded by a ~300 s
+# deadline. An unanswered prompt cancels automatically (fails safe to cancel).
 mx-agent device verify --user @peer:hs --device DEVICEID
 ```
 
 A headless/unattended daemon should use the out-of-band `--manual --fingerprint`
-path (or pre-seeded cross-signing); the interactive SAS expects an operator.
+path (or pre-seeded cross-signing); the interactive SAS expects an operator. An
+in-progress interactive verification does not block other daemon IPC commands
+(exec, approval, task, heartbeat) — each connection is served on its own worker
+thread (issue #258).
 
 **Cross-signing.** Bootstrap the daemon's own cross-signing identity so verifying
 a user's identity marks their cross-signed devices verified:
@@ -465,7 +470,7 @@ to structured fields here.
 - [ ] `recovery enable` run once per daemon identity; recovery key stored safely offline (shown once, never logged or persisted in clear).
 - [ ] After a re-provision onto a new host, `recovery recover` run before accepting privileged events so history remains decryptable.
 - [ ] If peer device verification is required, `require_verified_device = true` set *after* verifying peer devices via `mx-agent device verify`; the flag is additive-deny only and does not relax execution policy.
-- [ ] Interactive SAS (`mx-agent device verify`) treated as operator-attended; headless daemons use `--manual --fingerprint` or pre-seeded cross-signing instead.
+- [ ] Interactive SAS (`mx-agent device verify`) treated as operator-attended; headless daemons use `--manual --fingerprint` or pre-seeded cross-signing instead. An unanswered prompt cancels automatically after ~300 s (fails safe to cancel); other daemon IPC commands remain unaffected while the flow is in progress.
 - [ ] Audit log monitored and shipped off-box if you need non-repudiation.
 
 See also: [`SECURITY.md`](../SECURITY.md) for reporting vulnerabilities, and the

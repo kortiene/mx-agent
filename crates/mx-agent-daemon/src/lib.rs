@@ -88,9 +88,10 @@ pub use context::{
 pub use device_ipc::{
     bootstrap_cross_signing_for_session, cancel_verify, confirm_verify,
     cross_signing_status_for_session, list_devices_for_session, manual_verify_for_session,
-    run_device_verify, show_device_for_session, DeviceListParams, DeviceShowParams,
-    DeviceVerifyFrame, DeviceVerifyManualParams, DeviceVerifyStartParams, VerificationActionResult,
-    VerifyDecision, VerifyFlowParams, METHOD_DEVICE_VERIFY_START,
+    read_verify_decision, run_device_verify, show_device_for_session, DeviceListParams,
+    DeviceShowParams, DeviceVerifyFrame, DeviceVerifyManualParams, DeviceVerifyStartParams,
+    VerificationActionResult, VerifyDecision, VerifyFlowParams, METHOD_DEVICE_VERIFY_START,
+    VERIFY_DEADLINE,
 };
 pub use event_router::{
     classify as classify_event, events_from_sync_response, EventCategory, EventMeta, EventRouter,
