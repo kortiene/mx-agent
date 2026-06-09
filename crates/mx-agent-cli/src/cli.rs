@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 /// Top-level parser for the `mx-agent` binary.
@@ -106,6 +106,36 @@ enum Command {
     /// Manage server-side key backup and recovery.
     #[command(subcommand)]
     Recovery(RecoveryCommand),
+
+    /// Generate shell completions and man pages (tooling for packagers).
+    #[command(subcommand, hide = true)]
+    Generate(GenerateCommand),
+}
+
+/// `generate` subcommands: emit shell completions and man pages directly from
+/// the command tree (via `clap_complete`/`clap_mangen`) so packaged artifacts
+/// never drift from the binary. Hidden from `--help`: this is tooling, not part
+/// of the day-to-day surface.
+#[derive(Debug, Subcommand)]
+enum GenerateCommand {
+    /// Print a shell completion script to stdout.
+    Completions(GenerateCompletionsArgs),
+    /// Write man pages (one per command and subcommand) into a directory.
+    Man(GenerateManArgs),
+}
+
+#[derive(Debug, Args)]
+struct GenerateCompletionsArgs {
+    /// Shell dialect to generate completions for.
+    #[arg(value_enum, value_name = "SHELL")]
+    shell: clap_complete::Shell,
+}
+
+#[derive(Debug, Args)]
+struct GenerateManArgs {
+    /// Directory to write the generated man pages into (created if absent).
+    #[arg(long, value_name = "DIR")]
+    dir: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -914,6 +944,40 @@ pub fn run() -> ExitCode {
         Command::Exec(args) => cmd_exec(g, args),
         Command::Device(cmd) => handle_device(g, cmd),
         Command::Recovery(cmd) => handle_recovery(g, cmd),
+        Command::Generate(cmd) => handle_generate(cmd),
+    }
+}
+
+/// Handle the hidden `generate` command group: emit shell completions and man
+/// pages from the derived command tree. Used by packagers and the release
+/// pipeline; not Matrix-backed, so it does not touch the daemon.
+fn handle_generate(cmd: &GenerateCommand) -> ExitCode {
+    let mut command = Cli::command();
+    match cmd {
+        GenerateCommand::Completions(args) => {
+            let bin = command.get_name().to_string();
+            clap_complete::generate(args.shell, &mut command, bin, &mut std::io::stdout());
+            ExitCode::SUCCESS
+        }
+        GenerateCommand::Man(args) => {
+            if let Err(e) = std::fs::create_dir_all(&args.dir) {
+                eprintln!(
+                    "mx-agent: cannot create man output directory {}: {e}",
+                    args.dir.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            match clap_mangen::generate_to(command, &args.dir) {
+                Ok(_) => {
+                    eprintln!("mx-agent: wrote man pages to {}", args.dir.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("mx-agent: failed to generate man pages: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
@@ -3565,6 +3629,13 @@ fn command_path(command: &Command) -> String {
                 RecoveryCommand::Recover(_) => "recover",
             }
         ),
+        Command::Generate(c) => format!(
+            "generate {}",
+            match c {
+                GenerateCommand::Completions(_) => "completions",
+                GenerateCommand::Man(_) => "man",
+            }
+        ),
     }
 }
 
@@ -4239,6 +4310,119 @@ mod tests {
     fn cli_definition_is_valid() {
         // Panics if the derived command tree is malformed.
         Cli::command().debug_assert();
+    }
+
+    /// Drift guard: `docs/cli-reference.md` must document every (visible) command
+    /// and every non-global flag in the binary, and must not document commands
+    /// that no longer exist. Keeps the hand-written reference honest as the CLI
+    /// surface changes. Fails with a precise list of what to add/remove.
+    #[test]
+    fn cli_reference_matches_command_surface() {
+        use std::collections::BTreeSet;
+
+        let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/cli-reference.md");
+        let doc = std::fs::read_to_string(doc_path)
+            .unwrap_or_else(|e| panic!("cannot read {doc_path}: {e}"));
+
+        // Global flags are documented once under "Global options"; clap also
+        // injects --help/--version. None of these are per-command.
+        const GLOBAL_OR_BUILTIN: &[&str] =
+            &["json", "config", "socket", "verbose", "help", "version"];
+
+        fn collect(
+            cmd: &clap::Command,
+            prefix: &str,
+            paths: &mut BTreeSet<String>,
+            problems: &mut Vec<String>,
+            doc: &str,
+        ) {
+            for sub in cmd.get_subcommands() {
+                if sub.is_hide_set() {
+                    continue; // tooling like `generate` is intentionally undocumented
+                }
+                let path = format!("{prefix} {}", sub.get_name());
+                paths.insert(path.clone());
+
+                // Leaf commands get a `### `mx-agent <path>`` heading.
+                let is_leaf = sub.get_subcommands().next().is_none();
+                if is_leaf && !doc.contains(&format!("`{path}`")) {
+                    problems.push(format!("missing documentation for command `{path}`"));
+                }
+
+                // Every non-global long flag must appear somewhere in the doc.
+                for arg in sub.get_arguments() {
+                    if arg.is_hide_set() {
+                        continue;
+                    }
+                    if let Some(long) = arg.get_long() {
+                        if GLOBAL_OR_BUILTIN.contains(&long) {
+                            continue;
+                        }
+                        let flag = format!("--{long}");
+                        if !doc.contains(&flag) {
+                            problems
+                                .push(format!("missing documentation for flag {flag} of `{path}`"));
+                        }
+                    }
+                }
+
+                collect(sub, &path, paths, problems, doc);
+            }
+        }
+
+        let cmd = Cli::command();
+        let mut paths = BTreeSet::new();
+        let mut problems = Vec::new();
+        collect(&cmd, "mx-agent", &mut paths, &mut problems, &doc);
+
+        // Reverse direction: every documented command must still exist.
+        for line in doc.lines() {
+            if let Some(rest) = line.strip_prefix("### `") {
+                if let Some(end) = rest.find('`') {
+                    let documented = &rest[..end];
+                    if documented.starts_with("mx-agent ") && !paths.contains(documented) {
+                        problems.push(format!(
+                            "documents `{documented}`, which is not a current command"
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "docs/cli-reference.md is out of sync with the CLI surface:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// The hidden `generate` command must be able to emit completions for every
+    /// supported shell and a directory of man pages without panicking.
+    #[test]
+    fn generate_completions_and_man_succeed() {
+        let mut cmd = Cli::command();
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::Elvish,
+            clap_complete::Shell::PowerShell,
+        ] {
+            let mut buf: Vec<u8> = Vec::new();
+            clap_complete::generate(shell, &mut cmd, "mx-agent", &mut buf);
+            assert!(!buf.is_empty(), "{shell} completion script was empty");
+        }
+
+        let dir = std::env::temp_dir().join("mx_agent_man_smoke_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp man dir");
+        clap_mangen::generate_to(Cli::command(), &dir).expect("generate man pages");
+        assert!(
+            dir.join("mx-agent.1").exists(),
+            "expected mx-agent.1 in {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
