@@ -4301,8 +4301,11 @@ async fn live_decrypt_after_restart_from_persistent_store() {
 /// 3. **Re-provision**: a second `login_password` for the same user mints
 ///    **device B** with an empty store; device B can fetch but **not** decrypt
 ///    the history (asserted before restore).
-/// 4. **Restore**: `recover` with the recovery key re-imports the backed-up keys,
-///    and device B now decrypts the previously-encrypted history.
+/// 4. **Restore**: `recover` with the recovery key re-imports the secrets
+///    (cross-signing + the backup decryption key) and enables the backup, then
+///    the room's keys are pulled down from the server-side backup
+///    (`download_room_keys_for_room`) so device B decrypts the
+///    previously-encrypted history.
 ///
 /// Uses a fresh-per-run `MX_AGENT_TEST_BACKUP_USER` (pristine cross-signing +
 /// clean backup version), falling back to the shared user when unset (hermetic
@@ -4435,15 +4438,21 @@ async fn live_key_backup_restore_across_reprovision() {
         "device A must decrypt the history before backup; got {pre}"
     );
 
-    // Upload device A's room keys to server-side backup and wait until steady.
-    let _ = tokio::time::timeout(Duration::from_secs(60), async {
+    // Upload device A's room keys to server-side backup and wait until the
+    // upload reaches steady state. Assert the outcome (rather than discarding it)
+    // so an incomplete server-side backup upload fails loud here with a clear
+    // signal, instead of surfacing later as a confusing decrypt timeout on
+    // device B (issue #260 review finding).
+    tokio::time::timeout(Duration::from_secs(60), async {
         device_a
             .encryption()
             .backups()
             .wait_for_steady_state()
             .await
     })
-    .await;
+    .await
+    .expect("server-side key-backup upload did not reach steady state within 60s")
+    .expect("server-side key-backup upload failed");
 
     // ---- Re-provision: log in again as the SAME user → device B, empty store. ----
     let device_b_session = login_password(&config, &alice_user, &alice_pass)
@@ -4497,6 +4506,20 @@ async fn live_key_backup_restore_across_reprovision() {
         restored.backup_enabled,
         "key backup must be enabled after recover; got {restored:?}"
     );
+
+    // `recover` re-imports the secrets (cross-signing + the backup decryption
+    // key) and enables the backup, but it does not eagerly pull the room keys
+    // down from the server-side backup: in production that happens lazily on the
+    // daemon's long-running sync via the SDK's download-after-decryption-failure
+    // strategy. This test decrypts a single historical event synchronously, so
+    // pull the room's keys from the backup explicitly to prove the restore
+    // round-trip deterministically instead of racing the background download.
+    device_b
+        .encryption()
+        .backups()
+        .download_room_keys_for_room(&room_id)
+        .await
+        .expect("device B downloads the room's keys from the server-side backup");
 
     // ---- Device B can now decrypt the previously-encrypted history. ----
     let post = decrypted_content(&b_room, &history_id).await;
