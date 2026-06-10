@@ -513,6 +513,29 @@ pub fn approval_request_expiry(now: SystemTime, ttl: Duration) -> String {
     unix_to_rfc3339(secs)
 }
 
+/// Whether an approval request stamped with `expires_at` (RFC 3339 UTC) has
+/// closed at or before `now_unix` (Unix seconds).
+///
+/// Pure and deterministic given its inputs, so the expiry transition is
+/// unit-testable without mocking the wall clock (mirrors
+/// [`approval_request_expiry`]). The boundary is `<=` to match
+/// [`ReplayCache::admit_at`](crate::replay::ReplayCache): a stamp equal to
+/// `now_unix` counts as expired.
+///
+/// A malformed `expires_at` is treated as **not yet expired** (fail-open on the
+/// *expiry* axis only): the request stays pending and resolvable by an explicit
+/// decision rather than being silently finalized off an unparseable stamp. The
+/// same daemon stamps the value with a well-formed formatter, so a malformed
+/// stamp signals corruption, not a closed window — and an explicit deny/approve
+/// still terminates the request. This never weakens execution safety: a task
+/// still requires a verified approval to ever run.
+pub fn approval_request_expired(expires_at: &str, now_unix: i64) -> bool {
+    match crate::replay::parse_rfc3339_to_unix(expires_at) {
+        Some(expiry) => expiry <= now_unix,
+        None => false,
+    }
+}
+
 /// Format the current wall-clock time as an RFC 3339 UTC timestamp.
 fn now_rfc3339() -> String {
     let secs = SystemTime::now()
@@ -887,6 +910,30 @@ mod tests {
         let with_default = approval_request_expiry(base, APPROVAL_REQUEST_TTL);
         assert_eq!(with_default.len(), 20);
         assert!(with_default.ends_with('Z'));
+    }
+
+    #[test]
+    fn approval_request_expired_is_true_for_past_stamp() {
+        // A stamp strictly before `now_unix` is expired.
+        let now = 1_748_865_600; // 2025-06-02T12:00:00Z
+        assert!(approval_request_expired("2025-06-02T11:00:00Z", now));
+    }
+
+    #[test]
+    fn approval_request_expired_is_false_for_future_stamp() {
+        let now = 1_748_865_600; // 2025-06-02T12:00:00Z
+        assert!(!approval_request_expired("2025-06-02T13:00:00Z", now));
+        // Boundary: a stamp equal to `now_unix` counts as expired (`<=`).
+        assert!(approval_request_expired("2025-06-02T12:00:00Z", now));
+    }
+
+    #[test]
+    fn approval_request_expired_is_false_for_malformed_stamp() {
+        // Fail-open on the expiry axis: an unparseable stamp is never treated as
+        // a closed window (it stays decidable by an explicit approve/deny).
+        let now = 1_748_865_600;
+        assert!(!approval_request_expired("garbage", now));
+        assert!(!approval_request_expired("", now));
     }
 
     #[test]

@@ -239,7 +239,11 @@ fn now_unix() -> i64 {
 /// Supports the forms produced by mx-agent peers, e.g.
 /// `2026-06-02T12:05:00Z`, `2026-06-02T12:05:00.123Z`, and numeric offsets such
 /// as `2026-06-02T14:05:00+02:00`. Returns `None` for malformed input.
-fn parse_rfc3339_to_unix(s: &str) -> Option<i64> {
+///
+/// Exposed `pub(crate)` so the approval gate can reuse this single parser when
+/// comparing an approval request's stamped `expires_at` against "now" (issue
+/// #265) rather than duplicating a second RFC 3339 parser.
+pub(crate) fn parse_rfc3339_to_unix(s: &str) -> Option<i64> {
     let bytes = s.as_bytes();
     // Minimum: "YYYY-MM-DDTHH:MM:SS" + zone designator.
     if s.len() < 20 {
