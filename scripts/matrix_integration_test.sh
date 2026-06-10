@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # matrix_integration_test.sh — run the local Matrix integration test (issue #60).
 #
-# Stands up the throwaway local homeserver (issue #59), registers two test
-# users, and runs the daemon's `#[ignore]`d Matrix integration test against it.
-# The test logs in, restores a session, drives the real `/sync` loop, and
-# asserts the daemon observes a message sent by the second user. See
-# crates/mx-agent-daemon/tests/matrix_integration.rs and dev/matrix/README.md.
+# Stands up the throwaway local homeserver (issue #59), registers the test
+# users, and runs the daemon's `#[ignore]`d Matrix integration suite against it.
+# The suite logs in, restores sessions, drives the real `/sync` loop, and covers
+# the live daemon paths end to end — including (issue #260) E2EE restart
+# durability (decrypt-after-restart from the persistent crypto store),
+# key-backup restore across a re-provision, and the interactive two-daemon SAS
+# verification flow. See crates/mx-agent-daemon/tests/matrix_integration.rs and
+# dev/matrix/README.md.
+#
+# Some tests need a homeserver user with pristine state, so they are provisioned
+# fresh per run (a unique name registered cleanly each time): the recovery and
+# key-backup tests need a pristine cross-signing identity and a clean backup
+# version; the two-daemon SAS test needs single-device peers so the all-devices
+# `sender_verified == Some(true)` assertion is not defeated by devices a shared
+# user accumulates across `login_password` calls in the same run.
 #
 # Usage:
 #   scripts/matrix_integration_test.sh [--teardown]
@@ -49,6 +59,21 @@ PASS2="${USER2}-pass"
 USER_REC="mxagent_it_recovery_$$_${RANDOM}"
 PASS_REC="${USER_REC}-pass"
 
+# The key-backup restore test (issue #260) likewise needs a pristine
+# cross-signing identity and a clean backup version, so it gets its own
+# fresh-per-run user.
+USER_BACKUP="mxagent_it_backup_$$_${RANDOM}"
+PASS_BACKUP="${USER_BACKUP}-pass"
+
+# The two-daemon SAS test (issue #260) needs both peers to have exactly one
+# device, so the all-devices `sender_verified == Some(true)` assertion is not
+# defeated by devices the shared users accumulate across `login_password` calls
+# in the same run. Give each side a fresh-per-run single-device user.
+USER_SAS1="mxagent_it_sas1_$$_${RANDOM}"
+PASS_SAS1="${USER_SAS1}-pass"
+USER_SAS2="mxagent_it_sas2_$$_${RANDOM}"
+PASS_SAS2="${USER_SAS2}-pass"
+
 # Register a user if needed; fall back to login so re-runs (where the user
 # already exists) still succeed. Both paths confirm the credentials work.
 ensure_user() {
@@ -69,8 +94,11 @@ HOMESERVER="$("$MATRIX_DEV" url)"
 
 ensure_user "$USER1" "$PASS1"
 ensure_user "$USER2" "$PASS2"
-# Fresh per run, so the unique name always registers cleanly (never reused).
+# Fresh per run, so the unique names always register cleanly (never reused).
 ensure_user "$USER_REC" "$PASS_REC"
+ensure_user "$USER_BACKUP" "$PASS_BACKUP"
+ensure_user "$USER_SAS1" "$PASS_SAS1"
+ensure_user "$USER_SAS2" "$PASS_SAS2"
 
 note "running integration test against $HOMESERVER"
 set +e
@@ -83,6 +111,12 @@ set +e
   MX_AGENT_TEST_PASSWORD2="$PASS2" \
   MX_AGENT_TEST_RECOVERY_USER="$USER_REC" \
   MX_AGENT_TEST_RECOVERY_PASSWORD="$PASS_REC" \
+  MX_AGENT_TEST_BACKUP_USER="$USER_BACKUP" \
+  MX_AGENT_TEST_BACKUP_PASSWORD="$PASS_BACKUP" \
+  MX_AGENT_TEST_SAS_USER="$USER_SAS1" \
+  MX_AGENT_TEST_SAS_PASSWORD="$PASS_SAS1" \
+  MX_AGENT_TEST_SAS_USER2="$USER_SAS2" \
+  MX_AGENT_TEST_SAS_PASSWORD2="$PASS_SAS2" \
     cargo test -p mx-agent-daemon --test matrix_integration -- --ignored --nocapture --test-threads=1
 )
 status=$?
