@@ -54,6 +54,7 @@ use base64::Engine as _;
 use std::time::Duration;
 
 use matrix_sdk::config::SyncSettings;
+use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::api::client::room::{create_room, Visibility};
 use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::events::room::message::{
@@ -66,22 +67,22 @@ use serde_json::{json, Value};
 use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
-    build_signed_exec_request, cancel_task_for_session, create_task, create_workspace,
-    decide_approval_for_session, emit_heartbeat, get_invocation, list_agents,
-    list_pending_approvals, list_tasks, load_or_create_signing_key, load_sync_token,
+    build_signed_call_request_for_target, build_signed_exec_request, cancel_task_for_session,
+    create_task, create_workspace, decide_approval_for_session, emit_heartbeat, get_invocation,
+    list_agents, list_pending_approvals, list_tasks, load_or_create_signing_key, load_sync_token,
     login_password, read_latest_heartbeats, register_agent, restore_client, run_matrix_sync,
     run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, show_agent,
     sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, BackoffConfig,
-    CallOutcome, CallStartParams, CreateTaskOptions, CreateWorkspaceOptions, DaemonSigningKey,
-    ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry,
-    ExecSubscriptionKey, ForwardedExecEvent, HeartbeatConfig, ListAgentsOptions, ListTasksOptions,
-    Liveness, LivenessConfig, MatrixConfig, PtyWinsize, RegisterAgentOptions, SessionPaths,
-    SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceVisibility, DECISION_APPROVED,
-    DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
+    CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions, CreateWorkspaceOptions,
+    DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams,
+    ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent, HeartbeatConfig,
+    ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PtyWinsize,
+    RegisterAgentOptions, SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore,
+    WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
-use mx_agent_protocol::schema::{AgentState, StreamKind, TaskAction};
+use mx_agent_protocol::schema::{AgentState, ApprovalRequest, StreamKind, TaskAction};
 
 /// Read a required environment variable or fail with an actionable message.
 fn required_env(name: &str) -> String {
@@ -3819,4 +3820,293 @@ requires_approval = true
         sentinel.exists(),
         "legitimately approved task must spawn its command"
     );
+}
+
+/// Live named-`call` approval hold (issue #263).
+///
+/// Drives a real daemon sync loop against the live homeserver: Bob sends a
+/// signed `com.mxagent.call.request.v1` to Alice's daemon under a policy that
+/// marks the requesting agent with `requires_approval = true`. Three acceptance
+/// criteria are verified end-to-end against the real `handle_live_call_request`
+/// path:
+///
+/// 1. **Fail-closed hold** — no `com.mxagent.call.response.v1` is emitted; the
+///    handler returns before `execute_authorized_call` is reached.
+/// 2. **Approval request emitted** — a `com.mxagent.approval.request.v1` event
+///    carrying the call's `request_id` appears in the room.
+/// 3. **Queue durability** — a [`PendingApproval`] is written to the on-disk
+///    queue and survives a queue reload; the summary names only the tool and no
+///    call args leak into the queued record.
+///
+/// The non-approval path (immediate execution) is already covered end-to-end by
+/// [`live_matrix_backed_remote_call_round_trips`]; this test focuses on the new
+/// security guarantee.
+///
+/// Run via: `scripts/matrix_integration_test.sh`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_named_call_requires_approval_holds_and_enqueues() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent call approval hold test").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["call".to_string()],
+            tools: vec!["run_tests@1.0.0".to_string()],
+            cwd: "/home/me/code/mx-agent".to_string(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["call".to_string()],
+            tools: vec!["run_tests@1.0.0".to_string()],
+            cwd: "/home/me/code/mx-agent".to_string(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    // Trust the daemon's signing key so the call's signature check passes.
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+
+    // Policy: the tool is allowed but an operator decision is required before the
+    // call executes — this is the requires_approval gate under test (issue #263).
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_tools = ["run_tests"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+        ),
+    )
+    .expect("write approval-required policy");
+
+    // Start Alice's daemon sync loop so handle_live_call_request fires on the
+    // incoming call request.
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    // Build and send the signed call request directly — `start_call_matrix`
+    // blocks waiting for a `call.response` that a held call never emits, so
+    // we build the request ourselves and fire it into the room.
+    let invocation_id = format!("inv_call_approv_{}", std::process::id());
+    let request_id = format!("req_call_approv_{}", std::process::id());
+    save_session(&paths, &bob_session).expect("save requester session");
+    let content = build_signed_call_request_for_target(
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        &request_id,
+        format!("nonce-approv-{}", std::process::id()),
+        "2026-06-10T12:00:00Z",
+        "2099-01-01T00:00:00Z",
+        "run_tests",
+        // Secret-like arg value to assert it never leaks into the approval queue.
+        json!({ "package": "should_not_appear_in_approval" }),
+        CallTargeting {
+            requesting_agent: Some(requester_agent.clone()),
+            target_agent: Some(TARGET_AGENT.to_string()),
+        },
+    )
+    .expect("sign call request");
+
+    let bob_room = bob.get_room(&room_id).expect("bob sees room");
+    bob_room
+        .send_raw(timeline::CALL_REQUEST, content)
+        .await
+        .expect("send approval-required call request");
+
+    // Criterion 3: poll the local approval queue until the PendingApproval for
+    // this call appears (bounded 60 s). The daemon's sync handler enqueues it
+    // atomically via hold_call_for_approval before returning fail-closed.
+    let queue_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if pending.iter().any(|p| p.request_id() == request_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < queue_deadline,
+            "daemon should enqueue a PendingApproval for the approval-required call within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Validate queue entry: correct room, summary, invocation id, and no arg leak.
+    let pending = list_pending_approvals(&paths, Some(room_id.as_str())).expect("list pending");
+    let queued = pending
+        .iter()
+        .find(|p| p.request_id() == request_id)
+        .expect("PendingApproval must be in queue for approval-required call");
+    assert_eq!(queued.room_id, room_id.to_string());
+    assert_eq!(queued.request.summary, "Call tool run_tests");
+    assert_eq!(queued.request.invocation_id, invocation_id);
+    let queue_json = serde_json::to_string(&queued).expect("serialize queued approval");
+    assert!(
+        !queue_json.contains("should_not_appear_in_approval"),
+        "call args must not leak into the queued PendingApproval: {queue_json}"
+    );
+
+    // Queue reload: the entry must survive a fresh load (0600 persisted file).
+    let reloaded = mx_agent_daemon::ApprovalQueue::load(&paths).expect("reload approval queue");
+    assert!(
+        reloaded.get(&request_id).is_some(),
+        "PendingApproval must survive an approval queue reload"
+    );
+
+    // Criterion 2: a `com.mxagent.approval.request.v1` was emitted into the room
+    // by the daemon's hold path. Paginate backward through the room timeline
+    // (via Bob's client) and find the event with our request_id.
+    let mut msg_request = MessagesOptions::backward();
+    msg_request.limit = matrix_sdk::ruma::UInt::from(50_u32);
+    let messages = bob_room
+        .messages(msg_request)
+        .await
+        .expect("paginate room timeline");
+    let approval_request_found = messages.chunk.iter().any(|event| {
+        let raw = event.raw();
+        let is_type = raw.get_field::<String>("type").ok().flatten().as_deref()
+            == Some(timeline::APPROVAL_REQUEST);
+        if !is_type {
+            return false;
+        }
+        raw.get_field::<ApprovalRequest>("content")
+            .ok()
+            .flatten()
+            .map(|r| r.request_id == request_id)
+            .unwrap_or(false)
+    });
+    assert!(
+        approval_request_found,
+        "daemon must emit a com.mxagent.approval.request.v1 into the room when holding a call \
+         (issue #263): no approval.request.v1 with request_id={request_id} found in timeline"
+    );
+
+    // Criterion 1: no `com.mxagent.call.response.v1` with our request_id was
+    // emitted — the daemon returned before execute_authorized_call was reached.
+    // The same backward page is sufficient since no other sync activity generates
+    // a response for this request_id.
+    let call_response_found = messages.chunk.iter().any(|event| {
+        let raw = event.raw();
+        let is_type = raw.get_field::<String>("type").ok().flatten().as_deref()
+            == Some(timeline::CALL_RESPONSE);
+        if !is_type {
+            return false;
+        }
+        raw.get_field::<Value>("content")
+            .ok()
+            .flatten()
+            .and_then(|c| {
+                c.get("request_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == request_id)
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        !call_response_found,
+        "daemon must NOT emit a call.response for an approval-required call before a decision \
+         (issue #263): call.response with request_id={request_id} found in timeline"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
 }
