@@ -85,10 +85,13 @@ layer independently redacts any structured field whose key looks sensitive
 
 **CLI ⇄ daemon isolation.** The CLI talks to the daemon over a Unix domain
 socket created with mode `0600` in a directory that must not have group/world
-bits set. On Linux the daemon additionally checks the peer credentials
-(`SO_PEERCRED`) and rejects any connection whose UID does not match its own.
-Credentials are never passed over IPC or through the environment — the daemon
-reads them from its own `0600` files.
+bits set. The daemon additionally checks the peer credentials — `SO_PEERCRED`
+on Linux/Android, `LOCAL_PEERCRED` on macOS/iOS and the FreeBSD-family BSDs —
+and rejects any connection whose UID does not match its own. Platforms without
+a supported peer-credential mechanism (e.g. NetBSD/OpenBSD) fall back to the
+socket's `0600` mode under its `0700` parent directory as the sole access
+control. Credentials are never passed over IPC or through the environment — the
+daemon reads them from its own `0600` files.
 
 **Child-process environment is an allowlist, not a blocklist.** When a sandboxed
 command runs, its environment is built from scratch:

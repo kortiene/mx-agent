@@ -1268,15 +1268,18 @@ Peer credential verification works as follows (implemented in
 `mx-agent-ipc`, module `peercred`):
 
 - On Linux/Android the daemon reads the connecting peer's UID via
-  `SO_PEERCRED` and rejects any client whose UID does not match the daemon's
-  effective UID. Rejections are audited via a `tracing::warn!` log that records
-  only the peer and daemon UIDs — no request payloads or other peer data are
-  read before rejection.
-- On platforms without a supported peer credential mechanism the check returns
-  `Unsupported`: the daemon logs a single warning and falls back to the
-  socket's `0600` filesystem permissions and user-owned parent directory as the
-  sole access control. This keeps behavior well defined and observable rather
-  than silently allowing or failing.
+  `SO_PEERCRED`; on macOS/iOS and the FreeBSD-family BSDs (FreeBSD, DragonFly)
+  it reads the peer UID via `LOCAL_PEERCRED` (the safe `nix`
+  `sockopt::LocalPeerCred` wrapper). On either mechanism it rejects any client
+  whose UID does not match the daemon's effective UID. Rejections are audited
+  via a `tracing::warn!` log that records only the peer and daemon UIDs — no
+  request payloads or other peer data are read before rejection.
+- On platforms without a supported peer credential mechanism (e.g.
+  NetBSD/OpenBSD, Solaris), or if the OS unexpectedly refuses the sockopt, the
+  check returns `Unsupported`: the daemon logs a single warning and falls back
+  to the socket's `0600` filesystem permissions and user-owned parent directory
+  as the sole access control. This keeps behavior well defined and observable
+  rather than silently allowing or failing.
 
 ### 10.3 IPC Protocol
 

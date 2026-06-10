@@ -84,6 +84,24 @@ jobs:
           cargo build --release -p mx-agent-cli
           scripts/gen-cli-artifacts.sh "$RUNNER_TEMP/cli-artifacts" target/release/mx-agent
 
+  rust-macos:
+    # The peer-credential UID check has a macOS/BSD arm (`LOCAL_PEERCRED`, issue
+    # #267) that the `ubuntu-latest` jobs never compile or exercise. This job
+    # builds, lints, and tests the IPC crate on macOS so that arm is covered.
+    # Scoped to `mx-agent-ipc` to keep the (costlier) macOS runner minimal and
+    # avoid pulling the full Matrix/daemon toolchain.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy (mx-agent-ipc)
+        run: cargo clippy -p mx-agent-ipc --all-targets -- -D warnings
+      - name: cargo test (mx-agent-ipc)
+        run: cargo test -p mx-agent-ipc
+
   cargo-deny:
     # Enforces the dependency policy in deny.toml: security advisories, the
     # allowed-license set, and trusted crate sources. Denied licenses or

@@ -68,6 +68,42 @@ where
     })
 }
 
+/// Decide whether an incoming connection should be accepted, logging once for
+/// each noteworthy case.
+///
+/// Returns `true` when the connection may proceed, `false` when it must be
+/// closed. The `warned_unsupported` flag is latched on the first
+/// [`PeerCredCheck::Unsupported`] result so the "no peer-credential support"
+/// warning is emitted exactly once per listener lifetime.
+fn gate_peer_check(check: &PeerCredCheck, warned_unsupported: &mut bool) -> bool {
+    match check {
+        PeerCredCheck::Allowed { .. } => true,
+        PeerCredCheck::Denied {
+            peer_uid,
+            daemon_uid,
+        } => {
+            // Audit the rejection. Only UIDs are logged; no request contents
+            // or other peer data are read or recorded before this gate.
+            tracing::warn!(
+                peer_uid,
+                daemon_uid,
+                "rejecting ipc client: peer uid does not match daemon uid"
+            );
+            false
+        }
+        PeerCredCheck::Unsupported => {
+            if !*warned_unsupported {
+                *warned_unsupported = true;
+                tracing::warn!(
+                    "peer credential verification is unsupported on this platform; \
+                     relying on socket filesystem permissions (mode 0600)"
+                );
+            }
+            true
+        }
+    }
+}
+
 /// Accept connections on `listener` and dispatch each request through a handler
 /// that may write multiple JSON-RPC response frames.
 ///
@@ -90,31 +126,10 @@ where
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                match verify_peer(&stream) {
-                    PeerCredCheck::Allowed { .. } => {}
-                    PeerCredCheck::Denied {
-                        peer_uid,
-                        daemon_uid,
-                    } => {
-                        // Audit the rejection. Only UIDs are logged; no request
-                        // contents or other peer data are read or recorded.
-                        tracing::warn!(
-                            peer_uid,
-                            daemon_uid,
-                            "rejecting ipc client: peer uid does not match daemon uid"
-                        );
-                        drop(stream);
-                        continue;
-                    }
-                    PeerCredCheck::Unsupported => {
-                        if !warned_unsupported {
-                            warned_unsupported = true;
-                            tracing::warn!(
-                                "peer credential verification is unsupported on this platform; \
-                                 relying on socket filesystem permissions (mode 0600)"
-                            );
-                        }
-                    }
+                let check = verify_peer(&stream);
+                if !gate_peer_check(&check, &mut warned_unsupported) {
+                    drop(stream);
+                    continue;
                 }
                 // Serve this connection on a detached worker so a long-held or
                 // parked connection cannot block the accept loop or starve other
@@ -168,6 +183,55 @@ mod tests {
         let resp = handle_message(&bytes, &handler);
         assert_eq!(resp.error.unwrap().code, crate::rpc::METHOD_NOT_FOUND);
     }
+
+    // ── gate_peer_check unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn gate_allows_allowed_peer_without_warning() {
+        let check = PeerCredCheck::Allowed { uid: 1000 };
+        let mut warned = false;
+        assert!(gate_peer_check(&check, &mut warned));
+        // Allowed connections must not set the unsupported-platform latch.
+        assert!(!warned);
+    }
+
+    #[test]
+    fn gate_rejects_denied_peer() {
+        let check = PeerCredCheck::Denied {
+            peer_uid: 999,
+            daemon_uid: 1000,
+        };
+        let mut warned = false;
+        assert!(!gate_peer_check(&check, &mut warned));
+        // Denied does not touch the unsupported-platform latch.
+        assert!(!warned);
+    }
+
+    #[test]
+    fn gate_allows_unsupported_peer_and_latches_warn_once() {
+        let mut warned = false;
+        // First call: allowed, latch set to true.
+        assert!(gate_peer_check(&PeerCredCheck::Unsupported, &mut warned));
+        assert!(
+            warned,
+            "warned_unsupported must be latched after first Unsupported"
+        );
+        // Second call: still allowed, latch unchanged (warn fires only once).
+        assert!(gate_peer_check(&PeerCredCheck::Unsupported, &mut warned));
+        assert!(warned);
+    }
+
+    #[test]
+    fn gate_allowed_after_unsupported_does_not_clear_latch() {
+        let mut warned = false;
+        gate_peer_check(&PeerCredCheck::Unsupported, &mut warned);
+        assert!(warned);
+        // An Allowed result must not reset the latch.
+        gate_peer_check(&PeerCredCheck::Allowed { uid: 0 }, &mut warned);
+        assert!(warned);
+    }
+
+    // ── serve_streaming integration tests ─────────────────────────────────────
 
     #[test]
     fn serve_streaming_concurrent_connections_do_not_block() {
