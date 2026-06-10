@@ -26,7 +26,7 @@ use ed25519_dalek::{Signature as Ed25519Signature, Signer, SigningKey, Verifier,
 use serde_json::Value;
 
 use crate::canonical_json;
-use crate::schema::Signature;
+use crate::schema::{ApprovalDecision, Signature};
 
 /// Top-level content field that carries the detached signature.
 pub const SIGNATURE_FIELD: &str = "signature";
@@ -163,11 +163,111 @@ pub fn verify(verifying_key: &VerifyingKey, content: &Value) -> Result<(), Signa
     verify_signature(verifying_key, &signature, &bytes)
 }
 
+/// Sign an [`ApprovalDecision`] in place with the daemon's signing key.
+///
+/// The signature covers the decision's canonical bytes with the `signature`
+/// field excluded (so `nonce`, `expires_at`, `request_id`, `decision`,
+/// `approved_by` and `created_at` are all bound and cannot be swapped), then is
+/// embedded back into [`ApprovalDecision::signature`]. This routes through the
+/// audited [`sign_into`] path used for every other privileged event.
+pub fn sign_approval_decision(
+    signing_key: &SigningKey,
+    key_id: impl Into<String>,
+    decision: &mut ApprovalDecision,
+) -> Result<(), SignatureError> {
+    let mut value = serde_json::to_value(&*decision).map_err(|_| SignatureError::NotAnObject)?;
+    sign_into(signing_key, key_id, &mut value)?;
+    *decision = serde_json::from_value(value).map_err(|_| SignatureError::MalformedSignature)?;
+    Ok(())
+}
+
+/// Verify the signature embedded in an [`ApprovalDecision`] against
+/// `verifying_key`.
+///
+/// Returns [`SignatureError::MissingSignature`] when the decision carries no
+/// signature (a legacy/unsigned event), so the caller can fail closed.
+pub fn verify_approval_decision(
+    verifying_key: &VerifyingKey,
+    decision: &ApprovalDecision,
+) -> Result<(), SignatureError> {
+    let value = serde_json::to_value(decision).map_err(|_| SignatureError::NotAnObject)?;
+    verify(verifying_key, &value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::ApprovalDecision;
     use ed25519_dalek::SigningKey;
     use serde_json::json;
+
+    fn approval_decision() -> ApprovalDecision {
+        ApprovalDecision {
+            request_id: "approval:task-a".to_string(),
+            decision: "approved".to_string(),
+            approved_by: "@operator:server".to_string(),
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            nonce: Some("nonce-abc".to_string()),
+            expires_at: Some("2026-06-10T13:00:00Z".to_string()),
+            signature: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn approval_decision_sign_then_verify_round_trips() {
+        let key = test_key();
+        let mut decision = approval_decision();
+        sign_approval_decision(&key, "mxagent-ed25519:test", &mut decision).unwrap();
+        assert!(decision.signature.is_some());
+        assert!(verify_approval_decision(&key.verifying_key(), &decision).is_ok());
+    }
+
+    #[test]
+    fn unsigned_approval_decision_reports_missing_signature() {
+        let key = test_key();
+        let decision = approval_decision();
+        assert_eq!(
+            verify_approval_decision(&key.verifying_key(), &decision),
+            Err(SignatureError::MissingSignature)
+        );
+    }
+
+    #[test]
+    fn tampered_approval_decision_fails_verification() {
+        let key = test_key();
+        for tamper in ["decision", "request_id", "nonce", "expires_at"] {
+            let mut decision = approval_decision();
+            sign_approval_decision(&key, "mxagent-ed25519:test", &mut decision).unwrap();
+            match tamper {
+                "decision" => decision.decision = "denied".to_string(),
+                "request_id" => decision.request_id = "approval:other".to_string(),
+                "nonce" => decision.nonce = Some("nonce-evil".to_string()),
+                "expires_at" => decision.expires_at = Some("2099-01-01T00:00:00Z".to_string()),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                verify_approval_decision(&key.verifying_key(), &decision),
+                Err(SignatureError::Invalid),
+                "tampering with {tamper} must fail verification"
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_approval_decision_deserializes_forward_compatibly() {
+        // A legacy event with no nonce/signature still parses (so it can be
+        // logged and rejected rather than failing to deserialize).
+        let legacy = json!({
+            "request_id": "approval:task-a",
+            "decision": "approved",
+            "approved_by": "@operator:server",
+            "created_at": "2026-06-10T12:00:00Z"
+        });
+        let decision: ApprovalDecision = serde_json::from_value(legacy).unwrap();
+        assert!(decision.nonce.is_none());
+        assert!(decision.signature.is_none());
+    }
 
     /// Deterministic signing key from a fixed seed, so tests act as stable
     /// test vectors rather than depending on system randomness.

@@ -19,12 +19,12 @@ use mx_agent_policy::{Allowance, CallContext, ExecContext, Outcome, Policy};
 use mx_agent_protocol::canonical_json;
 use mx_agent_protocol::id::generate_invocation_id;
 use mx_agent_protocol::schema::{
-    ApprovalRequest, InvocationState, Signature, TaskAction, TaskActionAuthorization, TaskResult,
-    TaskState,
+    ApprovalDecision, ApprovalRequest, InvocationState, Signature, TaskAction,
+    TaskActionAuthorization, TaskResult, TaskState,
 };
 use mx_agent_protocol::signing::{self, SignatureError};
 
-use crate::approval::{ApprovalQueue, PendingApproval};
+use crate::approval::{decision_permits_spawn, ApprovalQueue, PendingApproval};
 use crate::invocation::{
     is_terminal as invocation_is_terminal, task_result_from_invocation, task_state_for_invocation,
 };
@@ -320,7 +320,7 @@ pub struct TaskOrchestrator {
     audit_log: Option<AuditLog>,
     trust_store: Option<TrustStore>,
     verifying_keys: BTreeMap<String, VerifyingKey>,
-    replay_cache: Option<RefCell<ReplayCache>>,
+    replay_cache: Option<Rc<RefCell<ReplayCache>>>,
     approval_gate: Option<RefCell<Box<dyn TaskApprovalGate>>>,
 }
 
@@ -371,9 +371,23 @@ impl TaskOrchestrator {
     }
 
     /// Attach replay protection for signed task action authorizations.
+    ///
+    /// The cache is held behind a shared [`Rc`] so the approval gate can consume
+    /// an approval **decision** nonce against the *same* on-disk cache (see
+    /// [`replay_cache_handle`](Self::replay_cache_handle)); a second cache over
+    /// the same file would race the orchestrator's persists.
     pub fn with_replay_cache(mut self, replay_cache: ReplayCache) -> Self {
-        self.replay_cache = Some(RefCell::new(replay_cache));
+        self.replay_cache = Some(Rc::new(RefCell::new(replay_cache)));
         self
+    }
+
+    /// A handle to the shared replay cache, if one is configured.
+    ///
+    /// The approval gate uses this to consume an approval decision's single-use
+    /// nonce on the pass that releases a held task, sharing the orchestrator's
+    /// cache instance so both task-action and decision nonces persist to one file.
+    pub fn replay_cache_handle(&self) -> Option<Rc<RefCell<ReplayCache>>> {
+        self.replay_cache.clone()
     }
 
     /// Attach the approval gate consulted when local policy requires approval.
@@ -1295,21 +1309,28 @@ pub struct QueueApprovalGate<R> {
     target_agent: String,
     expires_at: String,
     queue: Rc<RefCell<ApprovalQueue>>,
+    replay_cache: Option<Rc<RefCell<ReplayCache>>>,
     resolve_decision: R,
 }
 
 impl<R> QueueApprovalGate<R>
 where
-    R: FnMut(&str) -> Option<bool>,
+    R: FnMut(&str) -> Option<ApprovalDecision>,
 {
     /// Build a queue-backed approval gate for `room_id`/`target_agent`.
     ///
     /// `expires_at` is stamped onto emitted approval requests; `resolve_decision`
-    /// maps a request id to a recorded decision (`Some(true)`/`Some(false)`) or
-    /// `None` when still undecided. `queue` is the shared queue the gate enqueues
-    /// pending approvals into and removes decided ones from; pass it pre-seeded
-    /// with any persisted approvals so a restart does not re-emit them, and read
-    /// it back via [`queue`](Self::queue) after a run to persist changes.
+    /// maps a request id to a **verified** [`ApprovalDecision`] (sender- and
+    /// signature-checked by the scheduler, see
+    /// [`read_verified_approval_decisions`](crate::approval::read_verified_approval_decisions))
+    /// or `None` when still undecided. `queue` is the shared queue the gate
+    /// enqueues pending approvals into and removes decided ones from; pass it
+    /// pre-seeded with any persisted approvals so a restart does not re-emit them,
+    /// and read it back via [`queue`](Self::queue) after a run to persist changes.
+    ///
+    /// The gate is replay-cache-less by default (decisions still release on a
+    /// valid signature); attach one with [`with_replay_cache`](Self::with_replay_cache)
+    /// to burn the decision's single-use nonce on the releasing pass.
     pub fn new(
         room_id: impl Into<String>,
         target_agent: impl Into<String>,
@@ -1322,8 +1343,23 @@ where
             target_agent: target_agent.into(),
             expires_at: expires_at.into(),
             queue,
+            replay_cache: None,
             resolve_decision,
         }
+    }
+
+    /// Attach the shared replay cache used to consume an approving decision's
+    /// single-use nonce on the releasing pass (issue #264).
+    ///
+    /// Pass the orchestrator's own handle (via
+    /// [`TaskOrchestrator::replay_cache_handle`]) so decision and task-action
+    /// nonces persist to one file. A held decision (no approval yet) never reaches
+    /// the cache, so a legitimately-held task is not falsely replay-blocked; once
+    /// an approving decision burns its nonce, a stale duplicate is rejected and
+    /// the gate falls back to `Pending` rather than re-releasing.
+    pub fn with_replay_cache(mut self, replay_cache: Option<Rc<RefCell<ReplayCache>>>) -> Self {
+        self.replay_cache = replay_cache;
+        self
     }
 
     /// A handle to the gate's shared approval queue (for inspection or
@@ -1335,17 +1371,27 @@ where
 
 impl<R> TaskApprovalGate for QueueApprovalGate<R>
 where
-    R: FnMut(&str) -> Option<bool>,
+    R: FnMut(&str) -> Option<ApprovalDecision>,
 {
     fn evaluate(&mut self, task: &TaskState, action: &TaskAction) -> ApprovalDisposition {
         let request = task_approval_request(task, action, &self.target_agent, &self.expires_at);
         let request_id = request.request_id.clone();
         match (self.resolve_decision)(&request_id) {
-            Some(true) => {
+            Some(decision) if decision_permits_spawn(&decision) => {
+                // Releasing pass: consume the decision's single-use nonce so a
+                // stale duplicate in the scan window cannot re-release the task.
+                // A replayed/expired/absent nonce fails closed to `Pending`.
+                if !self.admit_decision_nonce(&decision) {
+                    self.queue.borrow_mut().enqueue(PendingApproval {
+                        room_id: self.room_id.clone(),
+                        request,
+                    });
+                    return ApprovalDisposition::Pending(request_id);
+                }
                 self.queue.borrow_mut().remove(&request_id);
                 ApprovalDisposition::Approved
             }
-            Some(false) => {
+            Some(_) => {
                 self.queue.borrow_mut().remove(&request_id);
                 ApprovalDisposition::Denied("approval denied by operator".to_string())
             }
@@ -1357,6 +1403,27 @@ where
                 ApprovalDisposition::Pending(request_id)
             }
         }
+    }
+}
+
+impl<R> QueueApprovalGate<R> {
+    /// Admit the approving decision's nonce into the shared replay cache.
+    ///
+    /// Returns `true` when the decision may release the task: either no replay
+    /// cache is attached (signature alone gates the release) or the nonce is
+    /// fresh and within its `expires_at`. Returns `false` — fail-closed — when a
+    /// cache is attached but the decision lacks replay material or its nonce is
+    /// expired/replayed.
+    fn admit_decision_nonce(&self, decision: &ApprovalDecision) -> bool {
+        let Some(cache) = &self.replay_cache else {
+            return true;
+        };
+        let (Some(nonce), Some(expires_at)) =
+            (decision.nonce.as_deref(), decision.expires_at.as_deref())
+        else {
+            return false;
+        };
+        cache.borrow_mut().admit(nonce, expires_at).is_ok()
     }
 }
 
@@ -1758,7 +1825,18 @@ requires_approval = true
             "agent-a",
             "2026-06-05T00:00:00Z",
             Rc::clone(&shared_queue),
-            move |_request_id: &str| if flag.get() { Some(true) } else { None },
+            move |request_id: &str| {
+                flag.get().then(|| ApprovalDecision {
+                    request_id: request_id.to_string(),
+                    decision: "approved".to_string(),
+                    approved_by: "@operator:server".to_string(),
+                    created_at: "2026-06-05T00:00:00Z".to_string(),
+                    nonce: Some("nonce-queue-gate".to_string()),
+                    expires_at: Some("2026-06-05T01:00:00Z".to_string()),
+                    signature: None,
+                    extra: Default::default(),
+                })
+            },
         );
         let gate = RefCell::new(gate);
         let t = approval_tool_task();
@@ -1794,6 +1872,97 @@ requires_approval = true
         assert!(
             shared_queue.borrow().get("approval:task-a").is_none(),
             "an approved request is removed from the queue"
+        );
+    }
+
+    #[test]
+    fn queue_gate_with_replay_cache_rejects_replayed_nonce() {
+        // Security regression #264: a stale `approved` event still present in
+        // the APPROVAL_DECISIONS_SCAN_LIMIT window must not re-release the held
+        // task on a subsequent pass once the nonce has been burned.
+        let expires_at = future_rfc3339();
+        let shared_queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        let (cache, dir) = replay_cache("gate-replay");
+        let cache_rc = Rc::new(RefCell::new(cache));
+
+        let et = expires_at.clone();
+        let gate = QueueApprovalGate::new(
+            "!room:server",
+            "agent-a",
+            "2099-01-01T00:00:00Z",
+            Rc::clone(&shared_queue),
+            move |request_id: &str| {
+                Some(ApprovalDecision {
+                    request_id: request_id.to_string(),
+                    decision: "approved".to_string(),
+                    approved_by: "@daemon:server".to_string(),
+                    created_at: "2026-06-10T12:00:00Z".to_string(),
+                    nonce: Some("nonce-gate-replay-test".to_string()),
+                    expires_at: Some(et.clone()),
+                    signature: None,
+                    extra: Default::default(),
+                })
+            },
+        )
+        .with_replay_cache(Some(Rc::clone(&cache_rc)));
+        let gate = RefCell::new(gate);
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+
+        // First pass: nonce is fresh — the decision is admitted and the task released.
+        assert_eq!(
+            gate.borrow_mut().evaluate(&t, &action),
+            ApprovalDisposition::Approved,
+            "first pass with fresh nonce must release the task"
+        );
+
+        // Second pass: same nonce is now replayed — gate must fail closed to Pending.
+        let second = gate.borrow_mut().evaluate(&t, &action);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            second,
+            ApprovalDisposition::Pending("approval:task-a".to_string()),
+            "a replayed decision nonce must not re-release the held task"
+        );
+    }
+
+    #[test]
+    fn queue_gate_with_replay_cache_rejects_decision_without_replay_material() {
+        // An approving decision that lacks both nonce and expires_at cannot
+        // consume a replay-cache slot; the gate must fail closed to Pending.
+        let shared_queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        let (cache, dir) = replay_cache("gate-no-nonce");
+        let cache_rc = Rc::new(RefCell::new(cache));
+
+        let gate = QueueApprovalGate::new(
+            "!room:server",
+            "agent-a",
+            "2099-01-01T00:00:00Z",
+            Rc::clone(&shared_queue),
+            |request_id: &str| {
+                Some(ApprovalDecision {
+                    request_id: request_id.to_string(),
+                    decision: "approved".to_string(),
+                    approved_by: "@daemon:server".to_string(),
+                    created_at: "2026-06-10T12:00:00Z".to_string(),
+                    nonce: None,
+                    expires_at: None,
+                    signature: None,
+                    extra: Default::default(),
+                })
+            },
+        )
+        .with_replay_cache(Some(Rc::clone(&cache_rc)));
+        let gate = RefCell::new(gate);
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+
+        let result = gate.borrow_mut().evaluate(&t, &action);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            ApprovalDisposition::Pending("approval:task-a".to_string()),
+            "an approving decision with no replay material must not release the task"
         );
     }
 

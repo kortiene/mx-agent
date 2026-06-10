@@ -419,7 +419,16 @@ pub struct ApprovalRequest {
     pub extra: Extra,
 }
 
-/// `com.mxagent.approval.decision.v1` content (architecture §11).
+/// `com.mxagent.approval.decision.v1` content (architecture §11, §12).
+///
+/// A decision releases (or denies) a held `requires_approval` action. To prevent
+/// any room member from forging a release, an honored decision must carry a
+/// single-use [`nonce`](Self::nonce) and a detached [`signature`](Self::signature)
+/// from a locally-trusted signing key, bounded by [`expires_at`](Self::expires_at)
+/// — mirroring [`ExecRequest`]/[`CallRequest`]. The fields are optional at the
+/// serde layer so older/hostile events still deserialize (and can be logged and
+/// rejected rather than failing to parse), but the verifier treats a missing
+/// nonce or signature as **not verifiable → rejected**.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDecision {
     /// Request identifier this decides.
@@ -430,6 +439,19 @@ pub struct ApprovalDecision {
     pub approved_by: String,
     /// Decision timestamp (RFC 3339).
     pub created_at: String,
+    /// Single-use nonce binding this decision for replay protection. Absent on
+    /// legacy/unsigned events, which the verifier rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+    /// Expiry (RFC 3339 UTC) bounding the decision's replay-cache lifetime.
+    /// Absent on legacy/unsigned events, which the verifier rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Detached Ed25519 signature over the decision's canonical bytes (the
+    /// `signature` field excluded). Absent on legacy/unsigned events, which the
+    /// verifier rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,

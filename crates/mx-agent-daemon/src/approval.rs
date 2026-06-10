@@ -23,23 +23,27 @@
 //! exec dispatch loop; this module provides the building blocks and enforces
 //! the "does not execute immediately" guarantee.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::VerifyingKey;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::{Client, Room};
 use mx_agent_policy::{Allowance, NetworkPolicy, Sandbox};
 use mx_agent_protocol::events::timeline::{APPROVAL_DECISION, APPROVAL_REQUEST};
+use mx_agent_protocol::id::generate_request_id;
 use mx_agent_protocol::schema::{ApprovalDecision, ApprovalRequest, ExecRequest};
+use mx_agent_protocol::signing::{sign_approval_decision, verify_approval_decision};
 use serde::{Deserialize, Serialize};
 
 use crate::matrix::restore_client;
 use crate::session::{SessionPaths, StoredSession};
+use crate::signing::load_or_create_signing_key;
 use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
 
 /// Whether an authorized request may run immediately or must wait for approval.
@@ -307,6 +311,9 @@ pub fn approval_decision_for(
         decision: decision.to_string(),
         approved_by: approved_by.to_string(),
         created_at: created_at.to_string(),
+        nonce: None,
+        expires_at: None,
+        signature: None,
         extra: Default::default(),
     }
 }
@@ -366,6 +373,105 @@ pub async fn read_approval_decisions(
         }
     }
     Ok(decisions)
+}
+
+/// Read `com.mxagent.approval.decision.v1` events from `room`, keeping only those
+/// bound to a verifiable approver identity (issue #264).
+///
+/// Tightens [`read_approval_decisions`] so a decision can release a held task
+/// **only if** every check passes — any failure drops the decision before it is
+/// mapped, so a forged or unverifiable `approved` event presents to the gate as
+/// "no decision" (still pending) rather than a release:
+///
+/// 1. **Sender** — the Matrix `sender` (read from the top-level event, not the
+///    attacker-controlled `content`) must equal `local_user`, the host daemon's
+///    own user id. Room membership alone never satisfies the approval gate.
+/// 2. **Signature** — the decision must carry a [`Signature`](mx_agent_protocol::schema::Signature)
+///    whose `key_id` resolves in `verifying_keys` and verifies over the
+///    decision's canonical bytes. Because the sender check already establishes
+///    provenance for a self-issued decision, the daemon's own published key
+///    (present in `verifying_keys`) is sufficient; no separate trust-store
+///    membership is required for `sender == local_user`.
+/// 3. **Replay material** — the decision must carry both a `nonce` and an
+///    `expires_at`, which the scheduler consumes through the [`ReplayCache`] on
+///    the pass that actually releases the task.
+///
+/// Rejections are logged with non-sensitive metadata only (sender, request_id,
+/// reason) — never the signature, nonce, or content.
+///
+/// [`ReplayCache`]: crate::replay::ReplayCache
+pub async fn read_verified_approval_decisions(
+    room: &Room,
+    limit: u32,
+    local_user: &str,
+    verifying_keys: &BTreeMap<String, VerifyingKey>,
+) -> Result<HashMap<String, ApprovalDecision>, WorkspaceError> {
+    let mut request = MessagesOptions::backward();
+    request.limit = matrix_sdk::ruma::UInt::from(limit);
+    let messages = room.messages(request).await.map_err(WorkspaceError::from)?;
+
+    let mut decisions: HashMap<String, ApprovalDecision> = HashMap::new();
+    for event in messages.chunk {
+        let raw = event.raw();
+        let is_decision =
+            raw.get_field::<String>("type").ok().flatten().as_deref() == Some(APPROVAL_DECISION);
+        if !is_decision {
+            continue;
+        }
+        let sender = raw
+            .get_field::<String>("sender")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let decision = match raw.get_field::<ApprovalDecision>("content") {
+            Ok(Some(decision)) => decision,
+            _ => continue,
+        };
+
+        if let Some(reason) = verification_failure(&decision, &sender, local_user, verifying_keys) {
+            tracing::warn!(
+                sender = %sender,
+                request_id = %decision.request_id,
+                reason,
+                "rejecting unverified approval decision"
+            );
+            continue;
+        }
+
+        // Newest-first scan: the first *verified* occurrence per request_id wins.
+        decisions
+            .entry(decision.request_id.clone())
+            .or_insert(decision);
+    }
+    Ok(decisions)
+}
+
+/// Return the non-sensitive reason a decision is not eligible to release a held
+/// task, or `None` when it passes every sender/signature/replay-material check.
+///
+/// Pure and fail-closed, so it is unit-testable without a live room.
+pub fn verification_failure(
+    decision: &ApprovalDecision,
+    sender: &str,
+    local_user: &str,
+    verifying_keys: &BTreeMap<String, VerifyingKey>,
+) -> Option<&'static str> {
+    if sender.is_empty() || sender != local_user {
+        return Some("untrusted_sender");
+    }
+    let Some(signature) = &decision.signature else {
+        return Some("missing_signature");
+    };
+    let Some(key) = verifying_keys.get(&signature.key_id) else {
+        return Some("unresolved_key");
+    };
+    if verify_approval_decision(key, decision).is_err() {
+        return Some("invalid_signature");
+    }
+    if decision.nonce.is_none() || decision.expires_at.is_none() {
+        return Some("missing_replay_material");
+    }
+    None
 }
 
 /// The outcome of deciding a queued approval.
@@ -478,7 +584,25 @@ pub async fn decide_approval_for_session(
     let client = restore_client(session).await?;
     let room = sync_and_get_room(&client, &pending.room_id).await?;
 
-    let content = approval_decision_for(request_id, decision, approved_by, &now_rfc3339());
+    // Bind the decision to a verifiable identity (issue #264): stamp a single-use
+    // replay nonce and a bounded expiry, then sign with the daemon's own key. The
+    // emitting Matrix user is the daemon itself, so a self-issued decision passes
+    // the scheduler's sender check; the signature lets it be verified against the
+    // daemon's published key before any held task is released.
+    let mut content = approval_decision_for(request_id, decision, approved_by, &now_rfc3339());
+    content.nonce = Some(generate_request_id());
+    content.expires_at = Some(approval_request_expiry(
+        SystemTime::now(),
+        APPROVAL_REQUEST_TTL,
+    ));
+    let signing_key = load_or_create_signing_key(paths)
+        .map_err(|e| WorkspaceError::Io(io::Error::other(e.to_string())))?;
+    sign_approval_decision(
+        signing_key.signing_key(),
+        signing_key.key_id(),
+        &mut content,
+    )
+    .map_err(|e| WorkspaceError::Io(io::Error::other(e.to_string())))?;
     emit_approval_decision(&room, &content).await?;
 
     // Only drop the request from the queue once the decision is published.
@@ -494,7 +618,9 @@ pub async fn decide_approval_for_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use mx_agent_protocol::schema::Signature;
+    use mx_agent_protocol::signing::sign_approval_decision;
 
     fn exec_request() -> ExecRequest {
         ExecRequest {
@@ -770,5 +896,194 @@ mod tests {
         let now = now_rfc3339();
         assert_eq!(now.len(), 20, "RFC 3339 UTC seconds is 20 chars");
         assert!(now.ends_with('Z'));
+    }
+
+    // --- verification_failure tests (issue #264) ----------------------------
+
+    fn vf_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[
+            0x3b, 0x6a, 0x27, 0xbc, 0xce, 0xb6, 0xa4, 0x2d, 0x62, 0xa3, 0xa8, 0xd0, 0x2a, 0x6f,
+            0x0d, 0x73, 0x65, 0x32, 0x15, 0x77, 0x1d, 0xe2, 0x43, 0xa6, 0x3a, 0xc0, 0x48, 0xa1,
+            0x8b, 0x59, 0xda, 0x29,
+        ])
+    }
+
+    const VF_KEY_ID: &str = "mxagent-ed25519:vf-test";
+    const VF_LOCAL_USER: &str = "@daemon:server";
+
+    fn vf_keys() -> BTreeMap<String, VerifyingKey> {
+        let mut keys = BTreeMap::new();
+        keys.insert(VF_KEY_ID.to_string(), vf_signing_key().verifying_key());
+        keys
+    }
+
+    fn signed_vf_decision() -> ApprovalDecision {
+        let mut d = ApprovalDecision {
+            request_id: "approval:task-a".to_string(),
+            decision: "approved".to_string(),
+            approved_by: VF_LOCAL_USER.to_string(),
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            nonce: Some("nonce-vf-test".to_string()),
+            expires_at: Some("2026-06-10T13:00:00Z".to_string()),
+            signature: None,
+            extra: Default::default(),
+        };
+        sign_approval_decision(&vf_signing_key(), VF_KEY_ID, &mut d).unwrap();
+        d
+    }
+
+    #[test]
+    fn verification_failure_passes_valid_signed_decision() {
+        // Positive path: a properly signed decision from the daemon's own user
+        // must pass all checks (returns None = no failure).
+        assert_eq!(
+            verification_failure(
+                &signed_vf_decision(),
+                VF_LOCAL_USER,
+                VF_LOCAL_USER,
+                &vf_keys()
+            ),
+            None,
+            "a valid signed decision from the daemon itself must pass all checks"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_empty_sender() {
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), "", VF_LOCAL_USER, &vf_keys()),
+            Some("untrusted_sender")
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_wrong_sender_room_member_cannot_approve() {
+        // Security regression #264: room membership alone must not satisfy the
+        // approval gate. A room member who is not the host daemon cannot release
+        // a held task regardless of what they put in the event content.
+        assert_eq!(
+            verification_failure(
+                &signed_vf_decision(),
+                "@attacker:server",
+                VF_LOCAL_USER,
+                &vf_keys()
+            ),
+            Some("untrusted_sender"),
+            "room membership alone must not satisfy the approval gate"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_unsigned_decision() {
+        // An event without a signature field must be rejected before it can
+        // release a held task, even if it looks otherwise valid.
+        let unsigned = ApprovalDecision {
+            request_id: "approval:task-a".to_string(),
+            decision: "approved".to_string(),
+            approved_by: VF_LOCAL_USER.to_string(),
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            nonce: Some("nonce-vf-test".to_string()),
+            expires_at: Some("2026-06-10T13:00:00Z".to_string()),
+            signature: None,
+            extra: Default::default(),
+        };
+        assert_eq!(
+            verification_failure(&unsigned, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            Some("missing_signature"),
+            "an unsigned decision must not release a held task"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_unresolved_key_id() {
+        // The signature's key_id must be known locally; an unknown key_id is
+        // rejected even if the signature bytes themselves could be valid.
+        let mut d = signed_vf_decision();
+        d.signature.as_mut().unwrap().key_id = "mxagent-ed25519:unknown".to_string();
+        assert_eq!(
+            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            Some("unresolved_key")
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_tampered_decision_field() {
+        // Flipping the decision from "approved" to "denied" after signing must
+        // invalidate the signature so the event is dropped.
+        let mut d = signed_vf_decision();
+        d.decision = "denied".to_string();
+        assert_eq!(
+            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            Some("invalid_signature"),
+            "a tampered decision field must fail signature verification"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_tampered_request_id() {
+        // Changing the request_id after signing must also invalidate the
+        // signature, preventing a forged release targeting a different task.
+        let mut d = signed_vf_decision();
+        d.request_id = "approval:other-task".to_string();
+        assert_eq!(
+            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            Some("invalid_signature")
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_missing_nonce() {
+        // No nonce means no replay protection: even a validly-signed decision
+        // must be rejected if the nonce field is absent.
+        let mut d = ApprovalDecision {
+            request_id: "approval:task-a".to_string(),
+            decision: "approved".to_string(),
+            approved_by: VF_LOCAL_USER.to_string(),
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            nonce: None,
+            expires_at: Some("2026-06-10T13:00:00Z".to_string()),
+            signature: None,
+            extra: Default::default(),
+        };
+        sign_approval_decision(&vf_signing_key(), VF_KEY_ID, &mut d).unwrap();
+        assert_eq!(
+            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            Some("missing_replay_material"),
+            "a decision without a nonce must not release a held task"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_missing_expires_at() {
+        // No expires_at means the replay cache cannot enforce a lifetime bound:
+        // reject even a validly-signed decision that lacks this field.
+        let mut d = ApprovalDecision {
+            request_id: "approval:task-a".to_string(),
+            decision: "approved".to_string(),
+            approved_by: VF_LOCAL_USER.to_string(),
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            nonce: Some("nonce-vf-test".to_string()),
+            expires_at: None,
+            signature: None,
+            extra: Default::default(),
+        };
+        sign_approval_decision(&vf_signing_key(), VF_KEY_ID, &mut d).unwrap();
+        assert_eq!(
+            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            Some("missing_replay_material"),
+            "a decision without expires_at must not release a held task"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_empty_verifying_keys_map() {
+        // The host daemon has no record of the signing key: must reject even
+        // if the signature is otherwise valid.
+        let empty: BTreeMap<String, VerifyingKey> = BTreeMap::new();
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, VF_LOCAL_USER, &empty),
+            Some("unresolved_key"),
+            "a decision whose key_id is not locally known must be rejected"
+        );
     }
 }

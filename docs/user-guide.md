@@ -363,7 +363,9 @@ anything runs:
   never spawn — they are blocked with a recorded, non-sensitive reason.
 - **Approvals** hold a task whose policy sets `requires_approval`; it does not
   run until you approve it (`mx-agent approval list` / `approve` / `deny`), and a
-  denied approval never spawns.
+  denied approval never spawns. The scheduler only honours a decision whose
+  Matrix sender is the daemon's own user and whose Ed25519 signature verifies —
+  room membership alone cannot release a held task (#264).
 - **Lifecycle:** a claimed task moves `pending`/`assigned` → `executing` →
   `succeeded`/`failed`; the result records the linked `invocation_id`, exit code,
   and a non-sensitive summary. Exit `0` succeeds; anything else fails.
