@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
 use mx_agent_policy::{Allowance, Policy};
@@ -400,6 +400,13 @@ fn scheduler_pass(
     let approval_queue_before = approval_queue.borrow().clone();
     // A single, finite expiry stamped onto requests raised this pass.
     let approval_expires_at = approval_request_expiry(SystemTime::now(), APPROVAL_REQUEST_TTL);
+    // The matching "now" (Unix seconds) used to detect a queued request whose
+    // stamped `expires_at` has already passed (issue #265). Captured once per
+    // pass so every gate agrees on the present.
+    let approval_now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
 
     for room in client.joined_rooms() {
         let room_id = room.room_id().to_string();
@@ -494,6 +501,7 @@ fn scheduler_pass(
                 &decisions,
                 Rc::clone(&approval_queue),
                 &approval_expires_at,
+                approval_now_unix,
             );
         }
     }
@@ -524,6 +532,7 @@ fn scheduler_pass_for_agent(
     decisions: &HashMap<String, ApprovalDecision>,
     approval_queue: Rc<RefCell<ApprovalQueue>>,
     approval_expires_at: &str,
+    approval_now_unix: i64,
 ) {
     // Deny-by-default: when no policy file is present, the default policy denies
     // every action, so nothing is claimed or dispatched.
@@ -563,6 +572,7 @@ fn scheduler_pass_for_agent(
         approval_queue,
         move |request_id: &str| decisions.get(request_id).cloned(),
     )
+    .with_now_unix(approval_now_unix)
     .with_replay_cache(orchestrator.replay_cache_handle());
     orchestrator = orchestrator.with_approval_gate(Box::new(gate));
 

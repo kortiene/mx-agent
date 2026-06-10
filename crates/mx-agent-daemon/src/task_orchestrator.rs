@@ -24,7 +24,9 @@ use mx_agent_protocol::schema::{
 };
 use mx_agent_protocol::signing::{self, SignatureError};
 
-use crate::approval::{decision_permits_spawn, ApprovalQueue, PendingApproval};
+use crate::approval::{
+    approval_request_expired, decision_permits_spawn, ApprovalQueue, PendingApproval,
+};
 use crate::invocation::{
     is_terminal as invocation_is_terminal, task_result_from_invocation, task_state_for_invocation,
 };
@@ -179,6 +181,10 @@ pub enum ApprovalDisposition {
     /// No decision yet: the action waits. The string is the request id the
     /// operator can inspect/decide.
     Pending(String),
+    /// The approval window closed (`expires_at` passed) before any decision was
+    /// made: the action must never spawn and the task is finalized `blocked`
+    /// (issue #265). The string is the request id, now removed from the queue.
+    Expired(String),
 }
 
 /// Gate consulted before running a task action that requires human approval.
@@ -1075,6 +1081,53 @@ impl TaskOrchestrator {
                     request_id: Some(request_id),
                 })
             }
+            ApprovalDisposition::Expired(request_id) => {
+                tracing::info!(
+                    task_id = %task.task_id,
+                    request_id = %request_id,
+                    decision = "approval_expired",
+                    "task approval window closed without a decision; blocking"
+                );
+                self.block_approval_expired(task, action, invocation_id, store)
+            }
+        }
+    }
+
+    /// Finalize a task blocked because its approval window closed before any
+    /// decision was made (issue #265). Never spawns.
+    fn block_approval_expired<S>(
+        &self,
+        task: &TaskState,
+        action: &TaskAction,
+        invocation_id: &str,
+        store: &mut S,
+    ) -> Result<(), OrchestrationOutcome>
+    where
+        S: TaskStore,
+    {
+        let result = failure_result(
+            &self.agent_id,
+            Some(invocation_id),
+            Some(action.kind()),
+            "approval_expired",
+            Some("approval window expired before a decision was made".to_string()),
+        );
+        match store.finalize(UpdateTaskOptions {
+            room: String::new(),
+            task_id: task.task_id.clone(),
+            state: Some(STATE_BLOCKED.to_string()),
+            result: Some(result),
+            expected_state_rev: Some(task.state_rev),
+            ..UpdateTaskOptions::default()
+        }) {
+            Ok(finalized) => Err(OrchestrationOutcome::Denied {
+                task_id: finalized.task_id,
+                invocation_id: invocation_id.to_string(),
+            }),
+            Err(err) => Err(OrchestrationOutcome::StoreError {
+                task_id: task.task_id.clone(),
+                reason: format_store_error(&err),
+            }),
         }
     }
 
@@ -1308,6 +1361,7 @@ pub struct QueueApprovalGate<R> {
     room_id: String,
     target_agent: String,
     expires_at: String,
+    now_unix: i64,
     queue: Rc<RefCell<ApprovalQueue>>,
     replay_cache: Option<Rc<RefCell<ReplayCache>>>,
     resolve_decision: R,
@@ -1342,10 +1396,24 @@ where
             room_id: room_id.into(),
             target_agent: target_agent.into(),
             expires_at: expires_at.into(),
+            now_unix: 0,
             queue,
             replay_cache: None,
             resolve_decision,
         }
+    }
+
+    /// Set the gate's "now" (Unix seconds) used to compare a queued request's
+    /// stamped `expires_at` against the present (issue #265).
+    ///
+    /// Injectable so the expiry transition is unit-testable without reading the
+    /// wall clock. The scheduler captures one value per pass (mirroring the
+    /// per-pass `expires_at` horizon) so every gate in a pass agrees on "now".
+    /// Defaults to `0` (the Unix epoch) when unset, which never spuriously
+    /// expires a request stamped with a real future deadline.
+    pub fn with_now_unix(mut self, now_unix: i64) -> Self {
+        self.now_unix = now_unix;
+        self
     }
 
     /// Attach the shared replay cache used to consume an approving decision's
@@ -1374,7 +1442,7 @@ where
     R: FnMut(&str) -> Option<ApprovalDecision>,
 {
     fn evaluate(&mut self, task: &TaskState, action: &TaskAction) -> ApprovalDisposition {
-        let request = task_approval_request(task, action, &self.target_agent, &self.expires_at);
+        let mut request = task_approval_request(task, action, &self.target_agent, &self.expires_at);
         let request_id = request.request_id.clone();
         match (self.resolve_decision)(&request_id) {
             Some(decision) if decision_permits_spawn(&decision) => {
@@ -1396,6 +1464,30 @@ where
                 ApprovalDisposition::Denied("approval denied by operator".to_string())
             }
             None => {
+                // No decision yet. The human-approval deadline is the stamp
+                // carried on the *already-queued* entry from the first pass that
+                // raised this request — NOT the freshly re-stamped per-pass
+                // `self.expires_at` (which would slide forward forever). Fall
+                // back to the rebuilt request's stamp only on the first
+                // encounter, before anything is queued.
+                let deadline = self
+                    .queue
+                    .borrow()
+                    .get(&request_id)
+                    .map(|pending| pending.request.expires_at.clone())
+                    .unwrap_or_else(|| request.expires_at.clone());
+                if approval_request_expired(&deadline, self.now_unix) {
+                    // Window closed without a decision: finalize (fail-closed
+                    // liveness) by dropping the queue entry and blocking the task
+                    // instead of re-enqueuing it forever (issue #265).
+                    self.queue.borrow_mut().remove(&request_id);
+                    return ApprovalDisposition::Expired(request_id);
+                }
+                // Anchor the deadline to the first time the request was queued:
+                // `enqueue` replaces any existing entry, so re-stamping with the
+                // fresh per-pass `self.expires_at` would slide the window forward
+                // every pass and never expire. Carry the persisted stamp back in.
+                request.expires_at = deadline;
                 self.queue.borrow_mut().enqueue(PendingApproval {
                     room_id: self.room_id.clone(),
                     request,
@@ -1794,6 +1886,38 @@ requires_approval = true
     }
 
     #[test]
+    fn expired_approval_blocks_task_with_reason() {
+        // Issue #265: an approval whose window closed without a decision must be
+        // finalized `blocked` with reason `approval_expired` — not held forever.
+        let t = approval_tool_task();
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy_requires_approval())
+            .with_approval_gate(Box::new(FixedGate(ApprovalDisposition::Expired(
+                "approval:task-a".to_string(),
+            ))))
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        // Terminal, not held: the task is finalized blocked rather than left
+        // AwaitingApproval (which is what would happen if expiry were ignored).
+        assert!(
+            matches!(outcome, OrchestrationOutcome::Denied { .. }),
+            "expired approval must reach a terminal outcome, got {outcome:?}"
+        );
+        assert!(
+            !matches!(outcome, OrchestrationOutcome::AwaitingApproval { .. }),
+            "an expired approval must not be held indefinitely"
+        );
+        assert_eq!(store.finalized_state.as_deref(), Some(STATE_BLOCKED));
+        let result = store.finalized_result.as_ref().expect("blocked result");
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("approval_expired")
+        );
+    }
+
+    #[test]
     fn approved_task_runs_through_dispatch() {
         let t = approval_tool_task();
         let mut store = MemoryStore::default();
@@ -1872,6 +1996,157 @@ requires_approval = true
         assert!(
             shared_queue.borrow().get("approval:task-a").is_none(),
             "an approved request is removed from the queue"
+        );
+    }
+
+    /// Seed a shared queue with a pending approval stamped `expires_at`.
+    fn seed_pending(queue: &Rc<RefCell<ApprovalQueue>>, expires_at: &str) {
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+        let request = task_approval_request(&t, &action, "agent-a", expires_at);
+        queue.borrow_mut().enqueue(PendingApproval {
+            room_id: "!room:server".to_string(),
+            request,
+        });
+    }
+
+    /// A gate whose decision source always returns `None` (undecided).
+    fn undecided_gate(
+        queue: Rc<RefCell<ApprovalQueue>>,
+        self_expires_at: &str,
+        now_unix: i64,
+    ) -> QueueApprovalGate<impl FnMut(&str) -> Option<ApprovalDecision>> {
+        QueueApprovalGate::new(
+            "!room:server",
+            "agent-a",
+            self_expires_at.to_string(),
+            queue,
+            |_request_id: &str| None,
+        )
+        .with_now_unix(now_unix)
+    }
+
+    #[test]
+    fn queue_gate_expires_held_request_past_deadline() {
+        // Issue #265: a queued request whose stamped `expires_at` is at/before
+        // `now_unix` and that has no decision must transition to `Expired` and be
+        // removed from the queue, not re-enqueued forever.
+        let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        seed_pending(&queue, "2020-01-01T00:00:00Z"); // 1_577_836_800
+        let mut gate = undecided_gate(Rc::clone(&queue), "2099-01-01T00:00:00Z", 1_577_836_801);
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+
+        let disposition = gate.evaluate(&t, &action);
+        assert_eq!(
+            disposition,
+            ApprovalDisposition::Expired("approval:task-a".to_string())
+        );
+        assert!(
+            queue.borrow().get("approval:task-a").is_none(),
+            "an expired request is removed from the queue"
+        );
+    }
+
+    #[test]
+    fn queue_gate_keeps_valid_request_pending() {
+        // A not-yet-expired held request stays `Pending` and remains queued
+        // (no regression to the approve/deny path).
+        let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        let mut gate = undecided_gate(Rc::clone(&queue), "2099-01-01T00:00:00Z", 1_577_836_801);
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+
+        let disposition = gate.evaluate(&t, &action);
+        assert_eq!(
+            disposition,
+            ApprovalDisposition::Pending("approval:task-a".to_string())
+        );
+        assert!(
+            queue.borrow().get("approval:task-a").is_some(),
+            "a valid pending request stays queued and resolvable"
+        );
+    }
+
+    #[test]
+    fn queue_gate_approved_decision_wins_over_expiry() {
+        // A verified `approved` decision releases the task even when the stamp is
+        // in the past: decision precedence is preserved and the entry is removed.
+        let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        seed_pending(&queue, "2020-01-01T00:00:00Z");
+        let gate = QueueApprovalGate::new(
+            "!room:server",
+            "agent-a",
+            "2099-01-01T00:00:00Z".to_string(),
+            Rc::clone(&queue),
+            |request_id: &str| {
+                Some(ApprovalDecision {
+                    request_id: request_id.to_string(),
+                    decision: "approved".to_string(),
+                    approved_by: "@operator:server".to_string(),
+                    created_at: "2020-01-01T00:00:00Z".to_string(),
+                    nonce: None,
+                    expires_at: None,
+                    signature: None,
+                    extra: Default::default(),
+                })
+            },
+        )
+        .with_now_unix(1_577_836_801);
+        let mut gate = gate;
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+
+        assert_eq!(gate.evaluate(&t, &action), ApprovalDisposition::Approved);
+        assert!(
+            queue.borrow().get("approval:task-a").is_none(),
+            "an approved request is removed even past the deadline"
+        );
+    }
+
+    #[test]
+    fn queue_gate_deadline_anchored_to_persisted_stamp() {
+        // The deadline is the *persisted* queued stamp, not the freshly
+        // re-stamped per-pass `self.expires_at`. A gate with a far-future
+        // `self.expires_at` must still expire a request whose queued stamp is
+        // past — otherwise the window would slide forward every pass forever.
+        let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        seed_pending(&queue, "2020-01-01T00:00:00Z");
+        let mut gate = undecided_gate(Rc::clone(&queue), "2099-01-01T00:00:00Z", 1_577_836_801);
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+
+        assert_eq!(
+            gate.evaluate(&t, &action),
+            ApprovalDisposition::Expired("approval:task-a".to_string()),
+            "deadline must be anchored to the persisted stamp, not self.expires_at"
+        );
+    }
+
+    #[test]
+    fn queue_gate_does_not_slide_persisted_deadline_across_passes() {
+        // Re-enqueuing a still-valid request must preserve the original stamp
+        // rather than overwriting it with the fresher per-pass `self.expires_at`.
+        let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        seed_pending(&queue, "2099-01-01T00:00:00Z");
+        let mut gate = undecided_gate(Rc::clone(&queue), "2100-01-01T00:00:00Z", 1_577_836_801);
+        let t = approval_tool_task();
+        let action = action_from_task(&t).unwrap();
+
+        assert_eq!(
+            gate.evaluate(&t, &action),
+            ApprovalDisposition::Pending("approval:task-a".to_string())
+        );
+        // The persisted stamp is unchanged — the fresh self.expires_at did not
+        // overwrite (slide) it.
+        assert_eq!(
+            queue
+                .borrow()
+                .get("approval:task-a")
+                .expect("still queued")
+                .request
+                .expires_at,
+            "2099-01-01T00:00:00Z"
         );
     }
 

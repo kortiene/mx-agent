@@ -1014,7 +1014,10 @@ releases a held task (§12). A verified approved decision lets the task proceed
 (verifying the task action's own signature/trust and consuming both the
 decision's and the task action's replay nonce on that pass) to claim/dispatch; a
 denied decision blocks the task (`reason = "approval_denied"`) and never spawns;
-an undecided, forged, or unverifiable decision keeps the task waiting. With no approval gate
+an undecided, forged, or unverifiable decision keeps the task waiting — but only
+until the request's stamped `expires_at` passes, after which the held task is
+finalized `blocked` with `reason = "approval_expired"` and removed from the local
+approval queue (§12), so the stamped TTL is enforced rather than cosmetic. With no approval gate
 configured the daemon fails closed and does not run the action. The claim is an optimistic, conditional update
 guarded by the observed `state_rev`: it transitions `pending`/`assigned` ->
 `executing`, records this agent as the owner (`assigned_to`), and attaches a
@@ -1045,7 +1048,8 @@ Successful result example:
 
 Failure, denial, and recovery results use the same object shape with
 `status = "failed"` and a machine-readable `reason`, e.g. `process_exit`,
-`policy_denied`, `dispatch_failed`, or `recovered_stale_invocation`:
+`policy_denied`, `approval_denied`, `approval_expired`, `dispatch_failed`, or
+`recovered_stale_invocation`:
 
 ```json
 {
@@ -1556,6 +1560,20 @@ order (any failure leaves the task `pending`, fail-closed):
 The daemon signs the decision with its own key and emits it as itself, so a
 self-issued (operator-approved) decision passes all three checks and the existing
 approve → execute flow is preserved.
+
+**Expiry (issue #265).** Every approval request carries a finite `expires_at`
+(stamped at `APPROVAL_REQUEST_TTL` = 1 h). A held `requires_approval` task whose
+queued request's `expires_at` passes without a verified decision is finalized
+`blocked` with `reason = "approval_expired"` (§9.2) and removed from the local
+approval queue, so it no longer appears under `mx-agent approval list`. The
+deadline is anchored to the request's **persisted** stamp from when it was first
+queued, so it cannot slide forward across scheduler passes. A verified
+approve/deny decision still takes priority over expiry, and a malformed stamp is
+treated as not-yet-expired (the task stays decidable) — expiry can only ever
+*block* a task, never release one, so it strengthens the deny-by-default posture
+rather than weakening it. This is distinct from the signed task-action
+authorization nonce (`auth.expires_at`), which guards authorization freshness,
+not the human-approval deadline.
 
 ---
 
