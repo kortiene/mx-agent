@@ -31,11 +31,12 @@ use matrix_sdk::config::SyncSettings;
 use matrix_sdk::Room;
 use serde_json::Value;
 
-use mx_agent_policy::{CallContext, DenyReason, Policy};
+use mx_agent_policy::{CallContext, DenyReason, Outcome, Policy};
 use mx_agent_protocol::events::timeline::{CALL_REQUEST, CALL_RESPONSE};
 use mx_agent_protocol::schema::{AgentState, CallRequest, CallResponse, Signature};
 use mx_agent_protocol::signing::{self, SignatureError, SIGNATURE_FIELD};
 
+use crate::audit::{append_audit, AuditRecord};
 use crate::call_ipc::{CallErrorKind, CallOutcome, CallStartParams, CallStartResult};
 use crate::session::{load_session, SessionPaths};
 use crate::signing::{decode_verifying_key, key_id_for_verifying_key, load_or_create_signing_key};
@@ -617,8 +618,33 @@ pub async fn handle_live_call_request(
     )
     .await
     {
-        Ok(authorized) => execute_authorized_call(&authorized),
-        Err(rejection) => rejection_response(request.request_id.clone(), &rejection),
+        Ok((authorized, allowance)) => {
+            audit_call_decision(
+                paths,
+                &meta.room_id,
+                &authorized,
+                requesting_agent,
+                target_agent,
+                &Outcome::Allow(allowance),
+            );
+            execute_authorized_call(&authorized)
+        }
+        Err(rejection) => {
+            // Policy denials and post-policy gate denials are audited via the
+            // routing helper; pre-policy authentication failures (unsigned, bad
+            // signature, untrusted key, malformed) are not attributable to a
+            // trusted requester and are intentionally not audited (mirrors exec).
+            if let Some(record) = call_rejection_audit_record(
+                &meta.room_id,
+                request,
+                requesting_agent,
+                target_agent,
+                &rejection,
+            ) {
+                append_audit(paths, &request.invocation_id, record);
+            }
+            rejection_response(request.request_id.clone(), &rejection)
+        }
     };
 
     if let Err(e) = emit_call_response(&room, &response).await {
@@ -633,7 +659,7 @@ async fn authorize_live_call(
     request: &CallRequest,
     requesting_agent: &str,
     room_id: &str,
-) -> Result<CallRequest, CallRejection> {
+) -> Result<(CallRequest, mx_agent_policy::Allowance), CallRejection> {
     let requester = crate::agent::read_agent_state(room, requesting_agent)
         .await
         .map_err(|_| CallRejection::Malformed)?
@@ -670,7 +696,73 @@ async fn authorize_live_call(
             "executing privileged call from an unverified Matrix device (authority from signing key; require_verified_device is off)"
         );
     }
-    Ok(request)
+    Ok((request, allowance))
+}
+
+/// Audit a named `call` decision (allow or policy deny) from its policy
+/// [`Outcome`]. Mirrors [`crate::exec`]'s `audit_exec_decision`: an allowed call
+/// records the resolved sandbox via [`AuditRecord::for_call`]; a `Deny` outcome
+/// records the policy rule's stable `deny:<reason>` string.
+fn audit_call_decision(
+    paths: &SessionPaths,
+    room_id: &str,
+    request: &CallRequest,
+    requester: &str,
+    target: &str,
+    outcome: &Outcome,
+) {
+    let record = AuditRecord::for_call(
+        room_id,
+        requester,
+        target,
+        Some(&request.invocation_id),
+        &request.tool,
+        outcome,
+    );
+    append_audit(paths, &request.invocation_id, record);
+}
+
+/// Compute the [`AuditRecord`] that should be appended for a [`CallRejection`],
+/// if any. Returns `None` for pre-policy authentication failures (`Malformed`,
+/// `Unsigned`, `InvalidSignature`, `UntrustedKey`) that are intentionally not
+/// audited — they are not attributable to a trusted requester, mirroring the
+/// exec path (issue #257).
+///
+/// Extracted from the inline dispatch in [`handle_live_call_request`] so the
+/// routing decision (which rejection variant audits which record) is testable
+/// without a live Matrix client.
+fn call_rejection_audit_record(
+    room_id: &str,
+    request: &CallRequest,
+    requester: &str,
+    target: &str,
+    rejection: &CallRejection,
+) -> Option<AuditRecord> {
+    match rejection {
+        // Policy denials record the detailed deny reason via the policy Outcome
+        // path, mirroring exec's audit_exec_decision with Outcome::Deny.
+        CallRejection::PolicyDenied(reason) => Some(AuditRecord::for_call(
+            room_id,
+            requester,
+            target,
+            Some(&request.invocation_id),
+            &request.tool,
+            &Outcome::Deny(reason.clone()),
+        )),
+        // The post-policy verified-device gate denial is audited with its stable
+        // deny reason, mirroring exec's for_exec_denied path (issue #240/#257).
+        CallRejection::UnverifiedDevice => Some(AuditRecord::for_call_denied(
+            room_id,
+            requester,
+            target,
+            Some(&request.invocation_id),
+            &request.tool,
+            &rejection.reason(),
+        )),
+        // Pre-policy authentication failures are not attributable to a trusted
+        // requester and are intentionally not audited.
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1165,5 +1257,160 @@ allow_tools = ["run_tests", "lint"]
             msg.contains("verified"),
             "display should mention 'verified': {msg}"
         );
+    }
+
+    // ── audit routing tests (issue #257) ─────────────────────────────────────
+
+    fn call_request_for_audit(tool: &str) -> CallRequest {
+        CallRequest {
+            invocation_id: "inv_audit_test".to_string(),
+            request_id: "req_audit_test".to_string(),
+            tool: tool.to_string(),
+            // args contain a secret-like value to verify it never reaches the log.
+            args: json!({"secret_key": "should_not_appear_in_audit"}),
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            expires_at: "2026-06-10T12:05:00Z".to_string(),
+            nonce: "nonce-audit-test".to_string(),
+            signature: Signature {
+                alg: signing::ALG_ED25519.to_string(),
+                key_id: "k-audit-test".to_string(),
+                sig: String::new(),
+            },
+            requesting_agent: Some(AGENT.to_string()),
+            target_agent: Some("dev-pi".to_string()),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn audit_allow_call_record_has_correct_fields() {
+        // An allowed named call must produce a record with:
+        // - request == "call", decision == allowed
+        // - the tool name, allow_tools rule family, sandbox == "none" by default
+        // - no command argv
+        // - invocation_id threaded from the CallRequest
+        // Security: the args JSON value must not appear in the audit record — only
+        // the tool name is logged, no redaction is needed because nothing is logged.
+        use crate::audit::{AuditDecision, AuditRecord};
+        use mx_agent_policy::{Allowance, Outcome};
+
+        let request = call_request_for_audit("run_tests");
+        let record = AuditRecord::for_call(
+            ROOM,
+            AGENT,
+            "dev-pi",
+            Some(&request.invocation_id),
+            &request.tool,
+            &Outcome::Allow(Allowance::default()),
+        );
+        assert_eq!(record.request, "call");
+        assert_eq!(record.decision, AuditDecision::Allowed);
+        assert_eq!(record.tool.as_deref(), Some("run_tests"));
+        assert_eq!(record.policy_rule, "allow_tools");
+        assert_eq!(record.sandbox.as_deref(), Some("none"));
+        assert_eq!(record.invocation_id.as_deref(), Some("inv_audit_test"));
+        assert!(
+            record.command.is_none(),
+            "call audit record must not carry command argv"
+        );
+        let json = record.to_json_line();
+        assert!(
+            !json.contains('\n'),
+            "audit record must be single-line JSON"
+        );
+        assert!(
+            !json.contains("should_not_appear_in_audit"),
+            "call args must not leak into audit record: {json}"
+        );
+    }
+
+    #[test]
+    fn call_rejection_audit_record_for_policy_denied() {
+        // A PolicyDenied rejection must produce a denied record whose policy_rule
+        // is the stable deny:<reason> string, with no sandbox or command argv.
+        use crate::audit::AuditDecision;
+        use mx_agent_policy::DenyReason;
+
+        let request = call_request_for_audit("deploy");
+        let rejection = CallRejection::PolicyDenied(DenyReason::ToolNotAllowed {
+            tool: "deploy".to_string(),
+        });
+        let record = call_rejection_audit_record(ROOM, &request, AGENT, "dev-pi", &rejection)
+            .expect("PolicyDenied must produce an audit record");
+        assert_eq!(record.request, "call");
+        assert_eq!(record.decision, AuditDecision::Denied);
+        assert_eq!(record.policy_rule, "deny:tool_not_allowed");
+        assert_eq!(record.tool.as_deref(), Some("deploy"));
+        assert_eq!(record.invocation_id.as_deref(), Some("inv_audit_test"));
+        assert!(record.sandbox.is_none(), "denied record must omit sandbox");
+        assert!(
+            record.command.is_none(),
+            "call audit record must not carry command argv"
+        );
+        let json = record.to_json_line();
+        assert!(
+            !json.contains('\n'),
+            "audit record must be single-line JSON"
+        );
+        assert!(
+            !json.contains("should_not_appear_in_audit"),
+            "call args must not leak into audit record: {json}"
+        );
+    }
+
+    #[test]
+    fn call_rejection_audit_record_for_unverified_device() {
+        // An UnverifiedDevice post-policy gate denial must produce a denied record
+        // with policy_rule == "deny:unverified_device", mirroring exec's
+        // for_exec_denied path (issue #240/#257).
+        use crate::audit::AuditDecision;
+
+        let request = call_request_for_audit("run_tests");
+        let record = call_rejection_audit_record(
+            ROOM,
+            &request,
+            AGENT,
+            "dev-pi",
+            &CallRejection::UnverifiedDevice,
+        )
+        .expect("UnverifiedDevice must produce an audit record");
+        assert_eq!(record.request, "call");
+        assert_eq!(record.decision, AuditDecision::Denied);
+        assert_eq!(record.policy_rule, "deny:unverified_device");
+        assert_eq!(record.tool.as_deref(), Some("run_tests"));
+        assert_eq!(record.invocation_id.as_deref(), Some("inv_audit_test"));
+        assert!(record.sandbox.is_none());
+        assert!(record.command.is_none());
+        let json = record.to_json_line();
+        assert!(
+            !json.contains('\n'),
+            "audit record must be single-line JSON"
+        );
+        assert!(
+            !json.contains("should_not_appear_in_audit"),
+            "call args must not leak into audit record: {json}"
+        );
+    }
+
+    #[test]
+    fn pre_policy_failures_produce_no_audit_record() {
+        // Unsigned, InvalidSignature, UntrustedKey, and Malformed are pre-policy
+        // failures that are NOT attributable to a trusted requester.  They must
+        // produce no audit record so an unauthenticated sender cannot spam the log.
+        let request = call_request_for_audit("run_tests");
+        let pre_policy: &[CallRejection] = &[
+            CallRejection::Unsigned,
+            CallRejection::InvalidSignature,
+            CallRejection::UntrustedKey {
+                key_id: "kid-not-trusted".to_string(),
+            },
+            CallRejection::Malformed,
+        ];
+        for rejection in pre_policy {
+            assert!(
+                call_rejection_audit_record(ROOM, &request, AGENT, "dev-pi", rejection).is_none(),
+                "pre-policy rejection {rejection:?} must produce no audit record"
+            );
+        }
     }
 }

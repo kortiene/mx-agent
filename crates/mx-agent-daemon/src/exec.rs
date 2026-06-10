@@ -51,7 +51,7 @@ use mx_agent_protocol::schema::{
 };
 use mx_agent_protocol::signing::{self, SignatureError, SIGNATURE_FIELD};
 
-use crate::audit::{AuditLog, AuditRecord};
+use crate::audit::{append_audit, AuditRecord};
 use crate::pty::{PtySession, PtyWinsize};
 use crate::runner::{
     build_command, kill_process_group, terminate_process_group, RunOutput, RunSpec,
@@ -1586,7 +1586,7 @@ fn audit_exec_decision(
         &request.command,
         outcome,
     );
-    append_exec_audit(paths, &request.invocation_id, record);
+    append_audit(paths, &request.invocation_id, record);
 }
 
 /// Audit an exec rejection from a gate that runs *after* the policy engine —
@@ -1612,21 +1612,7 @@ fn audit_exec_rejection(
         &request.command,
         &rejection.reason(),
     );
-    append_exec_audit(paths, &request.invocation_id, record);
-}
-
-/// Append a prepared exec [`AuditRecord`] to the local audit log, resolving the
-/// default config-dir path and falling back to the data dir. A failed append is
-/// logged and swallowed: auditing must never block or fail a decision.
-fn append_exec_audit(paths: &crate::SessionPaths, invocation_id: &str, record: AuditRecord) {
-    let Some(path) = AuditLog::default_path()
-        .or_else(|| Some(paths.data_dir.join(crate::audit::AUDIT_FILE_NAME)))
-    else {
-        return;
-    };
-    if let Err(e) = AuditLog::new(path).append(&record) {
-        tracing::warn!(error = %e, invocation_id = %invocation_id, "failed to append exec audit record");
-    }
+    append_audit(paths, &request.invocation_id, record);
 }
 
 fn rfc3339_now() -> String {

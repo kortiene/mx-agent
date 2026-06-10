@@ -433,10 +433,12 @@ deny:unverified_device
 ```
 
 The policy-engine reasons above are joined by `deny:unverified_device`, recorded
-when the optional `require_verified_device` gate rejects an `exec` from an
-unverified Matrix device (issue #240). That gate runs *after* the policy
-decision, so its denial is audited in addition to — not instead of — the
-policy outcome.
+when the optional `require_verified_device` gate rejects an `exec` or a named
+`call` from an unverified Matrix device (issues #240 and #257). That gate runs
+*after* the policy decision, so its denial is audited in addition to — not
+instead of — the policy outcome. Pre-policy authentication failures (unsigned,
+bad signature, untrusted key, malformed) are deliberately *not* audited for
+either path, since they are not attributable to a trusted requester.
 
 **Secrets are redacted in the log.** Command arguments pass through a redactor
 that masks `KEY=value` pairs and `--flag value` pairs whose key looks sensitive,
