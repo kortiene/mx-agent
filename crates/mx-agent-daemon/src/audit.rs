@@ -172,6 +172,41 @@ impl AuditRecord {
         }
     }
 
+    /// Build an audit record for a named `call` request denied by a gate that
+    /// runs *after* the policy engine — currently the verified-device gate
+    /// (issue #240/#257).
+    ///
+    /// Mirrors [`AuditRecord::for_exec_denied`] but records the `tool` name
+    /// instead of a command argv (a call carries no argv). Policy-engine denials
+    /// are recorded via [`AuditRecord::for_call`] from the engine's [`Outcome`];
+    /// this records a post-policy gate denial whose reason is not a policy
+    /// [`DenyReason`]. The decision is always [`AuditDecision::Denied`], no
+    /// sandbox is selected (nothing runs), and `deny_reason` is the gate's
+    /// stable, machine-readable reason, stored with the same `deny:` prefix as
+    /// policy denials so the log stays uniform.
+    pub fn for_call_denied(
+        room: &str,
+        requester: &str,
+        target: &str,
+        invocation_id: Option<&str>,
+        tool: &str,
+        deny_reason: &str,
+    ) -> Self {
+        Self {
+            ts: now_rfc3339(),
+            room: room.to_string(),
+            requester: requester.to_string(),
+            target: target.to_string(),
+            invocation_id: invocation_id.map(str::to_string),
+            request: "call",
+            command: None,
+            tool: Some(tool.to_string()),
+            decision: AuditDecision::Denied,
+            policy_rule: format!("deny:{deny_reason}"),
+            sandbox: None,
+        }
+    }
+
     /// Serialize the record to a single-line JSON string.
     pub fn to_json_line(&self) -> String {
         // The record contains only owned strings and enums, so serialization
@@ -245,6 +280,21 @@ impl AuditLog {
         file.write_all(record.to_json_line().as_bytes())?;
         file.write_all(b"\n")?;
         Ok(())
+    }
+}
+
+/// Append a prepared [`AuditRecord`] to the local audit log, resolving the
+/// default config-dir path and falling back to the data dir. A failed append is
+/// logged and swallowed: auditing must never block or fail a decision. Shared
+/// by the `exec` and `call` receive-side handlers.
+pub(crate) fn append_audit(paths: &crate::SessionPaths, invocation_id: &str, record: AuditRecord) {
+    let Some(path) =
+        AuditLog::default_path().or_else(|| Some(paths.data_dir.join(AUDIT_FILE_NAME)))
+    else {
+        return;
+    };
+    if let Err(e) = AuditLog::new(path).append(&record) {
+        tracing::warn!(error = %e, invocation_id = %invocation_id, "failed to append audit record");
     }
 }
 
@@ -510,6 +560,78 @@ mod tests {
         assert!(!json.contains("sandbox"), "got {json}");
         // The command is redacted just like an allowed or policy-denied exec.
         assert!(!json.contains("s3cr3t"), "secret leaked into audit: {json}");
+    }
+
+    #[test]
+    fn allowed_call_records_default_sandbox_and_tool() {
+        // An allowed named call records the tool name, the `allow_tools` rule
+        // family, and the baseline `none` sandbox by default.
+        let record =
+            AuditRecord::for_call("!abc", "@a", "t", Some("inv_01HZ"), "run_tests", &allow());
+        assert_eq!(record.decision, AuditDecision::Allowed);
+        assert_eq!(record.policy_rule, "allow_tools");
+        assert_eq!(record.sandbox.as_deref(), Some("none"));
+        assert_eq!(record.tool.as_deref(), Some("run_tests"));
+        let json = record.to_json_line();
+        assert!(json.contains("\"request\":\"call\""), "got {json}");
+        assert!(json.contains("\"tool\":\"run_tests\""), "got {json}");
+        assert!(json.contains("\"sandbox\":\"none\""), "got {json}");
+        assert!(!json.contains("\"command\""), "got {json}");
+        assert!(!json.contains('\n'));
+    }
+
+    #[test]
+    fn allowed_call_records_selected_sandbox() {
+        let outcome = Outcome::Allow(Allowance {
+            sandbox: Some(mx_agent_policy::Sandbox::Bubblewrap),
+            ..Allowance::default()
+        });
+        let record = AuditRecord::for_call("!r", "@a", "t", None, "run_tests", &outcome);
+        assert_eq!(record.sandbox.as_deref(), Some("bubblewrap"));
+        assert!(record.to_json_line().contains("\"sandbox\":\"bubblewrap\""));
+    }
+
+    #[test]
+    fn policy_denied_call_omits_sandbox_and_command() {
+        // A policy-denied call records the deny reason as its rule, omits the
+        // sandbox (nothing runs) and never carries a command argv.
+        let outcome = Outcome::Deny(DenyReason::ToolNotAllowed {
+            tool: "wipe".to_string(),
+        });
+        let record = AuditRecord::for_call("!abc", "@a", "t", None, "wipe", &outcome);
+        assert_eq!(record.decision, AuditDecision::Denied);
+        assert_eq!(record.policy_rule, "deny:tool_not_allowed");
+        assert_eq!(record.sandbox, None);
+        let json = record.to_json_line();
+        assert!(!json.contains("sandbox"), "got {json}");
+        assert!(!json.contains("\"command\""), "got {json}");
+    }
+
+    #[test]
+    fn post_policy_call_denial_is_recorded() {
+        // Issue #257: a verified-device gate denial on the call path is audited
+        // as a denial with its stable reason, the tool name, and no sandbox —
+        // mirroring the exec-side `for_exec_denied`.
+        let record = AuditRecord::for_call_denied(
+            "!abc",
+            "@a",
+            "t",
+            Some("inv-1"),
+            "run_tests",
+            "unverified_device",
+        );
+        assert_eq!(record.decision, AuditDecision::Denied);
+        assert_eq!(record.policy_rule, "deny:unverified_device");
+        assert_eq!(record.sandbox, None);
+        assert_eq!(record.tool.as_deref(), Some("run_tests"));
+        let json = record.to_json_line();
+        assert!(json.contains("\"request\":\"call\""), "got {json}");
+        assert!(json.contains("\"tool\":\"run_tests\""), "got {json}");
+        assert!(json.contains("\"invocation_id\":\"inv-1\""), "got {json}");
+        assert!(!json.contains("sandbox"), "got {json}");
+        assert!(!json.contains("\"command\""), "got {json}");
+        // Single line.
+        assert!(!json.contains('\n'));
     }
 
     #[test]

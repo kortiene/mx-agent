@@ -5682,6 +5682,11 @@ mod tests {
         assert_eq!(pw, "pass word ", "env-var password must not be trimmed");
     }
 
+    /// Serializes the tests that mutate stdin's terminal settings, since the
+    /// TTY is global shared state (like the process environment for passwords).
+    #[cfg(unix)]
+    static TERM_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The echo-suppression itself requires a real TTY, so this exercises the
     /// guard against `/dev/tty` when one is available and is skipped otherwise
     /// (e.g. CI with no controlling terminal) — same pattern as the
@@ -5704,6 +5709,7 @@ mod tests {
         if !isatty(&stdin) {
             return;
         }
+        let _lock = TERM_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(before) = tcgetattr(&stdin) else {
             return;
         };
@@ -5735,6 +5741,7 @@ mod tests {
         if !isatty(&stdin) {
             return;
         }
+        let _lock = TERM_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(before) = tcgetattr(&stdin) else {
             return;
         };

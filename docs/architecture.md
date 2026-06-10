@@ -1746,7 +1746,10 @@ writable_paths = ["/home/me/code/project", "/tmp/mx-agent"]
 
 ### 13.6 Audit Logging
 
-Every privileged decision should be logged locally without secrets:
+Every privileged decision is logged locally without secrets. Both raw `exec`
+and named `call` decisions are recorded — allows and denials alike — so the log
+is a complete trail of who asked for what and whether it ran. An `exec` record
+carries the redacted `command` argv:
 
 ```json
 {
@@ -1755,11 +1758,37 @@ Every privileged decision should be logged locally without secrets:
   "requester": "@claude:matrix.org",
   "target": "developer-pi",
   "invocation_id": "inv_01HZ",
+  "request": "exec",
   "command": ["npm", "test"],
   "decision": "allowed",
-  "policy_rule": "rooms.!abc.agents.@claude.allow_commands"
+  "policy_rule": "allow_commands",
+  "sandbox": "none"
 }
 ```
+
+A `call` record carries the `tool` name instead (never the tool `args`, which
+may hold sensitive values), with `policy_rule` drawn from the `allow_tools`
+family when allowed or a stable `deny:<reason>` string when denied:
+
+```json
+{
+  "ts": "2026-06-02T12:00:00Z",
+  "room": "!abc:matrix.org",
+  "requester": "@claude:matrix.org",
+  "target": "developer-pi",
+  "invocation_id": "inv_01HZ",
+  "request": "call",
+  "tool": "run_tests",
+  "decision": "allowed",
+  "policy_rule": "allow_tools",
+  "sandbox": "none"
+}
+```
+
+Pre-policy authentication failures (unsigned, bad signature, untrusted key,
+malformed) are intentionally not audited for either path: they are not
+attributable to a trusted requester, and logging them would let an
+unauthenticated sender spam the operator's log.
 
 ---
 

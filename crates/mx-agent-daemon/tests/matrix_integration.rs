@@ -379,13 +379,19 @@ async fn decrypted_content(room: &Room, event_id: &EventId) -> Value {
     .expect("privileged event was never decrypted by the daemon")
 }
 
-/// Live Matrix-backed remote call coverage (issue #194).
+/// Live Matrix-backed remote call coverage (issues #194, #257).
 ///
 /// Drives two real Matrix users in one room: Bob registers a requester agent,
 /// Alice registers the target agent and runs the daemon sync loop, Bob sends a
 /// signed targeted call through `start_call_matrix`, and Alice's sync handler
 /// verifies signature/trust/policy before executing the tool and emitting a
 /// response.
+///
+/// Issue #257: the test also sends a second call for an unlisted tool ("deploy")
+/// and asserts that both decisions — allowed and policy-denied — are written as
+/// newline-delimited JSON records to the local audit log, proving that
+/// `handle_live_call_request` produces audit entries for all named-call decisions
+/// and not only for `exec` decisions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_matrix_backed_remote_call_round_trips() {
@@ -534,11 +540,29 @@ allow_tools = ["run_tests"]
     })
     .await;
 
+    // Issue #257: send a second call for a tool not in allow_tools — Alice's
+    // daemon must audit a denied entry and return an error outcome.
+    let denied_result = start_call_matrix(&CallStartParams {
+        room: Some(room_id.to_string()),
+        agent: Some(TARGET_AGENT.to_string()),
+        tool: "deploy".to_string(),
+        input: json!({}),
+        invocation_id: None,
+    })
+    .await;
+
     running.store(false, Ordering::SeqCst);
     alice_sync
         .await
         .expect("sync task joins")
         .expect("sync exits cleanly");
+
+    // Read the audit log before clearing the config-dir env var; the file path
+    // is resolved from MX_AGENT_CONFIG_DIR, which is still set here.
+    let audit_log_path = config_dir.join(mx_agent_daemon::audit::AUDIT_FILE_NAME);
+    let audit_content = std::fs::read_to_string(&audit_log_path)
+        .expect("audit log must exist after live calls (issue #257)");
+
     std::env::remove_var(ENV_DATA_DIR);
     std::env::remove_var("MX_AGENT_CONFIG_DIR");
 
@@ -548,6 +572,62 @@ allow_tools = ["run_tests"]
         }
         other => panic!("expected successful remote call, got {other:?}"),
     }
+    assert!(
+        matches!(denied_result.outcome, CallOutcome::Error { .. }),
+        "policy-denied call must return an error outcome, got {:?}",
+        denied_result.outcome
+    );
+
+    // ── audit log assertions (issue #257) ────────────────────────────────────
+    // The daemon must write one JSON-line record for every named-call decision:
+    // one allowed entry for run_tests and one denied entry for deploy.
+    let audit_records: Vec<serde_json::Value> = audit_content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("each audit line must be valid JSON"))
+        .collect();
+
+    let allowed_entry = audit_records
+        .iter()
+        .find(|r| r["request"] == "call" && r["decision"] == "allowed" && r["tool"] == "run_tests");
+    assert!(
+        allowed_entry.is_some(),
+        "audit log must contain an allowed call record for run_tests (issue #257):\n{audit_content}"
+    );
+    let allowed = allowed_entry.unwrap();
+    assert_eq!(
+        allowed["policy_rule"], "allow_tools",
+        "allowed call must record the allow_tools rule: {allowed}"
+    );
+    assert!(
+        !allowed["sandbox"].is_null(),
+        "allowed call must record the sandbox backend: {allowed}"
+    );
+    assert!(
+        allowed.get("command").is_none(),
+        "call audit record must not carry command argv: {allowed}"
+    );
+
+    let denied_entry = audit_records
+        .iter()
+        .find(|r| r["request"] == "call" && r["decision"] == "denied" && r["tool"] == "deploy");
+    assert!(
+        denied_entry.is_some(),
+        "audit log must contain a denied call record for deploy (issue #257):\n{audit_content}"
+    );
+    let denied = denied_entry.unwrap();
+    assert_eq!(
+        denied["policy_rule"], "deny:tool_not_allowed",
+        "policy-denied call must record deny:tool_not_allowed: {denied}"
+    );
+    assert!(
+        denied.get("sandbox").is_none(),
+        "denied call must not carry a sandbox field: {denied}"
+    );
+    assert!(
+        denied.get("command").is_none(),
+        "denied call audit record must not carry command argv: {denied}"
+    );
 }
 
 /// Live Matrix-backed remote exec coverage (issue #196).

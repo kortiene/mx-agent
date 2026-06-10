@@ -3113,6 +3113,8 @@ The audit log (`~/.config/mx-agent/audit.log`) is newline-delimited JSON, one re
 ```jsonl
 {"ts":"2023-11-14T22:13:20Z","room":"!abc:matrix.org","requester":"@claude:matrix.org","target":"developer-pi","invocation_id":"inv_01HZ","request":"exec","command":["cargo","test"],"decision":"allowed","policy_rule":"allow_commands","sandbox":"bubblewrap"}
 {"ts":"2023-11-14T22:14:05Z","room":"!abc:matrix.org","requester":"@attacker:matrix.org","target":"developer-pi","request":"exec","command":["rm","-rf","/"],"decision":"denied","policy_rule":"deny:denied_arguments"}
+{"ts":"2023-11-14T22:15:00Z","room":"!abc:matrix.org","requester":"@claude:matrix.org","target":"developer-pi","invocation_id":"inv_02HZ","request":"call","tool":"run_tests","decision":"allowed","policy_rule":"allow_tools","sandbox":"none"}
+{"ts":"2023-11-14T22:15:30Z","room":"!abc:matrix.org","requester":"@claude:matrix.org","target":"developer-pi","invocation_id":"inv_03HZ","request":"call","tool":"deploy","decision":"denied","policy_rule":"deny:tool_not_allowed"}
 ```
 
 **Standard fields (all records):**
