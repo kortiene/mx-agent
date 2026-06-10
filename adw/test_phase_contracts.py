@@ -72,6 +72,18 @@ class PhaseContractTests(unittest.TestCase):
         self.assertIn("no pull request yet", normalized)
         self.assertNotIn("review this pull request", normalized)
 
+    def test_code_mutating_phases_instruct_cargo_fmt(self) -> None:
+        # Every phase that edits Rust must tell the agent to run `cargo fmt`.
+        # The Python finalize step runs `cargo fmt --check` as a pre-merge gate
+        # and aborts the run (no commit/push/PR) on any unformatted line, so a
+        # code phase that never formats can silently kill an otherwise-complete
+        # run. Regression: the `patch`/`resolve` phases once lacked this and a
+        # patch-phase formatting violation aborted a finished run before its PR.
+        for phase in ("implement", "tests", "e2e", "resolve", "patch"):
+            with self.subTest(phase=phase):
+                prompt = compose_phase_prompt(phase, ["specs/x.md", "ctx"], self.state)
+                self.assertIn("cargo fmt", prompt)
+
     def test_every_phase_contract_has_a_result_mapping(self) -> None:
         # Each phase named in the contract table must map to a dataclass.
         for phase in AGENT_PHASES:
