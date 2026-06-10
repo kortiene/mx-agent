@@ -38,11 +38,10 @@ use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
 use mx_agent_policy::{Allowance, Policy};
-use mx_agent_protocol::schema::{InvocationState, TaskAction, TaskState};
+use mx_agent_protocol::schema::{ApprovalDecision, InvocationState, TaskAction, TaskState};
 
 use crate::approval::{
-    approval_request_expiry, decision_permits_spawn, read_approval_decisions, ApprovalQueue,
-    APPROVAL_REQUEST_TTL,
+    approval_request_expiry, read_verified_approval_decisions, ApprovalQueue, APPROVAL_REQUEST_TTL,
 };
 use crate::scheduler::TaskScheduler;
 use crate::session::SessionPaths;
@@ -458,15 +457,18 @@ fn scheduler_pass(
             matches!(task.state.as_str(), STATE_PENDING | STATE_ASSIGNED)
                 && owned_ids.contains(task.assigned_to.as_str())
         });
-        let decisions: HashMap<String, bool> = if has_runnable_candidate {
-            match runtime.block_on(read_approval_decisions(
+        // Only sender- and signature-verified decisions are admitted (issue #264):
+        // a forged `approved` event from any room member other than this daemon,
+        // or one without a valid signature from a resolvable key, is dropped here
+        // and never reaches the gate, so it cannot release a held task.
+        let decisions: HashMap<String, ApprovalDecision> = if has_runnable_candidate {
+            match runtime.block_on(read_verified_approval_decisions(
                 &room,
                 APPROVAL_DECISIONS_SCAN_LIMIT,
+                &local_user,
+                &verifying_keys,
             )) {
-                Ok(found) => found
-                    .into_iter()
-                    .map(|(id, decision)| (id, decision_permits_spawn(&decision)))
-                    .collect(),
+                Ok(found) => found,
                 Err(e) => {
                     tracing::debug!(error = %e, room = %room_id, "scheduler pass could not read approval decisions");
                     HashMap::new()
@@ -519,7 +521,7 @@ fn scheduler_pass_for_agent(
     paths: &SessionPaths,
     attempted: &mut HashSet<(String, u64)>,
     claimed_invocations: &mut BTreeSet<String>,
-    decisions: &HashMap<String, bool>,
+    decisions: &HashMap<String, ApprovalDecision>,
     approval_queue: Rc<RefCell<ApprovalQueue>>,
     approval_expires_at: &str,
 ) {
@@ -546,18 +548,22 @@ fn scheduler_pass_for_agent(
     }
 
     // Approval gate: a task local policy marks `requires_approval` is held until a
-    // published decision approves it. The first undecided encounter enqueues a
-    // pending approval into the shared queue (persisted by the caller); a recorded
-    // `approved` decision lets it proceed, any other decision blocks it. Without
-    // this gate the orchestrator fails closed and never runs the action.
+    // verified, published decision approves it. The first undecided encounter
+    // enqueues a pending approval into the shared queue (persisted by the caller);
+    // a verified `approved` decision lets it proceed, any other decision blocks it.
+    // Without this gate the orchestrator fails closed and never runs the action.
+    // The gate shares the orchestrator's replay cache so an approving decision's
+    // single-use nonce is burned on the releasing pass (issue #264), preventing a
+    // stale duplicate from re-releasing the task on a later pass.
     let decisions = decisions.clone();
     let gate = QueueApprovalGate::new(
         room_id.to_string(),
         agent.agent_id.clone(),
         approval_expires_at.to_string(),
         approval_queue,
-        move |request_id: &str| decisions.get(request_id).copied(),
-    );
+        move |request_id: &str| decisions.get(request_id).cloned(),
+    )
+    .with_replay_cache(orchestrator.replay_cache_handle());
     orchestrator = orchestrator.with_approval_gate(Box::new(gate));
 
     // Only tasks assigned to this agent are claimed (auto-claim disabled): room
@@ -1278,6 +1284,22 @@ requires_approval = true
         .expect("approval policy parses")
     }
 
+    /// Build a verified-looking approval decision that permits (or denies) a
+    /// spawn. These gate tests attach no replay cache, so `nonce`/`expires_at`
+    /// can be absent — the gate releases on the decision value alone.
+    fn decision(permits: bool) -> ApprovalDecision {
+        ApprovalDecision {
+            request_id: "approval:task-a".to_string(),
+            decision: if permits { "approved" } else { "denied" }.to_string(),
+            approved_by: "@operator:server".to_string(),
+            created_at: "2026-06-05T00:00:00Z".to_string(),
+            nonce: None,
+            expires_at: None,
+            signature: None,
+            extra: Default::default(),
+        }
+    }
+
     /// Run one tick with an approval gate wired exactly as the live loop does:
     /// the gate shares `queue` and resolves decisions from `decisions`
     /// (`request_id -> permits_spawn`). Returns the outcomes; `queue` reflects the
@@ -1295,7 +1317,7 @@ requires_approval = true
             AGENT,
             "2026-06-05T00:00:00Z",
             Rc::clone(&queue),
-            move |request_id: &str| decisions.get(request_id).copied(),
+            move |request_id: &str| decisions.get(request_id).map(|&permits| decision(permits)),
         );
         let orchestrator = TaskOrchestrator::new(AGENT)
             .with_room_id(ROOM)
@@ -1453,7 +1475,7 @@ requires_approval = true
                 AGENT,
                 "2026-06-05T00:00:00Z",
                 Rc::clone(&queue),
-                move |id: &str| decisions.get(id).copied(),
+                move |id: &str| decisions.get(id).map(|&permits| decision(permits)),
             );
             let orchestrator = TaskOrchestrator::new(AGENT)
                 .with_room_id(ROOM)

@@ -1007,10 +1007,14 @@ tool/exec before claiming or dispatching. When local policy marks the action
 consults an approval gate that records a `com.mxagent.approval.request.v1` in the
 local approval queue (inspectable via `mx-agent approval list`) and holds the
 task. The live scheduler resolves the hold against published
-`com.mxagent.approval.decision.v1` events: an approved decision lets the task
-proceed (verifying signature/trust and consuming the replay nonce on that pass)
-to claim/dispatch; a denied decision blocks the task (`reason = "approval_denied"`)
-and never spawns; an undecided action keeps waiting. With no approval gate
+`com.mxagent.approval.decision.v1` events, but honours a decision only when it is
+**sender-verified** (its Matrix sender is the host daemon's own user) and
+**signature-verified** against a resolvable key — room membership alone never
+releases a held task (§12). A verified approved decision lets the task proceed
+(verifying the task action's own signature/trust and consuming both the
+decision's and the task action's replay nonce on that pass) to claim/dispatch; a
+denied decision blocks the task (`reason = "approval_denied"`) and never spawns;
+an undecided, forged, or unverifiable decision keeps the task waiting. With no approval gate
 configured the daemon fails closed and does not run the action. The claim is an optimistic, conditional update
 guarded by the observed `state_rev`: it transitions `pending`/`assigned` ->
 `executing`, records this agent as the owner (`assigned_to`), and attaches a
@@ -1521,10 +1525,37 @@ Approval decision event:
     "request_id": "req_01HZ...",
     "decision": "approved",
     "approved_by": "local-user",
-    "created_at": "2026-06-02T12:00:30Z"
+    "created_at": "2026-06-02T12:00:30Z",
+    "nonce": "01HZ...random...",
+    "expires_at": "2026-06-02T13:00:30Z",
+    "signature": { "alg": "ed25519", "key_id": "mxagent-ed25519:...", "sig": "..." }
   }
 }
 ```
+
+A decision can release a deliberately-held `requires_approval` task only when it
+is bound to a verifiable approver identity — **room membership is not execution
+permission** (§1.2). Before the scheduler honours a decision it must pass, in
+order (any failure leaves the task `pending`, fail-closed):
+
+1. **Sender check** — the Matrix `sender` of the decision event must equal the
+   host daemon's own user id. A decision published by any other room member is
+   dropped before it reaches the approval gate, so a newly-joined or compromised
+   member cannot release a held task.
+2. **Signature check** — the decision carries a detached Ed25519 `signature`
+   (over its canonical bytes with the `signature` field excluded, like an
+   `exec.request`/`call.request`) whose `key_id` resolves to a published agent
+   key and verifies. Because the sender check already establishes provenance for
+   a self-issued decision, the daemon's own published key is sufficient.
+3. **Replay check** — the decision's single-use `nonce` (bounded by `expires_at`)
+   is admitted into the daemon's replay cache on the pass that actually releases
+   the task, so a stale `approved` event lingering in the timeline scan window
+   cannot re-release it on a later pass. The nonce is **not** consumed while the
+   task is merely held, so a legitimately-held task still runs when approved.
+
+The daemon signs the decision with its own key and emits it as itself, so a
+self-issued (operator-approved) decision passes all three checks and the existing
+approve → execute flow is preserved.
 
 ---
 

@@ -35,7 +35,7 @@ a single byte executes: it must carry a **valid Ed25519 signature**, the signing
 key must be in your **local trust store**, the **policy engine** must explicitly
 allow the room + agent + command + working directory, and — if the request schema
 carries freshness fields — it must be **fresh** (not expired, not a replayed
-nonce). If policy requires human approval, that approval must also be present.
+nonce). If policy requires human approval, that approval — a **sender-verified, Ed25519-signed** decision emitted by the daemon itself — must also be present (room membership alone cannot release a held task).
 Every gate is deny-by-default. Removing any one of them (trusting a key you did
 not verify, marking a room `trusted` with a wide `allow_commands` list, running
 with `sandbox = "none"`) widens your exposure; the rest of this guide is about
