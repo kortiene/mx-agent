@@ -37,7 +37,7 @@ use matrix_sdk::{Client, Room};
 use mx_agent_policy::{Allowance, NetworkPolicy, Sandbox};
 use mx_agent_protocol::events::timeline::{APPROVAL_DECISION, APPROVAL_REQUEST};
 use mx_agent_protocol::id::generate_request_id;
-use mx_agent_protocol::schema::{ApprovalDecision, ApprovalRequest, ExecRequest};
+use mx_agent_protocol::schema::{ApprovalDecision, ApprovalRequest, CallRequest, ExecRequest};
 use mx_agent_protocol::signing::{sign_approval_decision, verify_approval_decision};
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +136,87 @@ fn risk_for(allowance: &Allowance) -> &'static str {
         "high"
     } else {
         "medium"
+    }
+}
+
+/// Whether an authorized named `call` may run immediately or must wait for
+/// approval.
+///
+/// The `call` analogue of [`ExecDisposition`]. [`ExecDisposition`] wraps an
+/// [`ExecRequest`], so a named call needs its own type wrapping a
+/// [`CallRequest`] (the two request shapes differ). A
+/// [`CallDisposition::RequiresApproval`] carries the [`ApprovalRequest`] the
+/// caller must queue and emit; the wrapped request must **not** be executed
+/// until an approval decision arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallDisposition {
+    /// The call is authorized and may be executed immediately.
+    Execute(CallRequest),
+    /// The call requires approval before running. The caller must queue and
+    /// emit the bundled [`ApprovalRequest`] and hold the call until a decision
+    /// arrives.
+    RequiresApproval {
+        /// The call that is being held pending approval.
+        request: CallRequest,
+        /// The approval request to queue locally and emit into the room.
+        approval: ApprovalRequest,
+    },
+}
+
+impl CallDisposition {
+    /// Whether this disposition holds the call pending approval.
+    pub fn requires_approval(&self) -> bool {
+        matches!(self, CallDisposition::RequiresApproval { .. })
+    }
+
+    /// The call that may run now, or `None` when approval is required.
+    pub fn executable(&self) -> Option<&CallRequest> {
+        match self {
+            CallDisposition::Execute(request) => Some(request),
+            CallDisposition::RequiresApproval { .. } => None,
+        }
+    }
+}
+
+/// Decide whether an authorized named `call` may run now or must be queued for
+/// approval, honouring the policy's `requires_approval` flag.
+///
+/// The `call` analogue of [`disposition_for_exec`]. `allowance` is the resolved
+/// [`Allowance`] the policy engine returned for the call (see
+/// [`crate::call::authorize_call_request_with_allowance`]). When it sets
+/// `requires_approval`, the call is wrapped in
+/// [`CallDisposition::RequiresApproval`] alongside the [`ApprovalRequest`] to
+/// emit; otherwise it is returned as [`CallDisposition::Execute`] and may run
+/// immediately, preserving the no-approval behaviour exactly.
+pub fn disposition_for_call(request: CallRequest, allowance: &Allowance) -> CallDisposition {
+    if allowance.requires_approval {
+        let approval = approval_request_for_call(&request, allowance);
+        CallDisposition::RequiresApproval { request, approval }
+    } else {
+        CallDisposition::Execute(request)
+    }
+}
+
+/// Build the `com.mxagent.approval.request.v1` content for a named call.
+///
+/// Pure and deterministic: identifiers, parties, and expiry are copied from the
+/// authorized request; the summary names only the tool (the call's `args` are
+/// never rendered, so nothing sensitive leaks — mirroring the no-leak posture of
+/// the audit path); the risk level reuses [`risk_for`].
+///
+/// `CallRequest::requesting_agent` / `target_agent` are `Option<String>`; the
+/// live handler only reaches the disposition once both are present, but this
+/// builder stays total via `unwrap_or_default`.
+pub fn approval_request_for_call(request: &CallRequest, allowance: &Allowance) -> ApprovalRequest {
+    ApprovalRequest {
+        request_id: request.request_id.clone(),
+        invocation_id: request.invocation_id.clone(),
+        requester: request.requesting_agent.clone().unwrap_or_default(),
+        target: request.target_agent.clone().unwrap_or_default(),
+        summary: format!("Call tool {}", request.tool),
+        risk: risk_for(allowance).to_string(),
+        expires_at: request.expires_at.clone(),
+        extra: Default::default(),
     }
 }
 
@@ -729,6 +810,119 @@ mod tests {
         assert_eq!(approval.requester, "claude-local");
         assert_eq!(approval.target, "developer-pi");
         assert_eq!(approval.expires_at, "2026-06-02T12:05:00Z");
+    }
+
+    // --- call disposition (issue #263) --------------------------------------
+
+    fn call_request() -> CallRequest {
+        CallRequest {
+            invocation_id: "inv_01HZ".to_string(),
+            request_id: "req_01HZ".to_string(),
+            tool: "deploy".to_string(),
+            // A secret-like arg value to prove it never reaches the emitted
+            // ApprovalRequest (the call surface's no-leak posture).
+            args: serde_json::json!({ "secret_key": "should_not_appear_in_approval" }),
+            created_at: "2026-06-02T12:00:00Z".to_string(),
+            expires_at: "2026-06-02T12:05:00Z".to_string(),
+            nonce: "base64-nonce".to_string(),
+            signature: Signature {
+                alg: "ed25519".to_string(),
+                key_id: "mxagent-ed25519:abc".to_string(),
+                sig: "c2ln".to_string(),
+            },
+            requesting_agent: Some("claude-local".to_string()),
+            target_agent: Some("developer-pi".to_string()),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn call_disposition_holds_when_approval_required() {
+        // Acceptance (issue #263): an approval-required named call must not be
+        // runnable immediately — `executable()` is the seam that proves the tool
+        // runner is never reached while the call awaits approval.
+        let disposition = disposition_for_call(call_request(), &allowance(true));
+        assert!(disposition.requires_approval());
+        assert!(
+            disposition.executable().is_none(),
+            "call must not be runnable while it awaits approval"
+        );
+        match disposition {
+            CallDisposition::RequiresApproval { approval, request } => {
+                assert_eq!(approval.request_id, "req_01HZ");
+                assert_eq!(approval.invocation_id, "inv_01HZ");
+                assert_eq!(approval.expires_at, "2026-06-02T12:05:00Z");
+                assert_eq!(request.invocation_id, "inv_01HZ");
+            }
+            CallDisposition::Execute(_) => panic!("expected approval to be required"),
+        }
+    }
+
+    #[test]
+    fn call_disposition_permits_immediate_run_without_flag() {
+        // Regression: with requires_approval = false a call still runs immediately
+        // (no behaviour change for ordinary named calls).
+        let disposition = disposition_for_call(call_request(), &allowance(false));
+        assert!(!disposition.requires_approval());
+        assert_eq!(disposition.executable().unwrap().invocation_id, "inv_01HZ");
+    }
+
+    #[test]
+    fn call_approval_request_summary_and_parties_match_request() {
+        let approval = approval_request_for_call(&call_request(), &allowance(true));
+        assert_eq!(approval.summary, "Call tool deploy");
+        assert_eq!(approval.requester, "claude-local");
+        assert_eq!(approval.target, "developer-pi");
+        assert_eq!(approval.expires_at, "2026-06-02T12:05:00Z");
+        // No-leak: the call's args must never appear in the emitted/queued request.
+        let json = serde_json::to_string(&approval).unwrap();
+        assert!(
+            !json.contains("should_not_appear_in_approval"),
+            "call args must not leak into the approval request: {json}"
+        );
+    }
+
+    #[test]
+    fn call_approval_request_parties_total_when_unset() {
+        // The builder must stay total even though the live handler only reaches
+        // it with both parties present.
+        let mut request = call_request();
+        request.requesting_agent = None;
+        request.target_agent = None;
+        let approval = approval_request_for_call(&request, &allowance(true));
+        assert_eq!(approval.requester, "");
+        assert_eq!(approval.target, "");
+    }
+
+    #[test]
+    fn held_call_approval_survives_save_and_load() {
+        // Acceptance (issue #263): a held call's PendingApproval is enqueued,
+        // durable, and 0600 — operator-visible exactly like an exec hold.
+        let dir = tmp_dir("call-hold");
+        let paths = paths_in(&dir);
+
+        let disposition = disposition_for_call(call_request(), &allowance(true));
+        let CallDisposition::RequiresApproval { approval, .. } = disposition else {
+            panic!("expected approval to be required");
+        };
+        let mut queue = ApprovalQueue::default();
+        queue.enqueue(PendingApproval {
+            room_id: "!abc:matrix.org".to_string(),
+            request: approval,
+        });
+        queue.save(&paths).unwrap();
+
+        let reloaded = ApprovalQueue::load(&paths).unwrap();
+        assert_eq!(reloaded.pending().len(), 1);
+        assert_eq!(reloaded.get("req_01HZ").unwrap().room_id, "!abc:matrix.org");
+
+        let mode = fs::metadata(approval_queue_file(&paths))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "queue file must be 0600");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -829,6 +829,55 @@ allow_cwd = ["/home/me/code/project"]
         );
     }
 
+    // --- requires_approval flag on the call surface (issue #263) ---
+
+    #[test]
+    fn call_allowance_carries_requires_approval_true_when_policy_demands_it() {
+        // The policy engine must propagate `requires_approval = true` from the
+        // agent rule through `evaluate_call` → `allowance_for` → returned
+        // `Allowance`.  This is the critical glue: the daemon's disposition gate
+        // reads `allowance.requires_approval` to decide whether to hold the call;
+        // if the flag is lost here the gate can never fire.
+        let toml = r#"
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_tools = ["deploy"]
+requires_approval = true
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        let outcome = p.evaluate_call(&CallContext {
+            room_id: ROOM,
+            requesting_agent: AGENT,
+            tool: "deploy",
+        });
+        let allowance = outcome
+            .allowance()
+            .expect("deploy is in allow_tools, so the call must be allowed");
+        assert!(
+            allowance.requires_approval,
+            "evaluate_call must propagate requires_approval = true from the agent rule"
+        );
+    }
+
+    #[test]
+    fn call_allowance_requires_approval_defaults_false() {
+        // Regression: when the policy does not set `requires_approval`, the flag
+        // must be false so existing calls continue to execute immediately.
+        let p = policy(); // policy() sets requires_approval = false explicitly
+        let outcome = p.evaluate_call(&CallContext {
+            room_id: ROOM,
+            requesting_agent: AGENT,
+            tool: "run_tests",
+        });
+        let allowance = outcome.allowance().expect("run_tests is allowed");
+        assert!(
+            !allowance.requires_approval,
+            "requires_approval must default false so ordinary calls are not held"
+        );
+    }
+
     #[test]
     fn allowance_network_resolves_agent_override_then_execution_default() {
         // Agent-level `network` overrides the execution-level default.

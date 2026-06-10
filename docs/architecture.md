@@ -301,6 +301,8 @@ mx-agent invocation cancel \
 
 Named tools are the preferred security boundary. They avoid arbitrary shell injection and allow strict input/output schemas. They are also confined *at least as strictly as* raw `exec`: a built-in tool is spawned through the same runner pipeline, so it inherits the resolved `Allowance`'s sandbox backend, network decision (fail-closed `deny`), read-only/writable filesystem binds, and a sanitized environment that strips the daemon's secrets (§13.4, §13.5). This applies to every tool entry point — the live signed `call` path, auto-executed task DAGs (`TaskAction::Tool`), and the local CLI loopback (which uses the operator's execution-level defaults).
 
+A live signed `call` also honours `requires_approval` identically to `exec` (§12): when the resolved `Allowance` demands approval, the call is **held — not executed** — enqueued to the local approval queue and emitted as a `com.mxagent.approval.request.v1`, so it is visible to `mx-agent approval list/show` and survives a daemon restart. The tool is reached only after an approving decision (fail closed). With `requires_approval = false` the call runs immediately, unchanged.
+
 ```bash
 mx-agent call \
   --room '!abc123:matrix.org' \
@@ -1486,7 +1488,14 @@ On daemon startup or reconnect:
 
 ## 12. Approval Workflow
 
-Policy can require approval before executing privileged requests.
+Policy can require approval before executing privileged requests. This applies to
+both surfaces: a raw `exec` request and a named `call` request (§5.2) are each
+**held — not executed** when their resolved `Allowance` sets `requires_approval`.
+Both enqueue an identically-shaped `PendingApproval` into the local queue and emit
+a `com.mxagent.approval.request.v1`, so `mx-agent approval list/show/approve/deny`
+covers `exec`- and `call`-originated pending approvals uniformly. (Inline resume of
+a *live* held request from a decision event is not wired on either surface today;
+held-action resume exists for task-backed actions via the scheduler.)
 
 Policy flag:
 

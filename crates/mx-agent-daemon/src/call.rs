@@ -637,6 +637,20 @@ pub async fn handle_live_call_request(
                 target_agent,
                 &Outcome::Allow(allowance.clone()),
             );
+            // Honour the policy's `requires_approval` flag, mirroring the exec
+            // path (`exec.rs`): an approval-required call is held — enqueued and
+            // emitted as a `com.mxagent.approval.request.v1` — and the tool is
+            // **not** executed until an operator decides. Fail closed: return
+            // before reaching `execute_authorized_call` (and without emitting a
+            // `call.response`, matching exec, which emits neither accept nor
+            // result while holding).
+            match crate::approval::disposition_for_call(authorized.clone(), &allowance) {
+                crate::approval::CallDisposition::RequiresApproval { approval, .. } => {
+                    hold_call_for_approval(paths, &room, &meta.room_id, &approval).await;
+                    return;
+                }
+                crate::approval::CallDisposition::Execute(_) => {}
+            }
             execute_authorized_call(&authorized, &allowance).await
         }
         Err(rejection) => {
@@ -659,6 +673,53 @@ pub async fn handle_live_call_request(
 
     if let Err(e) = emit_call_response(&room, &response).await {
         tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call response");
+    }
+}
+
+/// Enqueue a held `call`'s [`ApprovalRequest`](mx_agent_protocol::schema::ApprovalRequest)
+/// into the on-disk approval queue and persist it.
+///
+/// Loads the queue, enqueues the pending approval for `room_id` (idempotent by
+/// `request_id`), and saves it `0600`, so a held call is visible to
+/// `mx-agent approval list/show` and survives a daemon restart. Returns the
+/// [`PendingApproval`](crate::approval::PendingApproval) that was queued. A save
+/// failure is logged (with only the non-sensitive `request_id`) rather than
+/// propagated; the in-memory pending approval is still returned.
+///
+/// Extracted from the live handler so the "PendingApproval is enqueued" step is
+/// unit-testable against a temp dir without a live Matrix room.
+fn enqueue_call_approval(
+    paths: &SessionPaths,
+    room_id: &str,
+    approval: &mx_agent_protocol::schema::ApprovalRequest,
+) -> crate::approval::PendingApproval {
+    let pending = crate::approval::PendingApproval {
+        room_id: room_id.to_string(),
+        request: approval.clone(),
+    };
+    let mut queue = crate::approval::ApprovalQueue::load(paths).unwrap_or_default();
+    queue.enqueue(pending.clone());
+    if let Err(e) = queue.save(paths) {
+        tracing::warn!(error = %e, request_id = %approval.request_id, "failed to persist call approval request");
+    }
+    pending
+}
+
+/// Hold an approval-required `call`: enqueue its approval locally and emit the
+/// `com.mxagent.approval.request.v1` into the room, without executing the tool.
+///
+/// Mirrors the exec hold path (`exec.rs`): persist the [`PendingApproval`](crate::approval::PendingApproval)
+/// for operator visibility/durability, then ask for a decision. The tool is not
+/// run here; the call stays held (fail closed) until an operator decides.
+async fn hold_call_for_approval(
+    paths: &SessionPaths,
+    room: &Room,
+    room_id: &str,
+    approval: &mx_agent_protocol::schema::ApprovalRequest,
+) {
+    enqueue_call_approval(paths, room_id, approval);
+    if let Err(e) = crate::approval::emit_approval_request(room, approval).await {
+        tracing::warn!(error = %e, request_id = %approval.request_id, "failed to emit call approval request");
     }
 }
 
@@ -1407,6 +1468,172 @@ allow_tools = ["run_tests", "lint"]
             !json.contains("should_not_appear_in_audit"),
             "call args must not leak into audit record: {json}"
         );
+    }
+
+    // ── approval hold seam (issue #263) ──────────────────────────────────────
+
+    #[test]
+    fn enqueue_call_approval_persists_pending_approval() {
+        // The hold step must enqueue a PendingApproval (durable, operator-visible)
+        // before the tool is ever reached — the call analogue of exec's hold.
+        use crate::approval::{approval_request_for_call, ApprovalQueue};
+        use mx_agent_policy::Allowance;
+
+        let dir = std::env::temp_dir().join(format!("mx-agent-call-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = SessionPaths::for_data_dir(dir.clone());
+
+        let request = call_request_for_audit("deploy");
+        let allowance = Allowance {
+            requires_approval: true,
+            ..Allowance::default()
+        };
+        let approval = approval_request_for_call(&request, &allowance);
+
+        let pending = enqueue_call_approval(&paths, ROOM, &approval);
+        assert_eq!(pending.room_id, ROOM);
+        assert_eq!(pending.request_id(), "req_audit_test");
+
+        // The pending approval is durable on disk and names only the tool.
+        let reloaded = ApprovalQueue::load(&paths).unwrap();
+        let queued = reloaded.get("req_audit_test").expect("approval is queued");
+        assert_eq!(queued.room_id, ROOM);
+        assert_eq!(queued.request.summary, "Call tool deploy");
+        let json = serde_json::to_string(&reloaded).unwrap();
+        assert!(
+            !json.contains("should_not_appear_in_audit"),
+            "call args must not leak into the queued approval: {json}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── requires_approval integration (issue #263) ───────────────────────────
+
+    fn approval_required_policy() -> Policy {
+        let toml = r#"
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_tools = ["run_tests", "lint"]
+requires_approval = true
+"#;
+        Policy::parse(toml).expect("policy parses")
+    }
+
+    #[test]
+    fn authorize_call_returns_requires_approval_true_when_policy_demands_it() {
+        // Critical glue test: the full sign → trust → policy pipeline must carry
+        // `requires_approval = true` in the returned Allowance when the policy
+        // marks the tool with that flag.  The disposition gate in
+        // `handle_live_call_request` reads this flag; if it is lost here the gate
+        // can never fire and the call runs immediately.
+        let key = test_key();
+        let content = signed_request(&key, "run_tests");
+        let trust = trust_with(&key_id_for(&key));
+        let (_request, allowance) = authorize_call_request_with_allowance(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &approval_required_policy(),
+            ROOM,
+            AGENT,
+        )
+        .expect("call is authorized by the policy");
+        assert!(
+            allowance.requires_approval,
+            "authorize_call_request_with_allowance must carry requires_approval = true from policy"
+        );
+    }
+
+    #[test]
+    fn authorize_call_returns_requires_approval_false_for_ordinary_policy() {
+        // Regression: the normal (no approval required) policy must still produce
+        // requires_approval = false so ordinary calls continue to run immediately.
+        let key = test_key();
+        let content = signed_request(&key, "run_tests");
+        let trust = trust_with(&key_id_for(&key));
+        let (_request, allowance) = authorize_call_request_with_allowance(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &policy(),
+            ROOM,
+            AGENT,
+        )
+        .expect("call is authorized");
+        assert!(
+            !allowance.requires_approval,
+            "requires_approval must be false for a policy that does not demand approval"
+        );
+    }
+
+    #[test]
+    fn authorized_call_with_requires_approval_does_not_reach_executor() {
+        // End-to-end security acceptance criterion (issue #263): threading the
+        // full authorize → disposition chain must prevent execute_authorized_call
+        // from being reached when the policy demands approval.
+        //
+        // `disposition.executable()` is the seam that guards the tool runner:
+        // `None` means the executor is unreachable for this disposition, so the
+        // tool never runs until an operator decides.
+        let key = test_key();
+        let content = signed_request(&key, "run_tests");
+        let trust = trust_with(&key_id_for(&key));
+        let (request, allowance) = authorize_call_request_with_allowance(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &approval_required_policy(),
+            ROOM,
+            AGENT,
+        )
+        .expect("call is authorized by the policy");
+
+        let disposition = crate::approval::disposition_for_call(request, &allowance);
+        assert!(
+            disposition.requires_approval(),
+            "an approval-required call must be held after authorization"
+        );
+        assert!(
+            disposition.executable().is_none(),
+            "execute_authorized_call must not be reachable for an approval-required call"
+        );
+    }
+
+    #[test]
+    fn enqueue_call_approval_is_idempotent() {
+        // A redelivered `com.mxagent.call.request.v1` event (Matrix at-least-once
+        // delivery) must not pile up duplicate entries in the on-disk queue.
+        use crate::approval::{approval_request_for_call, ApprovalQueue};
+        use mx_agent_policy::Allowance;
+
+        let dir = std::env::temp_dir().join(format!("mx-agent-call-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = SessionPaths::for_data_dir(dir.clone());
+
+        let request = call_request_for_audit("deploy");
+        let allowance = Allowance {
+            requires_approval: true,
+            ..Allowance::default()
+        };
+        let approval = approval_request_for_call(&request, &allowance);
+
+        enqueue_call_approval(&paths, ROOM, &approval);
+        enqueue_call_approval(&paths, ROOM, &approval);
+
+        let reloaded = ApprovalQueue::load(&paths).unwrap();
+        assert_eq!(
+            reloaded.pending().len(),
+            1,
+            "re-enqueueing the same call approval must not create duplicates in the queue"
+        );
+        assert_eq!(reloaded.get("req_audit_test").unwrap().room_id, ROOM);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
