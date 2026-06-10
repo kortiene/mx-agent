@@ -1849,6 +1849,14 @@ family when allowed or a stable `deny:<reason>` string when denied:
 }
 ```
 
+The auto-executed task-DAG path is audited the same way: the live scheduler
+attaches an audit log to every task orchestrator it builds, resolving the same
+path the exec/call path uses, so a task-action policy decision (allow or deny)
+interleaves with direct exec/call decisions in one log (issue #266). Auditing is
+a side effect that never blocks dispatch — an audit-write failure on the task
+path is logged and swallowed, exactly as on the exec/call path, so a flaky or
+unwritable log cannot change an authorization outcome.
+
 Pre-policy authentication failures (unsigned, bad signature, untrusted key,
 malformed) are intentionally not audited for either path: they are not
 attributable to a trusted requester, and logging them would let an

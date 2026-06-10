@@ -440,6 +440,16 @@ instead of — the policy outcome. Pre-policy authentication failures (unsigned,
 bad signature, untrusted key, malformed) are deliberately *not* audited for
 either path, since they are not attributable to a trusted requester.
 
+**Auto-executed task-DAG decisions are covered too.** The scheduler attaches an
+audit log to every task orchestrator it builds, resolving the same path as the
+exec/call path (`~/.config/mx-agent/audit.log` with a data-dir fallback), so a
+task-action policy decision — whether the underlying action is a named tool
+(`"call"` record) or a shell command (`"exec"` record) — lands in the same file
+with the same record shape as a direct exec/call decision (#266). Audit-write
+failures on the task path are logged and swallowed — they never convert to a
+dispatch error — so a flaky or unwritable audit file cannot change an
+authorization outcome.
+
 **Secrets are redacted in the log.** Command arguments pass through a redactor
 that masks `KEY=value` pairs and `--flag value` pairs whose key looks sensitive,
 so the audit trail records *that* a command ran without recording its secrets.

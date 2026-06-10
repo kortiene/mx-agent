@@ -43,6 +43,7 @@ use mx_agent_protocol::schema::{ApprovalDecision, InvocationState, TaskAction, T
 use crate::approval::{
     approval_request_expiry, read_verified_approval_decisions, ApprovalQueue, APPROVAL_REQUEST_TTL,
 };
+use crate::audit::AuditLog;
 use crate::scheduler::TaskScheduler;
 use crate::session::SessionPaths;
 use crate::task::{
@@ -515,6 +516,46 @@ fn scheduler_pass(
     }
 }
 
+/// Build the production-configured task orchestrator for `agent_id`: the same
+/// policy / trust / replay / verifying-key / audit-log wiring the live scheduler
+/// uses, minus the approval gate (which borrows the returned orchestrator's
+/// replay-cache handle and so is attached by the caller).
+///
+/// The audit log is resolved the same way the exec/call path resolves it
+/// ([`crate::audit::append_audit`]): the default config-dir path
+/// ([`AuditLog::default_path`]) with a data-dir fallback, so task-action policy
+/// decisions and direct exec/call decisions land in one audit log. The fallback
+/// guarantees a path, so the production orchestrator is always audited.
+///
+/// Extracted from [`scheduler_pass_for_agent`] so the audit-log wiring is
+/// unit-testable without a live Matrix `Room`.
+pub(crate) fn build_scheduler_orchestrator(
+    agent_id: String,
+    room_id: &str,
+    policy: Policy,
+    trust: TrustStore,
+    replay: Option<ReplayCache>,
+    verifying_keys: &BTreeMap<String, VerifyingKey>,
+    paths: &SessionPaths,
+) -> TaskOrchestrator {
+    let audit_log = AuditLog::new(
+        AuditLog::default_path()
+            .unwrap_or_else(|| paths.data_dir.join(crate::audit::AUDIT_FILE_NAME)),
+    );
+    let mut orchestrator = TaskOrchestrator::new(agent_id)
+        .with_room_id(room_id.to_string())
+        .with_policy(policy)
+        .with_trust_store(trust)
+        .with_audit_log(audit_log);
+    if let Some(replay) = replay {
+        orchestrator = orchestrator.with_replay_cache(replay);
+    }
+    for (key_id, key) in verifying_keys {
+        orchestrator = orchestrator.with_verifying_key(key_id.clone(), *key);
+    }
+    orchestrator
+}
+
 /// Tick the orchestrator for a single local `agent` against a room snapshot.
 #[allow(clippy::too_many_arguments)]
 fn scheduler_pass_for_agent(
@@ -544,17 +585,19 @@ fn scheduler_pass_for_agent(
     // Task state is advisory: configuring the trust store (and replay cache when
     // available) makes the orchestrator require a valid signed authorization
     // before any claim/dispatch, so an unsigned/untrusted/expired/replayed task
-    // action is blocked rather than executed.
-    let mut orchestrator = TaskOrchestrator::new(agent.agent_id.clone())
-        .with_room_id(room_id.to_string())
-        .with_policy(policy)
-        .with_trust_store(trust);
-    if let Ok(replay) = ReplayCache::load(paths) {
-        orchestrator = orchestrator.with_replay_cache(replay);
-    }
-    for (key_id, key) in verifying_keys {
-        orchestrator = orchestrator.with_verifying_key(key_id.clone(), *key);
-    }
+    // action is blocked rather than executed. The audit log is attached here so
+    // every policy decision (allow and deny) leaves a trace, matching the direct
+    // exec/call path (issue #266).
+    let replay = ReplayCache::load(paths).ok();
+    let mut orchestrator = build_scheduler_orchestrator(
+        agent.agent_id.clone(),
+        room_id,
+        policy,
+        trust,
+        replay,
+        verifying_keys,
+        paths,
+    );
 
     // Approval gate: a task local policy marks `requires_approval` is held until a
     // verified, published decision approves it. The first undecided encounter
@@ -756,6 +799,44 @@ mod tests {
     const AGENT: &str = "agent-a";
     const PLANNER: &str = "@planner:server";
     const ROOM: &str = "!room:server";
+
+    /// Serializes tests that mutate the process-global `MX_AGENT_CONFIG_DIR`
+    /// env var so they cannot race each other (env vars are process-wide).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Points [`AuditLog::default_path`] at a private per-test tempdir by setting
+    /// `MX_AGENT_CONFIG_DIR`, so the scheduler-orchestrator audit tests resolve
+    /// their audit log into the tempdir instead of touching the real
+    /// `~/.config/mx-agent/audit.log` (test isolation, issue #266). The env lock
+    /// is held for the lifetime of the guard so a parallel test cannot observe a
+    /// half-set value.
+    struct ConfigDirGuard {
+        dir: std::path::PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ConfigDirGuard {
+        fn new(tag: &str) -> Self {
+            let guard = env_lock();
+            let dir =
+                std::env::temp_dir().join(format!("mx-agent-sched-{}-{}", tag, std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::env::set_var(mx_agent_policy::ENV_CONFIG_DIR, &dir);
+            Self { dir, _guard: guard }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(mx_agent_policy::ENV_CONFIG_DIR);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 
     /// In-memory model of `com.mxagent.task.v1` room state enforcing the same
     /// optimistic-concurrency contract as `update_task`.
@@ -1556,6 +1637,215 @@ requires_approval = true
             queue.borrow().get("approval:task-a").is_none(),
             "a denied request is removed from the queue"
         );
+    }
+
+    // --- build_scheduler_orchestrator audit-log wiring (issue #266) -----------
+
+    /// Build a signed tool action and the trust artifacts needed to validate it,
+    /// so tests can exercise the full `build_scheduler_orchestrator` path (which
+    /// requires a signed authorization when a trust store is attached).
+    ///
+    /// Returns `(TrustStore, verifying_keys, TaskState)`.  The signing key is
+    /// fixed (`[7u8; 32]`) for reproducibility; the key ID is a recognisable
+    /// test constant.
+    fn scheduler_signed_tool_task(
+        task_id: &str,
+        tool: &str,
+    ) -> (
+        crate::trust::TrustStore,
+        BTreeMap<String, ed25519_dalek::VerifyingKey>,
+        TaskState,
+    ) {
+        use ed25519_dalek::SigningKey;
+
+        const TEST_KEY_ID: &str = "mxagent-ed25519:sched-wiring-test-key";
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let mut trust = crate::trust::TrustStore::default();
+        trust.approve(
+            PLANNER,
+            TEST_KEY_ID,
+            Some("SHA256:test".to_string()),
+            Some(ROOM.to_string()),
+            None,
+        );
+
+        let mut keys = BTreeMap::new();
+        keys.insert(TEST_KEY_ID.to_string(), verifying_key);
+
+        let unsigned_action = TaskAction::Tool {
+            tool: tool.to_string(),
+            args: serde_json::json!({}),
+            authorization: None,
+        };
+        let auth = crate::task_orchestrator::sign_task_action(
+            &signing_key,
+            TEST_KEY_ID,
+            task_id,
+            &unsigned_action,
+            PLANNER,
+            AGENT,
+            "2026-01-01T00:00:00Z",
+            "2099-01-01T00:00:00Z",
+            "nonce-scheduler-wiring-001",
+        )
+        .expect("test signing must succeed");
+
+        let mut t = base_task(task_id, STATE_PENDING);
+        t.action = Some(TaskAction::Tool {
+            tool: tool.to_string(),
+            args: serde_json::json!({}),
+            authorization: Some(auth),
+        });
+
+        (trust, keys, t)
+    }
+
+    #[test]
+    fn build_scheduler_orchestrator_has_audit_log() {
+        // Regression guard for issue #266: build_scheduler_orchestrator must
+        // chain with_audit_log so task-action policy decisions leave a trace.
+        // audit_log_path() returns None only when with_audit_log was never called.
+        let paths = crate::session::SessionPaths::for_data_dir(
+            std::env::temp_dir().join(format!("mx-agent-sched-wiring-{}", std::process::id())),
+        );
+        let orchestrator = build_scheduler_orchestrator(
+            AGENT.to_string(),
+            ROOM,
+            policy(),
+            crate::trust::TrustStore::default(),
+            None,
+            &BTreeMap::new(),
+            &paths,
+        );
+        assert!(
+            orchestrator.audit_log_path().is_some(),
+            "build_scheduler_orchestrator must call with_audit_log(); \
+             audit_log_path() returns None only when with_audit_log was never called (issue #266)"
+        );
+    }
+
+    #[test]
+    fn build_scheduler_orchestrator_audits_policy_denied_action() {
+        // A policy-denied task action through the production scheduler
+        // orchestrator must produce an audit record with "decision":"denied"
+        // (issue #266: audit was silently skipped before the fix because the
+        // production orchestrator never had an audit log attached).
+        //
+        // MX_AGENT_CONFIG_DIR points AuditLog::default_path() at a private
+        // tempdir so this test never touches the real audit.log. We still track
+        // the byte offset across process_one to isolate our entry.
+        let config_dir = ConfigDirGuard::new("audit-deny");
+        let (trust, keys, t) = scheduler_signed_tool_task("task-sched-deny", "delete_everything");
+        let paths = crate::session::SessionPaths::for_data_dir(
+            std::env::temp_dir().join(format!("mx-agent-sched-audit-deny-{}", std::process::id())),
+        );
+        let orchestrator = build_scheduler_orchestrator(
+            AGENT.to_string(),
+            ROOM,
+            policy(),
+            trust,
+            None,
+            &keys,
+            &paths,
+        );
+        let audit_path = orchestrator
+            .audit_log_path()
+            .expect("production orchestrator must have audit log")
+            .to_path_buf();
+        assert!(
+            audit_path.starts_with(&config_dir.dir),
+            "audit log must resolve into the per-test tempdir, not {audit_path:?}"
+        );
+
+        // Snapshot the pre-existing byte count so we only inspect the new entry.
+        let pre_size = std::fs::metadata(&audit_path).map(|m| m.len()).unwrap_or(0);
+
+        let mut store_inner = RoomTaskStore::default();
+        store_inner.insert(t.clone());
+        let store_ref = std::cell::RefCell::new(store_inner);
+        let mut ms = MatrixTaskStore::new(ROOM, |opts: UpdateTaskOptions| {
+            store_ref.borrow_mut().apply(opts)
+        });
+        let mut dispatcher = RoutingDispatcher::new(
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
+                panic!("policy-denied action must never dispatch")
+            }),
+            ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+        );
+        orchestrator.process_one(&t, std::slice::from_ref(&t), &mut ms, &mut dispatcher);
+
+        let full =
+            std::fs::read_to_string(&audit_path).expect("audit log must exist after process_one");
+        let new_content = &full[pre_size as usize..];
+        assert!(
+            new_content.contains("\"decision\":\"denied\""),
+            "policy-denied action must be audited as denied: {new_content}"
+        );
+        assert!(new_content.contains("delete_everything"), "{new_content}");
+    }
+
+    #[test]
+    fn build_scheduler_orchestrator_audits_policy_allowed_action() {
+        // A policy-allowed task action through the production scheduler
+        // orchestrator must produce an audit record with "decision":"allowed"
+        // (issue #266: auditing was a no-op before the fix because the
+        // production orchestrator never had an audit log attached).
+        //
+        // MX_AGENT_CONFIG_DIR points AuditLog::default_path() at a private
+        // tempdir so this test never touches the real audit.log.
+        let config_dir = ConfigDirGuard::new("audit-allow");
+        let (trust, keys, t) = scheduler_signed_tool_task("task-sched-allow", "run_tests");
+        let paths = crate::session::SessionPaths::for_data_dir(
+            std::env::temp_dir().join(format!("mx-agent-sched-audit-allow-{}", std::process::id())),
+        );
+        let orchestrator = build_scheduler_orchestrator(
+            AGENT.to_string(),
+            ROOM,
+            policy(),
+            trust,
+            None,
+            &keys,
+            &paths,
+        );
+        let audit_path = orchestrator
+            .audit_log_path()
+            .expect("production orchestrator must have audit log")
+            .to_path_buf();
+        assert!(
+            audit_path.starts_with(&config_dir.dir),
+            "audit log must resolve into the per-test tempdir, not {audit_path:?}"
+        );
+
+        let pre_size = std::fs::metadata(&audit_path).map(|m| m.len()).unwrap_or(0);
+
+        let mut store_inner = RoomTaskStore::default();
+        store_inner.insert(t.clone());
+        let store_ref = std::cell::RefCell::new(store_inner);
+        let mut ms = MatrixTaskStore::new(ROOM, |opts: UpdateTaskOptions| {
+            store_ref.borrow_mut().apply(opts)
+        });
+        let mut dispatcher = RoutingDispatcher::new(
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
+                Ok(ToolResult {
+                    exit_code: 0,
+                    summary: "ok".to_string(),
+                })
+            }),
+            ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+        );
+        orchestrator.process_one(&t, std::slice::from_ref(&t), &mut ms, &mut dispatcher);
+
+        let full =
+            std::fs::read_to_string(&audit_path).expect("audit log must exist after process_one");
+        let new_content = &full[pre_size as usize..];
+        assert!(
+            new_content.contains("\"decision\":\"allowed\""),
+            "policy-allowed action must be audited as allowed: {new_content}"
+        );
+        assert!(new_content.contains("run_tests"), "{new_content}");
     }
 
     /// `sleep_interruptible` must wake early when the `running` flag is cleared
