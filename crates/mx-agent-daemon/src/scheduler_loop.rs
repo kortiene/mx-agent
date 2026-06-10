@@ -919,7 +919,7 @@ allow_cwd = ["/repo"]
         let mut attempted = HashSet::new();
         let mut runs = 0u32;
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|_n, _a| {
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
                 Ok(ToolResult {
                     exit_code: 0,
                     summary: "ok".to_string(),
@@ -974,7 +974,7 @@ allow_cwd = ["/repo"]
     #[test]
     fn routing_dispatcher_routes_by_action_kind() {
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|name, _args| {
+            ToolTaskDispatcher::with_runner(|name, _args, _al, _cwd| {
                 assert_eq!(name, "run_tests");
                 Ok(ToolResult {
                     exit_code: 0,
@@ -1021,7 +1021,7 @@ allow_cwd = ["/repo"]
         let mut store = RoomTaskStore::default();
         store.insert(tool_task("task-a", "run_tests"));
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|_n, _a| {
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
                 Ok(ToolResult {
                     exit_code: 0,
                     summary: "ok".to_string(),
@@ -1049,7 +1049,7 @@ allow_cwd = ["/repo"]
 
         let make_dispatcher = || {
             RoutingDispatcher::new(
-                ToolTaskDispatcher::with_runner(|_n, _a| {
+                ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
                     Ok(ToolResult {
                         exit_code: 0,
                         summary: "ok".to_string(),
@@ -1081,7 +1081,7 @@ allow_cwd = ["/repo"]
         // `rm` is not allowlisted -> denied by policy before dispatch.
         store.insert(exec_task("task-denied", "rm"));
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|_n, _a| panic!("no tool")),
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| panic!("no tool")),
             ExecTaskDispatcher::with_runner(|_r| panic!("denied exec must never spawn")),
         );
         let outcomes = tick_with(&mut store, &mut dispatcher);
@@ -1113,7 +1113,7 @@ allow_cwd = ["/repo"]
         store.insert(stale);
 
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|_n, _a| panic!("no tool")),
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| panic!("no tool")),
             ExecTaskDispatcher::with_runner(|_r| {
                 panic!("recovered task must not be re-dispatched")
             }),
@@ -1153,7 +1153,7 @@ allow_cwd = ["/repo"]
         // Persisted across both ticks, exactly as the live loop threads it.
         let mut claimed = BTreeSet::new();
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|_n, _a| {
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
                 Ok(ToolResult {
                     exit_code: 0,
                     summary: "ok".to_string(),
@@ -1327,7 +1327,7 @@ requires_approval = true
         let mut store = RoomTaskStore::default();
         store.insert(tool_task("task-a", "run_tests"));
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|_n, _a| panic!("held task must not spawn")),
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| panic!("held task must not spawn")),
             ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
         );
         let queue = Rc::new(RefCell::new(ApprovalQueue::default()));
@@ -1361,7 +1361,7 @@ requires_approval = true
         let mut store = RoomTaskStore::default();
         store.insert(tool_task("task-a", "run_tests"));
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|_n, _a| {
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
                 Ok(ToolResult {
                     exit_code: 0,
                     summary: "ok".to_string(),
@@ -1414,7 +1414,9 @@ requires_approval = true
                 .with_policy(approval_policy())
                 .with_approval_gate(Box::new(gate));
             let mut dispatcher = RoutingDispatcher::new(
-                ToolTaskDispatcher::with_runner(|_n, _a| panic!("held task must not spawn")),
+                ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
+                    panic!("held task must not spawn")
+                }),
                 ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
             );
             let store_ref = std::cell::RefCell::new(&mut store);
@@ -1458,7 +1460,7 @@ requires_approval = true
                 .with_policy(approval_policy())
                 .with_approval_gate(Box::new(gate));
             let mut dispatcher = RoutingDispatcher::new(
-                ToolTaskDispatcher::with_runner(|_n, _a| {
+                ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
                     Ok(ToolResult {
                         exit_code: 0,
                         summary: "ok".to_string(),
@@ -1497,7 +1499,9 @@ requires_approval = true
         let mut store = RoomTaskStore::default();
         store.insert(tool_task("task-a", "run_tests"));
         let mut dispatcher = RoutingDispatcher::new(
-            ToolTaskDispatcher::with_runner(|_n, _a| panic!("denied task must never spawn")),
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
+                panic!("denied task must never spawn")
+            }),
             ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
         );
         let decisions = HashMap::from([("approval:task-a".to_string(), false)]);

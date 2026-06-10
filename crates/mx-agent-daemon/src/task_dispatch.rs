@@ -29,8 +29,10 @@ use crate::runner::{RunError, RunOutput, RunSpec, DEFAULT_GRACE_PERIOD};
 use crate::task_orchestrator::{TaskDispatchError, TaskDispatcher, TaskExecutionResult};
 use crate::tool_exec::{execute_tool, ToolError, ToolResult};
 
-/// A function that runs a named tool with JSON arguments.
-type ToolRunner = fn(&str, &Value) -> Result<ToolResult, ToolError>;
+/// A function that runs a named tool with JSON arguments, confined by the
+/// policy-resolved [`Allowance`](mx_agent_policy::Allowance) and run in `cwd`.
+type ToolRunner =
+    fn(&str, &Value, &mx_agent_policy::Allowance, PathBuf) -> Result<ToolResult, ToolError>;
 
 /// Dispatches tool-backed task actions by invoking the named tool.
 ///
@@ -64,7 +66,7 @@ impl ToolTaskDispatcher<ToolRunner> {
 
 impl<F> ToolTaskDispatcher<F>
 where
-    F: FnMut(&str, &Value) -> Result<ToolResult, ToolError>,
+    F: FnMut(&str, &Value, &mx_agent_policy::Allowance, PathBuf) -> Result<ToolResult, ToolError>,
 {
     /// Build a dispatcher with a custom tool runner (used by tests and callers
     /// that wire the Matrix-backed `call` path).
@@ -75,26 +77,34 @@ where
 
 impl<F> TaskDispatcher for ToolTaskDispatcher<F>
 where
-    F: FnMut(&str, &Value) -> Result<ToolResult, ToolError>,
+    F: FnMut(&str, &Value, &mx_agent_policy::Allowance, PathBuf) -> Result<ToolResult, ToolError>,
 {
     fn dispatch(
         &mut self,
         _task: &TaskState,
         action: &TaskAction,
         _invocation_id: &str,
-        _allowance: &mx_agent_policy::Allowance,
+        allowance: &mx_agent_policy::Allowance,
     ) -> Result<TaskExecutionResult, TaskDispatchError> {
         match action {
-            TaskAction::Tool { tool, args, .. } => match (self.run_tool)(tool, args) {
-                Ok(result) => Ok(TaskExecutionResult {
-                    exit_code: Some(result.exit_code),
-                    summary: result.summary,
-                    artifact_mxc: None,
-                }),
-                Err(err) => Err(TaskDispatchError::Failed(format!(
-                    "tool {tool:?} could not be invoked: {err}"
-                ))),
-            },
+            // Confine the tool under the policy-resolved allowance, identical to
+            // the `TaskAction::Exec` arm, so an auto-executed task DAG never runs
+            // a built-in tool unsandboxed or with un-scrubbed env (architecture
+            // §13.5). The cwd is the daemon's working directory, mirroring the
+            // pre-confinement behavior.
+            TaskAction::Tool { tool, args, .. } => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                match (self.run_tool)(tool, args, allowance, cwd) {
+                    Ok(result) => Ok(TaskExecutionResult {
+                        exit_code: Some(result.exit_code),
+                        summary: result.summary,
+                        artifact_mxc: None,
+                    }),
+                    Err(err) => Err(TaskDispatchError::Failed(format!(
+                        "tool {tool:?} could not be invoked: {err}"
+                    ))),
+                }
+            }
             TaskAction::Exec { .. } => Err(TaskDispatchError::Failed(
                 "exec action cannot run through the tool dispatcher".to_string(),
             )),
@@ -440,7 +450,7 @@ allow_cwd = ["/repo"]
     #[test]
     fn successful_tool_marks_task_succeeded() {
         let t = tool_task("run_tests");
-        let mut dispatcher = ToolTaskDispatcher::with_runner(|name, _args| {
+        let mut dispatcher = ToolTaskDispatcher::with_runner(|name, _args, _al, _cwd| {
             assert_eq!(name, "run_tests");
             Ok(ToolResult {
                 exit_code: 0,
@@ -467,7 +477,7 @@ allow_cwd = ["/repo"]
     #[test]
     fn failing_tool_marks_task_failed() {
         let t = tool_task("run_tests");
-        let mut dispatcher = ToolTaskDispatcher::with_runner(|_name, _args| {
+        let mut dispatcher = ToolTaskDispatcher::with_runner(|_name, _args, _al, _cwd| {
             Ok(ToolResult {
                 exit_code: 1,
                 summary: "tests failed".to_string(),
@@ -491,7 +501,7 @@ allow_cwd = ["/repo"]
         // The tool is policy-allowed, but the runner reports it cannot be
         // invoked at all; that maps to a dispatch failure (task `failed`).
         let t = tool_task("run_tests");
-        let mut dispatcher = ToolTaskDispatcher::with_runner(|name, _args| {
+        let mut dispatcher = ToolTaskDispatcher::with_runner(|name, _args, _al, _cwd| {
             Err(ToolError::UnknownTool(name.to_string()))
         });
         let (outcome, store) = run(&t, &mut dispatcher);
@@ -535,7 +545,7 @@ allow_cwd = ["/repo"]
         // The tool is not allowlisted, so the orchestrator denies before dispatch
         // and the runner must never be called.
         let t = tool_task("forbidden_tool");
-        let mut dispatcher = ToolTaskDispatcher::with_runner(|_name, _args| {
+        let mut dispatcher = ToolTaskDispatcher::with_runner(|_name, _args, _al, _cwd| {
             panic!("policy-denied tool must not be dispatched")
         });
         let (outcome, store) = run(&t, &mut dispatcher);
@@ -802,6 +812,51 @@ allow_cwd = ["/repo"]
             req.network,
             mx_agent_sandbox::Network::Deny,
             "policy network=deny must reach the runner"
+        );
+    }
+
+    // --- tool allowance wiring (issue #262) ----------------------------------
+    //
+    // The tool dispatch path must thread the policy-resolved `Allowance` into the
+    // tool runner (rather than discarding it), so a `TaskAction::Tool` is confined
+    // identically to `TaskAction::Exec`.
+
+    #[test]
+    fn tool_dispatcher_forwards_allowance_to_runner() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let captured: Rc<RefCell<Option<mx_agent_policy::Allowance>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+
+        let t = tool_task("run_tests");
+        let action = t.action.clone().unwrap();
+
+        let allowance = mx_agent_policy::Allowance {
+            sandbox: Some(mx_agent_policy::Sandbox::Bubblewrap),
+            network: Some(mx_agent_policy::NetworkPolicy::Allow),
+            read_only_paths: vec![PathBuf::from("/usr")],
+            writable_paths: vec![PathBuf::from("/work")],
+            env_allowlist: vec!["CARGO_HOME".to_string()],
+            ..mx_agent_policy::Allowance::default()
+        };
+
+        let mut dispatcher = ToolTaskDispatcher::with_runner(
+            move |_name, _args, al: &mx_agent_policy::Allowance, _cwd| {
+                *cap.borrow_mut() = Some(al.clone());
+                Ok(ToolResult {
+                    exit_code: 0,
+                    summary: "ok".to_string(),
+                })
+            },
+        );
+
+        let _ = dispatcher.dispatch(&t, &action, "inv-1", &allowance);
+
+        let forwarded = captured.borrow().clone().expect("runner was called");
+        assert_eq!(
+            forwarded, allowance,
+            "the policy-resolved allowance must reach the tool runner unchanged"
         );
     }
 }

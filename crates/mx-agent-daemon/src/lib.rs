@@ -191,7 +191,7 @@ pub use task_orchestrator::{
     OrchestrationOutcome, QueueApprovalGate, TaskActionError, TaskApprovalGate, TaskDispatchError,
     TaskDispatcher, TaskExecutionResult, TaskOrchestrator, TaskStore, TaskStoreError,
 };
-pub use tool_exec::{execute_tool, ToolError, ToolResult, RUN_TESTS};
+pub use tool_exec::{execute_tool, execute_tool_async, ToolError, ToolResult, RUN_TESTS};
 pub use tools::{builtin_tools, ToolRegistry};
 pub use trust::{fingerprint_from_key_id, TrustEntry, TrustStatus, TrustStore};
 pub use trust_state::{

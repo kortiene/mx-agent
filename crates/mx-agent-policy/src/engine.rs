@@ -240,6 +240,29 @@ impl Policy {
         Outcome::Allow(self.allowance_for(room, agent))
     }
 
+    /// Build an [`Allowance`] carrying only the workspace-wide execution-level
+    /// defaults — `default_sandbox`, `network`, `env_allowlist`, and the
+    /// read-only / writable filesystem binds — with no per-agent gate.
+    ///
+    /// This is for local, already-trusted execution paths (e.g. the CLI `call`
+    /// loopback) that have no remote requester to evaluate but must still apply
+    /// the operator's configured confinement and environment scrubbing
+    /// (architecture §13.4, §13.5), rather than running with the daemon's full
+    /// inherited environment and no sandbox. Per-request limits that only exist
+    /// for an agent rule (`max_runtime_ms`, `max_output_bytes`,
+    /// `requires_approval`, `require_verified_device`) are left at their
+    /// defaults.
+    pub fn execution_allowance(&self) -> Allowance {
+        Allowance {
+            sandbox: self.execution.default_sandbox,
+            network: self.execution.network,
+            env_allowlist: self.execution.env_allowlist.clone(),
+            read_only_paths: self.execution.read_only_paths.clone(),
+            writable_paths: self.execution.writable_paths.clone(),
+            ..Allowance::default()
+        }
+    }
+
     /// Resolve the room/agent rule pair, mapping missing entries to a deny
     /// reason.
     fn lookup(
@@ -416,6 +439,41 @@ allow_cwd = ["/home/me/code/project"]
             .unwrap()
             .clone();
         assert_eq!(a.env_allowlist, ["CARGO_HOME", "RUSTUP_HOME"]);
+    }
+
+    #[test]
+    fn execution_allowance_carries_execution_defaults_without_agent_gate() {
+        let toml = r#"
+[execution]
+default_sandbox = "bubblewrap"
+network = "deny"
+env_allowlist = ["CARGO_HOME"]
+read_only_paths = ["/usr"]
+writable_paths = ["/work"]
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        let a = p.execution_allowance();
+        assert_eq!(a.sandbox, Some(Sandbox::Bubblewrap));
+        assert_eq!(a.network, Some(NetworkPolicy::Deny));
+        assert_eq!(a.env_allowlist, vec!["CARGO_HOME".to_string()]);
+        assert_eq!(a.read_only_paths, vec![std::path::PathBuf::from("/usr")]);
+        assert_eq!(a.writable_paths, vec![std::path::PathBuf::from("/work")]);
+        // No per-agent rule means no per-request limits or gates.
+        assert_eq!(a.max_runtime_ms, None);
+        assert!(!a.requires_approval);
+        assert!(!a.require_verified_device);
+    }
+
+    #[test]
+    fn execution_allowance_defaults_are_empty_and_fail_closed() {
+        // An empty policy yields no sandbox/network override; the daemon's
+        // `network_for(None)` then fails closed to deny.
+        let a = Policy::default().execution_allowance();
+        assert_eq!(a.sandbox, None);
+        assert_eq!(a.network, None);
+        assert!(a.env_allowlist.is_empty());
+        assert!(a.read_only_paths.is_empty());
+        assert!(a.writable_paths.is_empty());
     }
 
     #[test]

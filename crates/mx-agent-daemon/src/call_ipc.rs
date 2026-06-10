@@ -15,14 +15,24 @@
 //!
 //! - Loopback runs only built-in, schema-validated tools via
 //!   [`crate::tool_exec::execute_tool`] — never arbitrary shell.
+//! - The tool is confined under the operator's **execution-level defaults**
+//!   ([`Policy::execution_allowance`]): the configured sandbox backend, network
+//!   decision, filesystem binds, and — most importantly — a sanitized
+//!   environment, so the daemon's secrets (e.g. `MATRIX_ACCESS_TOKEN`) are not
+//!   inherited by `cargo test` / `cargo clippy` and the `build.rs`/proc-macro
+//!   code they run (architecture §13.4, §13.5). Loopback is operator-initiated
+//!   on the operator's own host, so this is defense-in-depth, not an
+//!   authorization gate.
 //! - The raw tool [`input`](CallStartParams::input) can carry secret-looking
 //!   arguments, so it is never logged here.
 
 use std::io::ErrorKind;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use mx_agent_policy::Policy;
 use mx_agent_protocol::id::{generate_invocation_id, generate_request_id};
 
 use crate::tool_exec::{execute_tool, ToolError};
@@ -110,16 +120,50 @@ pub struct CallStartResult {
 /// Execute a `call.start` request locally (loopback), without Matrix.
 ///
 /// Mints fresh `invocation_id`/`request_id`, runs the named built-in tool with
-/// the supplied input, and maps any invoke failure to a stable
-/// [`CallErrorKind`]. A tool that runs and exits nonzero still yields
-/// [`CallOutcome::Ok`]; only a failure to invoke yields [`CallOutcome::Error`].
+/// the supplied input under the operator's execution-level defaults
+/// ([`Policy::execution_allowance`], resolved like [`crate::call`]'s live path),
+/// and maps any invoke failure to a stable [`CallErrorKind`]. A tool that runs
+/// and exits nonzero still yields [`CallOutcome::Ok`]; only a failure to invoke
+/// yields [`CallOutcome::Error`].
 pub fn start_call_loopback(params: &CallStartParams) -> CallStartResult {
+    // Resolve the operator's execution-level confinement (sandbox/network/paths
+    // and, crucially, the env allowlist that scrubs the daemon's secrets) the
+    // same way the live `call` path loads policy, falling back to the safe
+    // defaults when no policy file is present.
+    let allowance = Policy::default_path()
+        .and_then(|path| Policy::load(path).ok())
+        .unwrap_or_default()
+        .execution_allowance();
+    run_loopback_with(params, allowance, execute_tool)
+}
+
+/// Core loopback executor with an injectable tool runner.
+///
+/// Separated from [`start_call_loopback`] so the allowance-wiring can be
+/// verified in tests without a policy file or a real process spawn: a capturing
+/// closure passed as `run_tool` can assert that the allowance forwarded by
+/// [`start_call_loopback`] (resolved from `Policy::execution_allowance`) carries
+/// the expected confinement fields (architecture §13.4, §13.5).
+fn run_loopback_with<R>(
+    params: &CallStartParams,
+    allowance: mx_agent_policy::Allowance,
+    mut run_tool: R,
+) -> CallStartResult
+where
+    R: FnMut(
+        &str,
+        &serde_json::Value,
+        &mx_agent_policy::Allowance,
+        PathBuf,
+    ) -> Result<crate::tool_exec::ToolResult, ToolError>,
+{
     let invocation_id = params
         .invocation_id
         .clone()
         .unwrap_or_else(generate_invocation_id);
     let request_id = generate_request_id();
-    let outcome = match execute_tool(&params.tool, &params.input) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let outcome = match run_tool(&params.tool, &params.input, &allowance, cwd) {
         Ok(result) => CallOutcome::Ok {
             exit_code: result.exit_code,
             summary: result.summary,
@@ -228,5 +272,113 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         let back: CallStartResult = serde_json::from_value(json).unwrap();
         assert_eq!(back, result);
+    }
+
+    // --- confinement wiring (issue #262) -------------------------------------
+    //
+    // Verify that start_call_loopback threads the execution-defaults allowance
+    // into the tool runner rather than discarding it, so the loopback path
+    // is confined (env-scrubbed + policy sandbox/network/paths) identically to
+    // the live `call` and task-dispatch paths (architecture §13.4, §13.5).
+
+    #[test]
+    fn loopback_forwards_execution_allowance_to_tool_runner() {
+        // Build a policy with a specific env_allowlist and network decision, then
+        // confirm that run_loopback_with passes those fields to the tool runner
+        // unchanged — mirroring the exec and task-dispatch allowance-wiring tests.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let captured: Rc<RefCell<Option<mx_agent_policy::Allowance>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+
+        let policy = mx_agent_policy::Policy::parse(
+            r#"
+[execution]
+env_allowlist = ["CARGO_HOME"]
+network = "deny"
+read_only_paths = ["/usr"]
+writable_paths = ["/work"]
+"#,
+        )
+        .expect("policy parses");
+        let allowance = policy.execution_allowance();
+
+        // Drive run_loopback_with with a capturing runner; use an invalid-args
+        // case so the runner is called exactly once and exits quickly.
+        let _ = run_loopback_with(
+            &CallStartParams {
+                room: None,
+                agent: None,
+                tool: "run_tests".to_string(),
+                input: serde_json::json!({}), // missing `package` → InvalidArgs
+                invocation_id: None,
+            },
+            allowance.clone(),
+            move |_name, _args, al, _cwd| {
+                *cap.borrow_mut() = Some(al.clone());
+                // Return an error so the runner exits after capture.
+                Err(crate::tool_exec::ToolError::InvalidArgs(
+                    "captured".to_string(),
+                ))
+            },
+        );
+
+        let forwarded = captured
+            .borrow()
+            .clone()
+            .expect("tool runner must be called");
+        assert_eq!(
+            forwarded.env_allowlist,
+            vec!["CARGO_HOME".to_string()],
+            "env_allowlist from execution_allowance must reach the runner"
+        );
+        assert_eq!(
+            forwarded.network,
+            Some(mx_agent_policy::NetworkPolicy::Deny),
+            "network from execution_allowance must reach the runner"
+        );
+        assert_eq!(
+            forwarded.read_only_paths,
+            vec![std::path::PathBuf::from("/usr")],
+            "read_only_paths from execution_allowance must reach the runner"
+        );
+        assert_eq!(
+            forwarded.writable_paths,
+            vec![std::path::PathBuf::from("/work")],
+            "writable_paths from execution_allowance must reach the runner"
+        );
+    }
+
+    #[test]
+    fn loopback_default_policy_yields_fail_closed_execution_allowance() {
+        // With no policy file present the loopback falls back to Policy::default()
+        // → execution_allowance().  That floor allowance must be safe: no extra
+        // env vars pass through to the child (daemon secrets stay in the daemon),
+        // and no sandbox/network override (network_for(None) → Network::Deny in
+        // the runner, fail-closed).
+        let a = mx_agent_policy::Policy::default().execution_allowance();
+        assert_eq!(
+            a.sandbox, None,
+            "no sandbox override — host backend, no added attack surface"
+        );
+        assert_eq!(
+            a.network, None,
+            "None → Network::Deny via network_for (fail-closed)"
+        );
+        assert!(
+            a.env_allowlist.is_empty(),
+            "no extra env vars pass through — daemon secrets are stripped by default"
+        );
+        assert!(a.read_only_paths.is_empty());
+        assert!(a.writable_paths.is_empty());
+        assert!(
+            !a.requires_approval,
+            "loopback is operator-initiated, no interactive gate"
+        );
+        assert!(
+            !a.require_verified_device,
+            "no device-verification on loopback"
+        );
     }
 }
