@@ -396,6 +396,17 @@ impl TaskOrchestrator {
         self.replay_cache.clone()
     }
 
+    /// Path of the audit log this orchestrator records policy decisions to, or
+    /// `None` if no audit log is attached.
+    ///
+    /// Used by the scheduler wiring regression test to assert production
+    /// auditing is enabled, so a future refactor that drops
+    /// [`with_audit_log`](Self::with_audit_log) cannot silently regress.
+    #[cfg(test)]
+    pub(crate) fn audit_log_path(&self) -> Option<&std::path::Path> {
+        self.audit_log.as_ref().map(AuditLog::path)
+    }
+
     /// Attach the approval gate consulted when local policy requires approval.
     ///
     /// Without a gate, an action that requires approval cannot run: the
@@ -1023,13 +1034,11 @@ impl TaskOrchestrator {
                 .map(|_| Allowance::default());
         };
         let outcome = evaluate_task_action(policy, room_id, task, action);
-        if let Err(err) = self.audit_policy_decision(room_id, task, action, invocation_id, &outcome)
-        {
-            return Err(OrchestrationOutcome::StoreError {
-                task_id: task.task_id.clone(),
-                reason: format!("could not write task policy audit record: {err}"),
-            });
-        }
+        // Auditing is a side effect that must never block dispatch: a failed
+        // write is logged and swallowed (matching `append_audit`), so a flaky or
+        // unwritable audit file can never flip an allowed task to a `StoreError`
+        // or a denied task to anything other than `policy_denied`.
+        self.audit_policy_decision(room_id, task, action, invocation_id, &outcome);
         match outcome {
             Outcome::Allow(allowance) => Ok(allowance),
             Outcome::Deny(reason) => self
@@ -1206,6 +1215,11 @@ impl TaskOrchestrator {
         }
     }
 
+    /// Record a task-action policy decision (allow or deny) to the audit log.
+    ///
+    /// No-ops when no audit log is attached. A failed append is logged and
+    /// swallowed — auditing is a side effect that must never block or fail a
+    /// dispatch decision (matching [`crate::audit::append_audit`]).
     fn audit_policy_decision(
         &self,
         room_id: &str,
@@ -1213,9 +1227,9 @@ impl TaskOrchestrator {
         action: &TaskAction,
         invocation_id: &str,
         outcome: &Outcome,
-    ) -> std::io::Result<()> {
+    ) {
         let Some(log) = &self.audit_log else {
-            return Ok(());
+            return;
         };
         let record = match action {
             TaskAction::Tool { tool, .. } => AuditRecord::for_call(
@@ -1235,7 +1249,14 @@ impl TaskOrchestrator {
                 outcome,
             ),
         };
-        log.append(&record)
+        if let Err(e) = log.append(&record) {
+            tracing::warn!(
+                error = %e,
+                invocation_id = %invocation_id,
+                task_id = %task.task_id,
+                "failed to append task policy audit record"
+            );
+        }
     }
 
     fn is_assigned(&self, task: &TaskState) -> bool {
@@ -2513,6 +2534,87 @@ requires_approval = true
         assert!(
             audit.contains("ToolNotAllowed") || audit.contains("tool"),
             "{audit}"
+        );
+    }
+
+    #[test]
+    fn policy_allows_known_task_action_and_audits() {
+        // Mirror of policy_denies_malicious_tool_before_claim_and_audits for the
+        // allow path: a permitted tool action must produce an audit record with
+        // "decision":"allowed" (issue #266: production auditing was a no-op
+        // before the fix because the orchestrator had no audit log attached).
+        let t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"run_tests", "args":{}}),
+        );
+        let audit_path = audit_path("tool-allow");
+        let audit_log = AuditLog::new(audit_path.clone());
+        let mut store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_audit_log(audit_log)
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+
+        assert!(
+            matches!(outcome, OrchestrationOutcome::Completed { ref state, .. } if state == STATE_SUCCEEDED),
+            "allowed task must complete successfully: {outcome:?}"
+        );
+        let audit = std::fs::read_to_string(&audit_path).expect("audit log written");
+        let _ = std::fs::remove_file(&audit_path);
+        assert!(
+            audit.contains("\"decision\":\"allowed\""),
+            "allowed action must be audited: {audit}"
+        );
+        assert!(
+            audit.contains("run_tests"),
+            "audit must record the tool name: {audit}"
+        );
+    }
+
+    #[test]
+    fn audit_write_failure_is_swallowed_and_action_still_authorized() {
+        // Spec testing-plan item 4 / issue #266: task-path auditing is a side
+        // effect that must never block dispatch. With an unwritable audit path,
+        // `audit_policy_decision` logs-and-swallows the append error instead of
+        // mapping it to `OrchestrationOutcome::StoreError`, so a policy-allowed
+        // action still authorizes and completes. Guards against a regression
+        // that re-introduces audit-blocks-dispatch.
+        let t = with_action(
+            task("task-a", STATE_PENDING, "agent-a"),
+            json!({"type":"tool", "tool":"run_tests", "args":{}}),
+        );
+        // A regular file cannot serve as the log's parent directory, so
+        // `AuditLog::append`'s `create_dir_all(parent)` fails — exercising the
+        // swallow path without depending on filesystem permissions.
+        let blocker = audit_path("audit-unwritable");
+        std::fs::write(&blocker, b"not a directory").expect("seed blocker file");
+        let unwritable = blocker.join("audit.log");
+        let mut store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_audit_log(AuditLog::new(unwritable.clone()))
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+
+        let _ = std::fs::remove_file(&blocker);
+        assert!(
+            matches!(outcome, OrchestrationOutcome::Completed { ref state, .. } if state == STATE_SUCCEEDED),
+            "an unwritable audit log must not block dispatch (swallow contract); got {outcome:?}"
+        );
+        assert!(
+            !unwritable.exists(),
+            "the audit append must have failed (no log written), proving the swallow path ran"
         );
     }
 
