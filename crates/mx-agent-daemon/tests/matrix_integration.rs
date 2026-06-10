@@ -47,6 +47,15 @@
 //! `MX_AGENT_TEST_SAS_USER2`/`_PASSWORD2`) provisioned by the harness, falling
 //! back to the shared users when unset.
 //!
+//! [`workspace_create_with_e2ee_enables_encryption_and_routes_privileged_events`]
+//! (issue #249) proves the encrypted-on-create workspace path end-to-end: a
+//! [`create_workspace`] call with `e2ee: true` returns `encrypted: true` immediately,
+//! the live room reports `is_encrypted() == true` after the first sync, and a
+//! signed privileged event posted into the workspace decrypts correctly at the
+//! daemon and authorizes through the real pipeline — proving encryption-on-create
+//! composes with the existing fail-safe receive path. The unencrypted counterpart is
+//! covered by [`workspace_room_is_created_without_encryption`].
+//!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
 //!
@@ -3440,6 +3449,7 @@ async fn workspace_room_is_created_without_encryption() {
             topic: None,
             alias: None,
             visibility: WorkspaceVisibility::Private,
+            e2ee: false,
         },
     )
     .await
@@ -3459,6 +3469,7 @@ async fn workspace_room_is_created_without_encryption() {
             topic: None,
             alias: None,
             visibility: WorkspaceVisibility::Public,
+            e2ee: false,
         },
     )
     .await
@@ -3516,6 +3527,233 @@ async fn workspace_room_is_created_without_encryption() {
     );
 
     std::env::remove_var(ENV_DATA_DIR);
+}
+
+/// Workspace creation with E2EE enabled — contract test for issue #249.
+///
+/// Proves three properties of the encrypted-on-create workspace path end-to-end
+/// against a real homeserver:
+///
+/// 1. **Immediate result.** [`create_workspace`] with `e2ee: true` returns a
+///    [`WorkspaceInfo`] with `encrypted: true`, even before the client has synced
+///    the room's `m.room.encryption` state event. The
+///    [`WorkspaceInfo::from_room_with_e2ee`] helper ORs the *requested* flag with
+///    the live store state so the returned info never under-reports.
+///
+/// 2. **Live room state.** After the daemon's sync loop processes the room's
+///    `initial_state`, `room.encryption_state().is_encrypted()` reports `true`,
+///    proving the `m.room.encryption` event was actually sent in `initial_state`
+///    and not just OR-d into the return value.
+///
+/// 3. **Privileged event decrypt-and-route.** A signed `com.mxagent.exec.request.v1`
+///    event sent into the encrypted-on-create workspace by the requester (Bob)
+///    decrypts correctly at the daemon (Alice) and passes the real
+///    [`authorize_exec_request`] pipeline, proving that encryption-on-create
+///    composes with the existing fail-safe receive path (issue #61,
+///    `daemon_e2ee_privileged_event_coverage`).
+///
+/// **Security note:** this test does NOT weaken the authorization model. Room
+/// encryption is a transport/confidentiality property only; all signed-request,
+/// trust-store, and policy checks remain in place unchanged. Encrypting the room
+/// changes only what the homeserver operator can read — not who may cause
+/// execution (architecture §1.2).
+///
+/// The "default create is unencrypted" counterpart is covered by
+/// [`workspace_room_is_created_without_encryption`].
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn workspace_create_with_e2ee_enables_encryption_and_routes_privileged_events() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    // Isolate this test's persisted state without touching the process-global
+    // data-dir env var (same pattern as daemon_e2ee_privileged_event_coverage).
+    let paths = paths_in(throwaway_data_dir());
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login should succeed");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore should succeed");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login should succeed");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore should succeed");
+
+    // Drive the daemon's real /sync loop: it uploads device/one-time keys and
+    // decrypts incoming encrypted events.
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(
+                &alice,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+            )
+            .await
+        })
+    };
+    // The requester also needs a live sync so its crypto state (device keys,
+    // to-device key sharing) is established before it sends encrypted events.
+    let bob_sync = {
+        let bob = bob.clone();
+        tokio::spawn(async move {
+            let _ = bob.sync(SyncSettings::default()).await;
+        })
+    };
+
+    // The requester's signing identity and a trust store that accepts it.
+    let signing = load_or_create_signing_key(&paths).expect("requester signing key");
+    let key_id = signing.key_id();
+    let verifying = signing.verifying_key();
+    let mut trust = TrustStore::default();
+    trust.approve(REQUESTER_AGENT, &key_id, None, None, None);
+
+    let alice_id = alice.user_id().expect("alice has a user id").to_owned();
+
+    // ── Criterion 1: create_workspace with e2ee: true returns encrypted: true ──
+    //
+    // Use a public workspace so Bob (the requester) can join without an invite.
+    // WorkspaceInfo::from_room_with_e2ee ORs the requested flag with the live
+    // room state, ensuring the returned info is always correct even if the local
+    // store hasn't processed the initial_state encryption event yet.
+    let ws_info = create_workspace(
+        &alice,
+        &CreateWorkspaceOptions {
+            name: Some("it-e2ee-workspace".to_string()),
+            topic: None,
+            alias: None,
+            visibility: WorkspaceVisibility::Public,
+            e2ee: true,
+        },
+    )
+    .await
+    .expect("create encrypted workspace should succeed");
+
+    assert!(
+        ws_info.encrypted,
+        "create_workspace with e2ee: true must return WorkspaceInfo.encrypted == true \
+         (issue #249); got: {ws_info:?}"
+    );
+    let ws_room_id: OwnedRoomId = ws_info.room_id.parse().expect("valid workspace room id");
+
+    // ── Criterion 2: after sync the live room reports is_encrypted() == true ───
+    //
+    // The m.room.encryption initial_state event must be reflected in the client's
+    // local store after the sync loop processes it. Poll with a bounded deadline
+    // instead of a fixed sleep to avoid flakes.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(room) = alice.get_room(&ws_room_id) {
+                if room.encryption_state().is_encrypted() {
+                    return;
+                }
+            }
+            let _ = alice.sync_once(SyncSettings::default()).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect(
+        "workspace room created with e2ee: true must report is_encrypted() == true after sync \
+         (issue #249); the m.room.encryption event was not reflected in room state",
+    );
+
+    // ── Criterion 3: privileged event in encrypted-on-create room decrypts ─────
+    //
+    // Bob joins the workspace and sends a signed exec request as an encrypted
+    // Matrix event. Alice's daemon decrypts it over /sync and the real
+    // authorization pipeline admits it — proving encryption-on-create composes
+    // with the existing fail-safe receive path.
+    let alice_room = alice
+        .get_room(&ws_room_id)
+        .expect("alice owns the workspace room");
+
+    bob.join_room_by_id(&ws_room_id)
+        .await
+        .expect("bob joins the encrypted workspace");
+
+    // Wait until Alice is visible to Bob as a joined member so the megolm room
+    // key is shared with Alice's device before Bob sends.
+    let bob_room = bob
+        .get_room(&ws_room_id)
+        .expect("bob sees the workspace room");
+    wait_for_joined_member(&bob_room, &alice_id).await;
+
+    let policy = permissive_policy(ws_room_id.as_str(), REQUESTER_AGENT);
+
+    // Build and send an encrypted, signed exec request from Bob's perspective.
+    let exec_content = build_signed_exec_request(
+        signing.signing_key(),
+        &key_id,
+        "inv_e2ee_wscreate",
+        "req_e2ee_wscreate",
+        "e2ee-wscreate-nonce",
+        "2026-06-04T12:00:00Z",
+        "2099-01-01T00:00:00Z",
+        &exec_options(),
+    )
+    .expect("sign exec request for encrypted workspace");
+
+    let exec_event_id = bob_room
+        .send_raw(timeline::EXEC_REQUEST, exec_content)
+        .await
+        .expect("send encrypted exec request into workspace room")
+        .response
+        .event_id;
+
+    // Alice's client must decrypt the event. decrypted_content panics on
+    // timeout — an undecryptable privileged event is a regression in the path.
+    let exec_decrypted = decrypted_content(&alice_room, &exec_event_id).await;
+
+    // The decrypted content must authorize through the real pipeline.
+    let authorized = authorize_exec_request(
+        &exec_decrypted,
+        &verifying,
+        &trust,
+        &policy,
+        ws_room_id.as_str(),
+        REQUESTER_AGENT,
+        TARGET_AGENT,
+    )
+    .expect(
+        "decrypted exec metadata in an encrypted-on-create workspace room must authorize \
+         (issue #249)",
+    );
+    assert_eq!(
+        authorized.invocation_id, "inv_e2ee_wscreate",
+        "authorized exec must carry the expected invocation id"
+    );
+    assert_eq!(
+        authorized.command,
+        vec!["cargo", "test"],
+        "authorized exec must carry the expected command"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync task should join")
+        .expect("alice sync loop should exit cleanly");
+    bob_sync.abort();
 }
 
 /// Live scheduler rejects forged approval decisions from non-daemon room members

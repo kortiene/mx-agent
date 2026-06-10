@@ -128,9 +128,26 @@ mx-agent: created workspace !aBcD...:localhost
 Note the room alias (`#demo:localhost`) — every later command takes it via
 `--room`. Other members join with `mx-agent workspace join '#demo:localhost'`.
 
-> **Note.** In this alpha, `workspace create` does not enable end-to-end
-> encryption (there is no `--e2ee` flag yet), so the workspace reports
-> `encrypted: false`. Room-level E2EE is still landing — see the
+> **End-to-end encryption (opt-in).** By default `workspace create` makes an
+> unencrypted room, so it reports `encrypted: false`. Pass `--e2ee on` to create
+> the room born encrypted (Megolm v1); it then reports `encrypted: true`:
+>
+> ```bash
+> mx-agent workspace create --alias demo --name "Demo workspace" --e2ee on
+> ```
+>
+> ```text
+> mx-agent: created workspace !aBcD...:localhost
+>   alias:     #demo:localhost
+>   encrypted: true
+>   members:   1
+> ```
+>
+> Encryption protects channel confidentiality (what the homeserver operator can
+> read), not who may cause execution — privileged requests are still gated by
+> signature + trust + policy + approval. An encrypted room is unreadable to peers
+> whose daemons cannot decrypt, so for real confidentiality pair `--e2ee on` with
+> device verification and key backup (`recovery enable`). See the
 > [Security warnings](#security-warnings) and the project roadmap.
 
 Optionally bind the room to a local checkout so shares and registrations carry

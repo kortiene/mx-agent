@@ -138,13 +138,21 @@ Create a Matrix-backed workspace:
 mx-agent workspace create \
   --alias my-project \
   --name "my-project orchestration" \
-  --visibility private
+  --visibility private \
+  --e2ee on
 ```
 
-> **Note (current behavior).** In the current alpha, `workspace create` does not
-> enable end-to-end encryption — there is no `--e2ee` flag yet, and newly created
-> workspaces are unencrypted. Room-level E2EE on create is tracked alongside the
-> E2EE production-hardening work (issues #240 and #249).
+> **End-to-end encryption (opt-in).** `workspace create` accepts `--e2ee <on|off>`
+> (default `off`). With `--e2ee on` the room is born encrypted — an
+> `m.room.encryption` (Megolm v1) event is set via `initial_state`, so the room is
+> encrypted from its first event and `create` reports `encrypted: true`. Without
+> the flag (or with `--e2ee off`) the workspace is unencrypted and reports
+> `encrypted: false`; turning E2EE on by default is a separate rollout decision
+> (issue #240). Encryption is a *transport* property only: it changes who the
+> homeserver operator can read, never who may cause execution — privileged
+> requests remain gated by signature + trust + policy + approval (§1.2). For real
+> confidentiality, pair `--e2ee on` with device verification and key backup
+> (`recovery enable`); see issue #240.
 
 Join an existing workspace:
 
