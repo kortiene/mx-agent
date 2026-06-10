@@ -1171,7 +1171,7 @@ echo '{"package":"api","coverage":true}' | mx-agent call \
 **Notes**
 
 - The CLI is stateless; the daemon owns the Matrix client, signing key, policy, and trust context. Only the daemon can execute tools or send signed remote requests.
-- Tools are the safer default compared to raw shell execution (`exec`); they enforce input schemas and avoid shell injection.
+- Tools are the safer default compared to raw shell execution (`exec`); they enforce input schemas, avoid shell injection, and are confined at least as strictly as `exec` — same sandbox backend, network decision, filesystem binds, and sanitized env (architecture §5.2, §13.5).
 - Local loopback execution runs built-in tools immediately; remote execution over Matrix is asynchronous and may be held pending approval.
 - For signed Matrix-backed remote calls, the receiver verifies the Ed25519 request signature and checks the local trust store and policy before executing; room membership alone grants no execution rights.
 - Large artifacts (> 256 KiB) landing in future releases will be uploaded to Matrix media and referenced via `mxc://` URIs.

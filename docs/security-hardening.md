@@ -11,10 +11,10 @@ one, **what the safe default is and which options weaken it**.
 > default and become signed Matrix-backed remote operations when `--room`/`--agent`
 > target a registered, trusted, policy-allowed remote agent, with signed
 > stdin/resize/cancel controls for live remote exec. The trust, signing, policy, audit, and
-> sandbox machinery described here is real and already enforced for **batch exec** — on
-> the daemon that runs the command, local or remote. Interactive `exec --pty` has only
-> the baseline controls (env scrub, cwd, timeout, output cap); the PTY exec path does not
-> route through the sandbox backend. Replay/expiry checks are enforced for
+> sandbox machinery described here is real and already enforced for **batch exec and
+> named tool calls (`call`)** — on the daemon that runs the command, local or remote.
+> Interactive `exec --pty` has only the baseline controls (env scrub, cwd, timeout,
+> output cap); the PTY exec path does not route through the sandbox backend. Replay/expiry checks are enforced for
 > request types whose schema carries nonce/expiry fields.
 
 ## Contents
@@ -389,8 +389,8 @@ the sandbox; everything else is hidden. Read-only mounts are applied before
 writable ones, so a nested `writable_paths` entry can carve a writable hole in a
 read-only tree. Keep `writable_paths` as small as the task allows — typically
 the project directory and a scratch dir under `/tmp`. Filesystem-bind confinement
-applies to batch exec only; the interactive `exec --pty` path does not route
-through the sandbox backend.
+applies to batch exec and named tool calls (`call`); the interactive `exec --pty`
+path does not route through the sandbox backend.
 
 **What the sandbox does *not* do.** There is no seccomp filtering, no
 rlimit-based resource capping, and no UID/GID remapping — commands run as the

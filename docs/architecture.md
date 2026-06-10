@@ -299,7 +299,7 @@ mx-agent invocation cancel \
 
 ### 5.2 Named Tool Calls
 
-Named tools are the preferred security boundary. They avoid arbitrary shell injection and allow strict input/output schemas.
+Named tools are the preferred security boundary. They avoid arbitrary shell injection and allow strict input/output schemas. They are also confined *at least as strictly as* raw `exec`: a built-in tool is spawned through the same runner pipeline, so it inherits the resolved `Allowance`'s sandbox backend, network decision (fail-closed `deny`), read-only/writable filesystem binds, and a sanitized environment that strips the daemon's secrets (§13.4, §13.5). This applies to every tool entry point — the live signed `call` path, auto-executed task DAGs (`TaskAction::Tool`), and the local CLI loopback (which uses the operator's execution-level defaults).
 
 ```bash
 mx-agent call \
@@ -1743,6 +1743,12 @@ network = "deny"
 read_only_paths = ["/usr", "/bin", "/lib"]
 writable_paths = ["/home/me/code/project", "/tmp/mx-agent"]
 ```
+
+These controls apply uniformly to raw `exec` **and** named tools. Built-in tools
+(`run_tests`, `lint`) are spawned through the same runner pipeline as `exec`, so
+the resolved `Allowance` — sandbox backend, network decision, filesystem binds,
+and the env allowlist that drives the §13.4 scrub — confines them identically
+rather than letting them run on the bare host with the daemon's full environment.
 
 ### 13.6 Audit Logging
 

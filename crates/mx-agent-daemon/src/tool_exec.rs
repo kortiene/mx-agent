@@ -8,12 +8,22 @@
 //! human-readable summary.
 //!
 //! Tools are the preferred security boundary over raw `exec`: callers cannot
-//! inject arbitrary shell, only the typed arguments each tool declares.
+//! inject arbitrary shell, only the typed arguments each tool declares. They are
+//! also confined *at least as strictly as* `exec`: every built-in tool is spawned
+//! through the same [`crate::runner`] pipeline (`RunSpec` → `build_command` →
+//! `sandbox_for(...).prepare(...)`), so it inherits the policy-resolved sandbox
+//! backend, network decision, filesystem binds, and the sanitized environment
+//! that strips the daemon's secrets (architecture §5.2, §13.4, §13.5). The
+//! resolved [`Allowance`](mx_agent_policy::Allowance) is threaded into execution
+//! rather than discarded.
 
-use std::process::Command;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
+
+use crate::runner::{RunError, RunSpec, DEFAULT_GRACE_PERIOD};
 
 /// The built-in `run_tests` tool name.
 pub const RUN_TESTS: &str = "run_tests";
@@ -81,16 +91,132 @@ impl std::error::Error for ToolError {
     }
 }
 
-/// Execute a built-in tool by name with the given JSON `args`.
+/// Build the confined [`RunSpec`] for a built-in tool invocation.
+///
+/// Validates `args` via the tool's existing command builder, then wraps the
+/// resulting `(program, argv)` in a [`RunSpec`] carrying the policy-resolved
+/// confinement: the sandbox backend ([`crate::exec::sandbox_backend`]), the
+/// network decision ([`crate::exec::network_for`], fail-closed `deny`), the
+/// read-only / writable filesystem binds, and the env allowlist that drives
+/// `sanitize_env`. The runner spawns this exactly like a raw `exec`, so a named
+/// tool is confined at least as strictly as `exec` (architecture §13.5).
+///
+/// Pure and side-effect-free (the `cwd` is resolved by the caller) so tests can
+/// assert the resulting spec without spawning a process. Unknown-tool /
+/// invalid-args validation happens here, before any runtime is spun up.
+///
+/// Under an isolating sandbox the `cwd` must be inside the configured
+/// `writable_paths` for the tool to do anything useful — that is an operator
+/// configuration concern, not enforced here.
+fn tool_run_spec(
+    name: &str,
+    args: &Value,
+    allowance: &mx_agent_policy::Allowance,
+    cwd: PathBuf,
+) -> Result<RunSpec, ToolError> {
+    let (program, argv) = match name {
+        RUN_TESTS => run_tests_command(args)?,
+        LINT => lint_command(args)?,
+        other => return Err(ToolError::UnknownTool(other.to_string())),
+    };
+    let mut command = Vec::with_capacity(argv.len() + 1);
+    command.push(program);
+    command.extend(argv);
+    Ok(RunSpec {
+        command,
+        cwd,
+        env: Default::default(),
+        env_allowlist: allowance.env_allowlist.clone(),
+        stdin: None,
+        timeout: allowance.max_runtime_ms.map(Duration::from_millis),
+        grace_period: DEFAULT_GRACE_PERIOD,
+        sandbox: crate::exec::sandbox_backend(allowance.sandbox),
+        network: crate::exec::network_for(allowance.network),
+        read_only_paths: allowance.read_only_paths.clone(),
+        writable_paths: allowance.writable_paths.clone(),
+    })
+}
+
+/// The `summarize` label for a built-in tool (e.g. `"cargo test"`), so summaries
+/// read identically regardless of how the tool is spawned.
+fn tool_label(name: &str) -> &'static str {
+    match name {
+        RUN_TESTS => "cargo test",
+        LINT => "cargo clippy",
+        _ => "tool",
+    }
+}
+
+/// Map a [`RunError`] from the shared runner onto a [`ToolError`].
+///
+/// All runner failures describe a failure to *invoke* the tool (an empty argv,
+/// a missing working directory, or a spawn failure), so they collapse onto
+/// [`ToolError::Spawn`] — reusing the existing variant rather than widening the
+/// public enum. The `NotFound` io kind is preserved so callers can still map a
+/// missing program to a distinct error kind.
+fn map_run_error(err: RunError) -> ToolError {
+    match err {
+        RunError::Spawn(io) => ToolError::Spawn(io),
+        RunError::EmptyCommand => ToolError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tool command argv is empty",
+        )),
+        RunError::MissingCwd(path) => ToolError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("tool working directory {path:?} does not exist"),
+        )),
+    }
+}
+
+/// Execute a built-in tool by name, confined by `allowance` (async).
+///
+/// Builds the confined [`RunSpec`] and runs it through the shared
+/// [`crate::runner::run`] pipeline, mapping the captured outcome onto a
+/// [`ToolResult`]. Used by the live `call` handler, which is already async and
+/// must not nest a tokio runtime.
 ///
 /// Returns a [`ToolResult`] when the tool ran (even if it reported a nonzero
 /// exit code), or a [`ToolError`] when the tool could not be invoked at all.
-pub fn execute_tool(name: &str, args: &Value) -> Result<ToolResult, ToolError> {
-    match name {
-        RUN_TESTS => run_tests(args),
-        LINT => lint(args),
-        other => Err(ToolError::UnknownTool(other.to_string())),
-    }
+pub async fn execute_tool_async(
+    name: &str,
+    args: &Value,
+    allowance: &mx_agent_policy::Allowance,
+    cwd: PathBuf,
+) -> Result<ToolResult, ToolError> {
+    let spec = tool_run_spec(name, args, allowance, cwd)?;
+    let output = crate::runner::run(&spec).await.map_err(map_run_error)?;
+    let (exit_code, summary) = summarize(tool_label(name), output.exit_code);
+    Ok(ToolResult { exit_code, summary })
+}
+
+/// Execute a built-in tool by name, confined by `allowance` (sync).
+///
+/// Validates the request synchronously (so unknown-tool / bad-args never spin a
+/// runtime), then runs the confined [`RunSpec`] on a temporary current-thread
+/// runtime. Used by the synchronous task orchestrator dispatch and the loopback
+/// path, neither of which runs inside a tokio runtime (mirrors
+/// [`crate::task_dispatch`]'s exec command runner).
+///
+/// Returns a [`ToolResult`] when the tool ran (even if it reported a nonzero
+/// exit code), or a [`ToolError`] when the tool could not be invoked at all.
+pub fn execute_tool(
+    name: &str,
+    args: &Value,
+    allowance: &mx_agent_policy::Allowance,
+    cwd: PathBuf,
+) -> Result<ToolResult, ToolError> {
+    // Validate (and build the spec) synchronously first so an unknown tool or
+    // bad arguments never spins up a runtime.
+    let spec = tool_run_spec(name, args, allowance, cwd)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(ToolError::Spawn)?;
+    let output = runtime
+        .block_on(crate::runner::run(&spec))
+        .map_err(map_run_error)?;
+    let (exit_code, summary) = summarize(tool_label(name), output.exit_code);
+    Ok(ToolResult { exit_code, summary })
 }
 
 /// Build the program and argument vector for a `run_tests` invocation.
@@ -164,17 +290,6 @@ fn summarize(label: &str, code: Option<i32>) -> (i32, String) {
     }
 }
 
-/// Run the built-in `run_tests` tool.
-fn run_tests(args: &Value) -> Result<ToolResult, ToolError> {
-    let (program, argv) = run_tests_command(args)?;
-    let status = Command::new(&program)
-        .args(&argv)
-        .status()
-        .map_err(ToolError::Spawn)?;
-    let (exit_code, summary) = summarize("cargo test", status.code());
-    Ok(ToolResult { exit_code, summary })
-}
-
 /// Build the program and argument vector for a `lint` invocation.
 ///
 /// The built-in linter shells out to `cargo clippy`. Supported arguments (all
@@ -218,17 +333,6 @@ fn lint_command(args: &Value) -> Result<(String, Vec<String>), ToolError> {
         argv.push("--fix".to_string());
     }
     Ok(("cargo".to_string(), argv))
-}
-
-/// Run the built-in `lint` tool.
-fn lint(args: &Value) -> Result<ToolResult, ToolError> {
-    let (program, argv) = lint_command(args)?;
-    let status = Command::new(&program)
-        .args(&argv)
-        .status()
-        .map_err(ToolError::Spawn)?;
-    let (exit_code, summary) = summarize("cargo clippy", status.code());
-    Ok(ToolResult { exit_code, summary })
 }
 
 #[cfg(test)]
@@ -280,10 +384,114 @@ mod tests {
         ));
     }
 
+    use mx_agent_policy::{Allowance, NetworkPolicy, Sandbox};
+    use std::path::PathBuf;
+
+    fn allowance() -> Allowance {
+        Allowance::default()
+    }
+
     #[test]
     fn execute_tool_rejects_unknown_tool() {
-        let err = execute_tool("nope", &json!({})).unwrap_err();
+        // Validation happens before any runtime is spun up, so an unknown tool
+        // returns synchronously.
+        let err = execute_tool("nope", &json!({}), &allowance(), PathBuf::from(".")).unwrap_err();
         assert!(matches!(err, ToolError::UnknownTool(_)));
+    }
+
+    #[test]
+    fn tool_run_spec_carries_policy_sandbox_network_and_paths() {
+        // An allowance with Bubblewrap + Allow + paths + allowlist must produce a
+        // RunSpec carrying those values for both built-in tools, mirroring the
+        // exec confinement coverage (architecture §13.5).
+        let allowance = Allowance {
+            sandbox: Some(Sandbox::Bubblewrap),
+            network: Some(NetworkPolicy::Allow),
+            read_only_paths: vec![PathBuf::from("/usr"), PathBuf::from("/lib")],
+            writable_paths: vec![PathBuf::from("/work")],
+            env_allowlist: vec!["CARGO_HOME".to_string()],
+            ..Allowance::default()
+        };
+        for (name, args) in [(RUN_TESTS, json!({ "package": "api" })), (LINT, json!({}))] {
+            let spec = tool_run_spec(name, &args, &allowance, PathBuf::from("/work")).unwrap();
+            assert_eq!(spec.sandbox, mx_agent_sandbox::Backend::Bubblewrap);
+            assert_eq!(spec.network, mx_agent_sandbox::Network::Allow);
+            assert_eq!(
+                spec.read_only_paths,
+                vec![PathBuf::from("/usr"), PathBuf::from("/lib")]
+            );
+            assert_eq!(spec.writable_paths, vec![PathBuf::from("/work")]);
+            assert_eq!(spec.env_allowlist, vec!["CARGO_HOME".to_string()]);
+            assert_eq!(spec.cwd, PathBuf::from("/work"));
+            assert_eq!(spec.command.first().map(String::as_str), Some("cargo"));
+        }
+    }
+
+    #[test]
+    fn tool_run_spec_defaults_to_none_backend_and_deny() {
+        // A default allowance must yield Backend::None and fail closed to
+        // Network::Deny with empty paths, preserving the baseline confinement.
+        let spec = tool_run_spec(
+            RUN_TESTS,
+            &json!({ "package": "x" }),
+            &allowance(),
+            PathBuf::from("."),
+        )
+        .unwrap();
+        assert_eq!(spec.sandbox, mx_agent_sandbox::Backend::None);
+        assert_eq!(spec.network, mx_agent_sandbox::Network::Deny);
+        assert!(spec.read_only_paths.is_empty());
+        assert!(spec.writable_paths.is_empty());
+    }
+
+    #[test]
+    fn tool_run_spec_maps_docker_to_container_backend() {
+        let allowance = Allowance {
+            sandbox: Some(Sandbox::Docker),
+            ..Allowance::default()
+        };
+        let spec = tool_run_spec(LINT, &json!({}), &allowance, PathBuf::from(".")).unwrap();
+        assert_eq!(spec.sandbox, mx_agent_sandbox::Backend::Container);
+    }
+
+    #[test]
+    fn tool_run_spec_env_is_sanitized_dropping_secrets() {
+        // The spec's env_allowlist drives sanitize_env, which always drops known
+        // token variables (even if allowlisted) while passing the safe defaults
+        // through — mirroring sanitize_env_drops_secrets in runner.rs.
+        let allowance = Allowance {
+            env_allowlist: vec!["GITHUB_TOKEN".to_string()],
+            ..Allowance::default()
+        };
+        let spec = tool_run_spec(
+            RUN_TESTS,
+            &json!({ "package": "x" }),
+            &allowance,
+            PathBuf::from("."),
+        )
+        .unwrap();
+        let inherited = vec![
+            ("GITHUB_TOKEN".to_string(), "secret".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        let env = crate::runner::sanitize_env(inherited, &spec.env, &spec.env_allowlist);
+        assert!(
+            !env.contains_key("GITHUB_TOKEN"),
+            "a known secret must be scrubbed even when allowlisted"
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+
+    #[test]
+    fn tool_run_spec_rejects_unknown_and_invalid_without_spec() {
+        assert!(matches!(
+            tool_run_spec("nope", &json!({}), &allowance(), PathBuf::from(".")).unwrap_err(),
+            ToolError::UnknownTool(_)
+        ));
+        assert!(matches!(
+            tool_run_spec(RUN_TESTS, &json!({}), &allowance(), PathBuf::from(".")).unwrap_err(),
+            ToolError::InvalidArgs(_)
+        ));
     }
 
     #[test]
@@ -315,20 +523,32 @@ mod tests {
     #[test]
     fn run_tests_executes_and_reports_exit_code() {
         // Use a trivially-true/false program rather than cargo to keep the test
-        // fast and hermetic while still exercising the spawn + summarize path.
-        let result = run_tests_via("true", &json!({ "package": "x" })).unwrap();
+        // fast and hermetic while still exercising the spec → runner → summarize
+        // path (a default allowance + a real cwd).
+        let result = run_program_via("true").unwrap();
         assert_eq!(result.exit_code, 0);
-        let result = run_tests_via("false", &json!({ "package": "x" })).unwrap();
+        let result = run_program_via("false").unwrap();
         assert_ne!(result.exit_code, 0);
     }
 
-    /// Test-only variant of [`run_tests`] that runs an arbitrary `program`
-    /// instead of `cargo`, used to exercise the spawn + summarize path quickly.
-    fn run_tests_via(program: &str, args: &Value) -> Result<ToolResult, ToolError> {
-        // Validate args the same way the real tool does.
-        run_tests_command(args)?;
-        let status = Command::new(program).status().map_err(ToolError::Spawn)?;
-        let (exit_code, summary) = summarize(program, status.code());
+    /// Run an arbitrary `program` through the same `RunSpec` → runner →
+    /// `summarize` path the built-in tools use, substituting the program so the
+    /// spawn path can be exercised quickly without invoking `cargo`.
+    fn run_program_via(program: &str) -> Result<ToolResult, ToolError> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let spec = RunSpec {
+            command: vec![program.to_string()],
+            cwd,
+            ..RunSpec::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(ToolError::Spawn)?;
+        let output = runtime
+            .block_on(crate::runner::run(&spec))
+            .map_err(map_run_error)?;
+        let (exit_code, summary) = summarize(program, output.exit_code);
         Ok(ToolResult { exit_code, summary })
     }
 
@@ -390,27 +610,24 @@ mod tests {
     fn execute_tool_dispatches_lint() {
         // Before this fix `lint` returned `UnknownTool`; it must now be
         // recognized and fail only on bad arguments, never as unknown.
-        let err = execute_tool(LINT, &json!([])).unwrap_err();
+        let err = execute_tool(LINT, &json!([]), &allowance(), PathBuf::from(".")).unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
     }
 
     #[test]
-    fn lint_executes_and_reports_exit_code() {
-        // Use trivially-true/false programs rather than cargo to keep the test
-        // fast and hermetic while still exercising the spawn + summarize path.
-        let result = lint_via("true", &json!({})).unwrap();
-        assert_eq!(result.exit_code, 0);
-        let result = lint_via("false", &json!({})).unwrap();
-        assert_ne!(result.exit_code, 0);
-    }
-
-    /// Test-only variant of [`lint`] that runs an arbitrary `program` instead of
-    /// `cargo`, used to exercise the spawn + summarize path quickly.
-    fn lint_via(program: &str, args: &Value) -> Result<ToolResult, ToolError> {
-        // Validate args the same way the real tool does.
-        lint_command(args)?;
-        let status = Command::new(program).status().map_err(ToolError::Spawn)?;
-        let (exit_code, summary) = summarize(program, status.code());
-        Ok(ToolResult { exit_code, summary })
+    fn execute_tool_runs_confined_and_reports_exit_code() {
+        // End-to-end through the sync entry point with a default allowance and a
+        // real cwd: a missing program surfaces as a Spawn error, while a present
+        // tool would run confined. `cargo` may be absent in some CI sandboxes, so
+        // assert only the invoke-path contract here.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match execute_tool(RUN_TESTS, &json!({ "package": "x" }), &allowance(), cwd) {
+            Ok(result) => {
+                // cargo present: a real run reports some exit code/summary.
+                assert!(result.summary.contains("cargo test"));
+            }
+            Err(ToolError::Spawn(_)) => {} // cargo absent: invoke failure is fine.
+            Err(other) => panic!("unexpected error: {other}"),
+        }
     }
 }

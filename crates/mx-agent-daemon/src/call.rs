@@ -342,11 +342,21 @@ pub fn success_response(request_id: impl Into<String>, result: Value) -> CallRes
 ///
 /// This is the receive-side bridge from the verification pipeline
 /// ([`authorize_call_request`]) to the built-in tool runner
-/// ([`crate::tool_exec::execute_tool`]). A tool that runs and reports a nonzero
-/// exit code still produces a successful (`ok: true`) response carrying its
-/// structured result; only a failure to *invoke* the tool yields `ok: false`.
-pub fn execute_authorized_call(request: &CallRequest) -> CallResponse {
-    match crate::tool_exec::execute_tool(&request.tool, &request.args) {
+/// ([`crate::tool_exec::execute_tool_async`]). The resolved `allowance` confines
+/// the tool exactly as the raw `exec` path is confined — sandbox backend,
+/// network decision, filesystem binds, and a sanitized environment (architecture
+/// §13.5) — rather than running it on the bare host with the daemon's secrets.
+///
+/// A tool that runs and reports a nonzero exit code still produces a successful
+/// (`ok: true`) response carrying its structured result; only a failure to
+/// *invoke* the tool yields `ok: false`. Async because the live `call` handler is
+/// already async and must not nest a tokio runtime.
+pub async fn execute_authorized_call(
+    request: &CallRequest,
+    allowance: &mx_agent_policy::Allowance,
+) -> CallResponse {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match crate::tool_exec::execute_tool_async(&request.tool, &request.args, allowance, cwd).await {
         Ok(result) => success_response(request.request_id.clone(), result.to_value()),
         Err(err) => CallResponse {
             request_id: request.request_id.clone(),
@@ -625,9 +635,9 @@ pub async fn handle_live_call_request(
                 &authorized,
                 requesting_agent,
                 target_agent,
-                &Outcome::Allow(allowance),
+                &Outcome::Allow(allowance.clone()),
             );
-            execute_authorized_call(&authorized)
+            execute_authorized_call(&authorized, &allowance).await
         }
         Err(rejection) => {
             // Policy denials and post-policy gate denials are audited via the
@@ -1173,7 +1183,14 @@ allow_tools = ["run_tests", "lint"]
             target_agent: None,
             extra: Default::default(),
         };
-        let response = execute_authorized_call(&request);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        let response = runtime.block_on(execute_authorized_call(
+            &request,
+            &mx_agent_policy::Allowance::default(),
+        ));
         assert!(!response.ok);
         assert_eq!(response.request_id, "req_01HZ");
         assert!(response.result.is_none());
