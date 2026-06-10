@@ -39,7 +39,7 @@ If a box can sync with a homeserver, it can participate — even one that accept
 | Area | Status |
 |---|---|
 | Daemon lifecycle (`start` / `status` / `stop`), background + foreground | ✅ Implemented |
-| Local IPC: Unix-socket JSON-RPC 2.0 with `0600` perms + `SO_PEERCRED` peer check | ✅ Implemented |
+| Local IPC: Unix-socket JSON-RPC 2.0 with `0600` perms + peer-UID check (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS/BSD) | ✅ Implemented |
 | Structured logging, secret redaction, dev Matrix homeserver (Tuwunel) | ✅ Implemented |
 | Protocol event schema, Ed25519 signing, policy parser, sandbox selection | ✅ Implemented |
 | `auth`, `workspace`, `agent`, `trust`, `approval`, `share`, `invocation` commands fully daemon-IPC-mediated (CLI never restores a Matrix session/client) | ✅ Implemented |
@@ -117,7 +117,7 @@ mx-agent is **zero-trust and deny-by-default**: room membership grants nothing o
 - Every privileged request is **Ed25519-signed** and checked against **local policy** before running anything; request types that carry nonce/expiry fields are also replay/expiry checked.
 - The coding agent **never sees** Matrix tokens or device keys — they stay inside the daemon (`0600`, user-owned).
 - Child processes start from an **environment allowlist** with secret scrubbing (`GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_*`, …).
-- The local IPC socket enforces a **`SO_PEERCRED` UID check** and refuses cross-user or world-accessible runtime dirs.
+- The local IPC socket enforces a **peer-UID check** (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS/BSD) and refuses cross-user or world-accessible runtime dirs.
 - The workspace **forbids `unsafe` Rust** (`unsafe_code = "forbid"`).
 
 Full details and a complete `policy.toml`: [Security & Sandboxing](https://github.com/kortiene/mx-agent/wiki/Security-and-Sandboxing) · [Security hardening guide](docs/security-hardening.md).
@@ -205,7 +205,7 @@ a `daemon.log` for background output.
 
 The IPC socket is created with mode `0600`; the daemon refuses to run if its runtime
 directory is group- or world-accessible or owned by another user, and verifies the peer
-UID via `SO_PEERCRED`. Stale sockets from a previous run are cleaned up automatically
+UID (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS/BSD). Stale sockets from a previous run are cleaned up automatically
 when no daemon is listening. The CLI and daemon communicate over this socket using
 length-delimited (4-byte big-endian prefix) JSON-RPC 2.0 frames; malformed input yields
 a controlled JSON-RPC error rather than a dropped connection.
