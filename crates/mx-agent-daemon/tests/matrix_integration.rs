@@ -31,6 +31,22 @@
 //! a fresh timeline heartbeat, and the new `AgentListing` IPC envelope shape
 //! (`{ "agent": AgentState, "liveness": "active"|"stale"|"offline" }`) is pinned.
 //!
+//! The E2EE durability/verification tests (issue #260, extending #240) cover the
+//! three highest-value transport properties end-to-end against a real homeserver:
+//! [`live_decrypt_after_restart_from_persistent_store`] drops a daemon's client
+//! and rebuilds it from the *same* device-keyed crypto store, proving the resumed
+//! device decrypts a message that was encrypted while it was down;
+//! [`live_key_backup_restore_across_reprovision`] enables server-side key backup,
+//! re-provisions onto a fresh device with an empty store that cannot decrypt
+//! history, and proves `recover` restores decryptability; and
+//! [`live_two_daemon_sas_confirms_and_verifies`] drives the interactive emoji/SAS
+//! flow between two independent daemons to a mutual `confirmed` and asserts
+//! `sender_verified == Some(true)` on both sides. The backup and SAS tests read
+//! optional fresh-per-run users
+//! (`MX_AGENT_TEST_BACKUP_USER`/`_PASSWORD`, `MX_AGENT_TEST_SAS_USER`/`_PASSWORD`,
+//! `MX_AGENT_TEST_SAS_USER2`/`_PASSWORD2`) provisioned by the harness, falling
+//! back to the shared users when unset.
+//!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
 //!
@@ -45,6 +61,13 @@
 //! - `MX_AGENT_TEST_USER` / `MX_AGENT_TEST_PASSWORD` — the daemon-side user
 //! - `MX_AGENT_TEST_USER2` / `MX_AGENT_TEST_PASSWORD2` — a second user whose
 //!   message the daemon must observe over `/sync`
+//! - `MX_AGENT_TEST_RECOVERY_USER` / `_PASSWORD` — a fresh-per-run user with a
+//!   pristine cross-signing identity for the recovery/key-backup tests
+//! - `MX_AGENT_TEST_BACKUP_USER` / `_PASSWORD` — a fresh-per-run user (clean
+//!   backup version) for [`live_key_backup_restore_across_reprovision`]
+//! - `MX_AGENT_TEST_SAS_USER` / `_PASSWORD` and
+//!   `MX_AGENT_TEST_SAS_USER2` / `_PASSWORD2` — fresh-per-run single-device peers
+//!   for [`live_two_daemon_sas_confirms_and_verifies`]
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +79,7 @@ use std::time::Duration;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::api::client::room::{create_room, Visibility};
+use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
 use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::events::room::message::{
     OriginalSyncRoomMessageEvent, RoomMessageEventContent,
@@ -77,8 +101,8 @@ use mx_agent_daemon::{
     DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams,
     ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent, HeartbeatConfig,
     ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PtyWinsize,
-    RegisterAgentOptions, SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore,
-    WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
+    RegisterAgentOptions, SasAdvance, SessionPaths, SyncHealth, SyncState, TaskDispatchMode,
+    TrustStore, WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -2888,14 +2912,14 @@ async fn live_device_manual_verify_and_sender_verified() {
 /// active backup. Also checks the recovery key is redacted in `Debug` output
 /// (exercising the [`crate::session::Secret`] wrapper on the IPC surface).
 ///
-/// The full "restore across daemon restart" scenario — wipe the local crypto
-/// store, then call `recover` with the one-time key on a fresh client — is a
-/// chaos-test-style extension left for a follow-up: it requires either a
-/// second login (a different device, so the backup has keys to restore) or
-/// exposing the key out of `Secret` specifically for tests. The enable +
-/// status path tested here proves the provisioning path works end-to-end with
-/// a real homeserver; the `recover` round-trip is covered by unit tests in
-/// `verification.rs`.
+/// The full "restore across daemon restart" scenario — re-provision onto a fresh
+/// device with an empty crypto store, then call `recover` with the one-time key
+/// to regain decryptability of previously-encrypted history — is now covered live
+/// by [`live_key_backup_restore_across_reprovision`] (issue #260; it resolves the
+/// two blockers noted here by doing a second `login_password` for device B and
+/// reading the key via `Secret::expose`). The enable + status path tested here
+/// proves the provisioning path works end-to-end with a real homeserver; the
+/// `recover` round-trip is also covered by unit tests in `verification.rs`.
 ///
 /// Run via `scripts/matrix_integration_test.sh` alongside the rest of the
 /// Matrix integration suite.
@@ -4109,4 +4133,698 @@ requires_approval = true
         .expect("alice sync exits cleanly");
     std::env::remove_var(ENV_DATA_DIR);
     std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
+/// Decrypt-after-restart from the persistent crypto store (issue #260; issue
+/// #240 "Stage 1").
+///
+/// Proves the durability property the persistent, device-keyed crypto store
+/// exists for: a daemon that resumes as the **same** E2EE device decrypts a
+/// message that was encrypted to it *while it was down*.
+///
+/// 1. Alice (device A) and Bob log in and restore; both drive a live `/sync`.
+/// 2. Bob creates an encrypted room, Alice joins, and Bob sends message #1 —
+///    Alice decrypts it, persisting the inbound Megolm session into device A's
+///    SQLite store.
+/// 3. **Restart**: Alice's sync task is aborted and her client dropped so no
+///    in-memory crypto state survives, then Bob sends message #2 over the *same*
+///    Megolm session while Alice is down.
+/// 4. **Rebuild**: `restore_client` reopens the same device-id store and Alice
+///    decrypts message #2 — proving the resumed device identity plus the
+///    persisted Megolm session decrypt an event sent while the device was down.
+///
+/// Sync is driven via the **raw** matrix-sdk `Client::sync` rather than
+/// [`run_matrix_sync`]: the daemon sync loop publishes its client into the
+/// process-global active-client registry (`matrix.rs` `publish_active_client`),
+/// and a published client is returned by the second `restore_client`, which would
+/// reuse the in-memory client and defeat the rebuild-from-disk this test depends
+/// on. Aborting the sync task and dropping the client releases the SQLite store
+/// handle so the restart truly reopens it from disk.
+///
+/// Unlike the helper-only tests, this one needs the crypto store rooted at a
+/// throwaway `MX_AGENT_DATA_DIR` (both `login_password` and `restore_client`
+/// resolve the device-keyed store from that env var), so it sets the env var
+/// rather than using `paths_in`.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_decrypt_after_restart_from_persistent_store() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    // The device-keyed crypto store lives under MX_AGENT_DATA_DIR, so it must be
+    // set (not just `paths_in`) for the restart to rebuild from the same store.
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+
+    // Raw SDK sync for both (NOT run_matrix_sync — see the doc comment).
+    let bob_sync = {
+        let bob = bob.clone();
+        tokio::spawn(async move {
+            let _ = bob.sync(SyncSettings::default()).await;
+        })
+    };
+    let alice_sync = {
+        let alice = alice.clone();
+        tokio::spawn(async move {
+            let _ = alice.sync(SyncSettings::default()).await;
+        })
+    };
+
+    // Encrypted room shared with device A so Bob shares the Megolm room key.
+    let room = create_encrypted_room(&bob, "mx-agent decrypt-after-restart").await;
+    let room_id = room.room_id().to_owned();
+    let alice_room = alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins encrypted room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+
+    // Message #1 (while up) establishes + persists the inbound Megolm session.
+    let msg1 = "restart msg #1 (while up)";
+    let msg1_id = room
+        .send(RoomMessageEventContent::text_plain(msg1))
+        .await
+        .expect("bob sends msg #1")
+        .response
+        .event_id;
+    let decrypted1 = decrypted_content(&alice_room, &msg1_id).await;
+    assert_eq!(
+        decrypted1.get("body").and_then(|b| b.as_str()),
+        Some(msg1),
+        "device A must decrypt the first message while up; got {decrypted1}"
+    );
+
+    // ---- Restart: tear down Alice's client so no in-memory crypto remains. ----
+    alice_sync.abort();
+    let _ = alice_sync.await; // ensure the sync task's client clone is dropped
+    drop(alice_room);
+    drop(alice);
+    // Give the dropped client a moment to release its SQLite store handle.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The on-disk device-keyed crypto store must persist across the restart.
+    let device_store = data_dir.join(&alice_session.device_id);
+    assert!(
+        device_store.exists(),
+        "device-keyed crypto store {device_store:?} must persist across the restart"
+    );
+
+    // ---- While Alice is down: Bob sends msg #2 over the same Megolm session. ----
+    let msg2 = "restart msg #2 (while down)";
+    let msg2_id = room
+        .send(RoomMessageEventContent::text_plain(msg2))
+        .await
+        .expect("bob sends msg #2")
+        .response
+        .event_id;
+
+    // ---- Rebuild Alice from the same device-id store and decrypt msg #2. ----
+    let alice2 = restore_client(&alice_session)
+        .await
+        .expect("alice restart restore from the persistent store");
+    let alice2_sync = {
+        let alice2 = alice2.clone();
+        tokio::spawn(async move {
+            let _ = alice2.sync(SyncSettings::default()).await;
+        })
+    };
+    let alice2_room = alice2
+        .join_room_by_id(&room_id)
+        .await
+        .expect("resumed device A sees the room");
+    let decrypted2 = decrypted_content(&alice2_room, &msg2_id).await;
+    assert_eq!(
+        decrypted2.get("body").and_then(|b| b.as_str()),
+        Some(msg2),
+        "the resumed device A must decrypt a message sent while it was down; got {decrypted2}"
+    );
+
+    alice2_sync.abort();
+    let _ = alice2_sync.await;
+    bob_sync.abort();
+    let _ = bob_sync.await;
+    std::env::remove_var(ENV_DATA_DIR);
+}
+
+/// Key-backup restore across a re-provision (issue #260; issue #240 criterion
+/// #5).
+///
+/// Proves that server-side key backup restores decryptability of
+/// previously-encrypted history after a device is re-provisioned with an empty
+/// crypto store — the round-trip the existing `live_recovery_enable_and_status`
+/// test documented as a follow-up.
+///
+/// 1. **Device A**: log in, sync to `Healthy`, `bootstrap_cross_signing`, then
+///    `enable_recovery`; capture the one-time recovery key via `Secret::expose`
+///    (asserting `Debug` still redacts it). The key is held only in a local
+///    `String` and never logged.
+/// 2. **History**: Bob creates an encrypted room, device A joins and decrypts a
+///    message (so device A holds the room key), and that room key is uploaded to
+///    server-side backup (`wait_for_steady_state`).
+/// 3. **Re-provision**: a second `login_password` for the same user mints
+///    **device B** with an empty store; device B can fetch but **not** decrypt
+///    the history (asserted before restore).
+/// 4. **Restore**: `recover` with the recovery key re-imports the backed-up keys,
+///    and device B now decrypts the previously-encrypted history.
+///
+/// Uses a fresh-per-run `MX_AGENT_TEST_BACKUP_USER` (pristine cross-signing +
+/// clean backup version), falling back to the shared user when unset (hermetic
+/// only against a freshly-reset homeserver — see the recovery test's note).
+///
+/// Homeserver requirement: this exercises the full `/room_keys` upload +
+/// re-import round trip. If a Conduit-family homeserver does not fully support
+/// server-side key backup, `recover` / the final decrypt will fail loud, which is
+/// the intended signal that the homeserver lacks the capability.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_key_backup_restore_across_reprovision() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    // Fresh per-run user for pristine cross-signing + a clean backup version;
+    // fall back to the shared user so a bare `cargo test` still runs.
+    let alice_user = std::env::var("MX_AGENT_TEST_BACKUP_USER")
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_USER"));
+    let alice_pass = std::env::var("MX_AGENT_TEST_BACKUP_PASSWORD")
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_PASSWORD"));
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+
+    // ---- Device A: login, sync to Healthy, bootstrap cross-signing, backup. ----
+    let device_a_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("device A login");
+    let device_a = restore_client(&device_a_session)
+        .await
+        .expect("device A restore");
+    let running = Arc::new(AtomicBool::new(true));
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let a_sync = {
+        let device_a = device_a.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&device_a, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            {
+                let h = health.lock().unwrap();
+                if h.state == SyncState::Healthy && h.total_syncs > 0 {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("device A sync must reach Healthy before enabling recovery");
+
+    let cs = mx_agent_daemon::bootstrap_cross_signing(&device_a)
+        .await
+        .expect("bootstrap cross-signing on device A");
+    assert!(
+        cs.has_master && cs.complete,
+        "cross-signing identity must be complete on device A; got {cs:?}"
+    );
+    let enabled = mx_agent_daemon::enable_recovery(&device_a)
+        .await
+        .expect("enable recovery on device A");
+    assert_eq!(
+        enabled.status.state, "enabled",
+        "recovery must be enabled on device A; got {:?}",
+        enabled.status
+    );
+    assert!(
+        enabled.status.backup_enabled,
+        "key backup must be enabled on device A; got {:?}",
+        enabled.status
+    );
+    // Read the one-time recovery key into a local String. NEVER log it.
+    let recovery_key = enabled.recovery_key.expose().to_string();
+    // The Secret must still redact in Debug — the exposed value must not leak.
+    assert!(
+        format!("{:?}", enabled.recovery_key).contains("***redacted***"),
+        "recovery key must remain redacted in Debug output"
+    );
+
+    // ---- Establish backed-up history: Bob's encrypted message, decrypted by A. ----
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let bob_sync = {
+        let bob = bob.clone();
+        tokio::spawn(async move {
+            let _ = bob.sync(SyncSettings::default()).await;
+        })
+    };
+
+    let room = create_encrypted_room(&bob, "mx-agent key-backup restore").await;
+    let room_id = room.room_id().to_owned();
+    let a_room = device_a
+        .join_room_by_id(&room_id)
+        .await
+        .expect("device A joins encrypted room");
+    let a_id = device_a.user_id().expect("device A user id").to_owned();
+    wait_for_joined_member(&room, &a_id).await;
+
+    let history = "backed-up history line";
+    let history_id = room
+        .send(RoomMessageEventContent::text_plain(history))
+        .await
+        .expect("bob sends history")
+        .response
+        .event_id;
+    let pre = decrypted_content(&a_room, &history_id).await;
+    assert_eq!(
+        pre.get("body").and_then(|b| b.as_str()),
+        Some(history),
+        "device A must decrypt the history before backup; got {pre}"
+    );
+
+    // Upload device A's room keys to server-side backup and wait until steady.
+    let _ = tokio::time::timeout(Duration::from_secs(60), async {
+        device_a
+            .encryption()
+            .backups()
+            .wait_for_steady_state()
+            .await
+    })
+    .await;
+
+    // ---- Re-provision: log in again as the SAME user → device B, empty store. ----
+    let device_b_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("device B login (re-provision)");
+    assert_ne!(
+        device_b_session.device_id, device_a_session.device_id,
+        "re-provision must mint a new device id with a fresh, empty crypto store"
+    );
+    let device_b = restore_client(&device_b_session)
+        .await
+        .expect("device B restore");
+    let b_sync = {
+        let device_b = device_b.clone();
+        tokio::spawn(async move {
+            let _ = device_b.sync(SyncSettings::default()).await;
+        })
+    };
+    let b_room = device_b
+        .join_room_by_id(&room_id)
+        .await
+        .expect("device B sees the room (same user, already a member)");
+
+    // Prove the history is NOT decryptable on the empty store before restore.
+    let undecryptable = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(ev) = b_room.event(&history_id, None).await {
+                if ev.encryption_info().is_none() {
+                    return true; // fetched, but not decrypted
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        undecryptable,
+        "device B (empty store) must NOT decrypt the history before key-backup restore"
+    );
+
+    // ---- Restore: re-import keys from server-side backup with the recovery key. ----
+    let restored = mx_agent_daemon::recover(&device_b, &recovery_key)
+        .await
+        .expect("device B recovers keys from server-side backup");
+    assert_eq!(
+        restored.state, "enabled",
+        "recovery status after recover must be 'enabled'; got {restored:?}"
+    );
+    assert!(
+        restored.backup_enabled,
+        "key backup must be enabled after recover; got {restored:?}"
+    );
+
+    // ---- Device B can now decrypt the previously-encrypted history. ----
+    let post = decrypted_content(&b_room, &history_id).await;
+    assert_eq!(
+        post.get("body").and_then(|b| b.as_str()),
+        Some(history),
+        "device B must decrypt the history after restore; got {post}"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    let _ = a_sync.await.expect("device A sync joins");
+    b_sync.abort();
+    let _ = b_sync.await;
+    bob_sync.abort();
+    let _ = bob_sync.await;
+    std::env::remove_var(ENV_DATA_DIR);
+}
+
+/// Drive the **responder** side of an interactive SAS through the raw
+/// matrix-sdk verification API (issue #260).
+///
+/// The daemon exposes only the requester helpers (`start_sas`/`advance_sas`/…);
+/// the requester's flow id is an internal ULID, not the SDK transaction id, so
+/// the peer cannot look the flow up through the daemon. The responder therefore
+/// learns the SDK flow id from the captured incoming `m.key.verification.request`
+/// (`flow_id_slot`), resolves and accepts the request, accepts the SAS once the
+/// requester starts it, and confirms once the short-auth string is presentable.
+/// In the test there is no human, so it confirms unconditionally — both daemons
+/// compute the same SAS.
+async fn drive_sas_responder(
+    responder: &Client,
+    requester: &UserId,
+    flow_id_slot: Arc<Mutex<Option<String>>>,
+) {
+    // 1) Learn the SDK flow id from the captured incoming request.
+    let flow_id = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(id) = flow_id_slot.lock().unwrap().clone() {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("responder must observe the incoming verification request");
+
+    // 2) Resolve and accept the verification request.
+    let request = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(req) = responder
+                .encryption()
+                .get_verification_request(requester, &flow_id)
+                .await
+            {
+                return req;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("responder must resolve the verification request");
+    request
+        .accept()
+        .await
+        .expect("responder accepts the verification request");
+
+    // 3) Once the requester starts the SAS, obtain and accept it.
+    let sas = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(sas) = responder
+                .encryption()
+                .get_verification(requester, &flow_id)
+                .await
+                .and_then(|v| v.sas())
+            {
+                return sas;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("responder must obtain the SAS once the requester starts it");
+    // The requester started the flow; accept it on the responder side. Ignore an
+    // error in case the SDK already auto-accepted.
+    let _ = sas.accept().await;
+
+    // 4) Confirm once the short-auth string is presentable; drive to done.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut confirmed = false;
+        loop {
+            assert!(!sas.is_cancelled(), "responder SAS was cancelled");
+            if sas.is_done() {
+                return;
+            }
+            if !confirmed && sas.can_be_presented() {
+                sas.confirm().await.expect("responder confirms the SAS");
+                confirmed = true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("responder SAS must reach done");
+}
+
+/// Full two-daemon interactive SAS happy path (issue #260).
+///
+/// Drives the emoji/SAS request → accept → present → confirm flow between two
+/// independent daemons to a mutual `confirmed`, then asserts
+/// `sender_verified == Some(true)` on **both** sides — closing the gap left by
+/// `live_device_manual_verify_and_sender_verified`, which only exercises the
+/// out-of-band `manual_verify` path.
+///
+/// The requester (Alice) is driven through the daemon helpers
+/// (`start_sas`/`advance_sas`/`confirm_sas`); the responder (Bob) is driven
+/// through the raw matrix-sdk API by [`drive_sas_responder`] (no daemon
+/// responder helper exists — see its doc comment). Both run live `/sync` loops so
+/// the to-device verification traffic flows.
+///
+/// Uses fresh-per-run `MX_AGENT_TEST_SAS_USER`/`_USER2` so each peer has exactly
+/// **one** device — the all-devices `sender_verified == Some(true)` assertion
+/// would otherwise be defeated by devices accumulated by other tests'
+/// `login_password` calls on the shared users. Falls back to the shared users
+/// when unset (hermetic only against a freshly-reset homeserver).
+///
+/// This validates the **transport** verification signal only; per architecture
+/// §1.2 device verification stays advisory and never grants execution authority
+/// (signing + trust + policy remain the gate).
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_two_daemon_sas_confirms_and_verifies() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    // Fresh per-run users so each peer has exactly one device (see doc comment).
+    let alice_user = std::env::var("MX_AGENT_TEST_SAS_USER")
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_USER"));
+    let alice_pass = std::env::var("MX_AGENT_TEST_SAS_PASSWORD")
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_PASSWORD"));
+    let bob_user = std::env::var("MX_AGENT_TEST_SAS_USER2")
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_USER2"));
+    let bob_pass = std::env::var("MX_AGENT_TEST_SAS_PASSWORD2")
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_PASSWORD2"));
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    let bob_id = bob.user_id().expect("bob user id").to_owned();
+
+    // Both need live crypto sync for to-device verification traffic.
+    let alice_sync = {
+        let alice = alice.clone();
+        tokio::spawn(async move {
+            let _ = alice.sync(SyncSettings::default()).await;
+        })
+    };
+    let bob_sync = {
+        let bob = bob.clone();
+        tokio::spawn(async move {
+            let _ = bob.sync(SyncSettings::default()).await;
+        })
+    };
+
+    // A shared encrypted room makes each side download the other's device keys.
+    let room = create_encrypted_room(&bob, "mx-agent two-daemon SAS").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins encrypted room");
+    wait_for_joined_member(&room, &alice_id).await;
+
+    // Wait until Alice sees Bob's (single) device, and Bob sees Alice's.
+    let bob_device = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let Ok(devs) = mx_agent_daemon::list_devices(&alice, bob_id.as_str()).await {
+                if let Some(d) = devs.into_iter().next() {
+                    return d;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("alice must see bob's device");
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let Ok(devs) = mx_agent_daemon::list_devices(&bob, alice_id.as_str()).await {
+                if !devs.is_empty() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("bob must see alice's device");
+
+    // Pre-assert: neither side considers the other verified yet.
+    assert_ne!(
+        mx_agent_daemon::sender_verified(&alice, bob_id.as_str()).await,
+        Some(true),
+        "bob must not be verified by alice before SAS"
+    );
+    assert_ne!(
+        mx_agent_daemon::sender_verified(&bob, alice_id.as_str()).await,
+        Some(true),
+        "alice must not be verified by bob before SAS"
+    );
+
+    // Capture the incoming verification request's SDK flow id on Bob BEFORE the
+    // requester sends it, so the responder can resolve the SDK flow.
+    let flow_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let slot = flow_id_slot.clone();
+        let requester_uid = alice_id.clone();
+        bob.add_event_handler(move |ev: ToDeviceKeyVerificationRequestEvent| {
+            let slot = slot.clone();
+            let requester_uid = requester_uid.clone();
+            async move {
+                if ev.sender == requester_uid {
+                    let mut guard = slot.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(ev.content.transaction_id.to_string());
+                    }
+                }
+            }
+        });
+    }
+
+    // Requester (Alice) starts the SAS against Bob's device.
+    let flow_id_a = mx_agent_daemon::start_sas(&alice, bob_id.as_str(), &bob_device.device_id)
+        .await
+        .expect("alice starts the SAS");
+
+    // Drive the responder concurrently with the requester.
+    let responder = {
+        let bob = bob.clone();
+        let requester_uid = alice_id.clone();
+        let slot = flow_id_slot.clone();
+        tokio::spawn(async move { drive_sas_responder(&bob, &requester_uid, slot).await })
+    };
+
+    // Requester loop: advance to Ready, confirm once, advance to Done.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut confirmed = false;
+        loop {
+            match mx_agent_daemon::advance_sas(&flow_id_a)
+                .await
+                .expect("advance the SAS")
+            {
+                SasAdvance::Done => return,
+                SasAdvance::Cancelled => panic!("requester SAS was cancelled"),
+                SasAdvance::Ready { .. } => {
+                    if !confirmed {
+                        mx_agent_daemon::confirm_sas(&flow_id_a)
+                            .await
+                            .expect("requester confirms the SAS");
+                        confirmed = true;
+                    }
+                }
+                SasAdvance::Pending | SasAdvance::Negotiating => {}
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("requester SAS must reach done");
+
+    responder.await.expect("responder task joins");
+
+    // ---- Both-sides assertion: each side now considers the other verified. ----
+    let both_verified = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if mx_agent_daemon::sender_verified(&alice, bob_id.as_str()).await == Some(true)
+                && mx_agent_daemon::sender_verified(&bob, alice_id.as_str()).await == Some(true)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        both_verified,
+        "after a mutual SAS confirm, both sides must report sender_verified == Some(true)"
+    );
+
+    // Belt-and-suspenders: the specific peer device shows verified via list_devices.
+    let alice_view = mx_agent_daemon::list_devices(&alice, bob_id.as_str())
+        .await
+        .expect("alice lists bob's devices");
+    assert!(
+        alice_view
+            .iter()
+            .any(|d| d.device_id == bob_device.device_id && d.verified),
+        "bob's verified device must show verified in alice's device list; got {alice_view:?}"
+    );
+    let bob_view = mx_agent_daemon::list_devices(&bob, alice_id.as_str())
+        .await
+        .expect("bob lists alice's devices");
+    assert!(
+        !bob_view.is_empty() && bob_view.iter().all(|d| d.verified),
+        "alice's device(s) must show verified in bob's device list; got {bob_view:?}"
+    );
+
+    mx_agent_daemon::forget_sas(&flow_id_a);
+    alice_sync.abort();
+    let _ = alice_sync.await;
+    bob_sync.abort();
+    let _ = bob_sync.await;
+    std::env::remove_var(ENV_DATA_DIR);
 }

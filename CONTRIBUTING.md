@@ -91,7 +91,10 @@ signed remote `call` and `exec` (streaming, stdin, policy denial, and interactiv
 `--pty` with terminal resize), E2EE
 privileged-event handling, and the live scheduler loop auto-executing a signed,
 assigned task DAG over real room state while refusing policy-denied and
-approval-required actions. To drive the homeserver manually instead:
+approval-required actions. It also covers the E2EE durability/verification
+surface (issue #260): decrypt-after-restart from the persistent crypto store,
+key-backup restore across a re-provision, and the interactive two-daemon SAS
+verification flow. To drive the homeserver manually instead:
 
 ```bash
 scripts/matrix_dev.sh up              # start a loopback-only Tuwunel homeserver
