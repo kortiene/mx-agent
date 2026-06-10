@@ -70,7 +70,8 @@ mx-agent agent register --room '#my-project:example.org' \
 # 5. Run a command locally (daemon-mediated loopback)...
 mx-agent exec -- cargo test
 
-# 6. ...or on a trusted remote agent (Ed25519-signed over Matrix; alpha rooms are unencrypted).
+# 6. ...or on a trusted remote agent (Ed25519-signed over Matrix; unencrypted by default —
+#    use 'workspace create --e2ee on' to create an encrypted workspace).
 mx-agent exec --room '#my-project:example.org' --agent '@peer:example.org' -- uname -a
 ```
 
@@ -97,7 +98,7 @@ EXCEPTIONS/nuance:
 
 - `mx-agent daemon start/status/stop` manage the daemon process itself (not over IPC for start).
 - `auth login` is CLI-initiated only to receive the password and hand the new session to the daemon.
-- `call` and `exec` run daemon-mediated LOCAL loopback execution by DEFAULT; they become signed, Matrix-backed REMOTE operations when BOTH `--room` and `--agent` target a registered remote agent (Ed25519-signed; the workspace room is unencrypted in this alpha, so traffic is readable by the homeserver — see #249).
+- `call` and `exec` run daemon-mediated LOCAL loopback execution by DEFAULT; they become signed, Matrix-backed REMOTE operations when BOTH `--room` and `--agent` target a registered remote agent (Ed25519-signed; workspace rooms are **unencrypted by default** — use `workspace create --e2ee on` for channel confidentiality; see §3).
 - Privileged remote requests run the receiver-side pipeline: verify(Ed25519 signature) → local trust store → deny-by-default policy.toml → optional require_verified_device gate → optional approval gate → sandbox runner. Room membership alone grants NOTHING.
 
 ## Conventions
@@ -117,8 +118,8 @@ EXCEPTIONS/nuance:
 
 - **Local vs remote.** `call` and `exec` run locally through the daemon by default; supplying
   **both** `--room` and `--agent` turns them into signed remote operations (Ed25519-signed and
-  authorized by the target daemon; not end-to-end encrypted in this alpha) that the target daemon
-  authorizes independently.
+  authorized by the target daemon; workspace rooms are unencrypted by default — create with
+  `--e2ee on` for channel confidentiality) that the target daemon authorizes independently.
 
 Commands are grouped below. Each group lists its subcommands, then documents every option, behavior, exit codes, and examples.
 
@@ -567,10 +568,11 @@ mx-agent [GLOBAL] workspace create [OPTIONS]
 | `--name` | `<NAME>` | no | unset | Human-readable room name |
 | `--topic` | `<TOPIC>` | no | unset | Room topic (description) |
 | `--visibility` | `private\|public` | no | `private` | Room visibility: `private` (invite-only, hidden from directory) or `public` (joinable, listed in directory) |
+| `--e2ee` | `on\|off` | no | `off` | Enable end-to-end encryption for the new workspace (`on` = Megolm v1, born encrypted; `off` = unencrypted, default) |
 
 **Behavior**
 
-Creates a new Matrix room with the provided options. Private workspaces are invite-only; public workspaces are openly joinable and listed in the homeserver's public room directory. The room is created with E2EE encryption disabled (workspace state events must be readable to all members). Returns [`WorkspaceInfo`](https://spec.matrix.org) containing the room ID, canonical alias (if provided), name, topic, encryption state, and joined member count.
+Creates a new Matrix room with the provided options. Private workspaces are invite-only; public workspaces are openly joinable and listed in the homeserver's public room directory. With `--e2ee on`, the room is created born encrypted (an `m.room.encryption` Megolm v1 state event is injected at creation time so there is no unencrypted window). Returns [`WorkspaceInfo`](https://spec.matrix.org) containing the room ID, canonical alias (if provided), name, topic, encryption state, and joined member count.
 
 In human mode, prints the room details in a block; `--json` outputs a single-line JSON object with keys: `room_id`, `canonical_alias` (optional), `name` (optional), `topic` (optional), `encrypted`, `joined_members`.
 
@@ -584,6 +586,9 @@ mx-agent workspace create --alias my-project --name "My Project" --visibility pr
 
 # Create a public workspace visible in the room directory
 mx-agent workspace create --alias shared-space --visibility public
+
+# Create an end-to-end encrypted workspace (born encrypted, Megolm v1)
+mx-agent workspace create --alias secure-project --name "Secure Project" --e2ee on
 
 # Output as JSON for scripting
 mx-agent workspace create --alias test-room --json
@@ -1269,7 +1274,7 @@ mx-agent exec --cwd /tmp -- python3 -c "import sys; print(sys.stdin.read())" < i
 - **Large output:** Exec output larger than 256 KiB is automatically uploaded to a Matrix media artifact; the CLI receives a reference URI and a 4 KiB tail for preview.
 - **Strict mode:** `--strict-stream` is useful for audit trails (e.g., build logs); degraded output (default) is suitable for interactive use.
 - **Task integration:** `--task` links the invocation to a scheduled task's DAG; the daemon records the invocation ID on the task state and can thus trace execution lineage.
-- **Confidentiality:** Remote exec is **Ed25519-signed** for integrity and authenticity, and the receiver authorizes it (verify → trust store → deny-by-default policy → optional verified-device and approval gates). It is **not** end-to-end encrypted in this alpha: the workspace room is created with encryption disabled (see [`workspace create`](#mx-agent-workspace-create) above), so the command line, stdin, and captured output transit as cleartext Matrix timeline events **readable by the homeserver operator**. Confidentiality from the homeserver is not provided until workspace E2EE lands (#249; see [`docs/architecture.md`](architecture.md)).
+- **Confidentiality:** Remote exec is **Ed25519-signed** for integrity and authenticity, and the receiver authorizes it (verify → trust store → deny-by-default policy → optional verified-device and approval gates). Workspace rooms are **unencrypted by default** (see [`workspace create`](#mx-agent-workspace-create)), so the command line, stdin, and captured output transit as cleartext Matrix timeline events **readable by the homeserver operator**. Pass `--e2ee on` when creating the workspace to make it born encrypted (Megolm v1) — in an encrypted workspace, traffic is opaque to the homeserver. Encryption is a transport property only; signing + trust + policy + approval remain the execution gate. For real confidentiality pair `--e2ee on` with device verification and key backup.
 - **Restart durability:** a command held for approval survives a daemon restart — the approval queue is persisted (`approvals.json`). In-flight output of a running command is not guaranteed to survive a restart.
 - **Policy enforcement:** Remote exec checks `policy.toml` (`allow_commands` glob and `deny_args_regex`), optional verified-device gates, and optional approval before spawning.
 - **Stdin detection:** In non-PTY mode, stdin is auto-detected from `IsTerminal`; piped input is buffered and forwarded automatically. The `--stdin` flag is reserved for future use.
@@ -1332,7 +1337,7 @@ echo '{"status":"complete"}' | mx-agent share file --room '#work:example.com' --
 **Notes**
 
 - Payloads over 256 KiB are automatically offloaded to Matrix media (mxc://) to avoid bloating room state.
-- Shares transit an **unencrypted** workspace room in this alpha and are readable by the homeserver operator; room-wide E2EE is tracked by #249 (see [`docs/architecture.md`](architecture.md)). Payloads are integrity-checked via their recorded SHA-256 digest.
+- Shares transit an **unencrypted** workspace room unless the workspace was created with `--e2ee on`; without encryption, shares are readable by the homeserver operator. Payloads are integrity-checked via their recorded SHA-256 digest regardless of encryption state.
 - The context_id is sortable (ulid format, e.g. `ctx_01HZ...`) and can be used with `share get` to retrieve the artifact later.
 
 ---

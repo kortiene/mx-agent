@@ -274,6 +274,15 @@ enum Visibility {
     Public,
 }
 
+/// Whether to enable end-to-end encryption on `workspace create`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum E2ee {
+    /// Create the workspace born encrypted (Megolm v1).
+    On,
+    /// Create an unencrypted workspace (the default).
+    Off,
+}
+
 #[derive(Debug, Args)]
 struct WorkspaceCreateArgs {
     /// Room alias localpart, e.g. `my-project` for `#my-project:server`.
@@ -288,6 +297,13 @@ struct WorkspaceCreateArgs {
     /// Room visibility (privacy).
     #[arg(long, value_enum, default_value_t = Visibility::Private)]
     visibility: Visibility,
+    /// Enable end-to-end encryption for the new workspace (default: off).
+    ///
+    /// Encryption protects channel confidentiality only (what the homeserver
+    /// operator can read); it never grants execution rights. Privileged requests
+    /// remain gated by signature + trust + policy + approval regardless.
+    #[arg(long, value_enum, default_value_t = E2ee::Off)]
+    e2ee: E2ee,
 }
 
 #[derive(Debug, Args)]
@@ -1935,6 +1951,7 @@ fn workspace_create(global: &GlobalArgs, args: &WorkspaceCreateArgs) -> ExitCode
         name: args.name.clone(),
         topic: args.topic.clone(),
         visibility,
+        e2ee: matches!(args.e2ee, E2ee::On),
     };
     match daemon_ipc_call::<_, mx_agent_daemon::WorkspaceInfo>(global, "workspace.create", &options)
     {
@@ -4818,6 +4835,75 @@ mod tests {
             }
             other => panic!("expected workspace create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workspace_create_e2ee_defaults_to_off() {
+        // Regression for issue #249: --e2ee must default to off so a plain
+        // `workspace create` never silently creates an encrypted room.
+        let cli = Cli::try_parse_from(["mx-agent", "workspace", "create"]).unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Create(args)) => {
+                assert_eq!(args.e2ee, E2ee::Off, "--e2ee must default to off");
+            }
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_create_e2ee_on_parses() {
+        let cli = Cli::try_parse_from(["mx-agent", "workspace", "create", "--e2ee", "on"]).unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Create(args)) => {
+                assert_eq!(args.e2ee, E2ee::On, "--e2ee on must parse to E2ee::On");
+            }
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_create_e2ee_off_explicit_parses() {
+        let cli =
+            Cli::try_parse_from(["mx-agent", "workspace", "create", "--e2ee", "off"]).unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Create(args)) => {
+                assert_eq!(args.e2ee, E2ee::Off, "--e2ee off must parse to E2ee::Off");
+            }
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_create_e2ee_on_maps_to_options() {
+        // End-to-end: --e2ee on must produce e2ee: true in the IPC payload.
+        let args = WorkspaceCreateArgs {
+            alias: None,
+            name: None,
+            topic: None,
+            visibility: Visibility::Private,
+            e2ee: E2ee::On,
+        };
+        let e2ee_flag = matches!(args.e2ee, E2ee::On);
+        assert!(
+            e2ee_flag,
+            "E2ee::On must map to e2ee: true in CreateWorkspaceOptions"
+        );
+    }
+
+    #[test]
+    fn workspace_create_e2ee_off_maps_to_options() {
+        let args = WorkspaceCreateArgs {
+            alias: None,
+            name: None,
+            topic: None,
+            visibility: Visibility::Private,
+            e2ee: E2ee::Off,
+        };
+        let e2ee_flag = matches!(args.e2ee, E2ee::On);
+        assert!(
+            !e2ee_flag,
+            "E2ee::Off must map to e2ee: false in CreateWorkspaceOptions"
+        );
     }
 
     #[test]

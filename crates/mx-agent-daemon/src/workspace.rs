@@ -21,7 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::api::client::room::{create_room, Visibility};
-use matrix_sdk::ruma::events::StateEventType;
+use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
+use matrix_sdk::ruma::events::{InitialStateEvent, StateEventType};
 use matrix_sdk::ruma::{OwnedRoomId, RoomOrAliasId};
 use matrix_sdk::{Client, Room, RoomMemberships};
 use mx_agent_protocol::events::state::WORKSPACE as WORKSPACE_STATE_TYPE;
@@ -68,6 +69,22 @@ pub struct CreateWorkspaceOptions {
     pub topic: Option<String>,
     /// Room visibility (defaults to private for workspaces).
     pub visibility: WorkspaceVisibility,
+    /// Enable end-to-end encryption on the created room (default: `false`).
+    ///
+    /// When `true`, the room is born encrypted: an `m.room.encryption` (Megolm
+    /// v1) state event is included in the room's `initial_state` so the room is
+    /// encrypted from its first event, with no unencrypted window.
+    ///
+    /// Marked `#[serde(default)]` so an older CLI that omits the field over IPC
+    /// still deserializes (defaulting to off, preserving prior behavior).
+    ///
+    /// Encryption is a transport/confidentiality property only: it changes who
+    /// the homeserver operator can read, never who may cause execution. Room
+    /// membership, device presence, and room encryption never substitute for the
+    /// Ed25519 signature + local trust + deny-by-default policy + optional
+    /// approval that gate privileged requests (architecture §1.2).
+    #[serde(default)]
+    pub e2ee: bool,
 }
 
 impl Default for CreateWorkspaceOptions {
@@ -77,6 +94,7 @@ impl Default for CreateWorkspaceOptions {
             name: None,
             topic: None,
             visibility: WorkspaceVisibility::Private,
+            e2ee: false,
         }
     }
 }
@@ -112,6 +130,23 @@ impl WorkspaceInfo {
             encrypted: room.encryption_state().is_encrypted(),
             joined_members: room.joined_members_count(),
         }
+    }
+
+    /// Build a summary from a freshly-created [`Room`], OR-ing in the encryption
+    /// state that was *requested* at creation time.
+    ///
+    /// Immediately after `create_room` returns, the local store may not yet
+    /// reflect an `m.room.encryption` event supplied via `initial_state` (it can
+    /// lag the create response / first sync), so
+    /// [`from_room`](Self::from_room) could under-report `encrypted: false` for a
+    /// room that was in fact born encrypted. OR-ing `requested_e2ee` with the
+    /// live room state keeps the invariant that a `create --e2ee on` always
+    /// reports `encrypted: true`, while a default create still reports the room's
+    /// true state (`false`).
+    pub fn from_room_with_e2ee(room: &Room, requested_e2ee: bool) -> Self {
+        let mut info = Self::from_room(room);
+        info.encrypted = requested_e2ee || info.encrypted;
+        info
     }
 
     /// Render as a single-line JSON object.
@@ -381,15 +416,20 @@ impl From<std::io::Error> for WorkspaceError {
     }
 }
 
-/// Create a new workspace room with the given options.
+/// Build the `create_room` request for the given workspace options.
 ///
-/// The room's visibility maps to a Matrix preset: a private workspace is
-/// invite-only (`private_chat`), and a public workspace is openly joinable
-/// (`public_chat`).
-pub async fn create_workspace(
-    client: &Client,
+/// Extracted as a pure helper (no homeserver round-trip) so the room-request
+/// construction — in particular the `m.room.encryption` `initial_state` for an
+/// encrypted-on-create workspace — is unit-testable without a live Matrix
+/// server.
+///
+/// When `options.e2ee` is set, a single `m.room.encryption` (Megolm v1,
+/// recommended defaults) event is pushed into `initial_state` so the room is
+/// encrypted from event zero, with no unencrypted window — preferred over a
+/// post-create `room.enable_encryption()` (one round-trip, no unencrypted gap).
+pub(crate) fn build_create_room_request(
     options: &CreateWorkspaceOptions,
-) -> Result<WorkspaceInfo, WorkspaceError> {
+) -> create_room::v3::Request {
     let mut request = create_room::v3::Request::new();
     request.name = options.name.clone();
     request.topic = options.topic.clone();
@@ -405,11 +445,31 @@ pub async fn create_workspace(
         }
     }
 
+    if options.e2ee {
+        let content = RoomEncryptionEventContent::with_recommended_defaults();
+        request.initial_state = vec![InitialStateEvent::with_empty_state_key(content).to_raw_any()];
+    }
+
+    request
+}
+
+/// Create a new workspace room with the given options.
+///
+/// The room's visibility maps to a Matrix preset: a private workspace is
+/// invite-only (`private_chat`), and a public workspace is openly joinable
+/// (`public_chat`). With `options.e2ee` set, the room is created born encrypted
+/// (see [`build_create_room_request`]).
+pub async fn create_workspace(
+    client: &Client,
+    options: &CreateWorkspaceOptions,
+) -> Result<WorkspaceInfo, WorkspaceError> {
+    let request = build_create_room_request(options);
+
     let room = client
         .create_room(request)
         .await
         .map_err(WorkspaceError::from)?;
-    Ok(WorkspaceInfo::from_room(&room))
+    Ok(WorkspaceInfo::from_room_with_e2ee(&room, options.e2ee))
 }
 
 /// Create a workspace, restoring the authenticated client from `session`.
@@ -699,6 +759,135 @@ mod tests {
         assert!(opts.alias.is_none());
         assert!(opts.name.is_none());
         assert!(opts.topic.is_none());
+    }
+
+    #[test]
+    fn default_options_e2ee_is_false() {
+        // Regression for issue #249: workspace create must default to
+        // unencrypted and never silently enable E2EE without --e2ee on.
+        let opts = CreateWorkspaceOptions::default();
+        assert!(!opts.e2ee, "e2ee must default to false");
+    }
+
+    #[test]
+    fn create_workspace_options_ipc_compat_missing_e2ee_field() {
+        // An older CLI that doesn't send the `e2ee` field must not cause an
+        // IPC deserialization error, and the field must default to false.
+        let json = r#"{"alias":null,"name":null,"topic":null,"visibility":"private"}"#;
+        let opts: CreateWorkspaceOptions =
+            serde_json::from_str(json).expect("older IPC payload without e2ee must deserialize");
+        assert!(!opts.e2ee, "missing e2ee field must default to false");
+    }
+
+    // --- build_create_room_request unit tests --------------------------------
+
+    #[test]
+    fn build_create_room_request_no_e2ee_has_empty_initial_state() {
+        let opts = CreateWorkspaceOptions {
+            e2ee: false,
+            ..Default::default()
+        };
+        let req = build_create_room_request(&opts);
+        assert!(
+            req.initial_state.is_empty(),
+            "default (no e2ee) must not inject any initial_state events"
+        );
+    }
+
+    #[test]
+    fn build_create_room_request_e2ee_on_has_encryption_event() {
+        let opts = CreateWorkspaceOptions {
+            e2ee: true,
+            ..Default::default()
+        };
+        let req = build_create_room_request(&opts);
+        assert_eq!(
+            req.initial_state.len(),
+            1,
+            "e2ee=true must inject exactly one initial_state event"
+        );
+        let event_type = req.initial_state[0]
+            .get_field::<String>("type")
+            .expect("get_field must not err")
+            .expect("type field must be present");
+        assert_eq!(
+            event_type, "m.room.encryption",
+            "initial_state event must be m.room.encryption"
+        );
+    }
+
+    #[test]
+    fn build_create_room_request_private_sets_private_preset() {
+        let opts = CreateWorkspaceOptions {
+            visibility: WorkspaceVisibility::Private,
+            ..Default::default()
+        };
+        let req = build_create_room_request(&opts);
+        assert_eq!(req.visibility, Visibility::Private);
+        assert_eq!(req.preset, Some(create_room::v3::RoomPreset::PrivateChat));
+    }
+
+    #[test]
+    fn build_create_room_request_public_sets_public_preset() {
+        let opts = CreateWorkspaceOptions {
+            visibility: WorkspaceVisibility::Public,
+            ..Default::default()
+        };
+        let req = build_create_room_request(&opts);
+        assert_eq!(req.visibility, Visibility::Public);
+        assert_eq!(req.preset, Some(create_room::v3::RoomPreset::PublicChat));
+    }
+
+    #[test]
+    fn build_create_room_request_metadata_passthrough() {
+        let opts = CreateWorkspaceOptions {
+            alias: Some("my-project".to_string()),
+            name: Some("My Project".to_string()),
+            topic: Some("Build stuff".to_string()),
+            visibility: WorkspaceVisibility::Private,
+            e2ee: false,
+        };
+        let req = build_create_room_request(&opts);
+        assert_eq!(req.room_alias_name.as_deref(), Some("my-project"));
+        assert_eq!(req.name.as_deref(), Some("My Project"));
+        assert_eq!(req.topic.as_deref(), Some("Build stuff"));
+    }
+
+    #[test]
+    fn build_create_room_request_e2ee_and_public_combined() {
+        // Combining e2ee + public visibility must produce both a PublicChat
+        // preset and the encryption initial_state event.
+        let opts = CreateWorkspaceOptions {
+            visibility: WorkspaceVisibility::Public,
+            e2ee: true,
+            ..Default::default()
+        };
+        let req = build_create_room_request(&opts);
+        assert_eq!(req.preset, Some(create_room::v3::RoomPreset::PublicChat));
+        assert_eq!(req.initial_state.len(), 1);
+        let event_type = req.initial_state[0]
+            .get_field::<String>("type")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event_type, "m.room.encryption");
+    }
+
+    #[test]
+    fn workspace_info_encrypted_false_serializes() {
+        // Regression for issue #249: a default (unencrypted) workspace create
+        // must report `encrypted: false` in both human and JSON output, not true.
+        let info = WorkspaceInfo {
+            room_id: "!abc:matrix.org".to_string(),
+            canonical_alias: None,
+            name: None,
+            topic: None,
+            encrypted: false,
+            joined_members: 1,
+        };
+        let json = info.to_json();
+        assert!(json.contains("\"encrypted\":false"), "{json}");
+        let back: WorkspaceInfo = serde_json::from_str(&json).unwrap();
+        assert!(!back.encrypted);
     }
 
     #[test]
