@@ -60,7 +60,7 @@ use crate::stream::{
     capture_child_output, CaptureLimiter, CaptureSummary, OutputCaps, StreamCaptureConfig,
 };
 use crate::trust::TrustStore;
-use crate::workspace::WorkspaceError;
+use crate::workspace::{send_workspace_state, WorkspaceError};
 
 type StdinFrame = Option<Vec<u8>>;
 
@@ -481,9 +481,7 @@ pub async fn publish_invocation_state(
 ) -> Result<(), WorkspaceError> {
     let content = serde_json::to_value(state)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
-    room.send_state_event_raw(INVOCATION, &state.invocation_id, content)
-        .await
-        .map_err(WorkspaceError::from)?;
+    send_workspace_state(room, INVOCATION, &state.invocation_id, content).await?;
     Ok(())
 }
 

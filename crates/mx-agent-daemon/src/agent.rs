@@ -26,7 +26,9 @@ use crate::matrix::restore_client;
 use crate::session::{SessionPaths, StoredSession};
 use crate::signing::load_or_create_signing_key;
 use crate::tools::ToolRegistry;
-use crate::workspace::{git_output, parse_room_or_alias, resolve_room_id, WorkspaceError};
+use crate::workspace::{
+    git_output, parse_room_or_alias, resolve_room_id, send_workspace_state, WorkspaceError,
+};
 
 /// Default agent kind used when the caller does not specify one.
 pub const DEFAULT_AGENT_KIND: &str = "generic";
@@ -161,9 +163,7 @@ pub async fn register_agent(
 
     let content = serde_json::to_value(&state)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
-    room.send_state_event_raw(AGENT_STATE_TYPE, &agent_id, content)
-        .await
-        .map_err(WorkspaceError::from)?;
+    send_workspace_state(&room, AGENT_STATE_TYPE, &agent_id, content).await?;
 
     Ok(state)
 }

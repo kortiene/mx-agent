@@ -21,9 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::api::client::room::{create_room, Visibility};
+use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
 use matrix_sdk::ruma::events::{InitialStateEvent, StateEventType};
-use matrix_sdk::ruma::{OwnedRoomId, RoomOrAliasId};
+use matrix_sdk::ruma::serde::Raw;
+use matrix_sdk::ruma::{Int, OwnedRoomId, RoomOrAliasId, UserId};
 use matrix_sdk::{Client, Room, RoomMemberships};
 use mx_agent_protocol::events::state::WORKSPACE as WORKSPACE_STATE_TYPE;
 use mx_agent_protocol::schema::{RepoInfo, WorkspaceState};
@@ -31,6 +33,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::matrix::{restore_client, LoginError};
 use crate::session::StoredSession;
+
+/// Power level a workspace member needs to publish any `com.mxagent.*` **state**
+/// event (`agent` / `task` / `invocation` / `trust` / `workspace` / `tool`).
+///
+/// A freshly created workspace pins every `com.mxagent.*` state type to this
+/// level (see [`build_create_room_request`]). The room creator (Matrix default
+/// power level 100) grants it to each participating daemon via
+/// [`grant_workspace`]; a plain member stays at power level 0 and is refused on
+/// every `com.mxagent.*` state write. Power levels are a Matrix transport /
+/// integrity property only — they never gate execution, which remains governed
+/// by the Ed25519 signature + local trust + deny-by-default policy + approval
+/// chain (architecture §1.2 / §14).
+pub const WORKSPACE_AGENT_PL: i64 = 50;
+
+/// Power level required to change *native* room state (name, topic, encryption,
+/// the power levels themselves).
+///
+/// Pinned to the creator (power level 100) so a granted agent at
+/// [`WORKSPACE_AGENT_PL`] can write `com.mxagent.*` state but cannot rewrite the
+/// room's own metadata or re-grant power. The explicit per-event-type entries in
+/// the power-level override are what let granted agents write `com.mxagent.*`
+/// state despite this tighter `state_default`.
+pub(crate) const WORKSPACE_STATE_DEFAULT_PL: i64 = 100;
+
+/// Compile-time guard: a granted agent (PL 50) must not meet the threshold for
+/// native room-state writes (PL 100). If either constant drifts to break this,
+/// the build fails before the misconfiguration ships.
+const _: () = assert!(
+    WORKSPACE_STATE_DEFAULT_PL > WORKSPACE_AGENT_PL,
+    "state_default must exceed WORKSPACE_AGENT_PL"
+);
 
 /// Visibility (privacy) of a workspace room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +319,21 @@ pub enum WorkspaceError {
     /// A stream artifact could not be retrieved or decompressed (invalid
     /// `mxc://` URI, or zstd decompression failed/unavailable).
     ArtifactRetrievalFailed(String),
+    /// The daemon's Matrix user lacks the workspace power level required to write
+    /// this `com.mxagent.*` state event (architecture §9.4 / §14).
+    ///
+    /// Surfaced in place of a raw Matrix `M_FORBIDDEN` 403 so the operator learns
+    /// that the agent is below the workspace "agent" power level and how to obtain
+    /// it (`mx-agent workspace grant`). Carries only non-secret metadata — room
+    /// ID, event type, and the required power level — never tokens or signatures.
+    WorkspaceForbidden {
+        /// Room the state write was refused in.
+        room_id: String,
+        /// `com.mxagent.*` state event type that was refused.
+        event_type: String,
+        /// Power level the daemon's Matrix user must hold to perform the write.
+        required_pl: i64,
+    },
     /// Restoring the authenticated Matrix client from the session failed.
     Restore(Box<LoginError>),
     /// An underlying Matrix request failed.
@@ -380,6 +428,17 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::ArtifactRetrievalFailed(value) => {
                 write!(f, "could not retrieve artifact: {value}")
             }
+            WorkspaceError::WorkspaceForbidden {
+                room_id,
+                event_type,
+                required_pl,
+            } => write!(
+                f,
+                "the daemon's Matrix user lacks the power level (>= {required_pl}) required to \
+                 write {event_type:?} state in room {room_id:?}; ask the workspace creator to \
+                 grant it with `mx-agent workspace grant --room {room_id} --user <this agent's \
+                 @mxid>`"
+            ),
             WorkspaceError::Restore(e) => write!(f, "{e}"),
             WorkspaceError::Matrix(e) => write!(f, "Matrix request failed: {e}"),
             WorkspaceError::Io(e) => write!(f, "local file operation failed: {e}"),
@@ -427,6 +486,12 @@ impl From<std::io::Error> for WorkspaceError {
 /// recommended defaults) event is pushed into `initial_state` so the room is
 /// encrypted from event zero, with no unencrypted window — preferred over a
 /// post-create `room.enable_encryption()` (one round-trip, no unencrypted gap).
+///
+/// The request also carries a `power_level_content_override` (see
+/// [`build_power_level_override`]) so a granted non-creator daemon can publish
+/// `com.mxagent.*` state — multi-agent workspaces are otherwise broken out of
+/// the box, since Matrix defaults require power level 50 (`state_default`) for
+/// any state write and every joiner starts at power level 0.
 pub(crate) fn build_create_room_request(
     options: &CreateWorkspaceOptions,
 ) -> create_room::v3::Request {
@@ -450,7 +515,92 @@ pub(crate) fn build_create_room_request(
         request.initial_state = vec![InitialStateEvent::with_empty_state_key(content).to_raw_any()];
     }
 
+    request.power_level_content_override = Some(build_power_level_override());
+
     request
+}
+
+/// Build the `power_level_content_override` provisioned on every workspace room.
+///
+/// The override is overlaid on the homeserver's *default* power-levels content,
+/// so it deliberately **omits the `users` map**: that preserves the default
+/// `users: { <creator>: 100 }`, keeping the creator at power level 100 without
+/// [`build_create_room_request`] needing to know the creator's Matrix ID (which
+/// keeps the function pure and unit-testable). Setting `users` here would
+/// *replace* the default map and could lock the creator out.
+///
+/// It sets:
+///
+/// * `events`: every `com.mxagent.*` **state** type
+///   ([`mx_agent_protocol::events::state::ALL`]) pinned to [`WORKSPACE_AGENT_PL`]
+///   (50), so a granted agent at power level 50 may write them and a plain member
+///   (power level 0) is refused. Iterating `state::ALL` keeps the set from
+///   drifting from the protocol's state namespace.
+/// * `state_default`: [`WORKSPACE_STATE_DEFAULT_PL`] (100), so changing *native*
+///   room state (name / topic / encryption / power levels) stays creator-only;
+///   the explicit `events` entries above are what let granted agents still write
+///   `com.mxagent.*` state.
+/// * `users_default` / `events_default`: re-affirmed at 0 (timeline events of
+///   every other type remain sendable by any member, exactly as the Matrix
+///   default — mx-agent timeline events are signed and verified independently).
+fn build_power_level_override() -> Raw<create_room::RoomPowerLevelsContentOverride> {
+    let mut events = serde_json::Map::new();
+    for ty in mx_agent_protocol::events::state::ALL {
+        events.insert((*ty).to_string(), serde_json::json!(WORKSPACE_AGENT_PL));
+    }
+    let content = serde_json::json!({
+        "users_default": 0,
+        "events_default": 0,
+        "state_default": WORKSPACE_STATE_DEFAULT_PL,
+        "events": serde_json::Value::Object(events),
+    });
+    // The shape is a fixed set of integers and string keys, so serialization
+    // cannot fail; `cast_unchecked` only retypes the JSON wrapper.
+    Raw::new(&content)
+        .expect("static power-level override always serializes")
+        .cast_unchecked()
+}
+
+/// Map a Matrix error from a `com.mxagent.*` state write into a guided
+/// [`WorkspaceError`].
+///
+/// A homeserver `M_FORBIDDEN` (the caller's Matrix user is below
+/// [`WORKSPACE_AGENT_PL`] for `event_type`) becomes
+/// [`WorkspaceError::WorkspaceForbidden`], which explains how to obtain the
+/// power level; any other error passes through as
+/// [`WorkspaceError::Matrix`]. Carries only non-secret metadata.
+pub(crate) fn map_state_write_error(
+    room_id: &str,
+    event_type: &str,
+    err: matrix_sdk::Error,
+) -> WorkspaceError {
+    if matches!(err.client_api_error_kind(), Some(ErrorKind::Forbidden)) {
+        WorkspaceError::WorkspaceForbidden {
+            room_id: room_id.to_string(),
+            event_type: event_type.to_string(),
+            required_pl: WORKSPACE_AGENT_PL,
+        }
+    } else {
+        WorkspaceError::from(err)
+    }
+}
+
+/// Publish a `com.mxagent.*` state event, turning an `M_FORBIDDEN` 403 into a
+/// guided [`WorkspaceError::WorkspaceForbidden`].
+///
+/// Every `com.mxagent.*` state write in the daemon routes through here so a
+/// missing workspace power level surfaces uniformly (with the room, event type,
+/// and required power level) instead of a raw Matrix 403.
+pub(crate) async fn send_workspace_state(
+    room: &Room,
+    event_type: &str,
+    state_key: &str,
+    content: serde_json::Value,
+) -> Result<(), WorkspaceError> {
+    room.send_state_event_raw(event_type, state_key, content)
+        .await
+        .map_err(|e| map_state_write_error(room.room_id().as_str(), event_type, e))?;
+    Ok(())
 }
 
 /// Create a new workspace room with the given options.
@@ -645,9 +795,7 @@ pub async fn attach_workspace(
 
     let content = serde_json::to_value(&state)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
-    room.send_state_event_raw(WORKSPACE_STATE_TYPE, "", content)
-        .await
-        .map_err(WorkspaceError::from)?;
+    send_workspace_state(&room, WORKSPACE_STATE_TYPE, "", content).await?;
 
     Ok(state)
 }
@@ -659,6 +807,94 @@ pub async fn attach_workspace_for_session(
 ) -> Result<WorkspaceState, WorkspaceError> {
     let client = restore_client(session).await?;
     attach_workspace(&client, options).await
+}
+
+/// Options for [`grant_workspace`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GrantWorkspaceOptions {
+    /// Room ID or alias to grant power in.
+    pub room: String,
+    /// Matrix user ID (`@name:server`) to elevate to the workspace agent role.
+    pub user: String,
+    /// Power level to grant. Defaults to [`WORKSPACE_AGENT_PL`] (50) when `None`;
+    /// pass `Some(0)` to revoke a prior grant.
+    #[serde(default)]
+    pub level: Option<i64>,
+}
+
+/// A non-sensitive summary of a [`grant_workspace`] result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGrant {
+    /// Canonical room ID the grant was applied in.
+    pub room_id: String,
+    /// Matrix user ID that was granted (or revoked).
+    pub user: String,
+    /// Power level the user now holds for `com.mxagent.*` state.
+    pub level: i64,
+}
+
+impl WorkspaceGrant {
+    /// Render as a single-line JSON object.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Grant a Matrix user the workspace power level needed to publish
+/// `com.mxagent.*` state.
+///
+/// **Creator-only.** A joiner starts at power level 0 and cannot modify
+/// `m.room.power_levels`, so elevation must be performed by a member who already
+/// holds enough power (the room creator at power level 100). The homeserver
+/// enforces this; a caller below that level is surfaced as a guided
+/// [`WorkspaceError::WorkspaceForbidden`]. This is the production replacement for
+/// hand-written `m.room.power_levels` grants.
+///
+/// The level defaults to [`WORKSPACE_AGENT_PL`] (50); pass `level: Some(0)` to
+/// revoke a prior grant. Power levels are a Matrix integrity property only and
+/// never gate execution (architecture §14).
+pub async fn grant_workspace(
+    client: &Client,
+    options: &GrantWorkspaceOptions,
+) -> Result<WorkspaceGrant, WorkspaceError> {
+    let level = options.level.unwrap_or(WORKSPACE_AGENT_PL);
+    let int_level = Int::new(level).ok_or_else(|| {
+        WorkspaceError::InvalidTarget(format!("power level {level} is out of range"))
+    })?;
+    let user_id = UserId::parse(&options.user)
+        .map_err(|_| WorkspaceError::InvalidTarget(options.user.clone()))?;
+
+    let id = parse_room_or_alias(&options.room)?;
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .map_err(WorkspaceError::from)?;
+    let room_id = resolve_room_id(client, &id).await?;
+    let room = client
+        .get_room(&room_id)
+        .ok_or_else(|| WorkspaceError::RoomNotFound(options.room.clone()))?;
+
+    // Read-modify-write of `m.room.power_levels` (the SDK fetches the current
+    // content, sets the user's level, and re-sends). A caller below power level
+    // 100 is refused by the homeserver and surfaced as the guided error.
+    room.update_power_levels(vec![(&*user_id, int_level)])
+        .await
+        .map_err(|e| map_state_write_error(room.room_id().as_str(), "m.room.power_levels", e))?;
+
+    Ok(WorkspaceGrant {
+        room_id: room.room_id().to_string(),
+        user: user_id.to_string(),
+        level,
+    })
+}
+
+/// Grant workspace power, restoring the authenticated client from `session`.
+pub async fn grant_workspace_for_session(
+    session: &StoredSession,
+    options: &GrantWorkspaceOptions,
+) -> Result<WorkspaceGrant, WorkspaceError> {
+    let client = restore_client(session).await?;
+    grant_workspace(&client, options).await
 }
 
 /// Detect git repository metadata for `path`, returning `None` when `path` is
@@ -872,6 +1108,131 @@ mod tests {
         assert_eq!(event_type, "m.room.encryption");
     }
 
+    // --- power-level override (issue #301) ----------------------------------
+
+    #[test]
+    fn build_create_room_request_sets_power_level_override() {
+        use std::collections::BTreeMap;
+
+        let req = build_create_room_request(&CreateWorkspaceOptions::default());
+        let raw = req
+            .power_level_content_override
+            .as_ref()
+            .expect("every workspace room must provision a power_level_content_override");
+
+        // Every `com.mxagent.*` state type is pinned to the agent power level so
+        // a granted agent (PL 50) may write it and a plain member (PL 0) cannot.
+        // Driving the assertion off `state::ALL` keeps it from drifting.
+        let events: BTreeMap<String, i64> = raw
+            .get_field("events")
+            .expect("events field must deserialize")
+            .expect("override must carry an events map");
+        for ty in mx_agent_protocol::events::state::ALL {
+            assert_eq!(
+                events.get(*ty),
+                Some(&WORKSPACE_AGENT_PL),
+                "state type {ty} must require power level {WORKSPACE_AGENT_PL}"
+            );
+        }
+        assert_eq!(
+            events.len(),
+            mx_agent_protocol::events::state::ALL.len(),
+            "events map must contain exactly the com.mxagent.* state types"
+        );
+
+        let users_default: i64 = raw.get_field("users_default").unwrap().unwrap();
+        let events_default: i64 = raw.get_field("events_default").unwrap().unwrap();
+        let state_default: i64 = raw.get_field("state_default").unwrap().unwrap();
+        assert_eq!(users_default, 0, "joiners must default to power level 0");
+        assert_eq!(
+            events_default, 0,
+            "timeline events stay sendable by any member"
+        );
+        assert_eq!(
+            state_default, WORKSPACE_STATE_DEFAULT_PL,
+            "native room state must stay creator-only"
+        );
+
+        // The override must omit `users` so the homeserver preserves the default
+        // `users: {<creator>: 100}` and never locks the creator out.
+        let users: Option<BTreeMap<String, i64>> = raw.get_field("users").unwrap();
+        assert!(users.is_none(), "override must not set a users map");
+    }
+
+    #[test]
+    fn build_create_room_request_e2ee_keeps_power_level_override() {
+        // An encrypted-on-create room must carry BOTH the encryption
+        // initial_state event and the power-level override.
+        let opts = CreateWorkspaceOptions {
+            e2ee: true,
+            ..Default::default()
+        };
+        let req = build_create_room_request(&opts);
+        assert_eq!(
+            req.initial_state.len(),
+            1,
+            "encryption initial_state present"
+        );
+        assert!(
+            req.power_level_content_override.is_some(),
+            "e2ee create must still provision the power-level override"
+        );
+    }
+
+    #[test]
+    fn workspace_forbidden_display_is_guided_and_secret_free() {
+        let err = WorkspaceError::WorkspaceForbidden {
+            room_id: "!abc:server".to_string(),
+            event_type: "com.mxagent.agent.v1".to_string(),
+            required_pl: WORKSPACE_AGENT_PL,
+        };
+        let msg = err.to_string();
+        // Names the room, the event type, the required power level, and the
+        // grant command so the operator knows how to recover.
+        assert!(msg.contains("!abc:server"), "{msg}");
+        assert!(msg.contains("com.mxagent.agent.v1"), "{msg}");
+        assert!(msg.contains(">= 50"), "{msg}");
+        assert!(msg.contains("workspace grant"), "{msg}");
+        // Carries no secret-shaped material.
+        let lower = msg.to_lowercase();
+        for needle in [
+            "token",
+            "syt_",
+            "signature",
+            "password",
+            "device_key",
+            "ed25519",
+        ] {
+            assert!(
+                !lower.contains(needle),
+                "guided error leaked {needle:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_workspace_options_level_defaults_to_none() {
+        // An older CLI that omits `level` must still deserialize, defaulting to
+        // None (the daemon then applies WORKSPACE_AGENT_PL).
+        let opts: GrantWorkspaceOptions =
+            serde_json::from_str(r#"{"room":"!abc:server","user":"@bob:server"}"#)
+                .expect("grant params without level must deserialize");
+        assert!(opts.level.is_none());
+    }
+
+    #[test]
+    fn workspace_grant_json_round_trips() {
+        let grant = WorkspaceGrant {
+            room_id: "!abc:server".to_string(),
+            user: "@bob:server".to_string(),
+            level: WORKSPACE_AGENT_PL,
+        };
+        let json = grant.to_json();
+        assert!(json.contains("\"level\":50"), "{json}");
+        let back: WorkspaceGrant = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, grant);
+    }
+
     #[test]
     fn workspace_info_encrypted_false_serializes() {
         // Regression for issue #249: a default (unencrypted) workspace create
@@ -999,5 +1360,116 @@ mod tests {
         assert_eq!(membership_label(&MembershipState::Join), "join");
         assert_eq!(membership_label(&MembershipState::Invite), "invite");
         assert_eq!(membership_label(&MembershipState::Leave), "leave");
+    }
+
+    // --- power-level constant pinning (issue #301) ----------------------------
+
+    #[test]
+    fn workspace_agent_pl_is_50() {
+        // Pin the literal value so a future change to the constant is caught by
+        // tests before it silently breaks multi-agent workspaces or PL grant
+        // CLI output.
+        assert_eq!(WORKSPACE_AGENT_PL, 50);
+    }
+
+    #[test]
+    fn workspace_state_default_pl_is_100() {
+        // Native room state (name, topic, power levels) must require the
+        // creator-level PL (100), so a granted agent at PL 50 cannot
+        // re-grant power or rename the room.
+        assert_eq!(WORKSPACE_STATE_DEFAULT_PL, 100);
+    }
+
+    // --- map_state_write_error unit tests (issue #301) -----------------------
+
+    #[test]
+    fn map_state_write_error_non_forbidden_becomes_matrix_variant() {
+        // A Matrix SDK error that is NOT M_FORBIDDEN must pass through as
+        // WorkspaceError::Matrix, not be misclassified as WorkspaceForbidden.
+        // Uses the SerdeJson variant (no client_api_error_kind) as a proxy for
+        // any non-HTTP-403 error.
+        let serde_err = serde_json::from_str::<serde_json::Value>("!!!invalid").unwrap_err();
+        let sdk_err = matrix_sdk::Error::SerdeJson(serde_err);
+        let result = map_state_write_error("!room:server", "com.mxagent.agent.v1", sdk_err);
+        assert!(
+            matches!(result, WorkspaceError::Matrix(_)),
+            "non-forbidden Matrix error must remain WorkspaceError::Matrix, got: {result}"
+        );
+    }
+
+    // --- GrantWorkspaceOptions unit tests (issue #301) -----------------------
+
+    #[test]
+    fn grant_workspace_options_explicit_level_round_trips() {
+        // An explicit non-default level must survive serialization so the CLI
+        // can request a specific power level (e.g. for downgrade scenarios).
+        let json = r#"{"room":"!abc:server","user":"@bob:server","level":75}"#;
+        let opts: GrantWorkspaceOptions =
+            serde_json::from_str(json).expect("explicit level must deserialize");
+        assert_eq!(opts.level, Some(75));
+        let back = serde_json::to_string(&opts).expect("must serialize");
+        assert!(back.contains("\"level\":75"), "{back}");
+    }
+
+    #[test]
+    fn grant_workspace_options_revoke_via_level_zero() {
+        // level 0 is the revocation path: the user's PL is lowered to the
+        // default (PL 0), and they can no longer write com.mxagent.* state.
+        // Must not be conflated with None (= use WORKSPACE_AGENT_PL).
+        let json = r#"{"room":"!abc:server","user":"@bob:server","level":0}"#;
+        let opts: GrantWorkspaceOptions =
+            serde_json::from_str(json).expect("level 0 (revoke) must deserialize");
+        assert_eq!(opts.level, Some(0), "level 0 must be Some(0), not None");
+    }
+
+    #[test]
+    fn grant_workspace_options_none_level_resolves_to_agent_pl() {
+        // When `level` is absent, the daemon uses WORKSPACE_AGENT_PL so the
+        // default grant gives exactly the permissions needed for com.mxagent.*
+        // state writes and nothing more.
+        let opts = GrantWorkspaceOptions {
+            room: "!abc:server".to_string(),
+            user: "@bob:server".to_string(),
+            level: None,
+        };
+        let effective = opts.level.unwrap_or(WORKSPACE_AGENT_PL);
+        assert_eq!(effective, WORKSPACE_AGENT_PL);
+        assert_eq!(effective, 50, "default grant level must be exactly 50");
+    }
+
+    // --- WorkspaceForbidden display for all state types (issue #301) ---------
+
+    #[test]
+    fn workspace_forbidden_display_for_all_state_types() {
+        // The guided error must name the problematic event type for each of
+        // the six com.mxagent.* state types, not just com.mxagent.agent.v1.
+        // Iterating state::ALL keeps this in sync with protocol additions.
+        for &ty in mx_agent_protocol::events::state::ALL {
+            let err = WorkspaceError::WorkspaceForbidden {
+                room_id: "!r:example.com".to_string(),
+                event_type: ty.to_string(),
+                required_pl: WORKSPACE_AGENT_PL,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(ty),
+                "error for {ty} must name the event type: {msg}"
+            );
+            assert!(
+                msg.contains(">= 50"),
+                "error for {ty} must show required power level: {msg}"
+            );
+            assert!(
+                msg.contains("workspace grant"),
+                "error for {ty} must reference the grant command: {msg}"
+            );
+            // Must carry no secret-shaped material regardless of event type.
+            for needle in ["token", "syt_", "signature", "password", "ed25519"] {
+                assert!(
+                    !msg.to_lowercase().contains(needle),
+                    "error for {ty} must not leak {needle:?}: {msg}"
+                );
+            }
+        }
     }
 }

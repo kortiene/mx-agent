@@ -26,6 +26,7 @@ one, **what the safe default is and which options weaken it**.
 
 - [Threat model in one paragraph](#threat-model-in-one-paragraph)
 - [Safe defaults at a glance](#safe-defaults-at-a-glance)
+- [Workspace power levels (state-write integrity)](#workspace-power-levels-state-write-integrity)
 - [Token isolation model](#token-isolation-model)
 - [Trust bootstrap](#trust-bootstrap)
 - [Policy examples](#policy-examples)
@@ -59,9 +60,39 @@ doing that deliberately rather than by accident.
 | Environment | allowlist of 13 benign vars; secrets always scrubbed | large `env_allowlist` |
 | Token / key files | `0600`, dirs `0700` | loosening file modes |
 | IPC socket | `0600`, peer-UID checked | exposing the socket directory |
+| Workspace power levels | per-event-type PL 50, `state_default` 100, joiners PL 0 | lowering `state_default`, or a wide `events_default` |
 
 The single most important fact: **with no `policy.toml`, the engine denies every
 `exec` and `call`.** You opt into risk explicitly, never by omission.
+
+## Workspace power levels (state-write integrity)
+
+A workspace room is born with an explicit Matrix `m.room.power_levels`:
+
+- Each `com.mxagent.*` **state** type (`agent` / `task` / `invocation` / `trust`
+  / `workspace` / `tool`) requires **power level 50** to write.
+- `state_default` is **100**, so changing *native* room state (name, topic,
+  encryption, the power levels themselves) is creator-only.
+- `users_default` / `events_default` are **0**: any member may send signed
+  *timeline* events (`heartbeat`, `exec.request`, `call.request`, …), which are
+  verified independently of power levels.
+
+This yields three tiers — **creator** (PL 100), **granted agent** (PL 50, set via
+`mx-agent workspace grant`), and **member** (PL 0, refused on every
+`com.mxagent.*` state write). A plain member therefore cannot grief the room by
+overwriting another agent's `agent.v1` / `task.v1` / `invocation.v1` / `trust.v1`
+state.
+
+**Do not lower `state_default` or widen `events_default` as a shortcut.** A wide
+loosening lets any member overwrite any agent's state (an integrity/DoS hazard);
+the per-event-type grant model exists precisely so that is never necessary. Grant
+each participating daemon explicitly instead.
+
+**Power levels never gate execution.** They are a Matrix transport/integrity
+property: even a power-level-100 member cannot cause a command to run. Execution
+stays gated by the Ed25519 signature + local trust store (`key_id =
+SHA256(pubkey)`) + deny-by-default policy + sender-verified approval. Loosening
+power levels is a state-integrity decision only, never an authorization one.
 
 ## Token isolation model
 

@@ -267,6 +267,8 @@ enum WorkspaceCommand {
     Join(WorkspaceJoinArgs),
     /// Attach the current directory to a workspace.
     Attach(WorkspaceAttachArgs),
+    /// Grant a member the power level needed to publish agent state.
+    Grant(WorkspaceGrantArgs),
     /// Show workspace status.
     Status(WorkspaceStatusArgs),
 }
@@ -340,6 +342,27 @@ struct WorkspaceStatusArgs {
     /// Keep running and re-render the status as it changes (Ctrl-C to stop).
     #[arg(long)]
     watch: bool,
+}
+
+/// Arguments for `workspace grant`.
+///
+/// Must be run by the workspace **creator** (or any member whose Matrix power
+/// level is high enough to edit `m.room.power_levels`). The daemon performs the
+/// power-level write; the CLI never touches Matrix credentials. Granting power
+/// levels is a Matrix integrity property only — it never confers execution
+/// rights, which stay gated by signature + trust + policy + approval.
+#[derive(Debug, Args)]
+struct WorkspaceGrantArgs {
+    /// Room alias (`#name:server`) or room ID (`!id:server`) to grant power in.
+    #[arg(long, value_name = "ROOM")]
+    room: String,
+    /// Matrix user ID (`@name:server`) to elevate to the workspace agent role.
+    #[arg(long, value_name = "USER")]
+    user: String,
+    /// Power level to grant (default: 50, the agent role). Pass `--level 0` to
+    /// revoke a prior grant.
+    #[arg(long, value_name = "N")]
+    level: Option<i64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1927,6 +1950,7 @@ fn handle_workspace(global: &GlobalArgs, cmd: &WorkspaceCommand) -> ExitCode {
         WorkspaceCommand::Join(args) => workspace_join(global, args),
         WorkspaceCommand::Status(args) => workspace_status(global, args),
         WorkspaceCommand::Attach(args) => workspace_attach(global, args),
+        WorkspaceCommand::Grant(args) => workspace_grant(global, args),
     }
 }
 
@@ -2024,6 +2048,29 @@ fn workspace_attach(global: &GlobalArgs, args: &WorkspaceAttachArgs) -> ExitCode
                         println!("  commit:    {commit}");
                     }
                 }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+fn workspace_grant(global: &GlobalArgs, args: &WorkspaceGrantArgs) -> ExitCode {
+    let options = mx_agent_daemon::GrantWorkspaceOptions {
+        room: args.room.clone(),
+        user: args.user.clone(),
+        level: args.level,
+    };
+    match daemon_ipc_call::<_, mx_agent_daemon::WorkspaceGrant>(global, "workspace.grant", &options)
+    {
+        Ok(grant) => {
+            if global.json {
+                println!("{}", grant.to_json());
+            } else {
+                println!(
+                    "mx-agent: granted power level {} to {} in {}",
+                    grant.level, grant.user, grant.room_id
+                );
             }
             ExitCode::SUCCESS
         }
@@ -3640,6 +3687,7 @@ fn command_path(command: &Command) -> String {
                 WorkspaceCommand::Create(_) => "create",
                 WorkspaceCommand::Join(_) => "join",
                 WorkspaceCommand::Attach(_) => "attach",
+                WorkspaceCommand::Grant(_) => "grant",
                 WorkspaceCommand::Status(_) => "status",
             }
         ),
@@ -4951,6 +4999,59 @@ mod tests {
                 assert_eq!(args.room, "#proj:matrix.org");
             }
             other => panic!("expected workspace join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_grant_requires_room_and_user() {
+        // Both --room and --user are mandatory.
+        assert!(Cli::try_parse_from(["mx-agent", "workspace", "grant"]).is_err());
+        assert!(Cli::try_parse_from([
+            "mx-agent",
+            "workspace",
+            "grant",
+            "--room",
+            "!abc:matrix.org"
+        ])
+        .is_err());
+
+        // Level defaults to None (the daemon applies the agent power level).
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "workspace",
+            "grant",
+            "--room",
+            "!abc:matrix.org",
+            "--user",
+            "@bob:matrix.org",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Grant(args)) => {
+                assert_eq!(args.room, "!abc:matrix.org");
+                assert_eq!(args.user, "@bob:matrix.org");
+                assert!(args.level.is_none());
+            }
+            other => panic!("expected workspace grant, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "workspace grant");
+
+        // An explicit --level (including 0, the revoke form) is captured.
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "workspace",
+            "grant",
+            "--room",
+            "!abc:matrix.org",
+            "--user",
+            "@bob:matrix.org",
+            "--level",
+            "0",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Workspace(WorkspaceCommand::Grant(args)) => assert_eq!(args.level, Some(0)),
+            other => panic!("expected workspace grant, got {other:?}"),
         }
     }
 

@@ -28,7 +28,9 @@ use crate::invocation::{
 };
 use crate::matrix::restore_client;
 use crate::session::StoredSession;
-use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
+use crate::workspace::{
+    parse_room_or_alias, resolve_room_id, send_workspace_state, WorkspaceError,
+};
 
 /// Lifecycle state for newly proposed work not yet ready to run.
 pub const STATE_PROPOSED: &str = "proposed";
@@ -413,9 +415,7 @@ async fn publish_task_state(
 ) -> Result<(), WorkspaceError> {
     let content = serde_json::to_value(state)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
-    room.send_state_event_raw(TASK_STATE_TYPE, task_id, content)
-        .await
-        .map_err(WorkspaceError::from)?;
+    send_workspace_state(room, TASK_STATE_TYPE, task_id, content).await?;
     Ok(())
 }
 

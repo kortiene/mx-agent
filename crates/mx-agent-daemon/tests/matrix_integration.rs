@@ -102,16 +102,17 @@ use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
     build_signed_call_request_for_target, build_signed_exec_request, cancel_task_for_session,
     create_task, create_workspace, decide_approval_for_session, emit_heartbeat, get_invocation,
-    list_agents, list_pending_approvals, list_tasks, load_or_create_signing_key, load_sync_token,
-    login_password, read_latest_heartbeats, register_agent, restore_client, run_matrix_sync,
-    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, show_agent,
-    sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, BackoffConfig,
-    CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions, CreateWorkspaceOptions,
-    DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams,
-    ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent, HeartbeatConfig,
-    ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PtyWinsize,
-    RegisterAgentOptions, SasAdvance, SessionPaths, SyncHealth, SyncState, TaskDispatchMode,
-    TrustStore, WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
+    grant_workspace, list_agents, list_pending_approvals, list_tasks, load_or_create_signing_key,
+    load_sync_token, login_password, read_latest_heartbeats, register_agent, restore_client,
+    run_matrix_sync, run_matrix_sync_with_subscribers, run_scheduler_loop, save_session,
+    show_agent, sign_task_action, start_call_matrix, start_exec_matrix, AgentListing,
+    BackoffConfig, CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions,
+    CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
+    ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent,
+    GrantWorkspaceOptions, HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness,
+    LivenessConfig, MatrixConfig, PtyWinsize, RegisterAgentOptions, SasAdvance, SessionPaths,
+    SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceError, WorkspaceVisibility,
+    DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT, WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -5569,4 +5570,363 @@ async fn live_two_daemon_sas_confirms_and_verifies() {
     bob_sync.abort();
     let _ = bob_sync.await;
     std::env::remove_var(ENV_DATA_DIR);
+}
+
+/// A non-creator daemon can register and heartbeat in a workspace room provisioned
+/// by production code — issue #301.
+///
+/// Contract under test: `build_create_room_request` emits a
+/// `power_level_content_override` that pins every `com.mxagent.*` state type to
+/// power level 50 and raises `state_default` to 100 (creator-only for native room
+/// state). A non-creator daemon elevated to PL 50 via `grant_workspace` can then
+/// write `com.mxagent.agent.v1` (register) and `com.mxagent.agent.v1` (heartbeat
+/// state refresh) without hitting M_FORBIDDEN.
+///
+/// **No manual `m.room.power_levels` grant is made in this test** — the room's
+/// PL structure comes entirely from `create_workspace`. The only grant is the
+/// application-level `grant_workspace` that the creator is expected to issue in
+/// production.
+///
+/// Security: power levels are a Matrix transport/integrity property only.
+/// Granting PL 50 never implies execution permission; the Ed25519 signature +
+/// local trust + deny-by-default policy gate remains authoritative (architecture
+/// §14).
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn workspace_power_levels_non_creator_daemon_registers_and_heartbeats() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    // Each daemon gets its own data dir so signing identities don't collide.
+    let base = throwaway_data_dir();
+    let alice_dir = base.join("alice");
+    let bob_dir = base.join("bob");
+    paths_in(alice_dir.clone())
+        .ensure_data_dir()
+        .expect("create alice data dir");
+    paths_in(bob_dir.clone())
+        .ensure_data_dir()
+        .expect("create bob data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore");
+
+    // ── Step 1: Alice (creator) creates a workspace via production code ──────
+    //
+    // The public visibility lets Bob join without an invite. No manual
+    // `m.room.power_levels` grant is issued here; all PL structure comes from
+    // the `power_level_content_override` that `build_create_room_request` sets.
+    let ws_info = create_workspace(
+        &alice,
+        &CreateWorkspaceOptions {
+            name: Some("it-pl-non-creator-301".to_string()),
+            topic: None,
+            alias: None,
+            visibility: WorkspaceVisibility::Public,
+            e2ee: false,
+        },
+    )
+    .await
+    .expect("alice creates workspace via production code");
+
+    let ws_room_id: OwnedRoomId = ws_info.room_id.parse().expect("valid workspace room id");
+
+    // ── Step 2: Bob (non-creator) joins the workspace ────────────────────────
+    bob.join_room_by_id(&ws_room_id)
+        .await
+        .expect("bob joins workspace");
+
+    let alice_room = alice
+        .get_room(&ws_room_id)
+        .expect("alice sees her workspace room");
+
+    let bob_id = bob.user_id().expect("bob user id").to_owned();
+    wait_for_joined_member(&alice_room, &bob_id).await;
+
+    // ── Step 3: Alice grants Bob the workspace agent power level ─────────────
+    //
+    // In production the creator runs `mx-agent workspace grant` after inviting
+    // or after the joiner is visible. The grant issues a homeserver
+    // `m.room.power_levels` update that elevates Bob to PL 50.
+    grant_workspace(
+        &alice,
+        &GrantWorkspaceOptions {
+            room: ws_room_id.to_string(),
+            user: bob_id.to_string(),
+            level: None, // defaults to WORKSPACE_AGENT_PL (50)
+        },
+    )
+    .await
+    .expect("alice grants bob workspace agent PL");
+
+    // Sync Bob's client so it observes the updated power levels.
+    bob.sync_once(SyncSettings::default())
+        .await
+        .expect("bob syncs updated power levels");
+
+    let bob_room = bob.get_room(&ws_room_id).expect("bob sees workspace room");
+
+    // ── Step 4: Bob registers an agent — must NOT produce M_FORBIDDEN ────────
+    //
+    // `register_agent` writes a `com.mxagent.agent.v1` state event, which
+    // requires PL >= 50. Under production room setup (PL override from
+    // `build_create_room_request`) Bob at PL 50 is allowed.
+    std::env::set_var(ENV_DATA_DIR, &bob_dir);
+    let bob_agent_id = format!(
+        "bob-pl-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: ws_room_id.to_string(),
+            agent_id: Some(bob_agent_id.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["shell".to_string()],
+            tools: vec![],
+            cwd: "/tmp".to_string(),
+            project_id: "mx-agent-pl-301-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect(
+        "non-creator daemon at PL 50 must be able to register (write com.mxagent.agent.v1 state) \
+         without M_FORBIDDEN — issue #301: room was created by production code with \
+         power_level_content_override",
+    );
+
+    // ── Step 5: Bob emits a heartbeat — must NOT produce M_FORBIDDEN ─────────
+    //
+    // `emit_heartbeat` may refresh the durable `com.mxagent.agent.v1` state
+    // (another PL 50-gated write). A zero `state_refresh` forces the state
+    // path; the timeline heartbeat event (PL 0, always sendable) is the fast path.
+    let hb_cfg = HeartbeatConfig {
+        state_refresh: Duration::ZERO,
+        ..HeartbeatConfig::default()
+    };
+    emit_heartbeat(&bob_room, &bob_agent_id, "active", &hb_cfg, 0)
+        .await
+        .expect(
+            "non-creator daemon at PL 50 must be able to emit a heartbeat (write \
+             com.mxagent.agent.v1 durable state) without M_FORBIDDEN — issue #301",
+        );
+
+    // ── Step 6: confirm the registered agent is visible ──────────────────────
+    //
+    // Alice discovers Bob's agent via a standard sync. If the state write
+    // succeeded above, the agent listing must include Bob's agent ID.
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice syncs to observe bob's registration");
+    let agents = list_agents(
+        &alice,
+        &ListAgentsOptions {
+            room: ws_room_id.to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await
+    .expect("alice lists agents");
+    assert!(
+        agents.iter().any(|a| a.agent_id == bob_agent_id),
+        "alice must discover bob's registered agent after production-code workspace grant; \
+         agents found: {agents:?} — issue #301"
+    );
+
+    std::env::remove_var(ENV_DATA_DIR);
+}
+
+/// A plain workspace member (no PL grant) cannot overwrite another agent's state —
+/// issue #301 integrity guarantee.
+///
+/// Contract under test: with `state_default` raised to 100 and each
+/// `com.mxagent.*` type pinned to 50 in `power_level_content_override`, a member
+/// at PL 0 (no grant) is refused on any `com.mxagent.*` state write. The daemon
+/// surfaces this as [`WorkspaceError::WorkspaceForbidden`] with a guided message
+/// that names the room, event type, and required power level but contains no
+/// secrets (tokens, signatures).
+///
+/// Security: this guards state integrity / DoS. Without narrow per-type PLs a
+/// plain member could overwrite any agent's published state. The test confirms the
+/// refusal without weakening the execution gate (which is Ed25519 + trust, not
+/// room PLs).
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn workspace_plain_member_cannot_overwrite_agent_state() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let base = throwaway_data_dir();
+    let alice_dir = base.join("alice");
+    let bob_dir = base.join("bob");
+    paths_in(alice_dir.clone())
+        .ensure_data_dir()
+        .expect("create alice data dir");
+    paths_in(bob_dir.clone())
+        .ensure_data_dir()
+        .expect("create bob data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore");
+
+    // Alice creates a workspace with production power-level provisioning.
+    let ws_info = create_workspace(
+        &alice,
+        &CreateWorkspaceOptions {
+            name: Some("it-pl-integrity-301".to_string()),
+            topic: None,
+            alias: None,
+            visibility: WorkspaceVisibility::Public,
+            e2ee: false,
+        },
+    )
+    .await
+    .expect("alice creates workspace");
+
+    let ws_room_id: OwnedRoomId = ws_info.room_id.parse().expect("valid workspace room id");
+
+    // Alice registers her agent (PL 100 as creator — always succeeds).
+    std::env::set_var(ENV_DATA_DIR, &alice_dir);
+    let alice_agent_id = format!(
+        "alice-integrity-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: ws_room_id.to_string(),
+            agent_id: Some(alice_agent_id.clone()),
+            kind: "claude-code".to_string(),
+            capabilities: vec!["plan".to_string()],
+            tools: vec![],
+            cwd: "/tmp".to_string(),
+            project_id: "mx-agent-pl-301-integrity".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("alice registers her agent as workspace creator");
+    std::env::remove_var(ENV_DATA_DIR);
+
+    // Bob joins the workspace but is NOT granted any power level.
+    bob.join_room_by_id(&ws_room_id)
+        .await
+        .expect("bob joins workspace");
+
+    let alice_room = alice
+        .get_room(&ws_room_id)
+        .expect("alice sees her workspace room");
+    let bob_id = bob.user_id().expect("bob user id").to_owned();
+    wait_for_joined_member(&alice_room, &bob_id).await;
+
+    bob.sync_once(SyncSettings::default())
+        .await
+        .expect("bob syncs to see room state");
+
+    // Bob (PL 0, no grant) attempts to register an agent — this writes
+    // `com.mxagent.agent.v1`, which requires PL >= 50 under the workspace PL
+    // override. The attempt must produce WorkspaceError::WorkspaceForbidden.
+    std::env::set_var(ENV_DATA_DIR, &bob_dir);
+    let result = register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: ws_room_id.to_string(),
+            agent_id: Some(alice_agent_id.clone()), // attempt to overwrite alice's state key
+            kind: "attacker".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            cwd: "/tmp".to_string(),
+            project_id: "mx-agent-pl-301-integrity".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await;
+    std::env::remove_var(ENV_DATA_DIR);
+
+    match result {
+        Err(WorkspaceError::WorkspaceForbidden {
+            ref room_id,
+            ref event_type,
+            required_pl,
+        }) => {
+            assert_eq!(
+                room_id,
+                ws_room_id.as_str(),
+                "WorkspaceForbidden must name the correct room"
+            );
+            assert!(
+                !event_type.is_empty(),
+                "WorkspaceForbidden must name the refused event type"
+            );
+            assert_eq!(
+                required_pl, WORKSPACE_AGENT_PL,
+                "WorkspaceForbidden must report the correct required power level"
+            );
+            // The guided error message must not expose secrets. Check the
+            // Display output contains only non-secret metadata.
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                !msg.contains("token") && !msg.contains("signature"),
+                "WorkspaceForbidden message must not contain secrets; got: {msg}"
+            );
+            assert!(
+                msg.contains(ws_room_id.as_str()),
+                "WorkspaceForbidden message must name the room; got: {msg}"
+            );
+        }
+        Err(other) => panic!(
+            "expected WorkspaceError::WorkspaceForbidden for plain member state write, got: {other:?} \
+             — issue #301: production PL override should block PL-0 members from writing \
+             com.mxagent.* state"
+        ),
+        Ok(_) => panic!(
+            "plain member at PL 0 must NOT be able to overwrite another agent's \
+             com.mxagent.agent.v1 state — issue #301 integrity guarantee: the workspace \
+             power_level_content_override must block this write"
+        ),
+    }
 }

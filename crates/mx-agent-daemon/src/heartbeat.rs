@@ -28,7 +28,7 @@ use mx_agent_protocol::schema::{AgentLoad, AgentState, Heartbeat};
 
 use crate::agent::{read_agent_state, read_all_agent_states};
 use crate::scheduler_loop::sleep_interruptible;
-use crate::workspace::WorkspaceError;
+use crate::workspace::{send_workspace_state, WorkspaceError};
 
 /// Default interval between emitted heartbeats.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -249,9 +249,7 @@ pub async fn emit_heartbeat(
         state.state_rev += 1;
         let content = serde_json::to_value(&state)
             .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
-        room.send_state_event_raw(AGENT_STATE_TYPE, agent_id, content)
-            .await
-            .map_err(WorkspaceError::from)?;
+        send_workspace_state(room, AGENT_STATE_TYPE, agent_id, content).await?;
         Ok(true)
     } else {
         // No durable state to refresh; the timeline heartbeat still went out.

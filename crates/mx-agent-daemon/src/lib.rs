@@ -213,9 +213,10 @@ pub use watch::{
 };
 pub use workspace::{
     attach_workspace, attach_workspace_for_session, create_workspace, create_workspace_for_session,
-    join_workspace, join_workspace_for_session, workspace_status, workspace_status_for_session,
-    AttachWorkspaceOptions, CreateWorkspaceOptions, MemberSummary, WorkspaceError, WorkspaceInfo,
-    WorkspaceStatus, WorkspaceVisibility,
+    grant_workspace, grant_workspace_for_session, join_workspace, join_workspace_for_session,
+    workspace_status, workspace_status_for_session, AttachWorkspaceOptions, CreateWorkspaceOptions,
+    GrantWorkspaceOptions, MemberSummary, WorkspaceError, WorkspaceGrant, WorkspaceInfo,
+    WorkspaceStatus, WorkspaceVisibility, WORKSPACE_AGENT_PL,
 };
 
 use mx_agent_ipc::default_socket_name;

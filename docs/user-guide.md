@@ -171,6 +171,15 @@ Registering publishes an agent's presence, capabilities, and tool list into the
 workspace as room state so peers can discover it. Each session corresponds to
 one agent; the `--agent-id` is the state key and defaults to `<user>-<device>`.
 
+> **Non-creator agents need a power-level grant first.** The workspace creator is
+> the only member who can write `com.mxagent.*` state out of the box. A daemon
+> that *joined* a workspace it did not create starts at Matrix power level 0, so
+> `agent register` (and heartbeat / task claim / invocation) is refused with a
+> guided `M_FORBIDDEN` until the creator runs
+> `mx-agent workspace grant --room '#demo:localhost' --user '@<joiner>:server'`.
+> This gates state-write integrity only and never affects execution
+> authorization. See [`workspace grant`](cli-reference.md#mx-agent-workspace-grant).
+
 ```bash
 mx-agent agent register \
   --room '#demo:localhost' \
@@ -434,6 +443,12 @@ mx-agent workspace create --alias demo --name "Two-agent demo"
 mx-agent agent register --room '#demo:localhost' \
   --agent-id alice-agent --capability shell --capability test \
   --tool 'run_tests@1.0.0'
+
+# 2b. Alice (the creator) grants Bob's Matrix user the workspace "agent" power
+#     level. Without this, Bob's daemon is at power level 0 and every state write
+#     (register / heartbeat / task claim / invocation) is refused with a guided
+#     M_FORBIDDEN. Power levels gate state-write integrity only — never execution.
+mx-agent workspace grant --room '#demo:localhost' --user '@bob:localhost'
 
 # 3. Bob logs in, joins the same room, and registers the second agent.
 MX_AGENT_PASSWORD=bob-pass \
