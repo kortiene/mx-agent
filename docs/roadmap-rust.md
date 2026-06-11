@@ -603,14 +603,12 @@ cargo clippy
 cargo deny check
 ```
 
-Suggested release targets:
+Release targets (Unix-only; Windows intentionally dropped — see README.md):
 
 ```text
-x86_64-unknown-linux-musl
-aarch64-unknown-linux-musl
-x86_64-apple-darwin
+x86_64-unknown-linux-gnu
+x86_64-apple-darwin      (built on macos-15-intel, a native Intel runner)
 aarch64-apple-darwin
-x86_64-pc-windows-msvc
 ```
 
 ---
