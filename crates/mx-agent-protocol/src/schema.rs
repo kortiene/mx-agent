@@ -682,6 +682,40 @@ impl TaskAction {
             },
         }
     }
+
+    /// Consume this action and return it carrying `authorization`, replacing any
+    /// authorization already attached.
+    ///
+    /// Symmetric to [`TaskAction::without_authorization`]: the daemon signs the
+    /// authorization-stripped action, then re-attaches the freshly signed
+    /// [`TaskActionAuthorization`] via this helper before publishing the action
+    /// to room state. The signed (`task_id` + stripped-action) binding is what a
+    /// verifier checks, so attaching the authorization here does not change the
+    /// bytes that were signed.
+    pub fn with_authorization(self, authorization: TaskActionAuthorization) -> Self {
+        match self {
+            Self::Tool { tool, args, .. } => Self::Tool {
+                tool,
+                args,
+                authorization: Some(authorization),
+            },
+            Self::Exec {
+                command,
+                cwd,
+                env,
+                timeout_ms,
+                stream,
+                ..
+            } => Self::Exec {
+                command,
+                cwd,
+                env,
+                timeout_ms,
+                stream,
+                authorization: Some(authorization),
+            },
+        }
+    }
 }
 
 /// Stable result object stored in [`TaskState::result`] (architecture §9.2).
@@ -1256,6 +1290,43 @@ mod tests {
                 }
             }
         }));
+    }
+
+    #[test]
+    fn with_authorization_attaches_and_replaces_signature() {
+        let auth = TaskActionAuthorization {
+            requesting_agent: "@planner:server".to_string(),
+            target_agent: "developer-pi".to_string(),
+            created_at: "2026-06-02T12:00:00Z".to_string(),
+            expires_at: "2026-06-03T12:00:00Z".to_string(),
+            nonce: "req_abc".to_string(),
+            signature: Signature {
+                alg: "ed25519".to_string(),
+                key_id: "mxagent-ed25519:abc123".to_string(),
+                sig: "base64".to_string(),
+            },
+            extra: Default::default(),
+        };
+        // Attaching to an unsigned action yields the same action carrying `auth`.
+        let unsigned = TaskAction::Exec {
+            command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            cwd: "/repo".to_string(),
+            env: Default::default(),
+            timeout_ms: Some(60_000),
+            stream: false,
+            authorization: None,
+        };
+        let signed = unsigned.clone().with_authorization(auth.clone());
+        assert_eq!(signed.authorization(), Some(&auth));
+        // The signature binds only the authorization-stripped action, so
+        // `with_authorization` must be the exact inverse of `without_authorization`.
+        assert_eq!(signed.without_authorization(), unsigned);
+
+        // Re-attaching replaces any existing authorization rather than nesting.
+        let mut replacement = auth.clone();
+        replacement.nonce = "req_def".to_string();
+        let resigned = signed.with_authorization(replacement.clone());
+        assert_eq!(resigned.authorization(), Some(&replacement));
     }
 
     #[test]

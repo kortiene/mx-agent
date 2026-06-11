@@ -11,23 +11,27 @@
 //! carried forward as `previous_event_id` so stale overwrites can be detected
 //! (architecture §9.4).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::TASK as TASK_STATE_TYPE;
-use mx_agent_protocol::id::generate_task_id;
+use mx_agent_protocol::id::{generate_request_id, generate_task_id};
 use mx_agent_protocol::schema::{InvocationState, TaskAction, TaskResult, TaskState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::exec_ipc::rfc3339_after;
 use crate::invocation::{
     cancel_invocation, task_result_from_invocation, task_state_for_invocation,
 };
 use crate::matrix::restore_client;
-use crate::session::StoredSession;
+use crate::session::{SessionPaths, StoredSession};
+use crate::signing::{load_or_create_signing_key, DaemonSigningKey};
+use crate::task_orchestrator::sign_task_action;
 use crate::workspace::{
     parse_room_or_alias, resolve_room_id, send_workspace_state, WorkspaceError,
 };
@@ -221,6 +225,108 @@ fn unix_to_rfc3339(secs: u64) -> String {
     let year = if month <= 2 { y + 1 } else { y };
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Default validity window for a daemon-authored task-action authorization.
+///
+/// Long enough to outlast realistic dependency waits and a pending approval, but
+/// bounded so a captured-but-never-executed authorization does not stay valid
+/// forever. The single-use nonce (burned by the verifier on the executing pass)
+/// already prevents replay within this window; the TTL only bounds how long an
+/// unexecuted authorization remains admissible. Overridable via
+/// [`ENV_TASK_AUTH_TTL`].
+const TASK_AUTH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Environment variable overriding [`TASK_AUTH_TTL`], in whole seconds.
+const ENV_TASK_AUTH_TTL: &str = "MX_AGENT_TASK_AUTH_TTL";
+
+/// Resolve the validity window for a daemon-authored task-action authorization.
+///
+/// Reads [`ENV_TASK_AUTH_TTL`] as a positive number of seconds, falling back to
+/// [`TASK_AUTH_TTL`] when the variable is unset, unparseable, or zero.
+fn task_auth_ttl() -> Duration {
+    std::env::var(ENV_TASK_AUTH_TTL)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(TASK_AUTH_TTL)
+}
+
+/// Resolve the creator identity for a task, defaulting to the client's Matrix
+/// user ID when the caller left `created_by` empty (architecture §9.2).
+fn resolve_created_by(options: &CreateTaskOptions, client: &Client) -> String {
+    options
+        .created_by
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| client.user_id().map(|u| u.to_string()).unwrap_or_default())
+}
+
+/// Attach a daemon-authored signature to an actionable, unsigned task action.
+///
+/// This is the single production producer of a [`TaskActionAuthorization`]
+/// (issue #302): the CLI submits `Tool`/`Exec` actions with `authorization:
+/// None` because — per the architecture §10.3 auth/trust carve-out — it must
+/// never hold the daemon's signing key. The daemon signs on behalf of the
+/// locally-authenticated IPC caller, after the request crosses the local IPC
+/// boundary, so the live scheduler (which always configures a trust store) will
+/// admit the action instead of blocking it as `unsigned`.
+///
+/// Signs with the daemon's own Ed25519 identity, addressed to `target_agent`
+/// (the executing agent), binding the final `task_id`, with a fresh single-use
+/// nonce and a bounded `expires_at` ([`task_auth_ttl`]). Returns:
+///
+/// - `Ok(Some(signed_action))` when the daemon signed the action;
+/// - `Ok(None)` to leave the caller's action field untouched when the action
+///   already carries an authorization (a pre-signed action from a test or a
+///   future programmatic caller is honored exactly as supplied — the daemon
+///   never overwrites an existing signature), or when `target_agent` is empty
+///   (an unassigned actionable task cannot be addressed yet; it stays advisory
+///   until an assigning update names a target).
+///
+/// Signing happens only on the authoring IPC path; the executing agent still
+/// runs the full gate (signature verify + local trust store + deny-by-default
+/// policy + approval + replay/expiry). Attaching a signature is not a grant:
+/// room membership is not execution permission, and an authorization from an
+/// untrusted key stays blocked.
+fn authored_authorization(
+    signing: &DaemonSigningKey,
+    task_id: &str,
+    action: &TaskAction,
+    requesting_agent: &str,
+    target_agent: &str,
+) -> Result<Option<TaskAction>, WorkspaceError> {
+    if action.authorization().is_some() {
+        return Ok(None);
+    }
+    if target_agent.is_empty() {
+        return Ok(None);
+    }
+    // Sign the authorization-stripped action: the signature binds `task_id` plus
+    // the action without its authorization, which the verifier re-derives.
+    let unsigned = action.without_authorization();
+    let auth = sign_task_action(
+        signing.signing_key(),
+        signing.key_id(),
+        task_id,
+        &unsigned,
+        requesting_agent,
+        target_agent,
+        rfc3339_after(Duration::ZERO),
+        rfc3339_after(task_auth_ttl()),
+        generate_request_id(),
+    )
+    .map_err(|e| WorkspaceError::Io(io::Error::other(e.to_string())))?;
+    Ok(Some(unsigned.with_authorization(auth)))
+}
+
+/// Load the daemon signing key for daemon-side authoring, mapping a key error to
+/// a [`WorkspaceError`] the IPC layer surfaces to the CLI (mirroring the
+/// `task.cancel` signing path).
+fn load_authoring_key() -> Result<DaemonSigningKey, WorkspaceError> {
+    load_or_create_signing_key(&SessionPaths::resolve())
+        .map_err(|e| WorkspaceError::Io(io::Error::other(e.to_string())))
 }
 
 /// Build the `com.mxagent.task.v1` content for a newly created task.
@@ -441,11 +547,7 @@ pub async fn create_task(
         return Err(WorkspaceError::TaskExists(task_id));
     }
 
-    let created_by = options
-        .created_by
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| client.user_id().map(|u| u.to_string()).unwrap_or_default());
+    let created_by = resolve_created_by(options, client);
 
     let state = build_new_task(options, task_id.clone(), created_by, now_rfc3339());
     check_known_state(&state.state)?;
@@ -454,12 +556,43 @@ pub async fn create_task(
 }
 
 /// Create a task, restoring the authenticated client from `session`.
+///
+/// This is the production `task.create` IPC entry point. When the caller submits
+/// a `Tool`/`Exec` action with no authorization, the daemon signs it on the
+/// caller's behalf ([`authored_authorization`]) so the live scheduler admits it
+/// instead of blocking it as `unsigned` (issue #302). The CLI never holds the
+/// signing key; signing happens here, after the request crosses the local IPC
+/// boundary. An unassigned actionable task is left advisory (unsigned) until an
+/// assigning [`update_task_for_session`] names a target.
 pub async fn create_task_for_session(
     session: &StoredSession,
     options: &CreateTaskOptions,
 ) -> Result<TaskState, WorkspaceError> {
     let client = restore_client(session).await?;
-    create_task(&client, options).await
+    let mut options = options.clone();
+
+    // Resolve the final task id *before* signing. The signature binds the id, so
+    // signing against a placeholder and then minting a different id inside
+    // `create_task` would make the verifier reject the action as
+    // `invalid_signature`. Pin the resolved id so both signing and publish agree.
+    let task_id = options
+        .task_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(generate_task_id);
+    options.task_id = Some(task_id.clone());
+
+    if let Some(action) = &options.action {
+        let signing = load_authoring_key()?;
+        let requester = resolve_created_by(&options, &client);
+        if let Some(signed) =
+            authored_authorization(&signing, &task_id, action, &requester, &options.assigned_to)?
+        {
+            options.action = Some(signed);
+        }
+    }
+
+    create_task(&client, &options).await
 }
 
 /// Update an existing task in a workspace room.
@@ -529,12 +662,108 @@ pub(crate) async fn apply_and_publish_task(
 }
 
 /// Update a task, restoring the authenticated client from `session`.
+///
+/// This is the production `task.update` IPC entry point. Like
+/// [`create_task_for_session`], it (re)signs the task action daemon-side when the
+/// update changes the action body or the assignee (issue #302), so a CLI-authored
+/// action — or a task reassigned to a new executing agent — carries a valid
+/// authorization addressed to the right target. State/title/description/result/
+/// invocation-only updates leave the action (and its existing signature)
+/// untouched. The scheduler's claim/finalize path uses [`update_task`] /
+/// [`update_task_in_room`] (no signer) and so never signs.
 pub async fn update_task_for_session(
     session: &StoredSession,
     options: &UpdateTaskOptions,
 ) -> Result<TaskState, WorkspaceError> {
     let client = restore_client(session).await?;
-    update_task(&client, options).await
+    // Only an action change or a reassignment can affect the signature; every
+    // other update round-trips the existing action untouched, so skip the key
+    // load and the extra read entirely.
+    if options.action.is_some() || options.assigned_to.is_some() {
+        let signing = load_authoring_key()?;
+        update_task_with_signing(&client, options, &signing).await
+    } else {
+        update_task(&client, options).await
+    }
+}
+
+/// Update a task on behalf of a local IPC caller, (re)signing the action when the
+/// update changes the action body or the assignee.
+///
+/// Reads the current task once and computes the *effective* action and assignee
+/// (the supplied value, falling back to the task's current value), then:
+///
+/// - a newly-supplied action is signed addressed to the effective assignee
+///   (honoring a caller-supplied pre-signed action, which is left untouched);
+/// - a reassignment with no new action re-targets the task's existing action to
+///   the new assignee by stripping the stale authorization and re-signing,
+///   because the signature binds the target (an authorization addressed to the
+///   old assignee would be rejected as `wrong_target`);
+/// - an empty effective assignee leaves the action advisory (unsigned).
+///
+/// Publishing is delegated to [`apply_and_publish_task`], so the same
+/// `expected_state_rev` stale guard and lifecycle-transition validation apply.
+/// Signing lives here (not in [`update_task_in_room`] / [`apply_and_publish_task`])
+/// so the scheduler's claim/finalize path — which has no signing key and must not
+/// re-sign — is never affected.
+async fn update_task_with_signing(
+    client: &Client,
+    options: &UpdateTaskOptions,
+    signing: &DaemonSigningKey,
+) -> Result<TaskState, WorkspaceError> {
+    let room = sync_and_get_room(client, &options.room).await?;
+    let (current, event_id) = read_task_state(&room, &options.task_id)
+        .await?
+        .ok_or_else(|| WorkspaceError::TaskNotFound(options.task_id.clone()))?;
+
+    let mut options = options.clone();
+
+    let effective_assignee = options
+        .assigned_to
+        .clone()
+        .unwrap_or_else(|| current.assigned_to.clone());
+    // The verifier does not semantically enforce `requesting_agent`, but it is
+    // bound into the signature; keep it consistent with the task's creator.
+    let requester = if current.created_by.is_empty() {
+        client.user_id().map(|u| u.to_string()).unwrap_or_default()
+    } else {
+        current.created_by.clone()
+    };
+
+    let signed = if let Some(new_action) = options.action.as_ref() {
+        // A newly-supplied action: sign it (honoring a pre-signed one), addressed
+        // to the effective assignee.
+        authored_authorization(
+            signing,
+            &current.task_id,
+            new_action,
+            &requester,
+            &effective_assignee,
+        )?
+    } else if options.assigned_to.is_some() {
+        // Reassignment of an existing actionable task with no new action body:
+        // re-target the current action to the new assignee. The current action is
+        // daemon-signed for the *old* target, so strip its authorization first and
+        // re-sign unconditionally (the strip makes `authored_authorization` sign
+        // rather than short-circuit on the existing signature).
+        match current.action.as_ref() {
+            Some(current_action) => authored_authorization(
+                signing,
+                &current.task_id,
+                &current_action.without_authorization(),
+                &requester,
+                &effective_assignee,
+            )?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(signed) = signed {
+        options.action = Some(signed);
+    }
+
+    apply_and_publish_task(&room, current, event_id, &options).await
 }
 
 /// Decide the terminal state and structured `result` for a cancelled task,
@@ -722,6 +951,161 @@ mod tests {
             blocks: vec!["task-review".to_string()],
             action: None,
         }
+    }
+
+    // ── Issue #302: daemon-side signing of CLI-authored task actions ────────────
+
+    use crate::task_orchestrator::verify_task_action_signature;
+    use mx_agent_protocol::schema::TaskActionAuthorization;
+
+    /// A throwaway data dir holding a fresh daemon signing key, removed on drop.
+    struct SigningFixture {
+        key: DaemonSigningKey,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for SigningFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Build a fresh signing key in an isolated data dir without mutating the
+    /// process environment (`for_data_dir`), so parallel tests do not race.
+    fn signing_fixture(tag: &str) -> SigningFixture {
+        let dir = std::env::temp_dir().join(format!(
+            "mx-agent-task-sign-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+        let key = load_or_create_signing_key(&paths).unwrap();
+        SigningFixture { key, dir }
+    }
+
+    fn exec_action(authorization: Option<TaskActionAuthorization>) -> TaskAction {
+        TaskAction::Exec {
+            command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            cwd: "/repo".to_string(),
+            env: Default::default(),
+            timeout_ms: Some(60_000),
+            stream: false,
+            authorization,
+        }
+    }
+
+    #[test]
+    fn authored_authorization_signs_actionable_assigned_unsigned_action() {
+        let fx = signing_fixture("signs");
+        let signed = authored_authorization(
+            &fx.key,
+            "task_T",
+            &exec_action(None),
+            "@planner:server",
+            "developer-pi",
+        )
+        .expect("signing succeeds")
+        .expect("an actionable, assigned, unsigned action is signed");
+
+        let auth = signed.authorization().expect("authorization attached");
+        assert_eq!(
+            auth.target_agent, "developer-pi",
+            "addressed to the assignee"
+        );
+        assert_eq!(auth.requesting_agent, "@planner:server");
+        assert!(!auth.nonce.is_empty(), "a fresh nonce is attached");
+        assert!(
+            auth.expires_at > auth.created_at,
+            "expiry must be after creation: {} !> {}",
+            auth.expires_at,
+            auth.created_at
+        );
+        assert_eq!(
+            auth.signature.key_id,
+            fx.key.key_id(),
+            "signed with the daemon key"
+        );
+        // The daemon-authored signature verifies against the daemon verifying key
+        // for this exact task id — the production scheduler will admit it.
+        verify_task_action_signature(&fx.key.verifying_key(), "task_T", &signed, auth)
+            .expect("daemon-authored signature must verify");
+    }
+
+    #[test]
+    fn authored_authorization_leaves_presigned_and_unassigned_untouched() {
+        let fx = signing_fixture("untouched");
+        // A pre-signed action (e.g. a manually-signed test action) is honored
+        // exactly as supplied — the daemon never overwrites an existing signature.
+        let presigned = authored_authorization(
+            &fx.key,
+            "task_T",
+            &exec_action(None),
+            "@planner:server",
+            "developer-pi",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            authored_authorization(
+                &fx.key,
+                "task_T",
+                &presigned,
+                "@planner:server",
+                "developer-pi"
+            )
+            .unwrap()
+            .is_none(),
+            "a pre-signed action is left untouched"
+        );
+
+        // An unassigned actionable task cannot be addressed yet; left advisory.
+        assert!(
+            authored_authorization(&fx.key, "task_T", &exec_action(None), "@planner:server", "")
+                .unwrap()
+                .is_none(),
+            "an unassigned action stays unsigned"
+        );
+    }
+
+    #[test]
+    fn authored_authorization_binds_the_task_id() {
+        // Guards the auto-id-resolution trap: a signature minted for one task id
+        // must not verify when bound to a different id.
+        let fx = signing_fixture("bind");
+        let signed =
+            authored_authorization(&fx.key, "task_T", &exec_action(None), "@p", "developer-pi")
+                .unwrap()
+                .unwrap();
+        let auth = signed.authorization().unwrap();
+        assert!(
+            verify_task_action_signature(&fx.key.verifying_key(), "task_OTHER", &signed, auth)
+                .is_err(),
+            "a signature bound to task_T must not verify for task_OTHER"
+        );
+    }
+
+    #[test]
+    fn task_auth_ttl_reads_env_override_and_falls_back() {
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_TASK_AUTH_TTL);
+            }
+        }
+        let _guard = EnvGuard;
+
+        std::env::set_var(ENV_TASK_AUTH_TTL, "3600");
+        assert_eq!(task_auth_ttl(), Duration::from_secs(3600));
+        // Unparseable and non-positive values fall back to the bounded default.
+        std::env::set_var(ENV_TASK_AUTH_TTL, "not-a-number");
+        assert_eq!(task_auth_ttl(), TASK_AUTH_TTL);
+        std::env::set_var(ENV_TASK_AUTH_TTL, "0");
+        assert_eq!(task_auth_ttl(), TASK_AUTH_TTL);
     }
 
     #[test]
@@ -1125,5 +1509,193 @@ mod tests {
             result.get("summary").and_then(Value::as_str),
             Some("task cancelled")
         );
+    }
+
+    // ── Update-path signing rules (issue #302) ─────────────────────────────────
+    // These tests exercise the signing decision logic that lives in
+    // update_task_with_signing by calling the underlying authored_authorization
+    // helper directly — no live Matrix client is required.
+
+    #[test]
+    fn authored_authorization_signs_tool_action() {
+        // Both TaskAction variants must be signable; the existing tests only cover
+        // Exec. Verify Tool actions are signed and verifiable via the daemon key.
+        let fx = signing_fixture("tool-action");
+        let tool_action = TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({ "suite": "unit" }),
+            authorization: None,
+        };
+        let signed = authored_authorization(
+            &fx.key,
+            "task_T",
+            &tool_action,
+            "@planner:server",
+            "developer-pi",
+        )
+        .expect("signing succeeds")
+        .expect("a Tool action gets a signed authorization");
+
+        let auth = signed.authorization().expect("authorization attached");
+        assert_eq!(auth.target_agent, "developer-pi");
+        verify_task_action_signature(&fx.key.verifying_key(), "task_T", &signed, auth)
+            .expect("Tool action signature must verify against the daemon key");
+    }
+
+    #[test]
+    fn update_reassignment_resigns_existing_action_to_new_target() {
+        // update_task_with_signing strips the old auth and re-signs when only the
+        // assignee changes (no new action body). A signature addressed to "old-agent"
+        // would be rejected by the verifier as `wrong_target` if it reached
+        // "new-agent". Re-signing after stripping produces a fresh nonce for the
+        // new target.
+        let fx = signing_fixture("reassign");
+
+        let old_signed = authored_authorization(
+            &fx.key,
+            "task_T",
+            &exec_action(None),
+            "@planner:server",
+            "old-agent",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            old_signed.authorization().unwrap().target_agent,
+            "old-agent"
+        );
+
+        // On reassignment, the existing auth is stripped before re-signing so that
+        // authored_authorization signs rather than short-circuiting on the old sig.
+        let stripped = old_signed.without_authorization();
+        assert!(
+            stripped.authorization().is_none(),
+            "auth must be stripped before re-signing"
+        );
+
+        let resigned =
+            authored_authorization(&fx.key, "task_T", &stripped, "@planner:server", "new-agent")
+                .expect("re-signing must succeed")
+                .expect("reassignment produces a new signed authorization");
+
+        let auth = resigned.authorization().unwrap();
+        assert_eq!(
+            auth.target_agent, "new-agent",
+            "re-signed to the new assignee"
+        );
+        assert_ne!(
+            old_signed.authorization().unwrap().nonce,
+            auth.nonce,
+            "re-signing mints a fresh nonce"
+        );
+        verify_task_action_signature(&fx.key.verifying_key(), "task_T", &resigned, auth)
+            .expect("re-signed authorization must verify for the new target");
+    }
+
+    #[test]
+    fn update_new_action_signed_to_effective_assignee() {
+        // When an update carries a new action body but no new assigned_to, the
+        // effective assignee is the task's existing assignee. The new action must
+        // be signed to that agent so the scheduler admits it.
+        let fx = signing_fixture("new-action-update");
+
+        let new_action = exec_action(None);
+        // effective_assignee = current task's assigned_to (no new assigned_to in opts)
+        let effective_assignee = "developer-pi";
+        let signed = authored_authorization(
+            &fx.key,
+            "task_T",
+            &new_action,
+            "@planner:server",
+            effective_assignee,
+        )
+        .expect("signing the new action succeeds")
+        .expect("new action on update is signed to the effective assignee");
+
+        let auth = signed.authorization().unwrap();
+        assert_eq!(auth.target_agent, effective_assignee);
+        verify_task_action_signature(&fx.key.verifying_key(), "task_T", &signed, auth)
+            .expect("new action signed on update must verify");
+    }
+
+    #[test]
+    fn state_only_update_preserves_existing_action_signature() {
+        // A state/title/invocation/result-only update (action = None, assigned_to =
+        // None) must leave the action and its signed authorization completely
+        // untouched. apply_update only writes the action field when options.action
+        // is Some; this test confirms the existing signature round-trips.
+        let fx = signing_fixture("state-only");
+
+        let signed_action = authored_authorization(
+            &fx.key,
+            "task_T",
+            &exec_action(None),
+            "@planner:server",
+            "developer-pi",
+        )
+        .unwrap()
+        .unwrap();
+        let original_nonce = signed_action.authorization().unwrap().nonce.clone();
+
+        let mut opts = create_opts();
+        opts.action = Some(signed_action);
+        let mut task = build_new_task(
+            &opts,
+            "task_T".to_string(),
+            "claude-local".to_string(),
+            "t0".to_string(),
+        );
+
+        // State-only update: neither action nor assigned_to is set.
+        let update = UpdateTaskOptions {
+            task_id: "task_T".to_string(),
+            state: Some(STATE_EXECUTING.to_string()),
+            ..Default::default()
+        };
+        apply_update(&mut task, &update, "t1".to_string(), None);
+
+        let preserved = task.action.as_ref().unwrap().authorization().unwrap();
+        assert_eq!(
+            preserved.nonce, original_nonce,
+            "a state-only update must not alter the action authorization"
+        );
+        assert_eq!(preserved.target_agent, "developer-pi");
+    }
+
+    #[test]
+    fn presigned_action_on_update_path_is_left_unchanged() {
+        // When the caller supplies an already-signed action on task.update, the
+        // daemon must not overwrite it. authored_authorization returns None for a
+        // pre-signed action, so the update path leaves the caller-provided
+        // authorization in place. This is the compatibility hinge that keeps
+        // signed_exec_task and other manually-signed test helpers green.
+        let fx = signing_fixture("presigned-update");
+
+        let presigned = authored_authorization(
+            &fx.key,
+            "task_T",
+            &exec_action(None),
+            "@planner:server",
+            "developer-pi",
+        )
+        .unwrap()
+        .unwrap();
+        let original_nonce = presigned.authorization().unwrap().nonce.clone();
+
+        // Passing the pre-signed action to authored_authorization returns None.
+        let result = authored_authorization(
+            &fx.key,
+            "task_T",
+            &presigned,
+            "@planner:server",
+            "developer-pi",
+        )
+        .expect("no error for a pre-signed action");
+        assert!(
+            result.is_none(),
+            "a pre-signed action submitted on the update path must not be overwritten"
+        );
+        // Original authorization is unchanged.
+        assert_eq!(presigned.authorization().unwrap().nonce, original_nonce);
     }
 }
