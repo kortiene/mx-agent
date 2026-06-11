@@ -60,7 +60,21 @@ The single most important fact: **with no `policy.toml`, the engine denies every
 
 ## Token isolation model
 
-The daemon owns all long-lived secrets; the CLI never handles them directly.
+The daemon owns all long-lived secrets **at rest**, and for the daemon-mediated
+command groups (`workspace`/`agent`/`approval`/`share`/`invocation`/`task`, and
+`trust publish`/`state`) the CLI never builds a Matrix client or touches them. The
+`auth`/`trust` carve-out is the exception: for `auth login` (and `trust
+fingerprint`/the local `trust` commands) the **same-binary CLI process** reads
+the password, builds a store-backed Matrix client, performs the network login,
+and creates/reads the crypto-store passphrase and Ed25519 signing key
+in-process. Because the CLI and daemon are the same binary at the same UID this
+is an **accepted same-UID exception, not a separate privilege boundary** (see
+[architecture §10.3](architecture.md#103-ipc-protocol) and issue #201). A
+cross-process advisory `flock` on `<data_dir>/.write.lock` serializes those
+in-process writes against a running daemon so they cannot lost-update the shared
+session/key files; the lock is advisory and coordinates only mx-agent's own
+writers. (It does **not** refresh a running daemon's in-memory client after a
+CLI-local re-login — that staleness is resolved only by restarting the daemon.)
 
 **What is stored, and where** (defaults; override the data dir with
 `MX_AGENT_DATA_DIR`, the config dir with `MX_AGENT_CONFIG_DIR`):

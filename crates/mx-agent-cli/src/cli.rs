@@ -1,15 +1,21 @@
 //! Command-line surface for `mx-agent`.
 //!
 //! This module defines the full command tree with `clap` and dispatches each
-//! command. The CLI is stateless: `auth`, `workspace`, `agent`, `trust`,
-//! `approval`, `share`, `invocation`, and `task` are mediated by the daemon over
-//! the local Unix-socket IPC channel, and `call`/`exec` run a daemon-mediated
-//! local execution by default or a signed Matrix-backed remote operation when
-//! `--room`/`--agent` target a remote agent. The CLI never reads the Matrix
-//! session or builds a Matrix client itself. Interactive `exec --pty` is also
-//! daemon-mediated: the daemon allocates the pseudo-terminal and the CLI streams
-//! it over a single IPC connection (issue #238). Large artifacts are still
-//! landing — see the project status in `README.md`.
+//! command. The CLI is stateless: `workspace`, `agent`, `approval`, `share`,
+//! `invocation`, and `task` (and `trust publish`/`state`) are mediated by the
+//! daemon over the local Unix-socket IPC channel, so for those the CLI never
+//! reads the Matrix session or builds a Matrix client itself; `call`/`exec` run
+//! a daemon-mediated local execution by default or a signed Matrix-backed remote
+//! operation when `--room`/`--agent` target a remote agent. The `auth`/`trust`
+//! carve-out is the exception: `auth login` is CLI-initiated and builds a
+//! store-backed Matrix client + creates the daemon-owned crypto store
+//! in-process, and `auth status`/`logout` plus the local `trust list`/`approve`/
+//! `revoke`/`fingerprint` commands read/write the data dir directly — an
+//! accepted same-binary, same-UID exception (see `docs/architecture.md` §10.3 /
+//! issue #201). Interactive `exec --pty` is also daemon-mediated: the daemon
+//! allocates the pseudo-terminal and the CLI streams it over a single IPC
+//! connection (issue #238). Large artifacts are still landing — see the project
+//! status in `README.md`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

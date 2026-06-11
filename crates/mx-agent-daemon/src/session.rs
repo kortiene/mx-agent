@@ -138,6 +138,12 @@ pub struct SessionPaths {
     /// store at rest (`0600`). Generated once on first use and reused across
     /// restarts so the daemon resumes as the same E2EE device.
     pub crypto_store_key_file: PathBuf,
+    /// Advisory write-lock file (`<data_dir>/.write.lock`, `0600`). Held with
+    /// `flock(LOCK_EX)` to serialize cross-process writes to the session,
+    /// crypto-store key, and signing key so a CLI-local `auth login` /
+    /// `trust fingerprint` cannot lost-update a running daemon's data dir
+    /// (issue #269). The file stores no data and is never part of any protocol.
+    pub lock_file: PathBuf,
 }
 
 impl SessionPaths {
@@ -168,6 +174,7 @@ impl SessionPaths {
             sync_token_file: data_dir.join("sync_token"),
             crypto_store_dir: data_dir.join("crypto-store"),
             crypto_store_key_file: data_dir.join("crypto-store-key"),
+            lock_file: data_dir.join(".write.lock"),
             data_dir,
         }
     }
@@ -221,42 +228,109 @@ impl SessionPaths {
     }
 
     /// Generate, persist (`0600`), and return a fresh crypto-store passphrase.
+    ///
+    /// Runs under the cross-process advisory write lock and **re-checks** the key
+    /// file once the lock is held: if a concurrent writer (e.g. a running daemon
+    /// racing a CLI-local `auth login`) created the key first, its passphrase is
+    /// returned unchanged instead of being clobbered. This is the damaging race
+    /// to avoid — a lost crypto-store passphrase can no longer decrypt a store
+    /// already encrypted under it (issue #269). The steady-state read path in
+    /// [`load_or_create_crypto_store_key`](Self::load_or_create_crypto_store_key)
+    /// stays lock-free.
     fn generate_crypto_store_key(&self) -> io::Result<Secret> {
         use base64::Engine as _;
-        self.ensure_data_dir()?;
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes)
-            .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
-        let key = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
-        let tmp = self.crypto_store_key_file.with_extension("tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.set_permissions(fs::Permissions::from_mode(0o600))?;
-            f.write_all(key.as_bytes())?;
-            f.flush()?;
-        }
-        fs::rename(&tmp, &self.crypto_store_key_file)?;
-        Ok(Secret::new(key))
+        with_data_dir_write_lock(self, || {
+            // Double-checked under the lock: another process may have created the
+            // key between our caller's lock-free read and our acquiring the lock.
+            match fs::read_to_string(&self.crypto_store_key_file) {
+                Ok(contents) => {
+                    let trimmed = contents.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(Secret::new(trimmed.to_string()));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            let mut bytes = [0u8; 32];
+            getrandom::fill(&mut bytes)
+                .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
+            let key = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+            let tmp = self.crypto_store_key_file.with_extension("tmp");
+            {
+                let mut f = fs::File::create(&tmp)?;
+                f.set_permissions(fs::Permissions::from_mode(0o600))?;
+                f.write_all(key.as_bytes())?;
+                f.flush()?;
+            }
+            fs::rename(&tmp, &self.crypto_store_key_file)?;
+            Ok(Secret::new(key))
+        })
     }
+}
+
+/// Hold a cross-process advisory exclusive lock for the duration of a write to
+/// the daemon-owned data dir (session, crypto-store key, signing key).
+///
+/// The lock is `flock(LOCK_EX)` on `<data_dir>/.write.lock` (created `0600`). It
+/// serializes a CLI-local `auth login` / `trust fingerprint` against a running
+/// daemon so two `mx-agent` processes cannot lost-update the same key/session
+/// file (issue #269). The lock is **advisory** and Unix-only — it coordinates
+/// only mx-agent's own writers — and is released when the guard drops as `f`
+/// returns (or errors). Callers must hold it only around infrequent create/write
+/// paths, never the hot read path, and must not nest acquisitions.
+///
+/// Generic over the closure's error type so the same helper guards both the
+/// `io::Result` session/crypto-store writers and the [`SigningKeyError`]-typed
+/// signing-key writer; any I/O error acquiring the lock is surfaced through
+/// `E: From<io::Error>`.
+///
+/// [`SigningKeyError`]: crate::signing::SigningKeyError
+pub(crate) fn with_data_dir_write_lock<T, E>(
+    paths: &SessionPaths,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<io::Error>,
+{
+    use nix::fcntl::{Flock, FlockArg};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    paths.ensure_data_dir()?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&paths.lock_file)?;
+    let guard = Flock::lock(file, FlockArg::LockExclusive)
+        .map_err(|(_file, errno)| io::Error::from_raw_os_error(errno as i32))?;
+    let result = f();
+    drop(guard); // release the advisory lock before returning
+    result
 }
 
 /// Persist `session` to daemon-owned storage with `0600` permissions.
 ///
 /// The write is atomic (write-to-temp then rename) so a crash cannot leave a
-/// half-written session file.
+/// half-written session file, and it runs under the cross-process advisory write
+/// lock so a CLI-local `auth login` cannot interleave its session write with a
+/// running daemon's (issue #269).
 pub fn save_session(paths: &SessionPaths, session: &StoredSession) -> io::Result<()> {
-    paths.ensure_data_dir()?;
-    let bytes = serde_json::to_vec_pretty(session)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let tmp = paths.session_file.with_extension("json.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.set_permissions(fs::Permissions::from_mode(0o600))?;
-        f.write_all(&bytes)?;
-        f.flush()?;
-    }
-    fs::rename(&tmp, &paths.session_file)?;
-    Ok(())
+    with_data_dir_write_lock(paths, || {
+        let bytes = serde_json::to_vec_pretty(session)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = paths.session_file.with_extension("json.tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            f.write_all(&bytes)?;
+            f.flush()?;
+        }
+        fs::rename(&tmp, &paths.session_file)?;
+        Ok(())
+    })
 }
 
 /// Load a persisted session, if one exists.
@@ -642,5 +716,204 @@ mod tests {
         for bad in ["", ".", "..", "../evil", "a/b", "a\\b", "x\0y"] {
             assert!(!is_plain_path_component(bad), "must reject {bad:?}");
         }
+    }
+
+    /// A unique, per-call data dir resolved via [`SessionPaths::for_data_dir`].
+    ///
+    /// The concurrency tests deliberately avoid the `MX_AGENT_DATA_DIR` env var
+    /// (and so the `env_lock()`) because they spawn threads that must share one
+    /// explicit data dir; mutating process env from multiple threads is the very
+    /// thing those tests must not depend on.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "mx-agent-lock-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            n,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn concurrent_crypto_store_key_creation_converges() {
+        // Issue #269: two processes that both observe "key absent" must not
+        // lost-update the crypto-store passphrase. The advisory lock + the
+        // double-checked create make them converge on one key. Each thread opens
+        // its own flock fd (the helper opens the lock file per call), so the two
+        // in-process callers genuinely serialize.
+        use std::sync::{Arc, Barrier};
+
+        let dir = unique_temp_dir("cryptorace");
+        let paths = Arc::new(SessionPaths::for_data_dir(dir.clone()));
+        paths.ensure_data_dir().unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let paths = Arc::clone(&paths);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    paths.load_or_create_crypto_store_key().unwrap()
+                })
+            })
+            .collect();
+        let keys: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            keys[0].expose(),
+            keys[1].expose(),
+            "both threads must observe the same passphrase (no lost update)"
+        );
+        // Exactly one key file, holding exactly the returned passphrase.
+        let on_disk = fs::read_to_string(&paths.crypto_store_key_file).unwrap();
+        assert_eq!(on_disk.trim(), keys[0].expose());
+        let mode = fs::metadata(&paths.crypto_store_key_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "crypto store key file must stay private");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_save_session_never_tears() {
+        // Issue #269: concurrent session writers must serialize so the file
+        // always parses to one complete session, never torn JSON (both writers
+        // share the same `session.json.tmp` path, which the lock protects).
+        use std::sync::{Arc, Barrier};
+
+        let dir = unique_temp_dir("saverace");
+        let paths = Arc::new(SessionPaths::for_data_dir(dir.clone()));
+        paths.ensure_data_dir().unwrap();
+
+        let mut a = sample();
+        a.user_id = "@a:matrix.org".to_string();
+        let mut b = sample();
+        b.user_id = "@b:matrix.org".to_string();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|session| {
+                let paths = Arc::clone(&paths);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..50 {
+                        save_session(&paths, &session).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The final file must parse to one of the two complete sessions.
+        let loaded = load_session(&paths).unwrap().expect("a session persists");
+        assert!(
+            loaded == a || loaded == b,
+            "final session must be one of the two complete writes, got {loaded:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Issue #269: advisory lock + permissions regression tests ──────────────
+
+    /// `for_data_dir` must include the advisory lock file path inside the
+    /// data dir so `with_data_dir_write_lock` writes it to the right location
+    /// (issue #269: the lock file was introduced to serialise cross-process
+    /// session/key writes).
+    #[test]
+    fn session_paths_lock_file_is_in_data_dir() {
+        let dir = unique_temp_dir("lockpath");
+        let paths = SessionPaths::for_data_dir(dir.clone());
+        assert_eq!(
+            paths.lock_file,
+            dir.join(".write.lock"),
+            "lock_file must be <data_dir>/.write.lock"
+        );
+        // The lock file must be distinct from the session and key files so
+        // the rename-over-tmp pattern used by save_session /
+        // generate_crypto_store_key cannot accidentally clobber it.
+        assert_ne!(paths.lock_file, paths.session_file);
+        assert_ne!(paths.lock_file, paths.crypto_store_key_file);
+    }
+
+    /// After `with_data_dir_write_lock` is called, the advisory lock file must
+    /// exist with `0600` permissions — the same restrictive mode as every other
+    /// daemon-owned private file (issue #269).
+    #[test]
+    fn write_lock_file_has_private_permissions() {
+        let _data = TempData::new("lockperms");
+        let paths = SessionPaths::resolve();
+        // Drive the lock helper to ensure the lock file is created on disk.
+        with_data_dir_write_lock::<(), io::Error>(&paths, || Ok(())).unwrap();
+        assert!(
+            paths.lock_file.exists(),
+            "lock file must exist after acquiring the lock"
+        );
+        let mode = fs::metadata(&paths.lock_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "advisory lock file must be private (0600)");
+    }
+
+    /// `ensure_data_dir` must create the data directory with `0700`
+    /// permissions so the entire directory is inaccessible to other users,
+    /// matching the daemon-owned storage model (issue #269).
+    #[test]
+    fn data_dir_has_private_permissions() {
+        let _data = TempData::new("datadirperms");
+        let paths = SessionPaths::resolve();
+        assert!(
+            !paths.data_dir.exists(),
+            "data dir must not pre-exist in a fresh temp environment"
+        );
+        paths.ensure_data_dir().unwrap();
+        let mode = fs::metadata(&paths.data_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "data dir must be owner-only (0700)");
+    }
+
+    /// If the crypto-store key file exists but is empty (e.g. the process was
+    /// killed between `File::create` and the first write), the loader must
+    /// detect the empty content and regenerate a valid key rather than
+    /// returning an empty `Secret` (issue #269: a zero-length passphrase
+    /// cannot decrypt the store encrypted under the real key).
+    #[test]
+    fn empty_crypto_store_key_file_is_regenerated() {
+        let _data = TempData::new("emptykey");
+        let paths = SessionPaths::resolve();
+        paths.ensure_data_dir().unwrap();
+        // Simulate a truncated write by placing an empty file at the key path.
+        fs::write(&paths.crypto_store_key_file, b"").unwrap();
+        // The loader must detect the empty file and generate a new key.
+        let key = paths.load_or_create_crypto_store_key().unwrap();
+        assert!(
+            !key.expose().is_empty(),
+            "must generate a non-empty key when the key file is empty"
+        );
+        // The on-disk key file must now contain the newly generated passphrase.
+        let on_disk = fs::read_to_string(&paths.crypto_store_key_file).unwrap();
+        assert_eq!(
+            on_disk.trim(),
+            key.expose(),
+            "regenerated key must match what was written to disk"
+        );
+        // The key file must have been replaced with the correct private permissions.
+        let mode = fs::metadata(&paths.crypto_store_key_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "regenerated key file must be private (0600)");
     }
 }

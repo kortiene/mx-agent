@@ -1,10 +1,17 @@
 //! Parameter types for daemon-mediated IPC methods (issue #201).
 //!
-//! The stateless CLI must never restore Matrix sessions or build Matrix clients
-//! itself (architecture §10, §13): every Matrix-backed command is sent to the
-//! daemon over the local Unix-socket JSON-RPC channel, and the daemon — which
-//! owns the session, signing key, policy, and trust store — performs the
-//! operation. Most methods reuse the existing option structs
+//! For every Matrix-backed command group **except the `auth`/`trust` carve-out**
+//! (architecture §10.3), the stateless CLI does not restore Matrix sessions or
+//! build Matrix clients itself: the command is sent to the daemon over the local
+//! Unix-socket JSON-RPC channel, and the daemon — which owns the session,
+//! signing key, policy, and trust store — performs the operation. The exception
+//! is `auth login` (CLI-initiated; it builds a store-backed client and creates
+//! the daemon-owned crypto store in-process) plus `auth status`/`logout` and the
+//! local `trust list`/`approve`/`revoke`/`fingerprint` commands, which run
+//! CLI-local against the data dir; those have no method in this module. This is
+//! safe only because the CLI and daemon are the same binary at the same UID. The
+//! methods defined here cover the daemon-mediated groups. Most methods reuse the
+//! existing option structs
 //! (`CreateWorkspaceOptions`, `RegisterAgentOptions`, `ShareContextOptions`, …)
 //! as their parameters; the small scalar-argument methods use the param structs
 //! defined here. Sharing these types between the CLI and the daemon keeps the
