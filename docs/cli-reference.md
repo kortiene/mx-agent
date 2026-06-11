@@ -548,6 +548,7 @@ A workspace is a Matrix room that agents use to discover peers, exchange context
 | `create` | Create a new private or public workspace room with optional alias, name, and topic |
 | `join` | Join an existing workspace room by alias or room ID |
 | `attach` | Attach the current directory (or a specified path) to a workspace as a project context |
+| `grant` | Grant a member the power level needed to publish `com.mxagent.*` state (creator-only) |
 | `status` | Display workspace membership and attached project metadata, with optional live streaming |
 
 ### `mx-agent workspace create`
@@ -599,6 +600,7 @@ mx-agent workspace create --alias test-room --json
 - The alias must be globally unique on the homeserver; creation fails if the alias is already taken.
 - Private workspaces start with no members except the creator; invite others with Matrix client tooling.
 - Public workspaces are joinable by anyone on the homeserver but still require explicit membership to exchange exec/call/share operations.
+- Every workspace room is born with an explicit power-level policy: each `com.mxagent.*` state type requires power level 50 to write, `state_default` is 100 (native room state is creator-only), and joiners start at power level 0. A joining daemon must be elevated with [`workspace grant`](#mx-agent-workspace-grant) before it can register, heartbeat, claim tasks, or publish invocations. Power levels are integrity protection only and never grant execution rights.
 
 ---
 
@@ -692,6 +694,59 @@ mx-agent workspace attach --room '#test:server' --project-id 'repo:github' --jso
 - Git metadata is auto-detected; if the path is not in a git work tree, `repo` is omitted.
 - Multiple agents can attach the same or different paths; the last attach wins.
 - The state event is unencrypted so all workspace members can read project metadata.
+
+---
+
+### `mx-agent workspace grant`
+
+Grant a member the power level needed to publish `com.mxagent.*` state.
+
+**Synopsis**
+
+```text
+mx-agent [GLOBAL] workspace grant --room <ROOM> --user <USER> [--level <N>]
+```
+
+**Options**
+
+| Option | Value | Required | Default | Description |
+|---|---|---|---|---|
+| `--room` | room alias or ID | yes | — | Room to grant power in (`#name:server` or `!id:server`) |
+| `--user` | `@name:server` | yes | — | Matrix user ID to elevate to the workspace agent role |
+| `--level` | `<N>` | no | `50` | Power level to grant; pass `--level 0` to revoke a prior grant |
+
+**Behavior**
+
+Elevates a workspace member's Matrix power level so it can write `com.mxagent.*`
+state (`agent` / `task` / `invocation` / `trust` / `workspace` / `tool`). Because
+a fresh joiner starts at power level 0 and cannot edit `m.room.power_levels`
+itself, this command **must be run by the workspace creator** (or any member
+whose power level is high enough to edit power levels). The daemon — which holds
+the creator's Matrix session — performs the write; the CLI never touches Matrix
+credentials.
+
+Returns a non-secret summary; `--json` outputs a single-line JSON object with
+keys: `room_id`, `user`, `level`. A caller who lacks the power level to edit
+`m.room.power_levels` receives a guided error and exit code 1.
+
+Power levels are a Matrix integrity/DoS property only — granting one **never**
+confers execution rights, which remain gated by Ed25519 signature + local trust +
+deny-by-default policy + approval.
+
+Requires daemon running and authentication.
+
+**Examples**
+
+```bash
+# Creator grants a joining daemon the agent role (power level 50)
+mx-agent workspace grant --room '#demo:localhost' --user '@bob:localhost'
+
+# Revoke a prior grant
+mx-agent workspace grant --room '#demo:localhost' --user '@bob:localhost' --level 0
+
+# JSON output for scripting
+mx-agent workspace grant --room '!abc:localhost' --user '@bob:localhost' --json
+```
 
 ---
 

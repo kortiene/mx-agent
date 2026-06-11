@@ -1179,8 +1179,41 @@ Matrix room state is last-write-wins per `(type, state_key)`. To reduce accident
 - Include `state_rev` on mutable state events.
 - Include `previous_event_id` when updating known state.
 - Treat lower or repeated `state_rev` as stale in clients.
-- Restrict task mutation by Matrix power levels and mx-agent policy.
+- Restrict task mutation by Matrix power levels (see the
+  [Workspace power-level model](#workspace-power-level-model)) and mx-agent policy.
 - For contentious workflows, append timeline decision events and let a coordinator agent resolve state.
+
+#### Workspace power-level model
+
+When the daemon creates a workspace room (`workspace create`) it provisions an
+explicit `m.room.power_levels` (`power_level_content_override`) instead of
+relying on Matrix defaults, so that multi-agent workspaces work out of the box
+**and** a plain member cannot overwrite another agent's state:
+
+| Tier | Power level | May do |
+|---|---|---|
+| Creator | 100 | Everything, including changing native room state (name/topic/encryption) and re-granting power (`state_default` = 100). |
+| Granted agent | 50 | Publish any `com.mxagent.*` **state** event (`agent` / `task` / `invocation` / `trust` / `workspace` / `tool`), each pinned to power level 50 in the `events` map. |
+| Member | 0 | Send signed **timeline** events (`heartbeat`, `exec.request`, `call.request`, …; `events_default` = 0). Refused on every `com.mxagent.*` state write. |
+
+A joiner starts at power level 0 and cannot elevate itself (editing
+`m.room.power_levels` requires the creator's power level). The creator therefore
+grants each participating daemon the agent tier with:
+
+```bash
+mx-agent workspace grant --room '#project:server' --user '@agent2:server'
+```
+
+A refused `com.mxagent.*` state write surfaces a guided error naming the room,
+the event type, the required power level, and this command — never a raw 403.
+
+**Power levels gate integrity/DoS only, never execution.** They are a Matrix
+transport property: even a power-level-100 member cannot cause code to run. Every
+privileged request stays gated by the Ed25519 signature + local trust store
+(`key_id = SHA256(pubkey)`) + deny-by-default policy + optional approval
+(architecture §1.2 / §14). Per-type power levels are defense-in-depth *under* the
+signing gate, which is why a blanket `state_default` loosening is never the
+recommended path.
 
 ### 9.5 Query Commands
 
@@ -1921,7 +1954,13 @@ Recommended room settings:
 - private invite-only rooms
 - E2EE enabled
 - history visibility: joined members only
-- power levels restrict state-event mutation
+- per-event-type power levels gate `com.mxagent.*` state mutation: workspace
+  rooms are born with each state type pinned to power level 50 and `state_default`
+  100, so only granted agents (and the creator) can write state — see the
+  [Workspace power-level model](#workspace-power-level-model). The creator grants
+  a joining daemon with `workspace grant`. Power levels are integrity/DoS
+  protection only; they never gate execution (that stays with signature + trust +
+  policy + approval).
 - only trusted agents can send `task`, `exec`, `call`, and `trust` events
 - one workspace room per repository/project
 - optional per-task rooms for highly sensitive workflows

@@ -30,7 +30,9 @@ use mx_agent_protocol::schema::TrustState;
 use crate::matrix::restore_client;
 use crate::session::StoredSession;
 use crate::trust::{TrustEntry, TrustStore};
-use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
+use crate::workspace::{
+    parse_room_or_alias, resolve_room_id, send_workspace_state, WorkspaceError,
+};
 
 /// Build the Matrix state key for a trust record: `<agent_id>|<key_id>`
 /// (architecture §13.2).
@@ -192,10 +194,7 @@ pub async fn publish_trust_state(
 
     let content = serde_json::to_value(&state)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
-    room_handle
-        .send_state_event_raw(TRUST_STATE_TYPE, &key, content)
-        .await
-        .map_err(WorkspaceError::from)?;
+    send_workspace_state(&room_handle, TRUST_STATE_TYPE, &key, content).await?;
 
     Ok(state)
 }

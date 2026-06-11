@@ -651,6 +651,12 @@ fn dispatch(
             }),
             Err(response) => *response,
         },
+        "workspace.grant" => match parse_params::<crate::GrantWorkspaceOptions>(req) {
+            Ok(options) => block_on_task_response(req, |session| async move {
+                crate::grant_workspace_for_session(&session, &options).await
+            }),
+            Err(response) => *response,
+        },
         "workspace.status" => match parse_params::<crate::RoomParams>(req) {
             Ok(params) => block_on_task_response(req, |session| async move {
                 crate::workspace_status_for_session(&session, &params.room).await
@@ -1433,6 +1439,7 @@ mod tests {
             "workspace.create",
             "workspace.join",
             "workspace.attach",
+            "workspace.grant",
             "workspace.status",
             "agent.register",
             "agent.list",
