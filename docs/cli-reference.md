@@ -1667,6 +1667,8 @@ A task action is either optional (manual/planning task) or one of:
 
 The task begins in the specified `--state` (default `pending`). If `--assign` is provided, the task starts assigned; otherwise it is unassigned. Dependencies and blocking relationships are recorded but not validated at creation time.
 
+**Action signing.** The CLI submits `--tool`/`--exec` actions *unsigned* (it never holds a signing key). Because the live scheduler treats task state as advisory, an action only becomes executable once it carries a signed `authorization`. The **daemon signs the action with its own Ed25519 identity** on the local IPC caller's behalf, addressed to the assigned agent, with a bounded expiry — so no separate signing step is needed. If the task is created **without** `--assign`, the action is left advisory (unsigned) until an assigning `task update` names a target, at which point the daemon signs it. Likewise, a `task update` that changes the action body or reassigns the task re-signs it for the new target. Execution still requires the **executing agent to trust the daemon's signing key** under deny-by-default policy (set up via `trust publish`/`trust approve`); room membership is not execution permission, so an action signed by an untrusted key stays blocked. If the daemon cannot load its signing key, `task create`/`task update` fails with a daemon-side error. The default authorization validity window is 24 hours, overridable via the `MX_AGENT_TASK_AUTH_TTL` environment variable (whole seconds) on the daemon.
+
 Human output prints `created task <ID>` followed by a compact summary (ID, state, title, assignment, dependencies, action, revision). JSON output returns the full `TaskState` object with all fields.
 
 **Exit codes**
@@ -1706,7 +1708,7 @@ mx-agent task create --room '#project:server' \
 
 - Task IDs must be unique within a room; `--id` should follow URI-friendly conventions (alphanumeric, `-`, `_`).
 - A task without an action (no `--tool` or `--exec`) is a manual/planning task and will never be auto-executed by the scheduler.
-- Tool and exec actions are advisory; the daemon's policy and trust store determine whether they are actually executable.
+- The daemon signs `--tool`/`--exec` actions on the local IPC caller's behalf (Ed25519, addressed to the assigned agent) so they are admissible to the live scheduler. An unassigned task's action is left unsigned until an assigning `task update` names a target, at which point the daemon re-signs for the new assignee. Policy, trust, and any approval gate still determine whether a signed action is actually executed — see **Action signing** above.
 - Output larger than 256 KiB is offloaded to a SHA-256 mxc:// artifact with a 4 KiB tail preview.
 - Tasks are durable across daemon restarts (persisted in the Matrix room).
 
@@ -1800,6 +1802,7 @@ mx-agent task update --room '#project:server' task_001 \
 - Task state transitions are subject to the lifecycle rules defined in the architecture; not all transitions are allowed (e.g., terminal states never transition).
 - The `--expected-state-rev` field prevents "lost updates" in concurrent scenarios; if omitted, the update is applied unconditionally.
 - Updating a task action does not automatically cancel any linked invocation; use `task cancel` to terminate a running invocation.
+- When `--tool`/`--exec` is supplied or `--assign` names a new agent, the daemon re-signs the action addressed to the effective assignee (stripping any stale authorization first). A state/title/description/invocation-only update leaves the existing signature untouched.
 
 ---
 
@@ -3013,6 +3016,7 @@ mx-agent recovery recover --recovery-key "$(cat /secure/recovery.key)" && mx-age
 - `MX_AGENT_PASSWORD` — non-interactive password for `auth login` (read via stdin if not set)
 - `MX_AGENT_RECOVERY_KEY` — fallback recovery key for `recovery recover` (else stdin prompt)
 - `MX_AGENT_TASK_DISPATCH` — `local` (default) | `matrix` — route live scheduler task dispatch through the signed Matrix call/exec transport instead of local dispatch
+- `MX_AGENT_TASK_AUTH_TTL` — validity window in whole seconds for daemon-authored task-action authorizations (default: 86400 — 24 hours); set on the daemon, not the CLI
 - `MX_AGENT_LOG` — tracing/EnvFilter directive (e.g. `debug`, `mx_agent=trace`); overrides `-v` flag
 - `MX_AGENT_LOG_FORMAT` — log output format: `human` (default) | `json`
 - `MX_AGENT_CONFIG_DIR` — directory override for config (policy.toml, audit.log)

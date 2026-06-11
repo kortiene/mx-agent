@@ -1292,7 +1292,7 @@ fn task_action_signing_value(
 }
 
 /// Verify a task-action authorization signature against `verifying_key`.
-fn verify_task_action_signature(
+pub(crate) fn verify_task_action_signature(
     verifying_key: &VerifyingKey,
     task_id: &str,
     action: &TaskAction,
@@ -3303,5 +3303,119 @@ requires_approval = true
             [OrchestrationOutcome::StaleRemoteExecuting { owner, .. }] if owner == "other-agent"
         ));
         assert!(store.finalized_state.is_none());
+    }
+
+    // ── Verifier security regressions (issue #302) ─────────────────────────────
+    // These tests confirm that the executing-side enforcement is unchanged after
+    // daemon-side authoring-time signing was introduced. Authoring-side signing
+    // only attaches a signature — it does not weaken any of the execution gates.
+
+    #[test]
+    fn wrong_target_signed_action_does_not_execute() {
+        // An action signed for "wrong-agent" must not run when presented to an
+        // orchestrator for "agent-a": the verifier rejects it as `wrong_target`
+        // before dispatch is attempted. This guards the case where an authorization
+        // was authored for a different executing agent or where the task was
+        // reassigned without re-signing.
+        let action = TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: None,
+        };
+        let auth = sign_task_action(
+            &signing_key(),
+            TEST_KEY_ID,
+            "task-a",
+            &action,
+            "@planner:server",
+            "wrong-agent", // not "agent-a"
+            "2026-06-02T12:00:00Z",
+            future_rfc3339(),
+            "nonce-wrong-target",
+        )
+        .expect("sign task action");
+        let mut t = task("task-a", STATE_PENDING, "agent-a");
+        t.action = Some(TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: Some(auth),
+        });
+
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a") // agent_id != target_agent
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        let result = finalized_result(&store);
+        assert!(
+            result
+                .get("summary")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("wrong_target")),
+            "wrong-target action must be blocked with reason wrong_target; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_key_signed_action_does_not_execute() {
+        // An action whose `signature.key_id` is trusted in the trust store but has
+        // no registered verifying key must not run: the verifier blocks it as
+        // `unresolved_key`. This covers the case where a daemon is listed as trusted
+        // in the trust store but its public key bytes have not been loaded (e.g.
+        // the key was approved by key_id before the public key was fetched and
+        // registered via `.with_verifying_key`).
+        //
+        // The trust check (is_key_trusted) passes because the key_id is approved,
+        // but the verifying-key lookup returns None, producing `unresolved_key`.
+        let action = TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: None,
+        };
+        let unknown_key_id = "mxagent-ed25519:trusted-but-unresolved";
+        let auth = sign_task_action(
+            &signing_key(),
+            unknown_key_id,
+            "task-a",
+            &action,
+            "@planner:server",
+            "agent-a",
+            "2026-06-02T12:00:00Z",
+            future_rfc3339(),
+            "nonce-unresolved-key",
+        )
+        .expect("sign task action");
+        let mut t = task("task-a", STATE_PENDING, "agent-a");
+        t.action = Some(TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: Some(auth),
+        });
+
+        // Trust store approves the key_id, but no verifying key is registered for it.
+        let mut trust = TrustStore::default();
+        trust.approve("@planner:server", unknown_key_id, None, None, None);
+
+        let mut store = MemoryStore::default();
+        let mut dispatcher = PanicDispatcher;
+        let outcome = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust) // unknown_key_id is trusted...
+            // ...but no .with_verifying_key(unknown_key_id, ...) → unresolved_key
+            .process_one(&t, std::slice::from_ref(&t), &mut store, &mut dispatcher);
+        assert!(matches!(outcome, OrchestrationOutcome::Denied { .. }));
+        let result = finalized_result(&store);
+        assert!(
+            result
+                .get("summary")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("unresolved_key")),
+            "trusted but unresolved key_id must be blocked as unresolved_key; got: {result:?}"
+        );
     }
 }

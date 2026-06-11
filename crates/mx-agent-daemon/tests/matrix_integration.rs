@@ -101,18 +101,19 @@ use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
     authorize_call_request, authorize_exec_request, build_signed_call_request,
     build_signed_call_request_for_target, build_signed_exec_request, cancel_task_for_session,
-    create_task, create_workspace, decide_approval_for_session, emit_heartbeat, get_invocation,
-    grant_workspace, list_agents, list_pending_approvals, list_tasks, load_or_create_signing_key,
-    load_sync_token, login_password, read_latest_heartbeats, register_agent, restore_client,
-    run_matrix_sync, run_matrix_sync_with_subscribers, run_scheduler_loop, save_session,
-    show_agent, sign_task_action, start_call_matrix, start_exec_matrix, AgentListing,
-    BackoffConfig, CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions,
-    CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
-    ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent,
-    GrantWorkspaceOptions, HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness,
-    LivenessConfig, MatrixConfig, PtyWinsize, RegisterAgentOptions, SasAdvance, SessionPaths,
-    SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceError, WorkspaceVisibility,
-    DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT, WORKSPACE_AGENT_PL,
+    create_task, create_task_for_session, create_workspace, decide_approval_for_session,
+    emit_heartbeat, get_invocation, grant_workspace, list_agents, list_pending_approvals,
+    list_tasks, load_or_create_signing_key, load_sync_token, login_password,
+    read_latest_heartbeats, register_agent, restore_client, run_matrix_sync,
+    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, show_agent,
+    sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, BackoffConfig,
+    CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions, CreateWorkspaceOptions,
+    DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams,
+    ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent, GrantWorkspaceOptions,
+    HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig,
+    PtyWinsize, RegisterAgentOptions, SasAdvance, SessionPaths, SyncHealth, SyncState,
+    TaskDispatchMode, TrustStore, WorkspaceError, WorkspaceVisibility, DECISION_APPROVED,
+    DECISION_DENIED, HEARTBEAT_SCAN_LIMIT, WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -2385,6 +2386,375 @@ requires_approval = true
     assert!(
         !approval_deny_sentinel.exists(),
         "denied task's command must never spawn"
+    );
+}
+
+/// Live proof of the production daemon-side task-action signing path (issue #302).
+///
+/// Verifies end-to-end that a task created through the production
+/// [`create_task_for_session`] IPC entry point with an unsigned `Exec` action
+/// is daemon-signed at authoring time, then claimed, dispatched, and executed
+/// by the live scheduler — **no** manual [`sign_task_action`] call anywhere in
+/// the user flow.
+///
+/// Two tasks are published in the same scheduler run to prove both directions:
+///
+/// - `task-302-prod`: created via [`create_task_for_session`] with
+///   `authorization: None`; the daemon signs it with its own Ed25519 key. The
+///   live scheduler finds it correctly signed and runs it to `succeeded`.
+/// - `task-302-untrusted`: pre-signed with a **throwaway key that is not in
+///   the trust store**, then published via [`create_task`] directly (so the
+///   authoring path is not invoked — the action already carries an
+///   authorization). The scheduler rejects it as `untrusted_key` and
+///   finalizes it `blocked`, proving that daemon-side signing at authoring
+///   time does not weaken executing-side enforcement.
+///
+/// The existing [`signed_exec_task`] helper (manual sign before create) is
+/// the positive control and is preserved in [`live_scheduler_executes_signed_task_dag_and_denies`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_production_task_create_signs_and_executes() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login should succeed");
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore should succeed");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login should succeed");
+    let bob = restore_client(&bob_session)
+        .await
+        .expect("bob session restore should succeed");
+
+    // Alice creates the room (PL 100 as creator) so she can write state events
+    // for agent registration, task creation, and scheduler updates without a
+    // separate power-level grant. Bob joins only to list task states from
+    // outside the scheduler thread.
+    let room = create_public_room(&alice, "mx-agent 302 production-sign test").await;
+    let room_id = room.room_id().to_owned();
+    bob.join_room_by_id(&room_id).await.expect("bob joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    let bob_id = bob.user_id().expect("bob user id").to_owned();
+    wait_for_joined_member(&room, &bob_id).await;
+
+    // Register TARGET_AGENT owned by Alice. The agent-state entry includes
+    // Alice's signing public key, which the scheduler uses to resolve the
+    // verifying key when it checks the signature.
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it-302".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    // Daemon signing key — the same key `create_task_for_session` and
+    // `register_agent` both loaded from `ENV_DATA_DIR` (via
+    // `SessionPaths::resolve()`). This is the key the trust store must trust
+    // for the scheduler to admit the production-path task.
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+
+    // Build a second, throwaway signing key that will NOT be added to the trust
+    // store. Used to produce the negative-case pre-signed action.
+    let untrusted_dir = data_dir.join("untrusted");
+    paths_in(untrusted_dir.clone())
+        .ensure_data_dir()
+        .expect("create untrusted dir");
+    let untrusted_signing =
+        load_or_create_signing_key(&paths_in(untrusted_dir)).expect("untrusted signing key");
+    assert_ne!(
+        signing.key_id(),
+        untrusted_signing.key_id(),
+        "the two signing identities must be distinct for this test to be meaningful"
+    );
+
+    // Trust only the daemon's own key. `create_task_for_session` will sign
+    // the production task with this key (addressed to TARGET_AGENT). The
+    // untrusted key is deliberately omitted so the scheduler blocks that task.
+    let alice_id_str = alice_id.to_string();
+    let mut trust = TrustStore::default();
+    trust.approve(
+        alice_id_str.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+
+    // Policy: allow the task creator (Alice's Matrix user id = `created_by`)
+    // to run "sh" in the work directory. Deny-by-default for everything else.
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{alice_id}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+"#,
+            room = room_id.as_str(),
+            alice_id = alice_id_str,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    // ── Production-path task: no pre-signed authorization ──
+    //
+    // This is the scenario issue #302 targeted: a user runs
+    // `mx-agent task create --exec -- sh -c 'exit 0'`. The CLI emits
+    // `authorization: None`; the daemon signs daemon-side in
+    // `create_task_for_session`. No manual `sign_task_action` call here.
+    let prod_task_id = "task-302-prod";
+    create_task_for_session(
+        &alice_session,
+        &CreateTaskOptions {
+            room: room_id.to_string(),
+            task_id: Some(prod_task_id.to_string()),
+            title: "production-path exec task (issue #302)".to_string(),
+            description: String::new(),
+            state: None,
+            assigned_to: TARGET_AGENT.to_string(),
+            created_by: Some(alice_id_str.clone()),
+            depends_on: Vec::new(),
+            blocks: Vec::new(),
+            action: Some(TaskAction::Exec {
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+                cwd: cwd.to_string_lossy().into_owned(),
+                env: BTreeMap::new(),
+                timeout_ms: Some(60_000),
+                stream: false,
+                authorization: None,
+            }),
+        },
+    )
+    .await
+    .expect("production-path create_task_for_session must succeed");
+
+    // Verify the daemon attached an authorization at authoring time, without
+    // any manual sign_task_action call. This is the direct proof of #302.
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice syncs to read task state");
+    {
+        let tasks = list_tasks(
+            &alice,
+            &ListTasksOptions {
+                room: room_id.to_string(),
+                state: None,
+                assigned_to: None,
+            },
+        )
+        .await
+        .expect("alice lists tasks after sync");
+        let prod = tasks
+            .iter()
+            .find(|t| t.task_id == prod_task_id)
+            .expect("production task must exist");
+        assert!(
+            prod.action
+                .as_ref()
+                .and_then(|a| a.authorization())
+                .is_some(),
+            "create_task_for_session must have daemon-signed the action (no manual \
+             sign_task_action call); issue #302 — task: {:?}",
+            prod
+        );
+        // The authorization must be addressed to TARGET_AGENT.
+        let auth = prod
+            .action
+            .as_ref()
+            .and_then(|a| a.authorization())
+            .expect("authorization present");
+        assert_eq!(
+            auth.target_agent, TARGET_AGENT,
+            "daemon-authored authorization must target the executing agent"
+        );
+    }
+
+    // ── Negative case: pre-signed by an untrusted key ──
+    //
+    // The action already carries an authorization from the throwaway key, so
+    // `create_task_for_session` would leave it untouched (the daemon never
+    // overwrites an existing signature). Using `create_task` directly makes
+    // the test intent explicit: we want the scheduler to see this key and
+    // reject it as `untrusted_key`.
+    let untrusted_task_id = "task-302-untrusted";
+    let unsigned_exec = TaskAction::Exec {
+        command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+        cwd: cwd.to_string_lossy().into_owned(),
+        env: BTreeMap::new(),
+        timeout_ms: Some(60_000),
+        stream: false,
+        authorization: None,
+    };
+    let untrusted_auth = sign_task_action(
+        untrusted_signing.signing_key(),
+        untrusted_signing.key_id(),
+        untrusted_task_id,
+        &unsigned_exec,
+        &alice_id_str,
+        TARGET_AGENT,
+        "2026-01-01T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        format!("untrusted-nonce-{untrusted_task_id}"),
+    )
+    .expect("sign with untrusted key");
+    create_task(
+        &alice,
+        &CreateTaskOptions {
+            room: room_id.to_string(),
+            task_id: Some(untrusted_task_id.to_string()),
+            title: "untrusted-key task (negative case — must stay blocked)".to_string(),
+            description: String::new(),
+            state: None,
+            assigned_to: TARGET_AGENT.to_string(),
+            created_by: Some(alice_id_str.clone()),
+            depends_on: Vec::new(),
+            blocks: Vec::new(),
+            action: Some(unsigned_exec.with_authorization(untrusted_auth)),
+        },
+    )
+    .await
+    .expect("publish untrusted-key task");
+
+    // Alice's /sync loop keeps her room state fresh for the scheduler.
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    // Run the real scheduler loop: admits the production-path task (trusted,
+    // signed, policy-allowed) and blocks the untrusted-key task.
+    let scheduler = {
+        let alice = alice.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            run_scheduler_loop(
+                alice,
+                ExecSubscriberRegistry::new(),
+                TaskDispatchMode::Local,
+                running,
+                Duration::from_secs(1),
+            );
+        })
+    };
+
+    // Poll until both tasks reach a terminal state or the deadline expires.
+    let list_opts = ListTasksOptions {
+        room: room_id.to_string(),
+        state: None,
+        assigned_to: None,
+    };
+    let mut final_states: BTreeMap<String, String> = BTreeMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+            final_states = tasks.into_iter().map(|t| (t.task_id, t.state)).collect();
+            let prod = final_states.get(prod_task_id).map(String::as_str);
+            let untrusted = final_states.get(untrusted_task_id).map(String::as_str);
+            let prod_terminal =
+                matches!(prod, Some("succeeded") | Some("blocked") | Some("failed"));
+            let untrusted_terminal = matches!(
+                untrusted,
+                Some("succeeded") | Some("blocked") | Some("failed")
+            );
+            if prod_terminal && untrusted_terminal {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Diagnostic dump for CI output on failure.
+    if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+        for t in &tasks {
+            eprintln!(
+                "DIAG task={} state={} result={}",
+                t.task_id,
+                t.state,
+                t.result
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "null".to_string())
+            );
+        }
+    }
+
+    running.store(false, Ordering::SeqCst);
+    scheduler.join().expect("scheduler thread should join");
+    alice_sync
+        .await
+        .expect("alice sync task should join")
+        .expect("alice sync loop should exit cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    // Production-path task must execute without any manual sign_task_action
+    // call — this is the end-to-end acceptance criterion for issue #302.
+    assert_eq!(
+        final_states.get(prod_task_id).map(String::as_str),
+        Some("succeeded"),
+        "production-path task (daemon-signed via create_task_for_session, \
+         no manual sign_task_action) must execute; states: {final_states:?}"
+    );
+
+    // Executing-side enforcement must be intact: the untrusted-key task is
+    // blocked even though it carries a signature, proving authoring-side
+    // signing did not weaken execution.
+    assert_eq!(
+        final_states.get(untrusted_task_id).map(String::as_str),
+        Some("blocked"),
+        "task pre-signed by an untrusted key must be blocked (untrusted_key); \
+         authoring-side signing must not weaken executing-side enforcement; \
+         states: {final_states:?}"
     );
 }
 

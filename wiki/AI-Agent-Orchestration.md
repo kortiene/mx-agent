@@ -2,7 +2,7 @@
 
 This is the flagship use case: mx-agent as the **secure substrate for multi-agent AI coding workflows**. If you are running LLM coding agents — Claude Code, Pi, terminal-based runners — across laptops, CI boxes, and remote machines, this page shows how they coordinate through mx-agent without exposing ports or sharing secrets.
 
-> **Implementation status.** The orchestration model is fully implemented and CI-stable. All command groups run through the daemon over local IPC; `call` and `exec` (batch and interactive `--pty`) support signed Matrix-backed remote dispatch (including stdin/resize/cancel controls) when `--room`/`--agent` target a registered, trusted, policy-allowed agent; `--pty` streams the daemon's pseudo-terminal over local IPC and the signed Matrix transport. The **live daemon scheduler loop** auto-claims assigned tasks from `com.mxagent.task.v1` room state, dispatches them (local tool/exec by default; opt into signed Matrix-backed remote dispatch via `MX_AGENT_TASK_DISPATCH=matrix`), and recovers stale work on restart. Sandbox backends (`none`, `bubblewrap`, Docker/Podman container) are implemented and policy-selectable, with `none` as the fallback and no standalone security-boundary guarantee. E2EE privileged-event decryption and fail-safe handling ship today; production E2EE hardening remains planned. Commands below are tagged where behavior is not yet live.
+> **Implementation status.** The orchestration model is fully implemented and CI-stable. All command groups run through the daemon over local IPC; `call` and `exec` (batch and interactive `--pty`) support signed Matrix-backed remote dispatch (including stdin/resize/cancel controls) when `--room`/`--agent` target a registered, trusted, policy-allowed agent; `--pty` streams the daemon's pseudo-terminal over local IPC and the signed Matrix transport. The **live daemon scheduler loop** claims **assigned, signed, policy-allowed** tasks from `com.mxagent.task.v1` room state and dispatches them (local tool/exec by default; opt into signed Matrix-backed remote dispatch via `MX_AGENT_TASK_DISPATCH=matrix`), recovering stale work on restart. A task action is only executable when it carries a signed `authorization` from a locally trusted signing key, addressed to the executing agent — so the **daemon signs CLI-authored task actions on the local IPC caller's behalf** (addressed to the assigned agent), and the CLI never holds the signing key. Execution still requires the executing agent to trust that key under deny-by-default policy: membership is not execution permission. Sandbox backends (`none`, `bubblewrap`, Docker/Podman container) are implemented and policy-selectable, with `none` as the fallback and no standalone security-boundary guarantee. E2EE privileged-event decryption and fail-safe handling ship today; production E2EE hardening remains planned. Commands below are tagged where behavior is not yet live.
 
 ---
 
@@ -114,6 +114,16 @@ mx-agent share diff --room "$ROOM" --base main --format unified
 mx-agent exec --room "$ROOM" --agent pi-builder --task "$TEST" \
   --cwd /home/me/code/project --stream -- npm test
 ```
+
+> **Tip — scheduler-driven alternative.** You can embed the exec directly in the task at create time with `--exec`:
+> ```bash
+> TEST=$(mx-agent task create --room "$ROOM" \
+>   --title "Run API test suite" --assign pi-builder \
+>   --depends-on "$CODE" \
+>   --exec --cwd /home/me/code/project --stream -- npm test \
+>   --json | jq -r .task_id)
+> ```
+> The daemon signs the action on the IPC caller's behalf (addressed to `pi-builder`) so the live scheduler admits and dispatches it automatically once `task-code` succeeds — no separate `exec` invocation needed. Execution still requires `pi-builder`'s daemon to trust the signing key under deny-by-default policy.
 
 Streamed back to the planner's terminal:
 
