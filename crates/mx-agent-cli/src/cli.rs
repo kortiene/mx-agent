@@ -4153,6 +4153,8 @@ fn cmd_exec_pty(global: &GlobalArgs, args: &ExecArgs, cwd: PathBuf) -> ExitCode 
         rows: initial.rows,
         cols: initial.cols,
         task: args.task.clone(),
+        // The CLI uses the daemon's default loopback output cap.
+        max_output_bytes: None,
     };
     let params_value = match serde_json::to_value(&params) {
         Ok(value) => value,
@@ -4273,7 +4275,9 @@ fn pty_render_loop(
                             }
                         }
                     }
-                    mx_agent_daemon::PtyServerFrame::Finished { exit_code, signal } => {
+                    mx_agent_daemon::PtyServerFrame::Finished {
+                        exit_code, signal, ..
+                    } => {
                         let _ = code_tx.send(pty_exit_code(exit_code, signal));
                         return;
                     }

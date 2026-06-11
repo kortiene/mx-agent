@@ -943,6 +943,263 @@ allow_cwd = ["{cwd}"]
     std::env::remove_var("MX_AGENT_CONFIG_DIR");
 }
 
+/// Live non-PTY exec output-cap: `exec.finished.truncated` carries the real value (issue #268).
+///
+/// Two daemons over the live homeserver. The target's policy sets `max_output_bytes = 10`:
+/// a command that produces more than 10 bytes must yield `truncated: true` in the forwarded
+/// `ExecFinished`, while a small-output command within the cap must yield `truncated: false`.
+/// This validates that the live non-PTY path threads the `CaptureSummary.truncated` flag
+/// through `emit_output_events` → `ExecFinished` rather than hardcoding `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_non_pty_exec_truncation_is_reported() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent live exec truncation test").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    for (client, agent_id) in [
+        (&bob, requester_agent.clone()),
+        (&alice, TARGET_AGENT.to_string()),
+    ] {
+        register_agent(
+            client,
+            &RegisterAgentOptions {
+                room: room_id.to_string(),
+                agent_id: Some(agent_id),
+                kind: "pi".to_string(),
+                capabilities: vec!["exec".to_string()],
+                tools: vec![],
+                cwd: cwd.to_string_lossy().into_owned(),
+                project_id: "mx-agent-it".to_string(),
+                max_invocations: 1,
+            },
+        )
+        .await
+        .expect("register agent");
+    }
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    // 10-byte output cap: any command producing more than 10 bytes must trigger truncation.
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+max_output_bytes = 10
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let subscribers = ExecSubscriberRegistry::new();
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &alice,
+                &paths,
+                health,
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    let bob_sync_paths = paths_in(data_dir.join("bob-sync"));
+    bob_sync_paths
+        .ensure_data_dir()
+        .expect("create bob sync dir");
+    let bob_sync = {
+        let bob = bob.clone();
+        let paths = bob_sync_paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &bob,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+
+    save_session(&paths, &bob_session).expect("save requester session");
+
+    // Command that produces ~50 bytes — well over the 10-byte cap.
+    let over_cap = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf '%050d' 0".to_string(),
+            ],
+            cwd: Some(cwd.clone()),
+            stdin: None,
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+            invocation_id: None,
+        },
+        &subscribers,
+    )
+    .await;
+    match over_cap.outcome {
+        ExecOutcome::Ok { ref frames } => {
+            let finished = frames
+                .iter()
+                .find_map(|f| {
+                    if let ExecFrame::Finished(fin) = f {
+                        Some(fin)
+                    } else {
+                        None
+                    }
+                })
+                .expect("over-cap exec must have a Finished frame");
+            assert!(
+                finished.truncated,
+                "output exceeding max_output_bytes must yield truncated:true; got {finished:?}"
+            );
+        }
+        other => panic!("expected Ok for over-cap exec, got {other:?}"),
+    }
+
+    // Command that produces 3 bytes ("hi\n") — within the 10-byte cap.
+    let within_cap = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            command: vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            cwd: Some(cwd.clone()),
+            stdin: None,
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+            invocation_id: None,
+        },
+        &subscribers,
+    )
+    .await;
+    match within_cap.outcome {
+        ExecOutcome::Ok { ref frames } => {
+            let finished = frames
+                .iter()
+                .find_map(|f| {
+                    if let ExecFrame::Finished(fin) = f {
+                        Some(fin)
+                    } else {
+                        None
+                    }
+                })
+                .expect("within-cap exec must have a Finished frame");
+            assert!(
+                !finished.truncated,
+                "output within max_output_bytes must yield truncated:false; got {finished:?}"
+            );
+        }
+        other => panic!("expected Ok for within-cap exec, got {other:?}"),
+    }
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync task joins")
+        .expect("alice sync exits cleanly");
+    bob_sync
+        .await
+        .expect("bob sync task joins")
+        .expect("bob sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
 /// Live Matrix-backed remote interactive PTY exec coverage (issue #238).
 ///
 /// Two daemons over the live homeserver: the requester (bob) sends a signed
@@ -1191,6 +1448,230 @@ allow_cwd = ["{cwd}"]
     assert!(
         output.contains("50 132"),
         "resize should propagate over the transport to the remote PTY: {output:?}"
+    );
+}
+
+/// Live PTY exec output-cap: `exec.finished.truncated` reflects the real cap (issue #268).
+///
+/// Two daemons over the live homeserver. The target's policy sets `max_output_bytes = 10`
+/// so a PTY command that outputs more than 10 bytes must produce `truncated: true` in the
+/// forwarded `ExecFinished`. This validates the live PTY path (`run_controlled_pty_exec`
+/// chunker → `PtyExecOutcome.truncated` → `exec.finished`) rather than hardcoding `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_pty_exec_truncation_is_reported() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent live pty truncation test").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    for (client, agent_id) in [
+        (&bob, requester_agent.clone()),
+        (&alice, TARGET_AGENT.to_string()),
+    ] {
+        register_agent(
+            client,
+            &RegisterAgentOptions {
+                room: room_id.to_string(),
+                agent_id: Some(agent_id),
+                kind: "pi".to_string(),
+                capabilities: vec!["exec".to_string()],
+                tools: vec![],
+                cwd: cwd.to_string_lossy().into_owned(),
+                project_id: "mx-agent-it".to_string(),
+                max_invocations: 1,
+            },
+        )
+        .await
+        .expect("register agent");
+    }
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    // 10-byte output cap on the PTY path — any PTY output > 10 bytes must truncate.
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+max_output_bytes = 10
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let subscribers = ExecSubscriberRegistry::new();
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &alice,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    let bob_sync_paths = paths_in(data_dir.join("bob-sync"));
+    bob_sync_paths.ensure_data_dir().expect("bob sync dir");
+    let bob_sync = {
+        let bob = bob.clone();
+        let paths = bob_sync_paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &bob,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+
+    // Sign and send a PTY exec request for a command that outputs ~50 bytes.
+    let invocation_id = format!("inv_pty_trunc_{}", std::process::id());
+    let options = ExecRequestOptions {
+        target_agent: TARGET_AGENT.to_string(),
+        requesting_agent: requester_agent.clone(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf '%050d' 0".to_string(),
+        ],
+        cwd: cwd.to_string_lossy().into_owned(),
+        env: Default::default(),
+        stdin: false,
+        stream: true,
+        pty: true,
+        timeout_ms: 600_000,
+        task_id: None,
+    };
+    let content = build_signed_exec_request(
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        format!("req_pty_trunc_{}", std::process::id()),
+        format!("pty-trunc-nonce-{}", std::process::id()),
+        "2026-01-01T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        &options,
+    )
+    .expect("sign pty exec request");
+
+    let mut subscription =
+        subscribers.subscribe(ExecSubscriptionKey::Invocation(invocation_id.clone()));
+    room.send_raw(timeline::EXEC_REQUEST, content)
+        .await
+        .expect("send pty exec request");
+
+    // Collect events until ExecFinished or deadline.
+    let mut truncated_result: Option<bool> = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv()).await {
+            Ok(Some(ForwardedExecEvent::ExecFinished(finished))) => {
+                truncated_result = Some(finished.truncated);
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let _ = alice_sync.await.expect("alice sync joins");
+    let _ = bob_sync.await.expect("bob sync joins");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    let truncated =
+        truncated_result.expect("PTY exec must deliver ExecFinished before the 30 s deadline");
+    assert!(
+        truncated,
+        "PTY output exceeding max_output_bytes must yield truncated:true"
     );
 }
 

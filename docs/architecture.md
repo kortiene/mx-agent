@@ -589,6 +589,13 @@ For non-UTF-8 data, use base64:
 }
 ```
 
+The merged interactive `pty` stream is byte-capped exactly like `stdout`/`stderr`
+(§8.1, §8.3): once the per-invocation `max_output_bytes` budget is exhausted the
+daemon stops forwarding `pty` chunks, still sends the terminating EOF chunk, and
+reports `truncated: true` on `exec.finished`. The capped child keeps running (it
+is bounded only by the exec timeout); capping drops forwarded output, it never
+kills the process.
+
 ### 7.4 Finished Event
 
 ```json
@@ -776,11 +783,18 @@ In strict mode, missing or invalid chunks cause local exit code `132`.
 
 The daemon must protect both Matrix and local processes:
 
-- Apply per-invocation output caps.
+- Apply per-invocation output caps. This includes the merged interactive `pty`
+  stream: the live PTY path enforces the requesting agent's
+  `max_output_bytes`, and the local loopback PTY falls back to a generous
+  default cap (64 MiB) since it resolves no policy — in both cases output past
+  the budget is dropped while the master is still drained so the child is never
+  stalled.
 - Pause local child reads only when safe.
 - Drop or summarize excessive output according to policy.
 - Switch to artifact mode when output exceeds timeline budget.
-- Surface truncation explicitly.
+- Surface truncation explicitly. The live and loopback PTY paths report capping
+  via `exec.finished.truncated` (and the loopback IPC `Finished` frame), just as
+  the non-PTY path does.
 
 ### 8.4 Large Output Artifact Mode
 

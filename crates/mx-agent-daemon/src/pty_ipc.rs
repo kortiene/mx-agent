@@ -51,6 +51,7 @@ use mx_agent_ipc::{read_frame, write_frame, Request, Response};
 
 use crate::pty::{PtySession, PtyWinsize};
 use crate::runner::RunSpec;
+use crate::stream::{CaptureLimiter, OutputCaps, DEFAULT_PTY_OUTPUT_CAP_BYTES};
 
 /// Streaming IPC method that starts an interactive PTY `exec` session.
 pub const METHOD_EXEC_PTY: &str = "exec.pty";
@@ -86,6 +87,13 @@ pub struct ExecPtyParams {
     /// Associated task id, if any.
     #[serde(default)]
     pub task: Option<String>,
+    /// Per-invocation output byte cap for a **loopback** PTY session. `None`
+    /// falls back to [`DEFAULT_PTY_OUTPUT_CAP_BYTES`]; the cap bounds forwarded
+    /// output only and never kills the child (issue #268). The CLI does not set
+    /// this today; it exists so tests (and any future flag) can override the
+    /// default.
+    #[serde(default)]
+    pub max_output_bytes: Option<u64>,
 }
 
 fn default_rows() -> u16 {
@@ -114,6 +122,11 @@ pub enum PtyServerFrame {
         exit_code: Option<i32>,
         /// Terminating signal number, when killed by a signal.
         signal: Option<i32>,
+        /// Whether forwarded PTY output was capped to honour the per-invocation
+        /// byte budget (issue #268). `#[serde(default)]` keeps the frame
+        /// compatible with peers that predate the field.
+        #[serde(default)]
+        truncated: bool,
     },
     /// The session could not be started or failed before/while running.
     Error {
@@ -209,15 +222,21 @@ pub fn run_pty_loopback(
     let out_stream = stream.try_clone()?;
     let in_stream = stream.try_clone()?;
 
+    // The loopback path resolves no policy/allowance, so it falls back to a
+    // generous default cap to bound the merged stream (issue #268). Tests (and
+    // any future flag) can override it via `ExecPtyParams::max_output_bytes`.
+    let cap = params
+        .max_output_bytes
+        .or(Some(DEFAULT_PTY_OUTPUT_CAP_BYTES));
     let request_id_out = request_id.clone();
     let output =
-        std::thread::spawn(move || pump_master_to_client(reader, out_stream, request_id_out));
+        std::thread::spawn(move || pump_master_to_client(reader, out_stream, request_id_out, cap));
     let input = std::thread::spawn(move || pump_client_to_master(in_stream, master_io));
 
     let status = session.wait();
     // The child has exited; the master reader sees EOF, so the output thread
     // drains and ends.
-    let _ = output.join();
+    let truncated = output.join().unwrap_or(false);
 
     let (exit_code, signal) = match status {
         Ok(status) => (status.code(), status_signal(&status)),
@@ -226,7 +245,11 @@ pub fn run_pty_loopback(
     let _ = write_server_frame(
         stream,
         request_id,
-        &PtyServerFrame::Finished { exit_code, signal },
+        &PtyServerFrame::Finished {
+            exit_code,
+            signal,
+            truncated,
+        },
     );
 
     // Unblock the input reader (it is parked in a blocking read of the client)
@@ -471,6 +494,9 @@ async fn drain_remote_pty(
                     &PtyServerFrame::Finished {
                         exit_code: finished.exit_code,
                         signal: finished.signal.as_deref().and_then(signal_number),
+                        // Surface the target's real truncation flag, which the
+                        // live PTY path now populates (issue #268).
+                        truncated: finished.truncated,
                     },
                 );
                 return;
@@ -492,6 +518,8 @@ async fn drain_remote_pty(
                     &PtyServerFrame::Finished {
                         exit_code: None,
                         signal: signal_number(&cancelled.signal_sent),
+                        // `exec.cancelled` carries no truncation flag.
+                        truncated: false,
                     },
                 );
                 return;
@@ -569,25 +597,47 @@ fn signal_number(name: &str) -> Option<i32> {
 }
 
 /// Copy the PTY's merged output to the client as base64 [`PtyServerFrame::Output`]
-/// frames until end-of-stream.
-fn pump_master_to_client(mut reader: std::fs::File, mut out: UnixStream, request_id: Value) {
+/// frames until end-of-stream, bounded by `max_output_bytes`.
+///
+/// Returns whether the stream was truncated to honour the byte budget. Once the
+/// budget is exhausted the pump stops forwarding frames but keeps draining the
+/// master to EOF so the child can finish naturally — capping prevents an
+/// IPC-socket flood, it does not kill the process (issue #268). Loopback has no
+/// wall-clock bound, so the child runs to its natural exit (or until the user
+/// sends Ctrl-D / Ctrl-C through stdin).
+fn pump_master_to_client(
+    mut reader: std::fs::File,
+    mut out: UnixStream,
+    request_id: Value,
+    max_output_bytes: Option<u64>,
+) -> bool {
+    let limiter = CaptureLimiter::new(OutputCaps {
+        max_output_bytes,
+        max_events_per_second: None,
+    });
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let frame = PtyServerFrame::Output {
-                    data: base64::engine::general_purpose::STANDARD.encode(&buf[..n]),
-                };
-                if write_server_frame(&mut out, &request_id, &frame).is_err() {
-                    break;
+                let allowed = limiter.reserve(n);
+                if allowed > 0 {
+                    let frame = PtyServerFrame::Output {
+                        data: base64::engine::general_purpose::STANDARD.encode(&buf[..allowed]),
+                    };
+                    if write_server_frame(&mut out, &request_id, &frame).is_err() {
+                        break;
+                    }
                 }
+                // Budget exhausted: keep reading (draining) so the child can
+                // finish, but stop forwarding frames to the client.
             }
             // A PTY master reports EIO (not EOF) once the slave is gone; treat
             // any read error as end-of-stream.
             Err(_) => break,
         }
     }
+    limiter.truncated()
 }
 
 /// Apply inbound client frames (keystrokes and resizes) to the PTY master until
@@ -661,6 +711,7 @@ mod tests {
         let finished = PtyServerFrame::Finished {
             exit_code: Some(0),
             signal: None,
+            truncated: false,
         };
         let value = serde_json::to_value(&finished).unwrap();
         assert_eq!(value["event"], "finished");
@@ -682,6 +733,7 @@ mod tests {
             PtyServerFrame::Finished {
                 exit_code: None,
                 signal: Some(2),
+                truncated: false,
             },
             PtyServerFrame::Error {
                 message: "nope".to_string(),

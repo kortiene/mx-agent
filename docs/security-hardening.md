@@ -14,7 +14,12 @@ one, **what the safe default is and which options weaken it**.
 > sandbox machinery described here is real and already enforced for **batch exec and
 > named tool calls (`call`)** — on the daemon that runs the command, local or remote.
 > Interactive `exec --pty` has only the baseline controls (env scrub, cwd, timeout,
-> output cap); the PTY exec path does not route through the sandbox backend. Replay/expiry checks are enforced for
+> output cap); the PTY exec path does not route through the sandbox backend. The output
+> cap for live remote PTY is the agent's `max_output_bytes` from policy (same as batch
+> exec); a loopback PTY (no `--room`/`--agent`) falls back to a 64 MiB hard cap when
+> `max_output_bytes` is unset. When the cap is reached the daemon stops forwarding
+> terminal output (the child keeps running), terminates the stream cleanly, and reports
+> `truncated: true` in `exec.finished`. Replay/expiry checks are enforced for
 > request types whose schema carries nonce/expiry fields.
 
 ## Contents
@@ -355,7 +360,7 @@ network = "deny"
 | `allow_cwd` | `[]` | Allowlisted absolute working directories (subdirs included). |
 | `deny_args_regex` | `[]` | Deny if any pattern matches the argv. |
 | `max_runtime_ms` | none | Wall-clock cap; unset ⇒ unbounded. |
-| `max_output_bytes` | none | Captured-output cap; unset ⇒ unbounded. |
+| `max_output_bytes` | none | Captured-output cap; unset ⇒ unbounded for batch exec/call. For live remote `--pty` sessions the same value is applied; a loopback `--pty` falls back to a 64 MiB default when unset. |
 | `requires_approval` | `false` | Hold the request for human sign-off. |
 | `sandbox` / `network` | none | Per-agent overrides. |
 | `require_verified_device` | `false` | Per-agent verified-device gate (deny-only; OR-ed with the room default). |
@@ -371,7 +376,9 @@ network = "deny"
   grants arbitrary execution — a shell can run anything. Allow specific tools,
   not interpreters.
 - **Unset `max_runtime_ms` / `max_output_bytes`** allow unbounded runtime and
-  output (resource exhaustion). Always set caps for untrusted peers.
+  output (resource exhaustion). Always set caps for untrusted peers. For interactive
+  `--pty`, an unset `max_output_bytes` still applies the 64 MiB loopback default, but
+  remote PTY sessions run without any cap — set it explicitly for remote agents.
 - **`requires_approval = false` with a wide allowlist** removes the human in the
   loop. Set `requires_approval = true` for anything you have not fully
   constrained.
@@ -404,7 +411,8 @@ writable ones, so a nested `writable_paths` entry can carve a writable hole in a
 read-only tree. Keep `writable_paths` as small as the task allows — typically
 the project directory and a scratch dir under `/tmp`. Filesystem-bind confinement
 applies to batch exec and named tool calls (`call`); the interactive `exec --pty`
-path does not route through the sandbox backend.
+path does not route through the sandbox backend, though the output byte cap
+(`max_output_bytes`) is still enforced on the PTY stream regardless of sandbox.
 
 **What the sandbox does *not* do.** There is no seccomp filtering, no
 rlimit-based resource capping, and no UID/GID remapping — commands run as the
