@@ -1846,6 +1846,18 @@ the resolved `Allowance` — sandbox backend, network decision, filesystem binds
 and the env allowlist that drives the §13.4 scrub — confines them identically
 rather than letting them run on the bare host with the daemon's full environment.
 
+An interactive `exec --pty` session under the **container** backend additionally
+allocates an in-container TTY (`-i -t`), so `isatty` is true inside the container
+and full-screen/interactive programs (a login shell, `vim`, `top`) work; the host
+already wires the PTY slave fds as the command's stdin/stdout/stderr, and these
+flags add the controlling terminal *inside* the container. Batch `exec` keeps the
+non-interactive argv (no `-i`/`-t`). The isolation flags — `--read-only`,
+`--network none`, the volume binds, `--workdir`, and the `--env` allowlist — are
+identical in both cases; `-i -t` only governs stdin attachment and TTY allocation
+and widens no filesystem, network, or privilege boundary. The `none` and
+`bubblewrap` backends already behave interactively under `--pty` because the
+command inherits the parent's PTY slave directly, so they ignore the signal.
+
 ### 13.6 Audit Logging
 
 Every privileged decision is logged locally without secrets. Both raw `exec`

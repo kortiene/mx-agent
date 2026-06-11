@@ -118,7 +118,12 @@ impl PtySession {
     /// ([`RunSpec::sandbox`]) exactly as [`crate::runner::run`] does, so the
     /// configured network policy and read-only/writable binds confine the
     /// interactive session too (architecture §13.5); the baseline `none` backend
-    /// adds no isolation. The child runs in `spec.cwd` with the same
+    /// adds no isolation. Because this is the interactive entry point, the
+    /// resolved [`Restrictions`] are marked `interactive`, so the container
+    /// backend additionally allocates an in-container TTY (`-i -t`) — `isatty` is
+    /// true inside the container and full-screen programs work; the
+    /// `none`/`bubblewrap` backends inherit the parent's PTY slave directly and
+    /// ignore the signal. The child runs in `spec.cwd` with the same
     /// allowlist-sanitized environment (secrets are never inherited) and is
     /// placed in its own process group so a later cancel/timeout can signal the
     /// whole group. Its stdin, stdout, and stderr are all wired to the PTY slave,
@@ -163,7 +168,13 @@ impl PtySession {
         // returns the argv unchanged. Without this the sandbox/network/path
         // fields on the spec would have no effect on the interactive path.
         let env = sanitize_env(std::env::vars(), &spec.env, &spec.env_allowlist);
-        let restrictions = restrictions_for(spec, env);
+        let mut restrictions = restrictions_for(spec, env);
+        // This is the interactive `--pty` path: signal the sandbox layer so a
+        // backend that launches through a separate runtime (the container
+        // backend) allocates an in-container TTY (`-i -t`), making `isatty` true
+        // inside the container. The `none`/`bubblewrap` backends inherit the
+        // parent's PTY slave directly and ignore this flag.
+        restrictions.interactive = true;
         let prepared = sandbox_for(spec.sandbox).prepare(spec.command.clone(), restrictions);
         let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
         let Restrictions { cwd, env, .. } = prepared.restrictions;
@@ -447,6 +458,81 @@ mod tests {
         assert!(
             !output.contains("PTY-SANDBOX-NET-OPEN"),
             "interactive PTY exec saw the host network — not sandboxed: {output:?}"
+        );
+    }
+
+    // --- Container backend under the interactive PTY path (issue #272) --------
+    //
+    // A container-backed `--pty` session must be genuinely interactive: the
+    // container backend allocates an in-container TTY (`-i -t`) so `isatty` is
+    // true inside the container. This is a behavioral integration test that
+    // skips gracefully when no container runtime/image is usable (no
+    // Docker/Podman, no network to pull, or a restricted CI sandbox).
+
+    /// A container runtime that can run `true` in a small image, if one is
+    /// available (mirrors the probe in the sandbox crate's integration tests).
+    /// `-t` requires the attached stdin to be a TTY, which it always is on the
+    /// PTY path, so the probe itself runs non-interactively.
+    fn usable_container_runtime() -> bool {
+        for runtime in ["docker", "podman"] {
+            for image in ["busybox", "alpine", "debian:stable-slim"] {
+                let ran = Command::new(runtime)
+                    .args(["run", "--rm", image, "true"])
+                    .output();
+                if let Ok(out) = ran {
+                    if out.status.success() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn pty_container_session_is_interactive() {
+        use mx_agent_sandbox::Backend;
+
+        if !usable_container_runtime() {
+            eprintln!("skipping: no usable container runtime/image in this environment");
+            return;
+        }
+
+        // `sandbox_for(Backend::Container)` resolves the default runtime/image
+        // (`debian:stable-slim`), so run `cwd = /` (present on host and in the
+        // image, needing no writable mount). Without the `-i -t` fix the command
+        // inside the container sees pipes, not a terminal, so `test -t 0` fails
+        // and prints NOTTY; with it, the in-container stdin is a real TTY.
+        let mut s = spec(&[
+            "sh",
+            "-c",
+            "if test -t 0; then echo PTY-CONTAINER-TTY; else echo PTY-CONTAINER-NOTTY; fi",
+        ]);
+        s.cwd = PathBuf::from("/");
+        s.sandbox = Backend::Container;
+
+        let session = match PtySession::spawn(&s, PtyWinsize::default()) {
+            Ok(session) => session,
+            Err(e) => {
+                // The default image may not be locally runnable even though the
+                // probe found a different one; never fail on environment gaps.
+                eprintln!("skipping: could not spawn container PTY session: {e}");
+                return;
+            }
+        };
+        let (status, output) = run_and_collect(session);
+
+        if !status.success() {
+            eprintln!("skipping: container session did not run cleanly: {output:?}");
+            return;
+        }
+        assert!(
+            output.contains("PTY-CONTAINER-TTY"),
+            "container PTY session was not interactive (no in-container TTY): {output:?}"
+        );
+        assert!(
+            !output.contains("PTY-CONTAINER-NOTTY"),
+            "container PTY session ran without a TTY inside the container: {output:?}"
         );
     }
 }

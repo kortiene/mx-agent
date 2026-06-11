@@ -136,6 +136,14 @@ pub struct Restrictions {
     /// (architecture §13.5, "writable workspace and temp only"). Ignored by
     /// `none`.
     pub writable_paths: Vec<PathBuf>,
+    /// Whether the command runs under an interactive pseudo-terminal (an
+    /// `exec --pty` session). Only a backend that launches the command through a
+    /// separate runtime needs this: the container backend allocates an
+    /// in-container TTY (`-i -t`) when set, so `isatty` is true inside the
+    /// container and full-screen/interactive programs work. The `none` and
+    /// `bubblewrap` backends inherit the parent's PTY slave directly and ignore
+    /// this flag. Defaults to `false` (the non-interactive batch path).
+    pub interactive: bool,
 }
 
 /// A command prepared for execution by a [`Sandbox`] backend.
@@ -307,6 +315,12 @@ const DEFAULT_IMAGE: &str = "debian:stable-slim";
 ///   inherit the runner's environment, so the variables are injected here rather
 ///   than relied on from the spawned process. Secrets are already scrubbed by the
 ///   caller (architecture §13.4), so no credential reaches the argv.
+/// - when [`Restrictions::interactive`] is set (an `exec --pty` session) the
+///   command also gets `-i -t`, allocating a controlling TTY inside the
+///   container so `isatty` is true and full-screen/interactive programs work.
+///   Non-interactive batch runs leave this out, so their argv is unchanged. The
+///   flag only governs stdin attachment and TTY allocation; it widens no
+///   filesystem, network, or privilege boundary.
 ///
 /// `--rm` removes the container when the command exits. The implementation is
 /// pure — it only computes an argv — so the wrapping rules are unit-tested
@@ -363,6 +377,18 @@ impl Sandbox for ContainerSandbox {
             // can be written (architecture §13.5).
             "--read-only".to_string(),
         ];
+
+        // Interactive PTY session: allocate a TTY inside the container so the
+        // command gets a controlling terminal (`isatty` true), enabling job
+        // control, line editing, and full-screen TUIs. The host already wires
+        // the PTY slave fds as this process's stdin/stdout/stderr; `-i` keeps
+        // stdin attached and `-t` allocates the in-container pty (architecture
+        // §13.5). Omitted for non-interactive batch runs so their argv is
+        // unchanged.
+        if restrictions.interactive {
+            wrapped.push("-i".to_string());
+            wrapped.push("-t".to_string());
+        }
 
         // Network deny: an isolated network namespace with no route out
         // (architecture §13.5, "network disabled by default"). `allow` keeps the
@@ -852,6 +878,180 @@ mod tests {
         // Each sanitized variable is forwarded explicitly as KEY=VALUE.
         assert!(flags.contains("--env PATH=/usr/bin"), "flags: {flags}");
         assert!(flags.contains("--env LANG=C"), "flags: {flags}");
+    }
+
+    /// Whether `flag` (accepting the short or long spelling) appears in `flags`.
+    fn has_interactive_flag(flags: &[String]) -> bool {
+        flags.iter().any(|f| f == "-i" || f == "--interactive")
+    }
+
+    /// Whether a TTY flag (short or long spelling) appears in `flags`.
+    fn has_tty_flag(flags: &[String]) -> bool {
+        flags.iter().any(|f| f == "-t" || f == "--tty")
+    }
+
+    #[test]
+    fn container_interactive_adds_tty_flags() {
+        // An interactive `--pty` session asks the container backend to allocate
+        // an in-container TTY, so both an interactive flag and a TTY flag appear
+        // among the `run` flags, before the image.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["sh"]),
+            Restrictions {
+                interactive: true,
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img");
+        assert!(has_interactive_flag(flags), "flags: {flags:?}");
+        assert!(has_tty_flag(flags), "flags: {flags:?}");
+    }
+
+    #[test]
+    fn container_non_interactive_omits_tty_flags() {
+        // The default (non-interactive) batch path must keep its argv unchanged:
+        // no interactive/TTY flag, and the rest of the prefix is still
+        // `docker run --rm --read-only …`.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img")
+            .prepare(argv(&["true"]), Restrictions::default());
+        let flags = container_flags(&prepared, "img");
+        assert!(!has_interactive_flag(flags), "flags: {flags:?}");
+        assert!(!has_tty_flag(flags), "flags: {flags:?}");
+        // Byte-for-byte unchanged from the historical non-interactive argv
+        // (`Restrictions::default()` denies the network, so `--network none` is
+        // present; no `-i`/`-t` appears anywhere).
+        assert_eq!(
+            prepared.argv,
+            argv(&[
+                "docker",
+                "run",
+                "--rm",
+                "--read-only",
+                "--network",
+                "none",
+                "--workdir",
+                "",
+                "img",
+                "true"
+            ]),
+            "argv: {:?}",
+            prepared.argv
+        );
+    }
+
+    #[test]
+    fn bubblewrap_ignores_interactive_flag() {
+        // Only the container backend reacts to `interactive`. The bubblewrap
+        // backend inherits the parent's PTY slave directly, so its argv must be
+        // identical whether or not the flag is set.
+        let interactive = BubblewrapSandbox.prepare(
+            argv(&["sh"]),
+            Restrictions {
+                interactive: true,
+                ..Restrictions::default()
+            },
+        );
+        let non_interactive = BubblewrapSandbox.prepare(
+            argv(&["sh"]),
+            Restrictions {
+                interactive: false,
+                ..Restrictions::default()
+            },
+        );
+        assert_eq!(interactive.argv, non_interactive.argv);
+        assert!(!has_interactive_flag(&interactive.argv));
+        assert!(!has_tty_flag(&interactive.argv));
+    }
+
+    #[test]
+    fn none_sandbox_ignores_interactive_flag() {
+        // The `none` backend inherits the PTY slave directly and must return
+        // the argv unchanged regardless of the `interactive` flag, just like
+        // bubblewrap.
+        let interactive = NoneSandbox.prepare(
+            argv(&["sh"]),
+            Restrictions {
+                interactive: true,
+                ..Restrictions::default()
+            },
+        );
+        let non_interactive = NoneSandbox.prepare(
+            argv(&["sh"]),
+            Restrictions {
+                interactive: false,
+                ..Restrictions::default()
+            },
+        );
+        assert_eq!(interactive.argv, non_interactive.argv);
+        assert!(!has_interactive_flag(&interactive.argv));
+        assert!(!has_tty_flag(&interactive.argv));
+    }
+
+    #[test]
+    fn container_interactive_adds_tty_flags_podman() {
+        // The Podman runtime must also emit -i/-t when interactive=true;
+        // both Docker and Podman accept the same flags.
+        let prepared = ContainerSandbox::new(Runtime::Podman, "img").prepare(
+            argv(&["sh"]),
+            Restrictions {
+                interactive: true,
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img");
+        assert!(
+            has_interactive_flag(flags),
+            "podman interactive: flags: {flags:?}"
+        );
+        assert!(has_tty_flag(flags), "podman interactive: flags: {flags:?}");
+    }
+
+    #[test]
+    fn container_non_interactive_podman_omits_tty_flags() {
+        // The non-interactive (batch) argv for Podman must also omit -i/-t.
+        let prepared = ContainerSandbox::new(Runtime::Podman, "img")
+            .prepare(argv(&["true"]), Restrictions::default());
+        let flags = container_flags(&prepared, "img");
+        assert!(
+            !has_interactive_flag(flags),
+            "podman non-interactive: flags: {flags:?}"
+        );
+        assert!(
+            !has_tty_flag(flags),
+            "podman non-interactive: flags: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn container_interactive_tty_flags_appear_before_image() {
+        // -i and -t must appear in the `run` prefix (before the image name),
+        // not after it — positional args after the image go to the command, not
+        // to the runtime.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "myimage").prepare(
+            argv(&["sh"]),
+            Restrictions {
+                interactive: true,
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "myimage");
+        let command = container_command(&prepared, "myimage");
+        assert!(
+            has_interactive_flag(flags),
+            "-i must be in the run-flags prefix (before the image): {flags:?}"
+        );
+        assert!(
+            has_tty_flag(flags),
+            "-t must be in the run-flags prefix (before the image): {flags:?}"
+        );
+        assert!(
+            !has_interactive_flag(command),
+            "-i must not appear in the command argv (after the image): {command:?}"
+        );
+        assert!(
+            !has_tty_flag(command),
+            "-t must not appear in the command argv (after the image): {command:?}"
+        );
     }
 
     // --- Integration tests that actually launch a container runtime. ---------

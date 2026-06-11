@@ -303,6 +303,10 @@ pub(crate) fn restrictions_for(spec: &RunSpec, env: BTreeMap<String, String>) ->
         network: spec.network,
         read_only_paths: spec.read_only_paths.clone(),
         writable_paths: spec.writable_paths.clone(),
+        // The non-interactive runner path: the interactive PTY signal is set by
+        // `PtySession::spawn` only (the container backend then allocates an
+        // in-container TTY). Batch `exec`/`call` keep the non-interactive argv.
+        interactive: false,
     }
 }
 
@@ -1122,5 +1126,63 @@ mod tests {
         let out = run(&spec).await.expect("runs");
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout.is_empty());
+    }
+
+    // --- interactive flag threading (issue #272) ------------------------------
+    //
+    // The non-interactive batch path (run / build_command) must never set
+    // interactive=true on the Restrictions it builds. Only PtySession::spawn
+    // is the interactive entry point; it sets the flag itself after calling
+    // restrictions_for. If restrictions_for ever changed this invariant, the
+    // container backend would emit -i/-t for all batch runs.
+
+    #[test]
+    fn restrictions_for_always_returns_interactive_false() {
+        // Regression guard: restrictions_for must return interactive=false for
+        // every backend on the non-interactive batch path.
+        for sandbox in [Backend::None, Backend::Bubblewrap, Backend::Container] {
+            let spec = RunSpec {
+                command: vec!["true".to_string()],
+                cwd: std::env::temp_dir(),
+                sandbox,
+                ..RunSpec::default()
+            };
+            let restrictions = restrictions_for(&spec, BTreeMap::new());
+            assert!(
+                !restrictions.interactive,
+                "restrictions_for must return interactive=false for the batch path \
+                 (backend: {sandbox:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn container_batch_argv_never_has_tty_flags_via_restrictions_for() {
+        // Regression guard: the full prepared container argv produced via
+        // restrictions_for (the non-interactive batch path) must contain no
+        // -i/--interactive or -t/--tty flags. Only PtySession::spawn sets
+        // interactive=true before calling prepare.
+        let spec = RunSpec {
+            command: vec!["echo".to_string()],
+            cwd: PathBuf::from("/work"),
+            sandbox: Backend::Container,
+            network: Network::Deny,
+            ..RunSpec::default()
+        };
+        let restrictions = restrictions_for(&spec, BTreeMap::new());
+        let prepared = sandbox_for(Backend::Container).prepare(spec.command.clone(), restrictions);
+        assert!(
+            !prepared
+                .argv
+                .iter()
+                .any(|a| a == "-i" || a == "--interactive"),
+            "batch container argv must not contain -i/--interactive: {:?}",
+            prepared.argv
+        );
+        assert!(
+            !prepared.argv.iter().any(|a| a == "-t" || a == "--tty"),
+            "batch container argv must not contain -t/--tty: {:?}",
+            prepared.argv
+        );
     }
 }
