@@ -73,6 +73,18 @@ pub const DEFAULT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 /// Default flush interval for interactive streams (§8.1: 50 ms).
 pub const DEFAULT_INTERACTIVE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Default per-invocation output byte cap for a **loopback** interactive PTY
+/// session (64 MiB).
+///
+/// The loopback PTY path resolves no policy/allowance, so it falls back to this
+/// generous constant to bound the merged terminal stream and stop a runaway
+/// program (`yes`, a verbose build) from flooding the local IPC socket
+/// unbounded (issue #268). An interactive terminal producing 64 MiB of output is
+/// already pathological, so in practice this is invisible; callers that need a
+/// different bound can override it (e.g. via `ExecPtyParams::max_output_bytes`).
+/// The cap only drops *forwarded* output — it never kills the child.
+pub const DEFAULT_PTY_OUTPUT_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Per-invocation output caps (architecture §8.1, §8.3).
 ///
 /// These limits are shared across all of an invocation's streams and enforced
@@ -248,8 +260,11 @@ impl CaptureLimiter {
     /// bytes may actually be forwarded.
     ///
     /// When the budget cannot satisfy the full request the invocation is flagged
-    /// as truncated. With no byte cap, the full `len` is always granted.
-    fn reserve(&self, len: usize) -> usize {
+    /// as truncated. With no byte cap, the full `len` is always granted. The call
+    /// is synchronous and atomic, so it is safe to share one [`CaptureLimiter`]
+    /// across the async capture stage and the blocking/loopback PTY pumps that
+    /// reuse it as a single-stream byte budget (issue #268).
+    pub fn reserve(&self, len: usize) -> usize {
         let Some(max) = self.inner.max_output_bytes else {
             return len;
         };
@@ -940,5 +955,89 @@ mod tests {
         assert!(ts.ends_with('Z'), "got: {ts}");
         assert_eq!(ts.len(), "2026-06-02T12:00:01.123Z".len(), "got: {ts}");
         assert!(ts.contains('.'), "got: {ts}");
+    }
+
+    // --- CaptureLimiter.reserve unit tests (issue #268) ---
+
+    #[test]
+    fn capture_limiter_reserve_within_budget_not_truncated() {
+        let limiter = CaptureLimiter::new(OutputCaps {
+            max_output_bytes: Some(1024),
+            max_events_per_second: None,
+        });
+        let granted = limiter.reserve(512);
+        assert_eq!(granted, 512);
+        assert!(
+            !limiter.truncated(),
+            "partial use of budget should not flag truncation"
+        );
+        assert_eq!(limiter.emitted_bytes(), 512);
+    }
+
+    #[test]
+    fn capture_limiter_reserve_exactly_at_cap_not_truncated() {
+        // Consuming precisely the byte budget is not a truncation event.
+        let limiter = CaptureLimiter::new(OutputCaps {
+            max_output_bytes: Some(100),
+            max_events_per_second: None,
+        });
+        let granted = limiter.reserve(100);
+        assert_eq!(granted, 100);
+        assert!(
+            !limiter.truncated(),
+            "exact-budget reservation must not set truncated"
+        );
+    }
+
+    #[test]
+    fn capture_limiter_reserve_over_budget_flags_truncation() {
+        // A single reserve that exceeds the cap must be partially granted and flag truncation.
+        let limiter = CaptureLimiter::new(OutputCaps {
+            max_output_bytes: Some(10),
+            max_events_per_second: None,
+        });
+        let granted = limiter.reserve(15);
+        assert_eq!(granted, 10, "should be capped to the remaining budget");
+        assert!(limiter.truncated(), "partial grant should set truncated");
+        assert_eq!(limiter.emitted_bytes(), 10);
+    }
+
+    #[test]
+    fn capture_limiter_reserve_zero_after_budget_exhausted() {
+        // Once the byte budget is drained, every subsequent reserve must return 0
+        // and truncated must remain true.
+        let limiter = CaptureLimiter::new(OutputCaps {
+            max_output_bytes: Some(5),
+            max_events_per_second: None,
+        });
+        assert_eq!(limiter.reserve(5), 5);
+        assert!(!limiter.truncated());
+        assert_eq!(limiter.reserve(1), 0, "exhausted budget must grant nothing");
+        assert!(limiter.truncated());
+        // A second call after exhaustion is still zero and still truncated.
+        assert_eq!(limiter.reserve(100), 0);
+        assert!(limiter.truncated());
+    }
+
+    #[test]
+    fn capture_limiter_reserve_unlimited_always_grants_full_len() {
+        let limiter = CaptureLimiter::unlimited();
+        assert_eq!(limiter.reserve(1_000_000), 1_000_000);
+        assert!(!limiter.truncated());
+    }
+
+    #[test]
+    fn capture_limiter_cumulative_reserves_share_budget() {
+        // Two consecutive reserves from the same limiter draw from one shared pool.
+        let limiter = CaptureLimiter::new(OutputCaps {
+            max_output_bytes: Some(20),
+            max_events_per_second: None,
+        });
+        assert_eq!(limiter.reserve(12), 12);
+        // 8 bytes remain; request 10 → 8 granted, truncated.
+        let second = limiter.reserve(10);
+        assert_eq!(second, 8);
+        assert!(limiter.truncated());
+        assert_eq!(limiter.emitted_bytes(), 20);
     }
 }

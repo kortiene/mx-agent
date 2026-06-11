@@ -56,7 +56,9 @@ use crate::pty::{PtySession, PtyWinsize};
 use crate::runner::{
     build_command, kill_process_group, terminate_process_group, RunOutput, RunSpec,
 };
-use crate::stream::{capture_child_output, OutputCaps, StreamCaptureConfig};
+use crate::stream::{
+    capture_child_output, CaptureLimiter, CaptureSummary, OutputCaps, StreamCaptureConfig,
+};
 use crate::trust::TrustStore;
 use crate::workspace::WorkspaceError;
 
@@ -651,7 +653,9 @@ pub async fn handle_live_exec_request(
                 mut output,
                 killed_process_group,
             }) => {
-                emit_output_events(
+                // `exec.cancelled` carries no `truncated` field, so the capture
+                // summary is intentionally discarded here.
+                let _ = emit_output_events(
                     &client,
                     &room,
                     &request.invocation_id,
@@ -687,7 +691,7 @@ pub async fn handle_live_exec_request(
             }
         };
 
-        emit_output_events(
+        let summary = emit_output_events(
             &client,
             &room,
             &request.invocation_id,
@@ -705,7 +709,7 @@ pub async fn handle_live_exec_request(
             duration_ms: started.elapsed().as_millis() as u64,
             stdout_bytes: output.stdout.len() as u64,
             stderr_bytes: output.stderr.len() as u64,
-            truncated: false,
+            truncated: summary.truncated,
             artifact_mxc: None,
             extra: Default::default(),
         };
@@ -914,6 +918,14 @@ async fn authorize_live_exec(
     Ok((request, allowance))
 }
 
+/// Stream a finished command's captured output to `room` and report whether it
+/// was truncated to honour the per-invocation byte cap.
+///
+/// Large outputs are offloaded as artifacts (the full log is preserved, so
+/// nothing is truncated); otherwise the output is chunked under
+/// `allowance.max_output_bytes` and the returned [`CaptureSummary`] carries the
+/// real `truncated` flag so the caller can populate `exec.finished` truthfully
+/// (issue #268).
 async fn emit_output_events(
     client: &matrix_sdk::Client,
     room: &Room,
@@ -921,7 +933,7 @@ async fn emit_output_events(
     stdout: &[u8],
     stderr: &[u8],
     allowance: &Allowance,
-) {
+) -> CaptureSummary {
     let total = stdout.len() + stderr.len();
     let artifact_config = crate::ArtifactConfig::default();
     if artifact_config.should_switch(total) {
@@ -942,7 +954,11 @@ async fn emit_output_events(
                 }
             }
         }
-        return;
+        // The full log is preserved in the artifact, so nothing was truncated.
+        return CaptureSummary {
+            truncated: false,
+            output_bytes: total as u64,
+        };
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
@@ -971,7 +987,7 @@ async fn emit_output_events(
             }
         }
     }
-    let _ = capture.await;
+    capture.await.unwrap_or_default()
 }
 
 enum ControlledExecResult {
@@ -1127,6 +1143,9 @@ struct PtyExecOutcome {
     cancelled: bool,
     killed_process_group: bool,
     output_bytes: u64,
+    /// Whether forwarded PTY output was capped to honour the per-invocation
+    /// byte budget (`allowance.max_output_bytes`).
+    truncated: bool,
 }
 
 /// Drive an interactive PTY invocation to completion, emitting the terminal
@@ -1187,7 +1206,7 @@ async fn run_pty_exec_task(
         // stdout and stderr is zero (architecture §7.3).
         stdout_bytes: outcome.output_bytes,
         stderr_bytes: 0,
-        truncated: false,
+        truncated: outcome.truncated,
         artifact_mxc: None,
         extra: Default::default(),
     };
@@ -1300,17 +1319,40 @@ async fn run_controlled_pty_exec(
 
     // Chunker: forward merged output to the room as `stream:"pty"` chunks until
     // the reader thread closes the channel (the child exited), then emit EOF.
+    // The merged PTY stream honours the same per-invocation byte budget as the
+    // non-PTY path so a runaway program cannot flood the Matrix timeline
+    // unbounded (issue #268). A single-stream `CaptureLimiter` reuses the exact
+    // truncation accounting used by the capture stage.
     let chunk_room = room.clone();
     let chunk_invocation = request.invocation_id.clone();
+    let limiter = CaptureLimiter::new(OutputCaps {
+        max_output_bytes: allowance.max_output_bytes,
+        max_events_per_second: None,
+    });
     let chunker = tokio::spawn(async move {
         let mut seq = 0u64;
         let mut total = 0u64;
         while let Some(bytes) = out_rx.recv().await {
             total += bytes.len() as u64;
-            emit_pty_chunk(&chunk_room, &chunk_invocation, &bytes, false, &mut seq).await;
+            let allowed = limiter.reserve(bytes.len());
+            if allowed > 0 {
+                emit_pty_chunk(
+                    &chunk_room,
+                    &chunk_invocation,
+                    &bytes[..allowed],
+                    false,
+                    &mut seq,
+                )
+                .await;
+            }
+            // Once the budget is exhausted `allowed` is 0: stop forwarding but
+            // keep draining `out_rx` so the blocking reader thread never blocks
+            // on a full channel (which would stall the master read and the
+            // child). The child is still bounded by the exec timeout.
         }
+        // The EOF chunk always terminates the stream, even after truncation.
         emit_pty_chunk(&chunk_room, &chunk_invocation, &[], true, &mut seq).await;
-        total
+        (total, limiter.truncated())
     });
 
     let grace = spec.grace_period;
@@ -1331,7 +1373,9 @@ async fn run_controlled_pty_exec(
             terminate_then_kill(pid, grace, &mut wait, &mut killed_process_group).await?
         }
     };
-    let output_bytes = chunker.await.unwrap_or(0);
+    // `output_bytes` stays the total *produced*; `truncated` reflects that
+    // *forwarded* bytes were capped (matching the non-PTY contract).
+    let (output_bytes, truncated) = chunker.await.unwrap_or((0, false));
 
     let signal = {
         use std::os::unix::process::ExitStatusExt as _;
@@ -1343,6 +1387,7 @@ async fn run_controlled_pty_exec(
         cancelled,
         killed_process_group,
         output_bytes,
+        truncated,
     })
 }
 

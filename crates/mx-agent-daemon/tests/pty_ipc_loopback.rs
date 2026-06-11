@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+use mx_agent_daemon::stream::DEFAULT_PTY_OUTPUT_CAP_BYTES;
 use mx_agent_daemon::{
     run_pty_loopback, ExecPtyParams, PtyResizeFrame, PtyServerFrame, PtySession, PtyStdinFrame,
     PtyWinsize, RunSpec, METHOD_PTY_RESIZE, METHOD_PTY_STDIN,
@@ -122,6 +123,7 @@ fn params(command: &[&str], rows: u16, cols: u16) -> ExecPtyParams {
         rows,
         cols,
         task: None,
+        max_output_bytes: None,
     }
 }
 
@@ -202,4 +204,108 @@ fn loopback_pty_propagates_resize() {
         "resize should reach the child's terminal: {text:?}"
     );
     assert!(matches!(terminal, PtyServerFrame::Finished { .. }));
+}
+
+#[test]
+fn loopback_pty_output_cap_reports_truncated_true() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    // A 10-byte cap on a command that outputs ~100 bytes must produce
+    // `truncated: true` in the Finished frame (issue #268).
+    let path = socket_path("cap-truncated");
+    let p = ExecPtyParams {
+        room: None,
+        agent: None,
+        // `printf '%0100d' 0 | tr 0 x` outputs exactly 100 'x' bytes on any
+        // POSIX shell without relying on bash-isms or optional utilities.
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%0100d' 0 | tr 0 x".into(),
+        ],
+        cwd: Some(PathBuf::from("/")),
+        rows: 24,
+        cols: 80,
+        task: None,
+        max_output_bytes: Some(10),
+    };
+    let server = spawn_server(path.clone(), p);
+
+    let mut client = UnixStream::connect(&path).expect("connect to test socket");
+    send_request(
+        &mut client,
+        "exec.pty",
+        json!({ "command": ["sh", "-c", "printf '%0100d' 0 | tr 0 x"] }),
+    )
+    .expect("send start");
+
+    let (_output, terminal) = collect(&mut client);
+    let _ = std::fs::remove_file(&path);
+    let _ = server.join();
+
+    match terminal {
+        PtyServerFrame::Finished { truncated, .. } => {
+            assert!(
+                truncated,
+                "100-byte output with a 10-byte cap must report truncated:true"
+            );
+        }
+        other => panic!("expected Finished frame, got {other:?}"),
+    }
+}
+
+#[test]
+fn loopback_pty_within_cap_reports_truncated_false() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    // When output fits within the cap, the Finished frame must report
+    // `truncated: false` (issue #268).
+    let path = socket_path("cap-within");
+    let p = ExecPtyParams {
+        room: None,
+        agent: None,
+        command: vec!["sh".into(), "-c".into(), "echo hi".into()],
+        cwd: Some(PathBuf::from("/")),
+        rows: 24,
+        cols: 80,
+        task: None,
+        max_output_bytes: Some(4096),
+    };
+    let server = spawn_server(path.clone(), p);
+
+    let mut client = UnixStream::connect(&path).expect("connect to test socket");
+    send_request(
+        &mut client,
+        "exec.pty",
+        json!({ "command": ["sh", "-c", "echo hi"] }),
+    )
+    .expect("send start");
+
+    let (_output, terminal) = collect(&mut client);
+    let _ = std::fs::remove_file(&path);
+    let _ = server.join();
+
+    match terminal {
+        PtyServerFrame::Finished { truncated, .. } => {
+            assert!(
+                !truncated,
+                "small output within cap must report truncated:false"
+            );
+        }
+        other => panic!("expected Finished frame, got {other:?}"),
+    }
+}
+
+#[test]
+fn default_pty_output_cap_is_64_mib() {
+    // Verify the safety-net constant is the documented 64 MiB (issue #268).
+    assert_eq!(
+        DEFAULT_PTY_OUTPUT_CAP_BYTES,
+        64 * 1024 * 1024,
+        "DEFAULT_PTY_OUTPUT_CAP_BYTES should be 64 MiB"
+    );
 }
