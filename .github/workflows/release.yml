@@ -6,34 +6,35 @@ name: release
 # dry run that builds and uploads artifacts without creating a release.
 #
 # Windows is intentionally not a target: the daemon's IPC uses Unix domain
-# sockets and the `nix` crate, so the `mx-agent` binary is Unix-only for now
-# (a Windows named-pipe transport is future work; see docs/architecture.md).
+# sockets and the `nix` crate, so `mx-agent` is Unix-only. Windows was
+# intentionally dropped (not future work); see README.md.
+#
+# The macOS-Intel target builds on `macos-15-intel` (a native Intel runner):
+# the retired `macos-13` image never schedules (#303), and a native Intel
+# runner is required because the packaging step executes the freshly built
+# binary to generate completions/man pages (no cross-compile on arm64).
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read # checkout only; the publish job holds contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
           - target: x86_64-apple-darwin
-            os: macos-13
-            archive: tar.gz
+            os: macos-15-intel # native Intel runner; macos-13 was retired (#303)
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -43,7 +44,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: cargo build --release
-        run: cargo build --release --target ${{ matrix.target }} --bin mx-agent
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mx-agent
       - name: Package archive and checksum
         id: package
         shell: bash
@@ -55,23 +56,16 @@ jobs:
             version="dev"
           fi
           bin="mx-agent"
-          ext=""
-          [ "${{ matrix.archive }}" = "zip" ] && ext=".exe"
           staging="mx-agent-${version}-${{ matrix.target }}"
           mkdir "$staging"
-          cp "target/${{ matrix.target }}/release/${bin}${ext}" "$staging/"
+          cp "target/${{ matrix.target }}/release/${bin}" "$staging/"
           cp README.md "$staging/" 2>/dev/null || true
           # Ship shell completions and man pages, generated from the freshly
           # built (runner-native) binary so downloads include them.
-          scripts/gen-cli-artifacts.sh "$staging" "target/${{ matrix.target }}/release/${bin}${ext}"
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            asset="${staging}.zip"
-            7z a "$asset" "$staging" >/dev/null
-          else
-            asset="${staging}.tar.gz"
-            tar czf "$asset" "$staging"
-          fi
-          # macOS ships `shasum`; Linux and Git-Bash on Windows ship `sha256sum`.
+          scripts/gen-cli-artifacts.sh "$staging" "target/${{ matrix.target }}/release/${bin}"
+          asset="${staging}.tar.gz"
+          tar czf "$asset" "$staging"
+          # macOS ships `shasum`; Linux ships `sha256sum`.
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" > "${asset}.sha256"
           else
@@ -91,6 +85,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag'
+    permissions:
+      contents: write # softprops/action-gh-release creates the Release
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -117,7 +113,6 @@ jobs:
         with:
           files: |
             artifacts/*.tar.gz
-            artifacts/*.zip
             artifacts/SHA256SUMS
           fail_on_unmatched_files: true
           generate_release_notes: true

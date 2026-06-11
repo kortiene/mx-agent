@@ -36,6 +36,13 @@ jobs:
         # signal, "disabled", #249 references) must not cause false positives;
         # and the real project docs must pass (#270 regression guard).
         run: bash scripts/test_check_doc_claims.sh
+      - name: Validate release workflow static acceptance criteria
+        # Greps release.yml for the structural invariants required by issue #303:
+        # no Windows packaging remnants (zip/exe/7z), --locked on the release
+        # build, schedulable Intel runner, least-privilege job permissions, and
+        # correct header comment wording. Runs on every PR so regressions are
+        # caught before they reach a tag push.
+        run: bash scripts/test_release_yml.sh
 
   adw:
     # Runs the Agent Development Workflow helper unit tests (adw/). They are
