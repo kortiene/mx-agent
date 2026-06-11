@@ -4,7 +4,7 @@ This guide takes you from nothing to your first remote-style command with mx-age
 
 We define every new term the first time it appears, explain *why* each step exists before giving the command, and end with a "Common errors & fixes" table.
 
-> **What's real in v0.2.0?** mx-agent is a public alpha. All command groups run against a real Matrix homeserver through the daemon — the stateless CLI never holds a Matrix session. `call` and `exec` (batch and interactive `--pty`) support signed Matrix-backed remote dispatch (including stdin/resize/cancel controls) when `--room`/`--agent` are provided; `--pty` streams the daemon's pseudo-terminal over local IPC and the signed Matrix transport. The live daemon scheduler loop auto-claims and runs assigned tasks from room state. CI is green and stable. Steps below are tagged ✅ (works today), 🟡 (designed, wiring in progress), or 🔮 (planned).
+> **What's real in v0.2.0?** mx-agent is a public alpha. The command groups run against a real Matrix homeserver through the daemon, with one deliberate exception: `auth login` is CLI-initiated and (same binary, same UID) builds a store-backed Matrix client and creates the daemon-owned crypto store in-process, and the local `auth`/`trust` commands touch the data dir directly (see [architecture §10.3](https://github.com/kortiene/mx-agent/blob/main/docs/architecture.md)). `call` and `exec` (batch and interactive `--pty`) support signed Matrix-backed remote dispatch (including stdin/resize/cancel controls) when `--room`/`--agent` are provided; `--pty` streams the daemon's pseudo-terminal over local IPC and the signed Matrix transport. The live daemon scheduler loop auto-claims and runs assigned tasks from room state. CI is green and stable. Steps below are tagged ✅ (works today), 🟡 (designed, wiring in progress), or 🔮 (planned).
 
 ---
 
@@ -105,7 +105,7 @@ daemon: running (pid 48213)
 
 ## Step 2 — Log in to Matrix 🟡
 
-**Why:** mx-agent doesn't run its own servers. It rides on Matrix, so it needs a Matrix account to send and receive events. This is the *only* place your token is entered — and it goes straight into the daemon, never to your coding agent.
+**Why:** mx-agent doesn't run its own servers. It rides on Matrix, so it needs a Matrix account to send and receive events. This is the *only* place your password is entered. `auth login` is a deliberate CLI-initiated exception (same binary, same UID): it builds a store-backed Matrix client in-process, performs the network login, and stores the session token in the daemon-owned data dir — your coding agent never sees it.
 
 ```bash
 mx-agent auth login \
@@ -133,7 +133,7 @@ matrix: logged in
   homeserver: https://matrix.org
 ```
 
-**What just happened?** The daemon now has a Matrix session. The token is stored in `~/.local/share/mx-agent/session.db` (mode `0600`), owned by the daemon. Your shell and any agent you later connect see *none* of it.
+**What just happened?** `auth login` built a store-backed Matrix client in-process (the CLI and daemon are the same binary), performed the network login, and wrote the session token to `~/.local/share/mx-agent/session.json` (mode `0600`). The token stays in that file, accessible only to you. Your shell and any agent you later connect see *none* of it; subsequent commands (`workspace`, `agent`, `exec`, …) go through the daemon over local IPC and never re-read the session file themselves.
 
 > **Just experimenting?** You don't need a public account. The repo ships a loopback homeserver called **Tuwunel** (`dev/matrix/`) that runs on `127.0.0.1:8008` and auto-registers test users — perfect for trying mx-agent entirely on one machine.
 

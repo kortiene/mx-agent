@@ -4,11 +4,18 @@ This guide walks a new user from a fresh checkout to a working **two-agent
 demo**: two agents registered in a shared Matrix workspace, discovering each
 other, then running a tool call and a remote-style `exec`.
 
-> **Alpha status.** `mx-agent` is pre-release software. The workspace, auth,
-> agent-registry, task, trust, approval, context-sharing, and invocation commands
-> run against a real Matrix homeserver entirely through the daemon over local IPC
-> — the stateless CLI never reads the Matrix session or builds a Matrix client
-> itself. `call` and `exec` (batch and interactive `--pty`) run daemon-mediated
+> **Alpha status.** `mx-agent` is pre-release software. The workspace,
+> agent-registry, task, approval, context-sharing, and invocation commands (and
+> `trust publish`/`state`) run against a real Matrix homeserver entirely through
+> the daemon over local IPC, so for those the CLI never reads the Matrix session
+> or builds a Matrix client itself. **`auth login` is a deliberate CLI-initiated
+> exception** that builds a store-backed Matrix client and creates the
+> daemon-owned crypto store in-process before handing the session to the daemon;
+> `auth status`/`logout` and the local `trust list`/`approve`/`revoke`/
+> `fingerprint` commands read/write the data dir directly. This is an accepted
+> same-binary, same-UID carve-out — see
+> [architecture §10.3](architecture.md#103-ipc-protocol). `call` and `exec`
+> (batch and interactive `--pty`) run daemon-mediated
 > locally by default and use signed Matrix-backed remote dispatch when
 > `--room`/`--agent` target a registered, trusted, policy-allowed agent, with
 > signed Matrix stdin/resize/cancel controls for live remote exec. A live daemon

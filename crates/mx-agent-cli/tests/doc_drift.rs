@@ -1,4 +1,4 @@
-//! Drift guards for the four documentation files corrected in issue #271.
+//! Drift guards for documentation files corrected in issues #271 and #269.
 //!
 //! Each test asserts that:
 //!   - the stale pre-v0.2.0 phrase is absent, and
@@ -7,10 +7,13 @@
 //! Files are embedded at compile time via `include_str!` so failures point
 //! directly at committed source, not a runtime filesystem path.
 
+const README: &str = include_str!("../../../README.md");
 const ROADMAP: &str = include_str!("../../../docs/roadmap-rust.md");
 const USER_GUIDE: &str = include_str!("../../../docs/user-guide.md");
 const ALPHA_CHECKLIST: &str = include_str!("../../../docs/alpha-release-checklist.md");
 const ARCHITECTURE: &str = include_str!("../../../docs/architecture.md");
+const SECURITY_HARDENING: &str = include_str!("../../../docs/security-hardening.md");
+const IPC_MOD: &str = include_str!("../../mx-agent-daemon/src/ipc.rs");
 
 /// Phase 10 of the roadmap must describe the live scheduler loop and the
 /// signed Matrix `exec` transport as *delivered*, not as remaining work.
@@ -137,5 +140,132 @@ fn architecture_recovery_is_room_state_not_process_table() {
     assert!(
         ARCHITECTURE.contains("no OS process table is consulted"),
         "architecture §11.3 must explicitly state that no OS process table is consulted"
+    );
+}
+
+// ── Issue #269: auth login / trust bypass daemon IPC — doc drift guards ────────
+//
+// The four docs below previously claimed that all Matrix-backed commands are
+// fully daemon-IPC-mediated and that "the CLI never builds a Matrix client".
+// The fix (issue #269) corrected them to name the auth/trust carve-out
+// explicitly.  These tests prevent regression back to the stale phrasing.
+
+/// README project-status table must name `auth login` as a CLI-initiated,
+/// same-binary exception — not as a fully daemon-IPC-mediated command.
+///
+/// Stale state (issue #269): the table row implied all listed commands were
+/// daemon-IPC-mediated; the auth/trust exception was absent.
+#[test]
+fn readme_project_status_names_auth_login_as_cli_initiated_exception() {
+    // Positive: the auth/trust carve-out must be explicitly named.
+    assert!(
+        README.contains("CLI-initiated"),
+        "README must describe auth login as a CLI-initiated exception, not daemon-IPC-mediated"
+    );
+    // Positive: the security rationale (same binary, same UID) must be present.
+    assert!(
+        README.contains("same binary") || README.contains("same-binary"),
+        "README must explain that auth login is safe because CLI and daemon are the same binary"
+    );
+}
+
+/// README description section must call out the advisory lock that serialises
+/// concurrent `auth login` / daemon writes — the fix for the concurrency hazard
+/// in issue #269.
+#[test]
+fn readme_advisory_lock_documented_for_auth_login_concurrency() {
+    assert!(
+        README.contains("advisory file lock") || README.contains("advisory lock"),
+        "README must document the advisory file lock that serializes auth login vs daemon \
+         session/key writes (issue #269)"
+    );
+}
+
+/// User guide must name `auth login` as a deliberate CLI-initiated exception
+/// to daemon-IPC mediation, matching the accepted carve-out in architecture §10.3.
+///
+/// Stale state (issue #269): lines 7-11 implied the CLI never builds a Matrix
+/// client for any command, with no exception stated.
+#[test]
+fn user_guide_auth_login_named_as_deliberate_exception() {
+    // Positive: the deliberate exception must be stated.
+    assert!(
+        USER_GUIDE.contains("deliberate") || USER_GUIDE.contains("carve-out"),
+        "user-guide must describe auth login as a deliberate or carve-out exception"
+    );
+    // Positive: architecture §10.3 cross-reference lets readers verify the rationale.
+    assert!(
+        USER_GUIDE.contains("architecture")
+            && (USER_GUIDE.contains("10.3") || USER_GUIDE.contains("§10.3")),
+        "user-guide must cross-reference architecture §10.3 for the auth/trust carve-out"
+    );
+}
+
+/// Security-hardening token-isolation model must document the auth/trust
+/// carve-out **and** the advisory flock that guards concurrent writes.
+///
+/// Stale state (issue #269): line 63 said "the CLI never builds a Matrix
+/// client" as an unqualified universal claim.
+#[test]
+fn security_hardening_auth_trust_carve_out_with_advisory_lock() {
+    // Positive: the carve-out must be named explicitly.
+    assert!(
+        SECURITY_HARDENING.contains("carve-out"),
+        "security-hardening must name the auth/trust carve-out exception"
+    );
+    // Positive: the advisory lock must be mentioned as the concurrency fix.
+    assert!(
+        SECURITY_HARDENING.contains("flock") || SECURITY_HARDENING.contains("advisory"),
+        "security-hardening must document the advisory lock serializing auth login writes \
+         (issue #269)"
+    );
+    // Positive: the accepted-exception rationale must appear.
+    assert!(
+        SECURITY_HARDENING.contains("accepted")
+            || SECURITY_HARDENING.contains("same-binary")
+            || SECURITY_HARDENING.contains("same UID"),
+        "security-hardening must explain why the auth/trust carve-out is safe (same UID)"
+    );
+}
+
+/// Architecture §10.3 must document the advisory `flock` on `.write.lock` and
+/// cite issue #269 — these were added as part of the concurrency-hazard fix.
+#[test]
+fn architecture_advisory_lock_and_issue_269_documented() {
+    // Positive: the advisory lock file name must appear in the IPC-protocol section.
+    assert!(
+        ARCHITECTURE.contains(".write.lock"),
+        "architecture §10.3 must name the advisory lock file (.write.lock)"
+    );
+    // Positive: issue #269 must be cited as the reason for the lock.
+    assert!(
+        ARCHITECTURE.contains("#269"),
+        "architecture must cite issue #269 as the motivation for the advisory write lock"
+    );
+    // Negative: auth.login must NOT appear as a daemon-IPC method in the table,
+    // because auth login is CLI-local (the carve-out).
+    assert!(
+        !ARCHITECTURE.contains("| `auth.login`") && !ARCHITECTURE.contains("auth.login |"),
+        "architecture IPC dispatch table must not list auth.login (it is CLI-local, not daemon-mediated)"
+    );
+}
+
+/// The `ipc.rs` module doc must name the `auth`/`trust` carve-out so a reader
+/// of that file cannot conclude that ALL commands are daemon-IPC-mediated.
+///
+/// Stale state (issue #269): lines 1-11 said "the stateless CLI does not
+/// restore Matrix sessions or build Matrix clients itself" with no exception.
+#[test]
+fn ipc_module_doc_names_auth_trust_exception() {
+    // Positive: the carve-out keyword must appear.
+    assert!(
+        IPC_MOD.contains("carve-out"),
+        "ipc.rs module doc must name the auth/trust carve-out exception"
+    );
+    // Negative: no AuthLoginParams or auth_login IPC param struct should be defined,
+    // since auth login is CLI-local and has no IPC method.
+    assert!(
+        !IPC_MOD.contains("AuthLoginParams"),
+        "ipc.rs must not define AuthLoginParams (auth login is CLI-local, not daemon-IPC-mediated)"
     );
 }

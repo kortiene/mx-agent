@@ -173,29 +173,53 @@ pub fn load_or_create_signing_key(
 }
 
 /// Generate a fresh Ed25519 key and persist it atomically with `0600` perms.
+///
+/// Runs under the data-dir cross-process advisory write lock and **re-checks**
+/// the key file once the lock is held, so two concurrent creators (e.g. a
+/// CLI-local `trust fingerprint` racing a running daemon's first signing
+/// operation) converge on a single key instead of one clobbering the other
+/// (issue #269). The common reload path in [`load_or_create_signing_key`] stays
+/// lock-free.
 fn generate_and_store(paths: &SessionPaths) -> Result<DaemonSigningKey, SigningKeyError> {
-    paths.ensure_data_dir()?;
+    crate::session::with_data_dir_write_lock(paths, || {
+        let file = signing_key_file(paths);
 
-    let mut secret = [0u8; SECRET_KEY_LENGTH];
-    getrandom::fill(&mut secret).map_err(SigningKeyError::Random)?;
-    let signing_key = SigningKey::from_bytes(&secret);
+        // Double-checked under the lock: another process may have generated the
+        // key between our caller's lock-free read and our acquiring the lock.
+        match fs::read(&file) {
+            Ok(bytes) => {
+                let secret: [u8; SECRET_KEY_LENGTH] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SigningKeyError::Malformed)?;
+                return Ok(DaemonSigningKey {
+                    signing_key: SigningKey::from_bytes(&secret),
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SigningKeyError::Io(e)),
+        }
 
-    let file = signing_key_file(paths);
-    let tmp = file.with_extension("ed25519.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.set_permissions(fs::Permissions::from_mode(0o600))?;
-        f.write_all(&secret)?;
-        f.flush()?;
-    }
-    fs::rename(&tmp, &file)?;
+        let mut secret = [0u8; SECRET_KEY_LENGTH];
+        getrandom::fill(&mut secret).map_err(SigningKeyError::Random)?;
+        let signing_key = SigningKey::from_bytes(&secret);
 
-    tracing::info!(
-        fingerprint = %fingerprint_of(&signing_key.verifying_key()),
-        "generated daemon signing key"
-    );
+        let tmp = file.with_extension("ed25519.tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            f.write_all(&secret)?;
+            f.flush()?;
+        }
+        fs::rename(&tmp, &file)?;
 
-    Ok(DaemonSigningKey { signing_key })
+        tracing::info!(
+            fingerprint = %fingerprint_of(&signing_key.verifying_key()),
+            "generated daemon signing key"
+        );
+
+        Ok(DaemonSigningKey { signing_key })
+    })
 }
 
 #[cfg(test)]
@@ -300,5 +324,158 @@ mod tests {
             load_or_create_signing_key(&paths),
             Err(SigningKeyError::Malformed)
         ));
+    }
+
+    #[test]
+    fn concurrent_signing_key_creation_converges() {
+        // Issue #269: two concurrent creators (e.g. a CLI-local `trust
+        // fingerprint` racing the daemon's first signing op) must converge on a
+        // single key under the data-dir advisory lock, never clobber each other.
+        // Uses `for_data_dir` (no env mutation) so the threads share one dir.
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "mx-agent-signing-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = Arc::new(SessionPaths::for_data_dir(dir.clone()));
+        paths.ensure_data_dir().unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let paths = Arc::clone(&paths);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_signing_key(&paths).unwrap().fingerprint()
+                })
+            })
+            .collect();
+        let prints: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            prints[0], prints[1],
+            "both threads must converge on one signing key fingerprint"
+        );
+        // Exactly one key file exists and reloads to the same fingerprint.
+        let reloaded = load_or_create_signing_key(&paths).unwrap().fingerprint();
+        assert_eq!(reloaded, prints[0]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Issue #269: signing-key helper regression tests ────────────────────────
+
+    /// `encode_verifying_key` and `decode_verifying_key` must be exact inverses:
+    /// encoding a key then decoding it must yield the identical public key bytes.
+    /// This exercises the base64-no-pad codec used when publishing and verifying
+    /// trust records (issue #269: the helpers are exercised by CLI-local `trust
+    /// fingerprint`, which may create the key in-process).
+    #[test]
+    fn encode_decode_verifying_key_roundtrips() {
+        let _data = TempData::new("roundtrip");
+        let paths = crate::session::SessionPaths::resolve();
+        let key = load_or_create_signing_key(&paths).unwrap();
+        let encoded = encode_verifying_key(&key.verifying_key());
+        let decoded = decode_verifying_key(&encoded).unwrap();
+        assert_eq!(
+            decoded.as_bytes(),
+            key.verifying_key().as_bytes(),
+            "decoded verifying key must match the original"
+        );
+    }
+
+    /// `decode_verifying_key` must return `Malformed` for clearly invalid input:
+    /// non-base64 characters and base64 strings that decode to the wrong number
+    /// of bytes. This prevents silent acceptance of corrupt or attacker-supplied
+    /// key material in trust records.
+    #[test]
+    fn decode_verifying_key_rejects_invalid_inputs() {
+        // Non-base64 characters.
+        assert!(
+            matches!(
+                decode_verifying_key("!not-base64"),
+                Err(SigningKeyError::Malformed)
+            ),
+            "non-base64 input must be Malformed"
+        );
+        // Valid base64 but decodes to only 3 bytes, not 32.
+        assert!(
+            matches!(
+                decode_verifying_key("AAAA"),
+                Err(SigningKeyError::Malformed)
+            ),
+            "too-short base64 must be Malformed"
+        );
+        // Empty string.
+        assert!(
+            matches!(decode_verifying_key(""), Err(SigningKeyError::Malformed)),
+            "empty input must be Malformed"
+        );
+    }
+
+    /// The key identifier returned by `key_id()` must start with `KEY_ID_PREFIX`
+    /// followed by a colon and a non-empty base64 string (SHA-256 of the 32-byte
+    /// public key encodes to exactly 43 base64-no-pad characters).
+    #[test]
+    fn key_id_format_matches_expected_structure() {
+        let _data = TempData::new("keyidfmt");
+        let paths = crate::session::SessionPaths::resolve();
+        let key = load_or_create_signing_key(&paths).unwrap();
+        let key_id = key.key_id();
+        // Must begin with the well-known prefix constant.
+        assert!(
+            key_id.starts_with(KEY_ID_PREFIX),
+            "key ID must start with {KEY_ID_PREFIX}, got {key_id}"
+        );
+        // Must contain exactly one colon separating prefix from the fingerprint.
+        let parts: Vec<&str> = key_id.splitn(2, ':').collect();
+        assert_eq!(parts.len(), 2, "key ID must contain a colon separator");
+        let fp_part = parts[1];
+        assert!(
+            !fp_part.is_empty(),
+            "key ID fingerprint part must not be empty"
+        );
+        // SHA-256 of 32 public-key bytes is 32 bytes, which base64-no-pad encodes
+        // to ceil(32 * 4 / 3) = 43 characters.
+        assert_eq!(
+            fp_part.len(),
+            43,
+            "key ID fingerprint part must be 43 base64-no-pad characters (SHA-256 of 32 bytes)"
+        );
+        // The fingerprint must also appear in the full fingerprint string.
+        let fingerprint = key.fingerprint();
+        assert!(
+            fingerprint.starts_with("SHA256:"),
+            "fingerprint must start with SHA256:"
+        );
+        assert_eq!(
+            &fingerprint["SHA256:".len()..],
+            fp_part,
+            "key ID fingerprint component must match the SHA256 fingerprint suffix"
+        );
+    }
+
+    /// `public_key_b64` must produce a string that `decode_verifying_key` accepts
+    /// and that roundtrips back to the same key — validating the end-to-end codec
+    /// used for Matrix trust-state publication.
+    #[test]
+    fn public_key_b64_is_decodable() {
+        let _data = TempData::new("pubkeyb64");
+        let paths = crate::session::SessionPaths::resolve();
+        let key = load_or_create_signing_key(&paths).unwrap();
+        let b64 = key.public_key_b64();
+        let decoded = decode_verifying_key(&b64)
+            .expect("public_key_b64 must produce input that decode_verifying_key accepts");
+        assert_eq!(
+            decoded.as_bytes(),
+            key.verifying_key().as_bytes(),
+            "public_key_b64 roundtrip must recover the original verifying key"
+        );
     }
 }

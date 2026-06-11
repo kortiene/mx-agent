@@ -1332,12 +1332,28 @@ Response:
 }
 ```
 
-Every Matrix-backed command group is daemon-mediated over the same local IPC
-channel so the CLI never reads Matrix session files, tokens, or device keys and
-never restores a Matrix client: the daemon owns Matrix restoration and calls the
-existing helpers internally (issue #201). `auth login` stays CLI-initiated (it
-receives the password and writes the session into the daemon-owned data dir);
-`auth status`/`logout` read only local session metadata.
+Every Matrix-backed command group **except the `auth`/`trust` carve-out** is
+daemon-mediated over the same local IPC channel, so for those the CLI never reads
+Matrix session files, tokens, or device keys and never restores a Matrix client:
+the daemon owns Matrix restoration and calls the existing helpers internally
+(issue #201). The carve-out is deliberate (issue #201 declined to add an
+`auth.login` IPC rather than create a new password-over-socket credential
+surface): `auth login` stays **CLI-initiated**, and because `mx-agent-cli` links
+`mx-agent-daemon` as a library and the two ship as the **same binary at the same
+UID**, the CLI process itself receives the password, **builds a store-backed
+Matrix client, performs the network login, and creates the daemon-owned crypto
+store in-process** before writing the session into the daemon-owned data dir.
+`auth status`/`logout` read/clear only local session metadata, and `trust
+list`/`approve`/`revoke`/`fingerprint` run CLI-local against `trust.json` —
+`trust fingerprint` can create the daemon's Ed25519 signing key in-process. These
+are in-process library calls at the same UID, not a separate privilege boundary,
+which is why no `auth.*` method exists in the table below. A cross-process
+advisory `flock` on `<data_dir>/.write.lock` now serializes those in-process
+session/crypto-store-key/signing-key writes against a running daemon so two
+`mx-agent` processes cannot lost-update the same file (issue #269); the lock is
+advisory and does **not** refresh a running daemon's in-memory client after a
+CLI-local re-login (that staleness clears only on daemon restart). `trust
+publish`/`state` remain fully daemon-IPC-mediated.
 
 | Method | Params | Result |
 |---|---|---|

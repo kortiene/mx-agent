@@ -92,12 +92,12 @@ Running `mx-agent` with NO subcommand prints help (`arg_required_else_help`).
 
 ## Architecture & the request pipeline
 
-The CLI is STATELESS. Every command group is mediated by the daemon over a local Unix-domain-socket JSON-RPC 2.0 channel (socket mode 0600, peer checked with SO_PEERCRED). The CLI never reads the Matrix session file and never builds a Matrix client itself.
+The CLI is STATELESS. Every Matrix-backed command group **except the `auth`/`trust` carve-out** (see EXCEPTIONS below) is mediated by the daemon over a local Unix-domain-socket JSON-RPC 2.0 channel (socket mode 0600, peer checked with SO_PEERCRED), so for those the CLI never reads the Matrix session file and never builds a Matrix client itself.
 
 EXCEPTIONS/nuance:
 
 - `mx-agent daemon start/status/stop` manage the daemon process itself (not over IPC for start).
-- `auth login` is CLI-initiated only to receive the password and hand the new session to the daemon.
+- `auth login` is CLI-initiated and, because the CLI and daemon are the **same binary at the same UID**, the CLI process itself receives the password, **builds a store-backed Matrix client, performs the network login, and creates the daemon-owned crypto store in-process**, then hands the new session to the daemon-owned data dir. `auth status`/`logout` and the local `trust list`/`approve`/`revoke`/`fingerprint` commands (the latter can create the daemon's Ed25519 signing key) likewise run CLI-local against the data dir. An advisory `flock` serializes these in-process writes against a running daemon (issue #269); it does not refresh a running daemon's in-memory client after a re-login. See architecture §10.3.
 - `call` and `exec` run daemon-mediated LOCAL loopback execution by DEFAULT; they become signed, Matrix-backed REMOTE operations when BOTH `--room` and `--agent` target a registered remote agent (Ed25519-signed; workspace rooms are **unencrypted by default** — use `workspace create --e2ee on` for channel confidentiality; see §3).
 - Privileged remote requests run the receiver-side pipeline: verify(Ed25519 signature) → local trust store → deny-by-default policy.toml → optional require_verified_device gate → optional approval gate → sandbox runner. Room membership alone grants NOTHING.
 

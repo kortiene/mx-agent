@@ -17,7 +17,11 @@ mx-agent-telemetry.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
-nix = { workspace = true }
+# `fs` gates `nix::fcntl::Flock` (a safe RAII `flock(2)` wrapper) used to take a
+# cross-process advisory write lock around session / crypto-store-key /
+# signing-key creation so a CLI-local `auth login` cannot lost-update a running
+# daemon's data dir (issue #269). It composes with the workspace feature set.
+nix = { workspace = true, features = ["fs"] }
 rustix = { workspace = true }
 signal-hook = { workspace = true }
 toml = { workspace = true }

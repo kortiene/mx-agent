@@ -5,6 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -14,13 +15,16 @@ use mx_agent_ipc::rpc::{Request, Response, METHOD_NOT_FOUND, PARSE_ERROR};
 use mx_agent_ipc::{bind, serve, serve_streaming, verify_peer, Client, PeerCredCheck};
 use serde_json::{json, Value};
 
+// Global counter ensures each call gets a unique directory even when multiple
+// tests call this function at the same instant from parallel test threads.
+// Nanosecond timestamps alone are not sufficient because threads can read the
+// same value; a shared directory causes `remove_dir_all` in one test to delete
+// another test's still-live socket (reproduces as ENOENT on `connect`).
+static SOCKET_DIR_CTR: AtomicUsize = AtomicUsize::new(0);
+
 fn temp_socket_dir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("mx-agent-ipc-it-{}-{}", std::process::id(), nanos));
+    let n = SOCKET_DIR_CTR.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mx-agent-ipc-it-{}-{}", std::process::id(), n));
     fs::create_dir_all(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     dir
