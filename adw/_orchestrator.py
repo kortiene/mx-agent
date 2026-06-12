@@ -650,7 +650,18 @@ def run(args: argparse.Namespace, passthru: Sequence[str], issue: int) -> int:
             if review_result is not None:
                 findings = review_result.findings
             else:
-                findings = [_phases.ReviewFinding(**f) for f in state.review_findings]
+                # Tolerant reconstruction (mirrors _phases.to_result): state.json
+                # is the cross-language contract and permits additive keys inside
+                # findings, so never ReviewFinding(**f) a persisted dict.
+                findings = [
+                    _phases.ReviewFinding(
+                        severity=str(f.get("severity", "skippable")),
+                        description=str(f.get("description", "")),
+                        location=str(f.get("location", "")),
+                    )
+                    for f in state.review_findings
+                    if isinstance(f, dict)
+                ]
             patch_loop(
                 state,
                 findings,

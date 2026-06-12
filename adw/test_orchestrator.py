@@ -388,6 +388,44 @@ class RunIntegrationTests(unittest.TestCase):
         self.assertEqual(seen[0].severity, "blocker")
         self.assertEqual(seen[0].location, "a.rs:1")
 
+    def test_resume_tolerates_additive_finding_keys(self) -> None:
+        # state.json is the cross-language contract (adw/state.schema.json):
+        # finding objects may carry additive keys, omit optional ones, or be
+        # junk from a foreign writer. Resume must coerce, never crash.
+        pre = AdwState(adw_id="a1b2c3d4", issue_number="5", branch_name="feat/5-x")
+        for ph in ["setup", "classify", "plan", "implement", "tests", "resolve", "e2e", "review"]:
+            pre.mark_done(ph)
+        pre.review_findings = [
+            {"severity": "blocker", "description": "bug", "location": "a.rs:1", "file": "a.rs"},
+            {"description": "no severity recorded"},
+            "not-a-dict",
+        ]
+        pre.commit_message = "feat: x\n\ncloses #5"
+        pre.pr_number = 42
+        pre.save()
+
+        seen: list = []
+
+        def capture_patch(_state, findings, **_kw):
+            seen.extend(findings)
+            return True
+
+        with ExitStack() as stack:
+            self._patch_env(
+                stack,
+                run_agent=lambda *a, **k: {},
+                fetch_issue={"title": "T", "body": "B", "labels": []},
+                env_vars={"PATH": "/bin"},
+                issue_states=["OPEN", "CLOSED"],
+                pr_for_branch="https://x/pull/42",
+            )
+            stack.enter_context(mock.patch.object(_orchestrator, "patch_loop", side_effect=capture_patch))
+            rc = _orchestrator.run(self._args(["--adw-id", "a1b2c3d4", "--resume"]), [], 5)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen), 2)  # the non-dict entry is dropped
+        self.assertEqual(seen[0].severity, "blocker")  # additive key ignored
+        self.assertEqual(seen[1].severity, "skippable")  # missing severity coerced
+
 
 def _loaded_id(tmp: str) -> str:
     """Return the single adw_id directory created under the temp AGENTS_DIR."""

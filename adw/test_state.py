@@ -262,6 +262,10 @@ class SchemaContractTests(unittest.TestCase):
             ({"schema_version": 0}, "minimum"),
             ({"schema_version": "1"}, "type"),
             ({"pr_number": "42"}, "type"),
+            # severity is load-bearing for the patch gate, so a finding
+            # without it is a contract violation (writers must record it;
+            # the reader still coerces tolerantly on resume).
+            ({"review_findings": [{"description": "d"}]}, "missing required"),
             ({"completed_phases": "plan"}, "type"),
             ({"review_findings": [["not-an-object"]]}, "type"),
         ]:

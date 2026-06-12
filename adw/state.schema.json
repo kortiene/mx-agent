@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/kortiene/mx-agent/main/adw/state.schema.json",
   "title": "AdwState",
-  "description": "On-disk contract for agents/{adw_id}/state.json, the sole cross-language boundary between the Python adw/ pipeline and the TypeScript adw_sdlc/ engine. Canonical v1 fields mirror adw/_state.py AdwState. Unknown keys are permitted (additionalProperties) so either engine may add fields additively; the Python reader drops keys it does not declare, so additions must never be load-bearing for resume.",
+  "description": "On-disk contract for agents/{adw_id}/state.json, the sole cross-language boundary between the Python adw/ pipeline and the TypeScript adw_sdlc/ engine. Canonical v1 fields mirror adw/_state.py AdwState. Unknown keys are permitted (additionalProperties) so either engine may add fields additively; the Python reader drops unknown TOP-LEVEL keys and tolerantly coerces nested finding objects, so additions must never be load-bearing for resume.",
   "type": "object",
   "required": ["adw_id", "schema_version"],
   "additionalProperties": true,
@@ -59,8 +59,9 @@
       "description": "Review findings as plain objects so they survive --resume and the patch phase can still see blockers.",
       "items": {
         "type": "object",
+        "required": ["severity"],
         "properties": {
-          "severity": { "type": "string" },
+          "severity": { "type": "string", "description": "Load-bearing for the patch gate: blocker findings are the ones patch_loop must fix." },
           "description": { "type": "string" },
           "location": { "type": "string" }
         },
