@@ -26,6 +26,7 @@ export { DEFAULT_RUNNER, loadRunner, resolveRunnerId, type RunnerModule } from '
 export {
   ISSUE_CLASSES,
   PHASE_SCHEMAS,
+  parsePhaseResult,
   phaseJsonSchema,
   type ClassifyResult,
   type DocumentResult,

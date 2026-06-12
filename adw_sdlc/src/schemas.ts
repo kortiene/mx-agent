@@ -16,6 +16,7 @@
 
 import { z } from 'zod';
 
+import { AdwError } from './errors.js';
 import type { JsonSchema } from './invoker.js';
 
 export const ISSUE_CLASSES = ['feat', 'fix', 'docs', 'chore', 'ci', 'test', 'refactor'] as const;
@@ -115,4 +116,40 @@ export type DocumentResult = z.infer<typeof DocumentResultSchema>;
  */
 export function phaseJsonSchema(phase: SchemaPhase): JsonSchema {
   return z.toJSONSchema(PHASE_SCHEMAS[phase]) as JsonSchema;
+}
+
+/**
+ * Parse a raw runner payload with to_result's tolerance (adw/_phases.py:293-353):
+ * non-object payloads and unparseable values raise AdwError; null-valued fields
+ * fall back to their defaults (real agents emit null for empty lists — Python
+ * guards every list with `or []`); non-dict entries inside review findings are
+ * dropped (adw/_phases.py:332). The schemas themselves stay null-free so
+ * phaseJsonSchema() keeps asking backends for the clean canonical shape.
+ */
+export function parsePhaseResult<P extends SchemaPhase>(
+  phase: P,
+  data: unknown,
+): z.infer<(typeof PHASE_SCHEMAS)[P]> {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    throw new AdwError(`${phase} phase output must be a JSON object`);
+  }
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (value === null) {
+      continue; // defaults apply, mirroring `data.get(key, default) or default`
+    }
+    normalized[key] = value;
+  }
+  if (phase === 'review' && Array.isArray(normalized['findings'])) {
+    normalized['findings'] = normalized['findings'].filter(
+      (f) => typeof f === 'object' && f !== null && !Array.isArray(f),
+    );
+  }
+  const parsed = PHASE_SCHEMAS[phase].safeParse(normalized);
+  if (!parsed.success) {
+    throw new AdwError(`${phase} phase output does not match its contract: ${parsed.error.message}`, {
+      cause: parsed.error,
+    });
+  }
+  return parsed.data as z.infer<(typeof PHASE_SCHEMAS)[P]>;
 }

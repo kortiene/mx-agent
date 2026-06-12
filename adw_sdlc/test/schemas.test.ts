@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
+import { AdwError } from '../src/errors.js';
 import {
   ClassifySchema,
   ISSUE_CLASSES,
   PHASE_SCHEMAS,
   ResolveResultSchema,
   ReviewResultSchema,
+  parsePhaseResult,
   phaseJsonSchema,
   type SchemaPhase,
 } from '../src/schemas.js';
@@ -96,5 +98,31 @@ describe('phase schemas', () => {
     });
     expect(parsed.findings[0]?.severity).toBe('skippable');
     expect(parsed.findings[0]).not.toHaveProperty('extra_key'); // stripped, like the tolerant Python reader
+  });
+});
+
+describe('parsePhaseResult (to_result tolerance parity)', () => {
+  it('null list/string fields fall back to defaults (Python `or []` guards)', () => {
+    const implement = parsePhaseResult('implement', { summary: null, files_changed: null });
+    expect(implement).toEqual({ summary: '', files_changed: [] });
+    const document = parsePhaseResult('document', { files: null, docs_updated: true });
+    expect(document.files).toEqual([]);
+    const plan = parsePhaseResult('plan', { plan_file: null, summary: 'x' });
+    expect(plan.plan_file).toBeNull(); // null is the legitimate plan_file value
+  });
+
+  it('drops non-dict review findings entries (adw/_phases.py:332)', () => {
+    const review = parsePhaseResult('review', {
+      findings: [{ severity: 'blocker', description: 'd' }, 'junk', null, 42],
+    });
+    expect(review.findings).toHaveLength(1);
+    expect(review.findings[0]?.severity).toBe('blocker');
+  });
+
+  it('raises AdwError on non-object payloads and contract garbage', () => {
+    expect(() => parsePhaseResult('resolve', 'not an object')).toThrowError(AdwError);
+    expect(() => parsePhaseResult('resolve', [1, 2])).toThrowError(AdwError);
+    expect(() => parsePhaseResult('resolve', { resolved: 'two' })).toThrowError(AdwError);
+    expect(() => parsePhaseResult('classify', {})).toThrowError(AdwError);
   });
 });
