@@ -869,6 +869,42 @@ self-spawned-server wrapper), **pi** (in-process SDK; no native schema → fence
    fenced-JSON+nudge path. **Other [VERIFY] steps:** readiness banner string; canonical structured
    accessor; per-request `?directory=`/`x-opencode-directory` honored on the v2 prompt route. **Verify:**
    self-spawn env-absence test; server start/readiness/teardown + port-collision handling.
+   *Landed notes — [VERIFY] resolutions (installed 1.17.3 `.d.ts`/`.js` + a live gate against the real
+   1.17.3 binary driven through a local OpenAI-compatible stub provider, so no credential was needed):*
+   the **v2 prompt route returns `.structured`** (`AssistantMessage.structured`), so
+   `caps.nativeSchema:true` stands — mechanically the server exposes a **`StructuredOutput` tool whose
+   parameters ARE the schema** (`tool_choice:'required'`) and validates the model's call, with
+   `StructuredOutputError` surfacing on `info.error` after `retryCount` exhaustion (mapped to a failed
+   result, `signal:'none'`, so the invoker's single nudge applies). Readiness banner is
+   `opencode server listening on <url>` (the same line the SDK's own wrapper scrapes; accepted from
+   stdout or stderr). **`--port 0` is NOT an ephemeral bind** — it silently falls back to the default
+   4096 (observed live) — so the adapter draws a random IANA dynamic-range port and retries
+   exit-before-banner up to 3 times (the observable symptom of a collision); spawn errors and banner
+   timeouts fail immediately. `directory` rides the prompt/create POSTs as an explicit **query param**
+   in the generated v2 client (the GET/HEAD-only header-rewrite interceptor is not involved) and is
+   honored live (`session.directory`/`info.path.cwd` = the request dir, macOS-realpath-canonicalized).
+   Config injection uses **`OPENCODE_CONFIG_CONTENT`** on the spawn env (the channel the SDK wrapper
+   uses) carrying the permission ruleset `{'*':'allow', bash:{'git *':'deny','gh *':'deny','*':'allow'}}`
+   — never `'ask'` (hangs headless); project `opencode.json` still merges (the live stub provider was
+   configured that way). **Deviation from the step sketch:** the server starts lazily on the FIRST
+   `runPhase`, not in `start()` — the registry's `createRunner()` contract provides no env/cwd at
+   construction, and they only arrive with the first `PhaseRequest`; `start()` is an interface-parity
+   no-op, `stop()` remains the teardown seam, and `orchestrator.run()` now calls
+   `await runner.start?.()` before the phase loop and `await runner.stop?.()` in a `finally` (mock-run
+   lifecycle test). One server per run (keyed to the first request), one session per phase
+   (`sessionId` = resume handle). The SSE tee (`client.event.subscribe`) streams **assistant-only**
+   text deltas/updates live (the bus replays the USER message's parts too, observed live — filtered by
+   tracking assistant message ids from `message.updated`), tool terminal states as file-only notes,
+   deduped against the authoritative final-parts replay by written-length tracking, so transcriptText
+   stays assistant-text-only for the fenced-JSON fallback. The SDK's `createOpencodeServer`/
+   `createOpencode(Tui)` spread the parent process env onto the child (verified on `dist/v2/server.js`)
+   and are banned by a fail-closed gate in `scripts/check-adw-sdlc-env.sh` (call/import/subpath
+   patterns; the adapter imports `@opencode-ai/sdk/v2/client` only). `OPENCODE_BIN` overrides binary
+   resolution (then PATH, then `~/.opencode/bin/opencode`); `XDG_DATA_HOME` joins the opencode
+   allowlist row so callers can point the auth dir at a scrubbed location (Section 4.4 mitigation,
+   CODEX_HOME parallel). Native cost (`info.cost`) and provider-shaped tokens (`tokens.input` is
+   cache-disjoint for the Anthropic-style providers the tier table routes to) are finite-checked
+   before use; cost degrades to `null`, never NaN.
 9. **Runner #4 = `pi` (`runner-pi.ts`).** Drive `@earendil-works/pi-coding-agent` (npm resolves
    `0.79.1`) over an orchestrator-owned subprocess boundary (CLI `-p --mode json` / `--mode rpc`, or the
    in-process SDK invoked inside a child we spawn) with the allowlist env **and** `agentDir`/`authStorage`
@@ -967,9 +1003,13 @@ Every uncertain runner fact is a **[VERIFY]** roadmap step, not an assertion.
 - ~~Does codex `outputSchema` guarantee JSON-only `finalResponse`, or can prose precede it?~~
   **Resolved in step 7:** documented as JSON but not contractual — the adapter parses defensively
   and the invoker fallback/nudge owns non-conforming replies.
-- Does the **v2** opencode prompt route (`@opencode-ai/sdk/v2`) return `.structured` against the pinned
+- ~~Does the **v2** opencode prompt route (`@opencode-ai/sdk/v2`) return `.structured` against the pinned
   `^1.17.3`; what is the exact readiness-banner string; are `?directory=`/`x-opencode-directory` honored
-  on the v2 prompt route? → step 8.
+  on the v2 prompt route?~~ **Resolved in step 8 (live gate on the real 1.17.3 binary):** `.structured`
+  is returned (via a server-injected `StructuredOutput` tool) → `nativeSchema:true` stands; banner =
+  `opencode server listening on <url>`; `directory` is an explicit query param on the v2 POSTs and is
+  honored. New finding: `--port 0` is not ephemeral (falls back to 4096) → random-port + retry instead
+  (see the step-8 roadmap entry).
 - Does pi's `--mode json/rpc` give a cleaner stream than `-p`, and how do `AuthStorage`/`agentDir`
   interact with a non-inheriting env? → step 9. *(Resolved already: pi ships a full in-process SDK with
   `createAgentSession`/`AuthStorage`/`agentDir`; `SessionStats.cost` is native; `prompt()` returns void
