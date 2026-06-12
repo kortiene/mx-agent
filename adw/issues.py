@@ -48,6 +48,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phases", help="forward --phases to issue.py (phased mode subset)")
     parser.add_argument("--one-shot", dest="one_shot", action="store_true", help="forward --one-shot to issue.py (legacy)")
     parser.add_argument("--log-dir", help="forward --log-dir to issue.py so each run is captured")
+    parser.add_argument(
+        "--ci-max-polls",
+        dest="ci_max_polls",
+        type=int,
+        default=80,
+        help="forward --ci-max-polls to issue.py (default 80; batches run the long live suite, so issue.py's 40-poll default can false-fail at the merge gate)",
+    )
+    parser.add_argument(
+        "--ci-poll-interval",
+        dest="ci_poll_interval",
+        type=int,
+        default=None,
+        help="forward --ci-poll-interval to issue.py (seconds between CI polls; default: issue.py's 30s)",
+    )
     parser.add_argument("--start", type=int, default=0, help="resume at the first occurrence of this issue")
     parser.add_argument("--delay", type=int, default=0, help="sleep this many seconds between issues")
     parser.add_argument("--keep-going", action="store_true", help="continue to the next issue even if one fails")
@@ -98,6 +112,10 @@ def issue_flags(args: argparse.Namespace, yes: bool) -> list[str]:
         flags += ["--one-shot"]
     if args.log_dir:
         flags += ["--log-dir", args.log_dir]
+    if getattr(args, "ci_max_polls", None) is not None:
+        flags += ["--ci-max-polls", str(args.ci_max_polls)]
+    if getattr(args, "ci_poll_interval", None) is not None:
+        flags += ["--ci-poll-interval", str(args.ci_poll_interval)]
     if yes:
         flags += ["--yes"]
     return flags
