@@ -12,6 +12,19 @@
 export const ENGINE = 'ts' as const;
 
 export {
+  DEFAULT_ENGINE,
+  ENGINE_IDS,
+  extractEngineFlag,
+  main as cliMain,
+  parseCliArgs,
+  resolveEngineId,
+  splitPassthru,
+  type CliDeps,
+  type EngineId,
+  type ParsedCli,
+} from './cli.js';
+
+export {
   RUNNER_IDS,
   type AgentRunner,
   type JsonSchema,
