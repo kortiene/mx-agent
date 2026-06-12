@@ -982,9 +982,27 @@ self-spawned-server wrapper), **pi** (in-process SDK; no native schema → fence
     → `run()` path over a vi-mocked SDK, with the D5 no-secret assertion re-checked on every
     `options.env` the SDK seam received. Per-adapter transport fidelity for codex/opencode/pi stays in
     their own step-7/8/9 suites. Live smoke: default → `python3 adw/issue.py` plan (`via pi`,
-    `setup(python)`); `MX_AGENT_ENGINE=ts` → TS plan via the real registry (`via claude`, `setup(ts)`);
-    unknown engine/runner → `error: unknown engine: 'rust' (valid: py, ts)` / `error: unknown runner:
-    'gemini' (…)`, rc 1.
+    `setup(python)`); `MX_AGENT_ENGINE=ts` → TS plan (`via claude`, `setup(ts)`); unknown
+    engine/runner → `error: unknown engine: 'rust' (valid: py, ts)` / `error: unknown runner:
+    'gemini' (…)`, rc 1. **Adversarial-review fixes folded in (8 confirmed findings):** `-h`/`--help`
+    prints usage and exits 0 on the ts engine (argparse parity; a py-engine `--help` is delegated so
+    Python prints its own) — without this, plain `--help` would regress to rc 1 at the step-12
+    cutover; positional tokens follow argparse `nargs='*'` semantics — ONE contiguous chunk anywhere,
+    a second run fails loud (`unrecognized argument: …`, so a space-separated `--phases plan implement`
+    typo cannot silently demote phases to notes); an option-looking token is never swallowed as a flag
+    value (negative numbers excepted), so `--model --yes` fails loud instead of eating the user's
+    `--yes`; explicit-but-empty `--engine=`/`--runner=` fail loud instead of masking the env vars and
+    silently picking defaults (empty *env vars* still mean unset); `--dry-run` previews WITHOUT
+    loading the optional runner SDK (py parity: the plan prints after a name-only check, via an inert
+    preview runner whose `runPhase` always throws); a set `PI_THINKING` is noted as ignored on the ts
+    engine rather than silently dropped (the phased Python path forwards it to the pi CLI; the
+    PY_ONLY_FLAGS doc was corrected accordingly — `--thinking` is phased-relevant in py, not
+    one-shot-only); the REAL `spawnPyEngine` is pinned by `cli-py-engine.test.ts` over a mocked
+    `node:child_process` (command `python3` + `adw/issue.py`, `cwd=REPO_ROOT`, `stdio:'inherit'`,
+    **no `env` option** so the child inherits the full parent env, exit-code passthrough, signal→1,
+    spawn-error→AdwError) — the one spawn site whose contract is the deliberate inverse of the D5
+    allowlist; and the py-delegation test forwards a TS-invalid runner (`gemini`) so accidental
+    pre-validation on the py path cannot ship green.
 11. **Parity checklist (Section 10) under mocked seams, then real-issue runs per runner.** Record
     cost/usage and structured-output hard-failure rates; assert cross-language state equivalence.
     **Verify:** all checklist boxes ticked for `claude` (cutover gate); other runners' capability-matrix

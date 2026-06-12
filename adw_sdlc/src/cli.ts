@@ -26,6 +26,8 @@ import { pathToFileURL } from 'node:url';
 
 import { REPO_ROOT } from './common.js';
 import { AdwError } from './errors.js';
+import { note } from './exec.js';
+import type { AgentRunner, RunnerId } from './invoker.js';
 import { run, type RunOptions } from './orchestrator.js';
 import { loadRunner, resolveRunnerId } from './registry.js';
 
@@ -75,13 +77,18 @@ export function extractEngineFlag(args: readonly string[]): { engine?: string; r
     const arg = args[i]!;
     if (arg === '--engine') {
       const value = args[i + 1];
-      if (value === undefined) {
+      if (value === undefined || value === '') {
         throw new AdwError('--engine requires a value (py or ts)');
       }
       engine = value;
       i += 1;
     } else if (arg.startsWith('--engine=')) {
       engine = arg.slice('--engine='.length);
+      if (engine === '') {
+        // An explicit-but-empty flag must fail loud, not mask MX_AGENT_ENGINE
+        // and silently pick the built-in default.
+        throw new AdwError('--engine requires a value (py or ts)');
+      }
     } else {
       rest.push(arg);
     }
@@ -92,6 +99,8 @@ export function extractEngineFlag(args: readonly string[]): { engine?: string; r
 // --- ts-engine flag parsing (mirrors adw/issue.py build_parser) ----------------
 
 export interface ParsedCli {
+  /** -h/--help was requested; print usage and exit 0 (the rest is unset). */
+  help?: true;
   issue: number;
   /** Free-form notes after the issue number (accepted for CLI parity; the
    * phased pipeline derives context from the issue itself, as in Python). */
@@ -101,7 +110,11 @@ export interface ParsedCli {
   options: RunOptions;
 }
 
-/** Flags that only exist on the py engine's one-shot/legacy paths. */
+/**
+ * Flags only the py engine understands: the one-shot/legacy modes, plus pi's
+ * --thinking — which the phased Python path DOES forward to the runner CLI;
+ * the ts engine has no runner command line, so it is rejected loudly here.
+ */
 const PY_ONLY_FLAGS = new Set([
   '--one-shot',
   '--template',
@@ -155,6 +168,37 @@ function parseFloatFlag(flag: string, value: string): number {
   return parsed;
 }
 
+export const CLI_USAGE = `usage: adw-sdlc issue [--engine {py,ts}] <issue-number> [notes...] [flags]
+
+Run the phased /issue delivery workflow. --engine / MX_AGENT_ENGINE picks the
+driving language (default: py -> delegates to python3 adw/issue.py, which has
+its own --help). Flags below apply to the ts engine:
+
+  --runner <id>            agent runner: claude (default) | codex | opencode | pi
+                           Env: MX_AGENT_RUNNER
+  --phases <list>          comma-separated phase subset/order (default: full chain)
+  --adw-id <id>            reuse/resume a run by its 8-char id
+  --resume                 resume from saved state (requires --adw-id)
+  --no-progress            do not post [MX-ADW] issue comments
+  --inherit-env            give the agent the full env (less isolated)
+  --max-resolve <n>        max self-heal test attempts (default: 3)
+  --max-patch <n>          max review-blocker patch attempts (default: 2)
+  --max-ci-fix <n>         max CI-fix attempts (default: 3)
+  --ci-poll-interval <s>   seconds between CI polls (default: 30)
+  --ci-max-polls <n>       max CI status polls (default: 40)
+  --test-cmd <cmd>         test gate command. Env: MX_AGENT_TEST_CMD
+  --model <id>             model override (overrides per-phase routing)
+  --repo <owner/repo>      repo for issue lookups. Env: REPO
+  --base <branch>          base branch to fork from / merge into (default: main)
+  --timeout <s>            abort a runner call after N seconds (0 = none)
+  --max-budget-usd <usd>   native budget cap (runners that support it)
+  --no-verify              skip the post-run CLOSED check
+  --force                  run even if the issue is already CLOSED
+  --allow-dirty            skip the clean-working-tree precondition
+  -y, --yes                do not prompt for confirmation
+  --dry-run                preview the plan; do not run
+  -h, --help               show this help and exit`;
+
 /**
  * Parse the ts-engine argv (post `--engine` extraction, pre `--` split) into
  * the issue number plus orchestrator RunOptions. Defaults mirror
@@ -167,15 +211,32 @@ export function parseCliArgs(
 ): ParsedCli {
   const tokens: string[] = [];
   const flags = new Map<string, string | true>();
+  let inTokenRun = false;
+  let tokenRunDone = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
     if (!arg.startsWith('-') || /^-?\d+$/.test(arg)) {
+      if (tokenRunDone) {
+        // argparse parity: the nargs='*' positional consumes ONE contiguous
+        // chunk; a second positional run is an error there, and a silent
+        // note-demotion here would hide typos like a space-separated
+        // --phases list.
+        throw new AdwError(`unrecognized argument: ${arg}`);
+      }
+      inTokenRun = true;
       tokens.push(arg);
       continue;
     }
+    if (inTokenRun) {
+      inTokenRun = false;
+      tokenRunDone = true;
+    }
     const eq = arg.indexOf('=');
     const name = eq === -1 ? arg : arg.slice(0, eq);
+    if (name === '-h' || name === '--help') {
+      return { help: true, issue: 0, notes: [], options: {} };
+    }
     if (PY_ONLY_FLAGS.has(name)) {
       throw new AdwError(`${name} is a py-engine option; rerun with --engine py (or MX_AGENT_ENGINE=py)`);
     }
@@ -192,11 +253,19 @@ export function parseCliArgs(
         value = arg.slice(eq + 1);
       } else {
         const next = argv[i + 1];
-        if (next === undefined) {
+        // argparse parity: an option-looking token (negative numbers
+        // excepted) is never swallowed as a value — `--model --yes` must
+        // fail loud, not silently consume the user's --yes.
+        if (next === undefined || (next.startsWith('-') && !/^-\d/.test(next))) {
           throw new AdwError(`${name} requires a value`);
         }
         value = next;
         i += 1;
+      }
+      if (name === '--runner' && value === '') {
+        // Loudness parity with adw/issue.py ("unknown --runner: ''"); an
+        // empty flag must not mask MX_AGENT_RUNNER and default silently.
+        throw new AdwError('--runner requires a non-empty value');
       }
       flags.set(name, value);
       continue;
@@ -304,6 +373,29 @@ function defaultCliDeps(): CliDeps {
 }
 
 /**
+ * --dry-run never invokes the runner (run() prints the plan and returns
+ * before any runner use beyond `id`), so previewing a plan must not require
+ * the selected runner's optional SDK — parity with adw/_orchestrator.py,
+ * which prints the plan after a name-only check, never resolving the binary.
+ */
+function dryRunRunner(id: RunnerId): AgentRunner {
+  return {
+    id,
+    caps: {
+      nativeSchema: false,
+      perToolHook: false,
+      envIsolation: 'subprocess-allowlist',
+      costUsd: false,
+      nativeBudget: false,
+      resume: false,
+    },
+    async runPhase(): Promise<never> {
+      throw new AdwError('the dry-run runner cannot execute phases');
+    },
+  };
+}
+
+/**
  * CLI entry: resolve the engine, then delegate (py) or bind the selected
  * runner into orchestrator.run (ts). Expected failures (AdwError, including
  * RunnerNotInstalledError) print `error: …` and return 1, mirroring
@@ -329,8 +421,19 @@ export async function main(argv: readonly string[], depsOverride: Partial<CliDep
       );
     }
     const parsed = parseCliArgs(rest, deps.env);
+    if (parsed.help === true) {
+      console.log(CLI_USAGE);
+      return 0;
+    }
+    if (deps.env['PI_THINKING']) {
+      // Python's phased path forwards PI_THINKING to the pi CLI; the ts
+      // engine routes models/effort per phase instead — say so rather than
+      // silently dropping the knob.
+      note('PI_THINKING is ignored by the ts engine (phased model routing applies); use --engine py for pi --thinking');
+    }
     const runnerId = resolveRunnerId(parsed.runner ?? deps.env['MX_AGENT_RUNNER']);
-    const runner = await deps.loadRunner(runnerId);
+    const runner =
+      parsed.options.dryRun === true ? dryRunRunner(runnerId) : await deps.loadRunner(runnerId);
     return await deps.runIssue(parsed.issue, runner, parsed.options);
   } catch (err) {
     if (err instanceof AdwError) {
