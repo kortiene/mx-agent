@@ -5,7 +5,7 @@
   "description": "TypeScript control plane for the phased ADW pipeline: one AgentRunner seam, four interchangeable runner backends (claude/codex/opencode/pi). See PLAN.md.",
   "type": "module",
   "engines": {
-    "node": ">=20.10"
+    "node": ">=20.19"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
