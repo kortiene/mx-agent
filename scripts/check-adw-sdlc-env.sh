@@ -40,7 +40,8 @@ fi
 # anywhere in adw_sdlc/src must use the one canonical shape — an inline
 # object literal whose FIRST key is env — and the class must never be
 # aliased (an alias would evade the pattern).
-codex_violations=$(perl -0777 -ne '
+# shellcheck disable=SC2016  # $ARGV/$head are perl variables, not shell expansions
+codex_violations=$(find adw_sdlc/src -name '*.ts' -print0 | xargs -0 perl -0777 -ne '
   print "$ARGV: aliasing the Codex class is not allowed (it evades this gate)\n"
     if /\bCodex\s+as\s+\w/ || /=\s*Codex\s*[;,)\s]/;
   while (/\bnew\s+Codex\b(?=(.{0,80}))/gs) {
@@ -48,7 +49,7 @@ codex_violations=$(perl -0777 -ne '
     $head =~ s/\s+/ /g;
     print "$ARGV: new Codex must take an inline literal starting with env: (saw: new Codex$head)\n"
       unless $head =~ /^\s*\(\s*\{\s*env\s*:/;
-  }' $(find adw_sdlc/src -name '*.ts'))
+  }')
 if [ -n "$codex_violations" ]; then
   echo "$codex_violations" >&2
   echo "error: the codex adapter must ALWAYS pass CodexOptions.env (omission inherits all of process.env)" >&2
