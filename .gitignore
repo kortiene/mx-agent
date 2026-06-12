@@ -3,6 +3,10 @@ __pycache__/
 /target/
 /logs/
 
+# Node (pnpm workspace: adw_sdlc/)
+node_modules/
+adw_sdlc/dist/
+
 # Ephemeral ADW phased-run workspaces (adw/_state.py): agents/{adw_id}/…
 /agents/
 

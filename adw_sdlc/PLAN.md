@@ -130,7 +130,7 @@ dependency tree and a second failure surface while covering neither `pi` nor arb
 
 ### D3 — TypeScript toolchain, runtime, deps & CI
 
-**Choice:** Node-LTS (`engines >=20.10`; CI matrix 20 + 22) **ESM-only** TypeScript package managed by
+**Choice:** Node-LTS (`engines >=20.19`, the floor imposed by the locked vitest/vite toolchain; CI matrix 20 + 22) **ESM-only** TypeScript package managed by
 **pnpm** (committed `pnpm-lock.yaml`, `pnpm-workspace.yaml` member `adw_sdlc/`). `tsc` for
 typecheck/emit; `tsx` for dev/CI run; `vitest` for tests. The four runner SDKs are
 **`optionalDependencies`** reached only through **dynamic `await import()`** inside a registry (the TS
@@ -219,7 +219,7 @@ mx-agent/
 │   └── state.schema.json      # NEW: single JSON-Schema for state.json, tested from BOTH Python and TS
 │
 ├── adw_sdlc/                  # NEW TypeScript/Node package (full orchestrator + 4 runner adapters)
-│   ├── package.json           # name "adw-sdlc"; ESM ("type":"module"); engines >=20.10  (D3)
+│   ├── package.json           # name "adw-sdlc"; ESM ("type":"module"); engines >=20.19  (D3)
 │   ├── tsconfig.json          # target ES2022, moduleResolution nodenext, declaration
 │   ├── tsconfig.build.json
 │   ├── src/
@@ -532,8 +532,9 @@ or a synthetic timeout/budget rc) feeds the existing loops exactly as a failed C
   `ImplementResult`, `TestsResult`, `ResolveResult`, `E2EResult`, `ReviewFinding`/`ReviewResult`,
   `PatchResult`, `DocumentResult` — fields exactly per `OUTPUT_CONTRACT`/`to_result`
   (`adw/_phases.py:397-410`). `ClassifySchema = z.object({ issue_class: z.enum([...7 classes]), reason: z.string() })`.
-- Convert Zod → JSON Schema (`zod-to-json-schema`, or `zodToJsonSchema(schema,{target:'openAi'})` for
-  codex) once, per phase, shared across all runners. **Always validate in the parent with Zod** (defense
+- Convert Zod → JSON Schema with zod v4's native `z.toJSONSchema()` (the scaffold pins `zod@^4`,
+  which `@anthropic-ai/sdk` peer-accepts, making the planned `zod-to-json-schema` dep unnecessary)
+  once, per phase, shared across all runners. **Always validate in the parent with Zod** (defense
   in depth) regardless of whether the backend claims native schema output.
 
 ### Native structured output per backend, with a shared fenced-JSON fallback
@@ -659,12 +660,16 @@ separate cleanup PR.
 
 ## 9. Dependency boundary & toolchain (per D3)
 
-- **Runtime:** Node LTS (`engines >=20.10`; CI matrix 20 + 22), **not** Bun/Deno. ESM-only
+- **Runtime:** Node LTS (`engines >=20.19`, the locked toolchain's floor — vite 8 under vitest 4
+  requires `^20.19.0 || >=22.12.0`; CI matrix 20 + 22), **not** Bun/Deno. Note the pinned
+  `@earendil-works/pi-coding-agent` declares `node >=22.19`, so the Node-20 lane exercises only
+  the claude/codex/opencode adapters once runners land. ESM-only
   (`"type":"module"`, `moduleResolution nodenext`, `target ES2022`).
 - **Package manager:** **pnpm** (committed `pnpm-lock.yaml`, `pnpm-workspace.yaml` member `adw_sdlc/`);
   `--frozen-lockfile` in CI. (npm is a viable fallback if the team prefers zero new tooling.)
 - **Non-optional runtime deps:** `@anthropic-ai/sdk` (`^0.104.1`, classify single-structured call) and
-  `zod` (validation), plus `zod-to-json-schema`.
+  `zod` (`^4`, validation; zod v4's native `z.toJSONSchema()` replaces the originally planned
+  `zod-to-json-schema`).
 - **`optionalDependencies` (the four runner SDKs):** `@anthropic-ai/claude-agent-sdk` (`^0.3.170`),
   `@openai/codex-sdk` (`0.139.0`, **exact**, lockstep with `@openai/codex`), `@opencode-ai/sdk`
   (`^1.17.3`, used via the **`@opencode-ai/sdk/v2`** subpath where native schema is required),

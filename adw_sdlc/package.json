@@ -1,0 +1,32 @@
+{
+  "name": "adw-sdlc",
+  "version": "0.0.1",
+  "private": true,
+  "description": "TypeScript control plane for the phased ADW pipeline: one AgentRunner seam, four interchangeable runner backends (claude/codex/opencode/pi). See PLAN.md.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "lint:env": "bash ../scripts/check-adw-sdlc-env.sh"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.1",
+    "zod": "^4.4.3"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.170",
+    "@earendil-works/pi-coding-agent": "^0.79.1",
+    "@openai/codex-sdk": "0.139.0",
+    "@opencode-ai/sdk": "^1.17.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
+  }
+}

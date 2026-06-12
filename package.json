@@ -1,0 +1,10 @@
+{
+  "name": "mx-agent-workspace",
+  "private": true,
+  "description": "pnpm workspace root for the TypeScript packages in this repo (currently adw_sdlc/). The Rust workspace (Cargo.toml) and Python adw/ are independent of it.",
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test"
+  }
+}
