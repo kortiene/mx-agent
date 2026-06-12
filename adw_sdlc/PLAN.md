@@ -796,12 +796,24 @@ self-spawned-server wrapper), **pi** (in-process SDK; no native schema → fence
    pathToClaudeCodeExecutable: resolvedBin, allowedTools, permissionMode:'acceptEdits',
    outputFormat:{json_schema}, maxBudgetUsd, abortController}})`; read terminal `SDKResultMessage`
    (`structured_output`/`total_cost_usd`/`usage`); map `error_max_budget_usd` → `signal:'budget'`. **No
-   forked child** — `options.env` is the boundary (verified replace-semantics). **[VERIFY] steps (narrow):**
-   exact `canUseTool`/`PermissionResult*` signatures; `permissionMode` values; `max_structured_output_retries`.
-   **Resolved (no longer [VERIFY]):** env replace-vs-merge (replace), SDK spawns a child, and PATH-on-allowlist
-   for `pathToClaudeCodeExecutable`/`executable` location. **Verify:** mocked-`query` unit tests (request
+   forked child** — `options.env` is the boundary (verified replace-semantics). **Resolved (no longer
+   [VERIFY], confirmed on the installed `sdk.d.ts` 0.3.173):** env replace-vs-merge (replace), SDK spawns
+   a child, PATH-on-allowlist for `pathToClaudeCodeExecutable`/`executable` location; `CanUseTool =
+   (toolName, input, {signal, toolUseID, ...}) => Promise<PermissionResult>` with `PermissionResult` the
+   allow/deny union (`updatedInput?` / `message`); `PermissionMode = 'default'|'acceptEdits'|
+   'bypassPermissions'|'plan'|'dontAsk'|'auto'` (`acceptEdits` exists as planned); there is **no**
+   `maxStructuredOutputRetries` option — schema-retry exhaustion surfaces only as the result subtype
+   `error_max_structured_output_retries`, which the adapter maps to a failed `PhaseResult` with
+   `signal:'none'` so the invoker's single nudge applies. **Verify:** mocked-`query` unit tests (request
    shape incl. tool grants + `env`, result mapping); env-isolation (assert `options.env`) + tool-grant
    tests; live smoke on one phase.
+   *Landed notes:* `canUseTool` denies Bash git/gh at a command position (best-effort; GH_TOKEN absence
+   stays the load-bearing control) and allows the granted tools; binary resolution ports
+   `adw/_exec.py:201-213` but reads the ALLOWLIST env and returns undefined instead of raising when
+   nothing resolves (the SDK then uses its built-in executable); a non-abort SDK throw maps to a failed
+   `PhaseResult` (rc 1, output kept) mirroring a crashed CLI run, never an exception, so the bounded
+   loops see it exactly as today. Live smoke verified: native `structured_output`, `total_cost_usd`,
+   `session_id`, transcript tee.
 7. **Runner #2 = `codex` (`runner-codex.ts`).** `new Codex({env: allowlist, apiKey})` →
    `startThread({model, modelReasoningEffort, workingDirectory, sandboxMode:'workspace-write',
    approvalPolicy:'never', skipGitRepoCheck:true})` → `thread.run(prompt, {outputSchema, signal})`;
@@ -904,10 +916,12 @@ Every uncertain runner fact is a **[VERIFY]** roadmap step, not an assertion.
 
 ### Open questions (resolved in the roadmap as **[VERIFY]** steps)
 
-- Exact `canUseTool`/`PermissionResultAllow|Deny` signatures, `permissionMode` values, and
-  `max_structured_output_retries` for the Claude Agent SDK? → step 6. *(Resolved already: env
-  replace-vs-merge = replace; SDK spawns a child; `pathToClaudeCodeExecutable`/`executable` need PATH on
-  the allowlist — no longer open.)*
+- ~~Exact `canUseTool`/`PermissionResultAllow|Deny` signatures, `permissionMode` values, and
+  `max_structured_output_retries` for the Claude Agent SDK?~~ **Resolved in step 6** from the installed
+  `sdk.d.ts` 0.3.173 (see the step-6 roadmap entry): signatures as planned, `acceptEdits` exists, and
+  there is no retries *option* — only the `error_max_structured_output_retries` result subtype. *(Also
+  resolved earlier: env replace-vs-merge = replace; SDK spawns a child;
+  `pathToClaudeCodeExecutable`/`executable` need PATH on the allowlist.)*
 - Current codex `-codex` model ids for the cheap/mid/capable tiers, and the minimal env for
   ChatGPT-login mode? → step 7.
 - Does codex `outputSchema` guarantee JSON-only `finalResponse`, or can prose precede it? → step 7.
