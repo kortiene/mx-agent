@@ -56,6 +56,20 @@
 //! composes with the existing fail-safe receive path. The unencrypted counterpart is
 //! covered by [`workspace_room_is_created_without_encryption`].
 //!
+//! [`live_result_plane_forge_is_rejected`] (issue #304) proves the result-plane
+//! sender-pin gate end-to-end against a real homeserver: Bob (the requester) also
+//! acts as an adversarial forger and publishes a `com.mxagent.exec.finished.v1`
+//! event carrying a fake exit code (42) **and** a `com.mxagent.stream.chunk.v1`
+//! with distinctive injected payload immediately after sending a signed exec
+//! request to Alice (the executor). The real command exits with code 77. The
+//! daemon's `ExecSubscriberRegistry` pins the subscription to Alice's Matrix user
+//! id; both of Bob's forged events are dropped by the sender-pin check and the
+//! subscription delivers only Alice's real result (exit 77, no forged chunks).
+//! This test exercises the full path for both attack vectors:
+//! Matrix SDK event delivery → sync loop routing → `publish_forwarded` →
+//! subscriber sender-pin → consumer, proving "room membership ≠ execution
+//! permission" for the result plane (fake exit status **and** injected output).
+//!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
 //!
@@ -1393,8 +1407,12 @@ allow_cwd = ["{cwd}"]
     )
     .expect("sign pty exec request");
 
-    let mut subscription =
-        subscribers.subscribe(ExecSubscriptionKey::Invocation(invocation_id.clone()));
+    // Pin the subscription to the executing agent (alice runs TARGET_AGENT), so
+    // only the real executor's stream/result events resolve it (issue #304).
+    let mut subscription = subscribers.subscribe(
+        ExecSubscriptionKey::Invocation(invocation_id.clone()),
+        alice_id.to_string(),
+    );
     room.send_raw(timeline::EXEC_REQUEST, content)
         .await
         .expect("send pty exec request");
@@ -1642,8 +1660,11 @@ max_output_bytes = 10
     )
     .expect("sign pty exec request");
 
-    let mut subscription =
-        subscribers.subscribe(ExecSubscriptionKey::Invocation(invocation_id.clone()));
+    // Pin the subscription to the executing agent (alice runs TARGET_AGENT).
+    let mut subscription = subscribers.subscribe(
+        ExecSubscriptionKey::Invocation(invocation_id.clone()),
+        alice_id.to_string(),
+    );
     room.send_raw(timeline::EXEC_REQUEST, content)
         .await
         .expect("send pty exec request");
@@ -6299,4 +6320,359 @@ async fn workspace_plain_member_cannot_overwrite_agent_state() {
              power_level_content_override must block this write"
         ),
     }
+}
+
+/// Result-plane forge rejection: a second room member cannot resolve an
+/// in-flight exec invocation with a forged `exec.finished` or inject output
+/// via a forged `stream.chunk` (issue #304).
+///
+/// Security invariant under test: `ExecSubscriberRegistry::subscribe` pins every
+/// subscription to the executing agent's Matrix user id (resolved from
+/// `AgentState.matrix_user_id` before the request is sent). `publish_forwarded`
+/// passes `meta.sender` into `ExecSubscriberRegistry::publish`, which delivers
+/// the event only when `sender == expected_sender`. A forged result/stream event
+/// from any other room member is counted as `filtered` and never reaches the
+/// waiting IPC consumer — room membership is not execution permission
+/// (architecture §1.2, §13). The test exercises this gate for both:
+/// - **fake exit status** (`exec.finished` from a non-executing member)
+/// - **injected output** (`stream.chunk` from a non-executing member)
+///
+/// This test exercises the full live path so that Matrix SDK event delivery,
+/// the `/sync` routing loop, and the registry sender-pin gate are all proven
+/// together across both event types (the unit-level coverage lives in
+/// `exec_subscribers::tests`).
+///
+/// Setup:
+/// - Alice is the **executor** (TARGET_AGENT): runs the target command and emits
+///   the real `exec.finished`.
+/// - Bob is both the **requester** (sends the signed exec request) and the
+///   **adversarial forger**: immediately after sending the request, Bob publishes
+///   a `com.mxagent.exec.finished.v1` carrying the distinctive fake exit code 42,
+///   and a `com.mxagent.stream.chunk.v1` with the injected payload `FORGED_CHUNK_OUTPUT_304`.
+///
+/// Expected outcome:
+/// - Bob's forged `exec.finished` (`sender = bob_id ≠ alice_id`) is filtered by
+///   the sender-pin gate and never delivered to the subscription.
+/// - Bob's forged `stream.chunk` is likewise filtered; the injected payload never
+///   appears in the received output.
+/// - Alice's real result (`sender = alice_id == expected_sender`) is eventually
+///   delivered with exit code 77.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_result_plane_forge_is_rejected() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+
+    let room = create_public_room(&bob, "mx-agent result-plane forge test").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    for (client, agent_id) in [
+        (&bob, requester_agent.clone()),
+        (&alice, TARGET_AGENT.to_string()),
+    ] {
+        register_agent(
+            client,
+            &RegisterAgentOptions {
+                room: room_id.to_string(),
+                agent_id: Some(agent_id),
+                kind: "pi".to_string(),
+                capabilities: vec!["exec".to_string()],
+                tools: vec![],
+                cwd: cwd.to_string_lossy().into_owned(),
+                project_id: "mx-agent-it".to_string(),
+                max_invocations: 1,
+            },
+        )
+        .await
+        .expect("register agent");
+    }
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let subscribers = ExecSubscriberRegistry::new();
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &alice,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    let bob_sync_paths = paths_in(data_dir.join("bob-sync"));
+    bob_sync_paths.ensure_data_dir().expect("bob sync dir");
+    let bob_sync = {
+        let bob = bob.clone();
+        let paths = bob_sync_paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &bob,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+
+    // Subscribe pinned to alice_id (the executor). Any event whose sender is not
+    // alice's Matrix user id is counted as filtered and never delivered here.
+    let invocation_id = format!("inv_forge_{}", std::process::id());
+    let mut subscription = subscribers.subscribe(
+        ExecSubscriptionKey::Invocation(invocation_id.clone()),
+        alice_id.to_string(),
+    );
+
+    // Build and send a signed exec request. The command sleeps for 1 s then
+    // exits with code 77, giving the forger time to inject his fake result first.
+    let options = ExecRequestOptions {
+        target_agent: TARGET_AGENT.to_string(),
+        requesting_agent: requester_agent.clone(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 1; exit 77".to_string(),
+        ],
+        cwd: cwd.to_string_lossy().into_owned(),
+        env: Default::default(),
+        stdin: false,
+        stream: true,
+        pty: false,
+        timeout_ms: 600_000,
+        task_id: None,
+    };
+    let exec_content = build_signed_exec_request(
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        format!("req_forge_{}", std::process::id()),
+        format!("forge-nonce-{}", std::process::id()),
+        "2026-01-01T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        &options,
+    )
+    .expect("sign exec request");
+
+    // Bob's view of the room (for sending both the legitimate request and the
+    // adversarial forge).
+    let bob_room = bob.get_room(&room_id).expect("bob has the room");
+
+    // Step 1 – send the legitimate signed exec request.
+    bob_room
+        .send_raw(timeline::EXEC_REQUEST, exec_content)
+        .await
+        .expect("send signed exec request");
+
+    // Step 2 – adversarial forge: Bob immediately publishes a raw
+    // `exec.finished` carrying the distinctive fake exit code 42. Bob's Matrix
+    // sender (bob_id) does not equal the expected_sender (alice_id), so the
+    // daemon's sender-pin gate must drop it before the subscription sees it.
+    bob_room
+        .send_raw(
+            timeline::EXEC_FINISHED,
+            json!({
+                "invocation_id": invocation_id,
+                "exit_code": 42,
+                "signal": null,
+                "duration_ms": 1,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "truncated": false,
+                "artifact_mxc": null
+            }),
+        )
+        .await
+        .expect("bob publishes forged exec.finished (exit code 42)");
+
+    // Step 3 – adversarial output injection: Bob also publishes a raw
+    // `stream.chunk` carrying distinctive content. The same sender-pin gate
+    // covers all forwarded result/stream events; Bob's chunk must be filtered
+    // before it reaches the subscription, so the injected payload never
+    // appears in the output received by the waiting consumer (issue #304).
+    const FORGED_CHUNK: &str = "FORGED_CHUNK_OUTPUT_304";
+    bob_room
+        .send_raw(
+            timeline::STREAM_CHUNK,
+            json!({
+                "invocation_id": invocation_id,
+                "stream": "stdout",
+                "seq": 0,
+                "encoding": "utf-8",
+                "data": FORGED_CHUNK,
+                "eof": false,
+                "compressed": false,
+                "sha256": null,
+                "timestamp": "2026-01-01T00:00:00Z"
+            }),
+        )
+        .await
+        .expect("bob publishes forged stream.chunk");
+
+    // Collect frames until ExecFinished arrives or the deadline expires.
+    // Also accumulate StreamChunk data so forged output injection can be
+    // detected: any chunk whose data contains FORGED_CHUNK was delivered by
+    // the subscription, meaning the sender-pin gate failed for stream events.
+    let mut seen_exit: Option<Option<i32>> = None;
+    let mut received_chunk_data: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_secs(5), subscription.recv()).await {
+            Ok(Some(ForwardedExecEvent::ExecFinished(finished))) => {
+                seen_exit = Some(finished.exit_code);
+                break;
+            }
+            Ok(Some(ForwardedExecEvent::ExecRejected(rejected))) => {
+                panic!(
+                    "exec request was rejected by alice's daemon (policy/trust error): {:?}; \
+                     check that policy.toml and trust store are set up correctly",
+                    rejected.reason
+                );
+            }
+            Ok(Some(ForwardedExecEvent::StreamChunk(chunk))) => {
+                received_chunk_data.push(chunk.data.clone());
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let _ = alice_sync.await.expect("alice sync task joins");
+    let _ = bob_sync.await.expect("bob sync task joins");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    let exit_code = seen_exit.expect(
+        "live exec invocation must deliver an ExecFinished frame within the 30 s deadline; \
+         check alice's daemon logs for exec execution or policy rejection",
+    );
+    // Primary security assertion: the forged result (exit 42) must never have
+    // been delivered. If sender-pinning were broken, Bob's forge would arrive
+    // first (it was sent before alice's real result) and the assertion below
+    // would catch it.
+    assert_ne!(
+        exit_code,
+        Some(42),
+        "forged exec.finished (exit 42) from a non-executing room member must not be \
+         delivered to the waiting subscriber — sender-pin gate is broken (issue #304)"
+    );
+    // Confirm the legitimate executor's real exit code was received.
+    assert_eq!(
+        exit_code,
+        Some(77),
+        "the legitimate executor (alice) must deliver exit code 77 after the sender-pin \
+         gate drops the forged event; got {exit_code:?}"
+    );
+    // Secondary security assertion: the injected stream chunk from Bob must
+    // never have been delivered. The subscription is pinned to alice_id;
+    // Bob's `stream.chunk` carries bob_id as sender, so the sender-pin gate
+    // in `publish_forwarded` must have dropped it silently. A mismatch here
+    // means the gate is broken for the output-injection attack vector.
+    let forged_chunk_delivered = received_chunk_data.iter().any(|d| d.contains(FORGED_CHUNK));
+    assert!(
+        !forged_chunk_delivered,
+        "forged stream.chunk from a non-executing room member must not be delivered \
+         to the waiting subscriber — sender-pin gate is broken for stream.chunk (issue #304); \
+         received chunks: {received_chunk_data:?}"
+    );
 }

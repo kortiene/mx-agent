@@ -66,7 +66,7 @@ Chunks are totally ordered within a stream by `(invocation_id, stream, seq)`. Re
 - de-duplicate exact repeated `(invocation_id, stream, seq)` chunks;
 - buffer out-of-order chunks for a bounded window;
 - mark the stream **degraded** if a gap persists past timeout;
-- mark **integrity failure** if a present `sha256` chunk digest is invalid;
+- mark **integrity failure** if the `sha256` chunk digest is invalid (mx-agent producers always populate it — a missing digest is treated as a passing check in best-effort mode and a failure in strict mode);
 - otherwise render best-effort.
 
 **Strict mode** turns "best-effort" into "fail loudly":
@@ -252,6 +252,10 @@ mx-agent invocation artifact --room "$ROOM" --stream stdout inv_01HZ8QK3M9V0X2YJ
 ```
 
 The daemon downloads from media, **recomputes SHA-256 over the raw bytes** and rejects a mismatch as tamper/corruption, then decompresses zstd so you get the original output.
+
+### Result-plane sender-pinning
+
+`exec.finished`, `stream.chunk`, `stream.artifact`, `exec.rejected`, `exec.cancelled`, and `call.response` are **sender-pinned** to the executing/producing agent's Matrix user id (resolved from its `com.mxagent.agent.v1` room state). The daemon drops any of these events whose Matrix `sender` is not the dispatched-to agent before it reaches a waiting consumer — so a room member who learns an in-flight `invocation_id` cannot forge an exit status, inject output chunks, or shadow a legitimate artifact. `stream.chunk` carries a populated `sha256` digest (base64 SHA-256 of the decoded bytes) that the CLI verifies in strict mode (exit `132`). See [[Security & Sandboxing|Security-and-Sandboxing]] and the architecture §1.2/§7.3–§7.4 for the full trust model.
 
 ---
 

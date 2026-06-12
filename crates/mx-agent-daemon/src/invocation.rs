@@ -235,7 +235,10 @@ async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, Worksp
 /// Read the `com.mxagent.invocation.v1` state event for `invocation_id`.
 ///
 /// Returns `Ok(None)` when no invocation with that ID exists in the room.
-async fn read_invocation_state(
+///
+/// Exposed within the crate so artifact retrieval can resolve an invocation's
+/// executing agent (`target`) to sender-pin its output artifacts (issue #304).
+pub(crate) async fn read_invocation_state(
     room: &Room,
     invocation_id: &str,
 ) -> Result<Option<InvocationState>, WorkspaceError> {

@@ -388,6 +388,15 @@ async fn setup_remote_pty(
         .min_by(|a, b| a.agent_id.cmp(&b.agent_id))
         .ok_or("local agent is not registered in the target room")?;
 
+    // Pin the PTY result subscription to the executing agent's Matrix user id so
+    // forged stream/result events from other room members are dropped (issue
+    // #304). Fail closed when the target agent is not registered in the room.
+    let expected_sender = crate::agent::read_agent_state(&room, &target_agent)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("target agent {target_agent:?} is not registered in the room"))?
+        .matrix_user_id;
+
     let signing = crate::load_or_create_signing_key(&paths).map_err(|e| e.to_string())?;
     let invocation_id = generate_invocation_id();
     let request_id = generate_request_id();
@@ -423,9 +432,10 @@ async fn setup_remote_pty(
     .map_err(|e| e.to_string())?;
 
     // Subscribe *before* sending so no early stream/result event is missed.
-    let subscription = subscribers.subscribe(crate::ExecSubscriptionKey::Invocation(
-        invocation_id.clone(),
-    ));
+    let subscription = subscribers.subscribe(
+        crate::ExecSubscriptionKey::Invocation(invocation_id.clone()),
+        expected_sender,
+    );
     room.send_raw(EXEC_REQUEST, content)
         .await
         .map_err(|e| e.to_string())?;

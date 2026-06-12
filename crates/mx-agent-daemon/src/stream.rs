@@ -623,12 +623,30 @@ async fn send_chunk(
         data: payload,
         eof,
         compressed: false,
-        sha256: None,
+        sha256: chunk_sha256(data),
         timestamp: now_rfc3339_millis(),
         extra: Default::default(),
     };
     *seq += 1;
     sink.send(chunk).await.is_ok()
+}
+
+/// Base64 SHA-256 digest of a chunk's **decoded** bytes, for the per-chunk
+/// integrity guard the CLI verifies in strict mode (architecture §7.3, issue
+/// #304).
+///
+/// `data` is the raw output slice — the same bytes the CLI reconstructs after
+/// decoding `data`/`encoding` (it decodes base64, or takes the UTF-8 bytes
+/// verbatim). Digesting the raw slice here keeps both sides over identical
+/// bytes, so a tampered chunk fails the CLI's `sha256` check. An empty EOF
+/// marker carries no payload, so it is left undigested (`None`).
+fn chunk_sha256(data: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+    if data.is_empty() {
+        return None;
+    }
+    Some(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data)))
 }
 
 /// Encode chunk bytes as UTF-8 text when valid, otherwise base64.
@@ -707,6 +725,48 @@ mod tests {
         assert!(chunks[1].eof);
         assert_eq!(chunks[1].seq, 1);
         assert_eq!(chunks[1].data, "");
+    }
+
+    #[tokio::test]
+    async fn chunks_carry_a_matching_sha256_over_decoded_bytes() {
+        // The per-chunk digest must cover the exact bytes the CLI reconstructs
+        // and re-hashes (issue #304): the raw output bytes. For a utf-8 chunk the
+        // CLI digests `data.into_bytes()`; the producer digests the same bytes.
+        // The EOF marker has no payload, so it carries no digest.
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let (tx, rx) = mpsc::channel(64);
+        let data = b"PASS src/foo.test.ts\n".to_vec();
+        capture_stream(
+            &data[..],
+            "inv_1",
+            StreamKind::Stdout,
+            StreamCaptureConfig::batch(),
+            tx,
+        )
+        .await;
+        let chunks = collect(rx).await;
+        let payload = &chunks[0];
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(Sha256::digest(payload.data.as_bytes()));
+        assert_eq!(
+            payload.sha256.as_deref(),
+            Some(expected.as_str()),
+            "a producer chunk must carry the digest of its decoded bytes"
+        );
+        // A tampered copy (same declared digest, different bytes) no longer matches.
+        let mut tampered = payload.clone();
+        tampered.data.push('!');
+        let recomputed = base64::engine::general_purpose::STANDARD
+            .encode(Sha256::digest(tampered.data.as_bytes()));
+        assert_ne!(
+            tampered.sha256.as_deref(),
+            Some(recomputed.as_str()),
+            "tampering with a chunk's bytes must break its recorded digest"
+        );
+        // EOF marker is undigested.
+        assert!(chunks.last().unwrap().eof);
+        assert!(chunks.last().unwrap().sha256.is_none());
     }
 
     #[tokio::test]
@@ -1039,5 +1099,76 @@ mod tests {
         assert_eq!(second, 8);
         assert!(limiter.truncated());
         assert_eq!(limiter.emitted_bytes(), 20);
+    }
+
+    #[tokio::test]
+    async fn binary_chunks_carry_sha256_over_decoded_bytes() {
+        // A non-UTF8 chunk is base64-encoded on the wire. The sha256 field must
+        // cover the **raw bytes** (before base64 encoding), matching what the CLI
+        // reconstructs after decoding (issue #304). If the digest instead covered
+        // the base64 string, the CLI's strict-mode check would always fail.
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let raw = vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02];
+        let (tx, rx) = mpsc::channel(64);
+        capture_stream(
+            &raw[..],
+            "inv_binary",
+            StreamKind::Stdout,
+            StreamCaptureConfig::batch(),
+            tx,
+        )
+        .await;
+        let chunks = collect(rx).await;
+        let data_chunk = &chunks[0];
+        assert_eq!(
+            data_chunk.encoding, "base64",
+            "binary data must be base64-encoded"
+        );
+        assert!(!data_chunk.eof);
+
+        // Verify the producer's sha256 matches the raw bytes, not the base64 string.
+        let expected_digest =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&raw));
+        assert_eq!(
+            data_chunk.sha256.as_deref(),
+            Some(expected_digest.as_str()),
+            "sha256 must cover the decoded raw bytes, not the base64-encoded string"
+        );
+
+        // Confirm the digest does NOT match the base64 string itself.
+        let wrong_digest = base64::engine::general_purpose::STANDARD
+            .encode(Sha256::digest(data_chunk.data.as_bytes()));
+        assert_ne!(
+            data_chunk.sha256.as_deref(),
+            Some(wrong_digest.as_str()),
+            "sha256 must not cover the base64 string"
+        );
+    }
+
+    #[test]
+    fn chunk_sha256_returns_none_for_empty_slice() {
+        // An empty slice (the EOF marker's payload) must carry no digest so the
+        // CLI's strict-mode check is not applied to zero-byte frames (issue #304).
+        assert!(
+            chunk_sha256(b"").is_none(),
+            "chunk_sha256 must return None for an empty slice"
+        );
+    }
+
+    #[test]
+    fn chunk_sha256_returns_base64_sha256_over_raw_bytes() {
+        // The producer-side digest must be the base64 of SHA-256 over the exact
+        // raw bytes. The CLI reconstructs the same bytes before hashing, so
+        // producer and consumer agree on the value (issue #304).
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let data = b"PASS src/security_test.rs\n";
+        let expected = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data));
+        assert_eq!(
+            chunk_sha256(data),
+            Some(expected),
+            "chunk_sha256 must return the base64-SHA256 of the raw bytes"
+        );
     }
 }

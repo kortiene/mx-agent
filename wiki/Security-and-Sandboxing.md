@@ -49,6 +49,8 @@ For a privileged action delivered over E2EE, **both must hold**: the event must 
 | **room-admin grant** | An admin publishes `com.mxagent.trust.v1` state | Advisory only; never overrides local store | ✅ Partial |
 | **TOFU** | First key seen is trusted | Convenient, but vulnerable on first contact | Planned |
 
+**Result-plane sender-pinning (issue #304).** The "room membership ≠ authority" rule extends beyond the request plane to every result event a dispatch produces. `stream.chunk`, `stream.artifact`, `exec.rejected`, `exec.finished`, `exec.cancelled`, `call.response`, and `context.share` events are **sender-pinned** to the executing/producing agent's `matrix_user_id` (resolved from `com.mxagent.agent.v1` room state). A result event from any other room member is dropped, fail-closed, before it reaches a waiting consumer — so a member who merely learns an in-flight `request_id`/`invocation_id` cannot forge a result, fake an exit status, inject output, or shadow an artifact. `stream.chunk` additionally carries a populated `sha256` digest of its decoded bytes, verified by the CLI in strict mode (`--strict-stream`, exit `132`). Sender-pinning is a transport-level denial (uses the homeserver-asserted `sender`); rooting the highest-stakes events in Ed25519 + the local trust store (mirroring the request plane) is the tracked next step.
+
 **Trust precedence — the local store is final authority.** Room-published trust state is purely advisory and is consulted *only* when the local store has no record for an `(agent_id, key_id)` pair. A **local revocation always wins** and can never be undone by a room admin:
 
 ```bash

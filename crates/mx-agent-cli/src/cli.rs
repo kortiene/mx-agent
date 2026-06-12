@@ -3190,6 +3190,7 @@ fn share_get(global: &GlobalArgs, args: &ShareGetArgs) -> ExitCode {
         room: args.room.clone(),
         context_id: args.context_id.clone(),
         limit: args.limit,
+        ..Default::default()
     };
     match daemon_ipc_call::<_, mx_agent_daemon::FetchedContext>(global, "share.get", &options) {
         Ok(fetched) => emit_fetched_context(global, &fetched, args.output.as_ref()),
@@ -3268,6 +3269,7 @@ fn invocation_artifact(global: &GlobalArgs, args: &InvocationArtifactArgs) -> Ex
         invocation_id: args.invocation_id.clone(),
         stream: args.stream.to_stream_kind(),
         limit: args.limit,
+        ..Default::default()
     };
     match daemon_ipc_call::<_, mx_agent_daemon::RetrievedArtifact>(
         global,

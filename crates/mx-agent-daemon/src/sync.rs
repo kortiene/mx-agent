@@ -473,13 +473,17 @@ fn publish_forwarded(
         return;
     };
     let key = event.key();
-    let stats = subscribers.publish(event);
+    // Sender-pin the result plane: the registry delivers this event only to
+    // subscribers that pinned `meta.sender` as the executing agent, so a forged
+    // result/stream event from any other room member is dropped (issue #304).
+    let stats = subscribers.publish(event, &meta.sender);
     tracing::debug!(
         event_type = %meta.event_type,
         room = %meta.room_id,
         sender = %meta.sender,
         key = ?key,
         delivered = stats.delivered,
+        filtered = stats.filtered,
         pruned = stats.pruned,
         "forwarded routed Matrix result event to exec subscribers"
     );

@@ -452,6 +452,16 @@ async fn start_exec_matrix_inner(
         .min_by(|a, b| a.agent_id.cmp(&b.agent_id))
         .ok_or_else(|| "local agent is not registered in the target room".to_string())?;
 
+    // Resolve the executing agent's Matrix user id so the result subscription is
+    // pinned to it: only stream/result events the target actually sends are
+    // delivered, dropping anything forged by another room member (issue #304).
+    // Fail closed when the target agent is not registered in the room.
+    let expected_sender = crate::agent::read_agent_state(&room, &target_agent)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("target agent {target_agent:?} is not registered in the room"))?
+        .matrix_user_id;
+
     let signing = crate::load_or_create_signing_key(&paths).map_err(|e| e.to_string())?;
     let created_at = rfc3339_after(Duration::ZERO);
     let expires_at = rfc3339_after(Duration::from_secs(300));
@@ -484,8 +494,10 @@ async fn start_exec_matrix_inner(
     )
     .map_err(|e| e.to_string())?;
 
-    let mut subscription =
-        subscribers.subscribe(ExecSubscriptionKey::Invocation(invocation_id.to_string()));
+    let mut subscription = subscribers.subscribe(
+        ExecSubscriptionKey::Invocation(invocation_id.to_string()),
+        expected_sender,
+    );
     room.send_raw(EXEC_REQUEST, content)
         .await
         .map_err(|e| e.to_string())?;

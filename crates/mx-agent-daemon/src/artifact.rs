@@ -324,6 +324,14 @@ pub struct RetrieveArtifactOptions {
     /// Maximum number of recent timeline events to scan when locating the
     /// artifact.
     pub limit: u32,
+    /// Matrix user id of the agent expected to have produced the artifact. When
+    /// `None` (the default), [`retrieve_artifact`] resolves the producer from the
+    /// invocation's `com.mxagent.invocation.v1` state (`target` → its
+    /// `matrix_user_id`) and fails closed if it cannot. Set it to pin the
+    /// producer explicitly; either way an artifact from any other sender is
+    /// rejected so a room member cannot shadow a legitimate one (issue #304).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sender: Option<String>,
 }
 
 impl Default for RetrieveArtifactOptions {
@@ -333,6 +341,7 @@ impl Default for RetrieveArtifactOptions {
             invocation_id: String::new(),
             stream: StreamKind::Stdout,
             limit: DEFAULT_ARTIFACT_SCAN_LIMIT,
+            expected_sender: None,
         }
     }
 }
@@ -389,16 +398,38 @@ async fn verify_and_decompress(
     }
 }
 
-/// Select the newest artifact matching `invocation_id` and `stream` from a
-/// timeline scan (artifacts arrive newest-first, so the first match wins).
+/// A stream artifact scanned from the room timeline, paired with the Matrix user
+/// id (`sender`) that published it. The producer travels independently of the
+/// (attacker-controllable) event content, so it is the value the sender-pin is
+/// checked against (issue #304).
+struct ScannedArtifact {
+    /// The parsed artifact content.
+    artifact: StreamArtifact,
+    /// Matrix user id of the event sender.
+    producer: String,
+}
+
+/// Select the newest artifact matching `invocation_id`, `stream`, **and**
+/// `expected_sender` from a timeline scan (artifacts arrive newest-first, so the
+/// first match wins).
+///
+/// Pinning the producer means a same-`invocation_id`+`stream` artifact published
+/// by any other room member cannot shadow the legitimate one: it never matches
+/// and is skipped (issue #304).
 fn select_artifact(
-    artifacts: Vec<StreamArtifact>,
+    artifacts: Vec<ScannedArtifact>,
     invocation_id: &str,
     stream: StreamKind,
+    expected_sender: &str,
 ) -> Option<StreamArtifact> {
     artifacts
         .into_iter()
-        .find(|a| a.invocation_id == invocation_id && a.stream == stream)
+        .find(|s| {
+            s.artifact.invocation_id == invocation_id
+                && s.artifact.stream == stream
+                && s.producer == expected_sender
+        })
+        .map(|s| s.artifact)
 }
 
 /// Decompress zstd `data` with the `zstd` binary, returning `None` if zstd is
@@ -468,16 +499,17 @@ async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, Worksp
         .ok_or_else(|| WorkspaceError::RoomNotFound(target.to_string()))
 }
 
-/// List recent stream artifacts in a workspace room, newest first.
+/// Scan up to `limit` recent timeline events in `room` for stream artifacts,
+/// pairing each with the Matrix `sender` that published it (newest first).
 ///
-/// Scans up to `limit` recent timeline events and returns the parsed content of
-/// every `com.mxagent.stream.artifact.v1` event among them.
-pub async fn list_stream_artifacts(
-    client: &Client,
-    room: &str,
+/// The `sender` is read from the raw event (not from its content), so it is the
+/// homeserver-asserted producer used for the sender-pin (issue #304). An event
+/// missing a `sender` is skipped — an artifact whose producer cannot be
+/// established is never returned.
+async fn scan_stream_artifacts(
+    room: &Room,
     limit: u32,
-) -> Result<Vec<StreamArtifact>, WorkspaceError> {
-    let room = sync_and_get_room(client, room).await?;
+) -> Result<Vec<ScannedArtifact>, WorkspaceError> {
     let mut request = MessagesOptions::backward();
     request.limit = matrix_sdk::ruma::UInt::from(limit);
     let messages = room.messages(request).await.map_err(WorkspaceError::from)?;
@@ -487,36 +519,102 @@ pub async fn list_stream_artifacts(
         let raw = event.raw();
         let is_artifact =
             raw.get_field::<String>("type").ok().flatten().as_deref() == Some(STREAM_ARTIFACT);
-        if is_artifact {
-            if let Ok(Some(content)) = raw.get_field::<StreamArtifact>("content") {
-                artifacts.push(content);
-            }
+        if !is_artifact {
+            continue;
+        }
+        let producer = raw.get_field::<String>("sender").ok().flatten();
+        if let (Ok(Some(artifact)), Some(producer)) =
+            (raw.get_field::<StreamArtifact>("content"), producer)
+        {
+            artifacts.push(ScannedArtifact { artifact, producer });
         }
     }
     Ok(artifacts)
 }
 
+/// List recent stream artifacts in a workspace room, newest first.
+///
+/// Scans up to `limit` recent timeline events and returns the parsed content of
+/// every `com.mxagent.stream.artifact.v1` event among them. This is a display
+/// lister; [`retrieve_artifact`] applies the sender-pin when actually fetching
+/// bytes.
+pub async fn list_stream_artifacts(
+    client: &Client,
+    room: &str,
+    limit: u32,
+) -> Result<Vec<StreamArtifact>, WorkspaceError> {
+    let room = sync_and_get_room(client, room).await?;
+    Ok(scan_stream_artifacts(&room, limit)
+        .await?
+        .into_iter()
+        .map(|s| s.artifact)
+        .collect())
+}
+
+/// Resolve the Matrix user id of the agent expected to have produced the
+/// artifact for `options.invocation_id`.
+///
+/// An explicit [`RetrieveArtifactOptions::expected_sender`] override wins.
+/// Otherwise the producer is the invocation's executing agent: read the
+/// `com.mxagent.invocation.v1` state, take its `target`, and map that to the
+/// agent's `matrix_user_id`. Fails closed (no unverified producer is accepted)
+/// when the invocation state or its target agent cannot be resolved (issue #304).
+async fn resolve_artifact_producer(
+    room: &Room,
+    options: &RetrieveArtifactOptions,
+) -> Result<String, WorkspaceError> {
+    if let Some(sender) = options.expected_sender.as_deref().filter(|s| !s.is_empty()) {
+        return Ok(sender.to_string());
+    }
+    let invocation = crate::invocation::read_invocation_state(room, &options.invocation_id)
+        .await?
+        .ok_or_else(|| {
+            WorkspaceError::ArtifactNotFound(format!(
+                "{} (no invocation state to resolve its producer)",
+                options.invocation_id
+            ))
+        })?;
+    let agent = crate::agent::read_agent_state(room, &invocation.target)
+        .await?
+        .ok_or_else(|| {
+            WorkspaceError::ArtifactRetrievalFailed(format!(
+                "could not resolve the executing agent {:?} for invocation {:?}",
+                invocation.target, options.invocation_id
+            ))
+        })?;
+    Ok(agent.matrix_user_id)
+}
+
 /// Retrieve, verify, and decompress a single invocation output artifact.
 ///
 /// Locates the artifact for `options.invocation_id` and `options.stream` among
-/// the recent timeline events, downloads its uploaded media, verifies the bytes
-/// against the artifact's [`sha256`](StreamArtifact::sha256), and decompresses
-/// them when the artifact is zstd-compressed. A digest mismatch is reported as
-/// [`WorkspaceError::ArtifactIntegrity`]; an unknown invocation/stream as
+/// the recent timeline events — accepting only one published by the invocation's
+/// executing agent (sender-pinned, issue #304) — downloads its uploaded media,
+/// verifies the bytes against the artifact's [`sha256`](StreamArtifact::sha256),
+/// and decompresses them when the artifact is zstd-compressed. A digest mismatch
+/// is reported as [`WorkspaceError::ArtifactIntegrity`]; an unknown
+/// invocation/stream, or one only published by an unexpected sender, as
 /// [`WorkspaceError::ArtifactNotFound`].
 pub async fn retrieve_artifact(
     client: &Client,
     options: &RetrieveArtifactOptions,
 ) -> Result<RetrievedArtifact, WorkspaceError> {
-    let artifacts = list_stream_artifacts(client, &options.room, options.limit).await?;
-    let artifact =
-        select_artifact(artifacts, &options.invocation_id, options.stream).ok_or_else(|| {
-            WorkspaceError::ArtifactNotFound(format!(
-                "{} ({})",
-                options.invocation_id,
-                stream_stem(options.stream)
-            ))
-        })?;
+    let room = sync_and_get_room(client, &options.room).await?;
+    let expected_sender = resolve_artifact_producer(&room, options).await?;
+    let artifacts = scan_stream_artifacts(&room, options.limit).await?;
+    let artifact = select_artifact(
+        artifacts,
+        &options.invocation_id,
+        options.stream,
+        &expected_sender,
+    )
+    .ok_or_else(|| {
+        WorkspaceError::ArtifactNotFound(format!(
+            "{} ({})",
+            options.invocation_id,
+            stream_stem(options.stream)
+        ))
+    })?;
 
     if artifact.mxc_uri.is_empty() {
         return Err(WorkspaceError::ArtifactRetrievalFailed(format!(
@@ -681,31 +779,63 @@ mod tests {
         assert!(!is_compressed(&plain));
     }
 
+    const PRODUCER: &str = "@exec:hs";
+
+    fn scanned(inv: &str, stream: StreamKind, producer: &str) -> ScannedArtifact {
+        ScannedArtifact {
+            artifact: StreamArtifact {
+                invocation_id: inv.into(),
+                stream,
+                name: "x.log".into(),
+                mime_type: "text/plain".into(),
+                size_bytes: 0,
+                sha256: String::new(),
+                mxc_uri: "mxc://s/a".into(),
+                tail_preview: String::new(),
+                extra: Default::default(),
+            },
+            producer: producer.into(),
+        }
+    }
+
     #[test]
-    fn select_artifact_matches_invocation_and_stream() {
-        let mk = |inv: &str, stream| StreamArtifact {
-            invocation_id: inv.into(),
-            stream,
-            name: "x.log".into(),
-            mime_type: "text/plain".into(),
-            size_bytes: 0,
-            sha256: String::new(),
-            mxc_uri: "mxc://s/a".into(),
-            tail_preview: String::new(),
-            extra: Default::default(),
+    fn select_artifact_matches_invocation_stream_and_sender() {
+        let artifacts = || {
+            vec![
+                scanned("inv_1", StreamKind::Stdout, PRODUCER),
+                scanned("inv_1", StreamKind::Stderr, PRODUCER),
+                scanned("inv_2", StreamKind::Stdout, PRODUCER),
+            ]
         };
-        let artifacts = vec![
-            mk("inv_1", StreamKind::Stdout),
-            mk("inv_1", StreamKind::Stderr),
-            mk("inv_2", StreamKind::Stdout),
-        ];
         // stdout/stderr of the same invocation are told apart by stream.
-        let stderr = select_artifact(artifacts.clone(), "inv_1", StreamKind::Stderr)
+        let stderr = select_artifact(artifacts(), "inv_1", StreamKind::Stderr, PRODUCER)
             .expect("inv_1 stderr exists");
         assert_eq!(stderr.invocation_id, "inv_1");
         assert_eq!(stderr.stream, StreamKind::Stderr);
 
-        assert!(select_artifact(artifacts, "inv_1", StreamKind::Pty).is_none());
+        assert!(select_artifact(artifacts(), "inv_1", StreamKind::Pty, PRODUCER).is_none());
+    }
+
+    #[test]
+    fn select_artifact_rejects_a_shadow_from_an_unexpected_sender() {
+        // A room member republishing the same invocation+stream artifact (with a
+        // self-consistent digest) must not be able to shadow the legitimate one:
+        // pinning the producer means only the executing agent's artifact matches
+        // (issue #304).
+        let artifacts = vec![
+            // The forged artifact arrives first (newest), but from a foreign sender.
+            scanned("inv_1", StreamKind::Stdout, "@member:hs"),
+            scanned("inv_1", StreamKind::Stdout, PRODUCER),
+        ];
+        let picked = select_artifact(artifacts, "inv_1", StreamKind::Stdout, PRODUCER)
+            .expect("the legitimate producer's artifact is selected");
+        // The pinned producer's artifact is chosen, not the foreign shadow.
+        let only_foreign = vec![scanned("inv_1", StreamKind::Stdout, "@member:hs")];
+        assert!(
+            select_artifact(only_foreign, "inv_1", StreamKind::Stdout, PRODUCER).is_none(),
+            "an artifact only published by an unexpected sender must be rejected"
+        );
+        assert_eq!(picked.invocation_id, "inv_1");
     }
 
     #[tokio::test]
