@@ -78,10 +78,12 @@ export async function loadRunner(id: RunnerId): Promise<AgentRunner> {
 /**
  * Recognize "module/package not found" across the loaders we run under:
  * Node ESM (ERR_MODULE_NOT_FOUND), CJS interop (MODULE_NOT_FOUND), and
- * vitest/vite-node's rewritten dynamic imports (message-based).
+ * vitest/vite-node's rewritten dynamic imports (message-based). Loaders may
+ * wrap the original error, so the `cause` chain is walked too (bounded —
+ * causes can cycle).
  */
-function isModuleNotFound(err: unknown): boolean {
-  if (typeof err !== 'object' || err === null) {
+function isModuleNotFound(err: unknown, depth = 0): boolean {
+  if (typeof err !== 'object' || err === null || depth > 4) {
     return false;
   }
   const code = (err as { code?: unknown }).code;
@@ -89,11 +91,14 @@ function isModuleNotFound(err: unknown): boolean {
     return true;
   }
   const message = (err as { message?: unknown }).message;
-  return (
+  if (
     typeof message === 'string' &&
     (message.includes('Cannot find module') ||
       message.includes('Cannot find package') ||
       message.includes('Failed to resolve import') ||
       message.includes('Failed to load url'))
-  );
+  ) {
+    return true;
+  }
+  return isModuleNotFound((err as { cause?: unknown }).cause, depth + 1);
 }

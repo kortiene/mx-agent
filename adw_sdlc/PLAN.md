@@ -408,14 +408,17 @@ A shared `safeSubprocessEnv()` centralizes env construction so adding a runner c
 4. **pi** — `@earendil-works/pi-coding-agent` ships a **full in-process Node SDK** (`createAgentSession`,
    `AgentSession`, `RpcClient`, `runPrintMode`/`runRpcMode`, programmatic tools), and crucially
    `AuthStorage` + `agentDir` injection (a credential-isolation primitive *stronger* than env scrubbing).
-   Because the SDK is in-process, the **secret boundary is an orchestrator-owned subprocess**: spawn pi
-   (CLI `-p --mode json` / `--mode rpc`, or the SDK invoked inside a child we spawn) with the allowlist
-   env, and additionally point `agentDir`/`authStorage` at a scrubbed throwaway dir holding only the
-   needed provider auth. Allowlist = `{base, provider key (ANTHROPIC_API_KEY|OPENAI_API_KEY|...),
-   PI_BIN/PI_MODEL/PI_THINKING}`. **Output is captured via the event bus, not a return value:**
-   `AgentSession.prompt(text, options?)` returns `Promise<void>` and emits through
-   `subscribe(listener)` (`dist/core/agent-session.d.ts:319,235`); the adapter accumulates assistant
-   output + `SessionStats.cost` (`dist/core/agent-session.d.ts:150`) from `AgentSessionEvent`s and then
+   Because the SDK is in-process, the **secret boundary is an orchestrator-owned subprocess**: the
+   landed adapter (step 9) spawns the **CLI in `--mode json`** — print mode subscribes to the same
+   `AgentSession` event bus and writes one JSON event per stdout line (`dist/modes/print-mode.js`), so
+   the orchestrator-owned spawn and the event-bus capture are the *same mechanism* — with the allowlist
+   env, and additionally points `agentDir` at a scrubbed throwaway dir holding only the needed provider
+   auth via `PI_CODING_AGENT_DIR` (read by `getAgentDir()`, `dist/config.js:393-398`; provider keys
+   resolve auth.json → env → models.json fallback, pi-ai `dist/env-api-keys.js`). Allowlist = `{base,
+   provider key (ANTHROPIC_API_KEY|OPENAI_API_KEY), PI_BIN/PI_MODEL/PI_THINKING,
+   PI_CODING_AGENT_DIR/PI_CODING_AGENT_SESSION_DIR}`. **Output is captured via the event bus, not a
+   return value:** the adapter accumulates assistant `text_delta`s and per-message `usage` (incl. native
+   `usage.cost.total` dollars) from the `message_update`/`message_end` events on the line stream, then
    applies the fenced-JSON+nudge contract. `pi` has **no** native JSON-schema-constrained output
    (`PromptOptions` has no `responseFormat`), so `caps.nativeSchema=false` — correct, and the only pi
    capability that remains "weak".
@@ -462,16 +465,16 @@ confirmed on disk (Section 12). `costUsd=no` = token-only (parent computes from 
 
 | Dimension | `claude` | `codex` | `opencode` | `pi` |
 |---|---|---|---|---|
-| **Integration** | native SDK (spawns Claude Code child via `options.env`) | native SDK (spawns native binary; env always passed) | **v2 SDK + self-spawned server** | **in-process SDK over owned subprocess** |
+| **Integration** | native SDK (spawns Claude Code child via `options.env`) | native SDK (spawns native binary; env always passed) | **v2 SDK + self-spawned server** | **CLI `--mode json` event stream over owned subprocess** |
 | **Package (pin)** | `@anthropic-ai/claude-agent-sdk` `^0.3.170` | `@openai/codex-sdk` `0.139.0` (+ `@openai/codex` lockstep) | `@opencode-ai/sdk` `^1.17.3` (**v2 client subpath**) | `@earendil-works/pi-coding-agent` (npm resolves `0.79.1`) |
 | **Auth / credential** | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | `apiKey`→`CODEX_API_KEY` / `OPENAI_API_KEY` or `~/.codex` login | multi-provider keys / `~/.local/share/opencode/auth.json` | provider key / `AuthStorage`+`agentDir` (`~/.pi/agent/auth.json`) |
 | **Agentic-edit model** | native tools `Read/Write/Edit/Glob/Grep/Bash`, `cwd` | `workspace-write` sandbox, `workingDirectory` | server-resolved `directory`; built-in edit tools | built-in `read/write/edit/bash/grep/find/ls`, `cwd`, `createCodingTools` |
 | **Structured output** | `outputFormat:{json_schema}` → `result.structured_output` | `TurnOptions.outputSchema` → `JSON.parse(turn.finalResponse)` | **v2** `body.format:{json_schema,retryCount}` → `result.structured` | **none** — prompt-and-parse fenced-JSON + nudge-retry |
-| **Env-control mechanism** | `options.env` replace (verified) — boundary is the SDK's own child | `CodexOptions.env` (no-inherit, verified) — **must always pass** | self-spawn `serve` w/ allowlist env | own subprocess w/ allowlist env + `agentDir`/`authStorage` |
+| **Env-control mechanism** | `options.env` replace (verified) — boundary is the SDK's own child | `CodexOptions.env` (no-inherit, verified) — **must always pass** | self-spawn `serve` w/ allowlist env | own subprocess w/ allowlist env + scrubbed `PI_CODING_AGENT_DIR` |
 | **Tool/permission control** | `canUseTool` per-tool veto + `permissionMode` | **coarse** sandbox + `approvalPolicy:'never'` (no per-tool veto) | config `permission` allow/deny (avoid `ask`); event hook | `tools`/`excludeTools`/`createCodingTools`; event-bus hook |
 | **Model/provider** | Claude models (per-call `model` string) | OpenAI/Codex (`model` string + `modelReasoningEffort`; tier ids verified in step 7) | `provider/model` per prompt | any of 40+ providers (`--provider`/`--model`) |
-| **Usage/cost** | `total_cost_usd` + `usage` (**costUsd=yes, nativeBudget=yes** via `maxBudgetUsd`) | token-only `Usage` (**costUsd=no**; `pricing.ts`) | `tokens` + `cost` (**costUsd=yes**) | `SessionStats.cost` (**costUsd=yes**) |
-| **Transcript** | terminal `SDKResultMessage`; stream events to log | `runStreamed()` `ThreadEvent`s → log | v2 `event` SSE → log | `subscribe()` `AgentSessionEvent` bus → log (no return value) |
+| **Usage/cost** | `total_cost_usd` + `usage` (**costUsd=yes, nativeBudget=yes** via `maxBudgetUsd`) | token-only `Usage` (**costUsd=no**; `pricing.ts`) | `tokens` + `cost` (**costUsd=yes**) | per-message `usage.cost.total` summed (**costUsd=yes**) |
+| **Transcript** | terminal `SDKResultMessage`; stream events to log | `runStreamed()` `ThreadEvent`s → log | v2 `event` SSE → log | `--mode json` JSON-per-line `AgentSessionEvent` stream → log |
 | **Resume** | `resume=sessionUUID` | `resumeThread(id)` (`~/.codex/sessions`) | session id | `--session` / SDK session |
 | **`caps`** | `{nativeSchema:T, perToolHook:T, envIsolation:'explicit-no-inherit', costUsd:T, nativeBudget:T, resume:T}` | `{nativeSchema:T, perToolHook:F, envIsolation:'explicit-no-inherit', costUsd:F, nativeBudget:F, resume:T}` | `{nativeSchema:T(v2), perToolHook:F(event), envIsolation:'subprocess-allowlist', costUsd:T, nativeBudget:F, resume:T}` | `{nativeSchema:F, perToolHook:F(event), envIsolation:'subprocess-allowlist', costUsd:T, nativeBudget:F, resume:T}` |
 | **Outlier needing `start()/stop()`** | no | no | **yes** (server lifecycle) | no |
@@ -552,7 +555,7 @@ or a synthetic timeout/budget rc) feeds the existing loops exactly as a failed C
 | `claude` | `options.outputFormat:{type:'json_schema',schema}` → `result.structured_output` | invoker fenced-JSON + 1 nudge |
 | `codex` | `TurnOptions.outputSchema` → `JSON.parse(turn.finalResponse)` (string) | invoker fenced-JSON + 1 nudge |
 | `opencode` (**v2 client**) | `session.prompt({...,format:{type:'json_schema',schema,retryCount}})` → `result.structured` (`StructuredOutputError` on exhaustion) | invoker fenced-JSON + 1 nudge |
-| `pi` | **none** — accumulate assistant text from the `subscribe()` event bus, keep the trailing-fenced-JSON contract | invoker fenced-JSON + 1 nudge (this *is* pi's primary path) |
+| `pi` | **none** — accumulate assistant text from the `--mode json` line stream (the event bus on stdout), keep the trailing-fenced-JSON contract | invoker fenced-JSON + 1 nudge (this *is* pi's primary path) |
 
 `opencode` native schema is **only** available via `@opencode-ai/sdk/v2` (`OutputFormatJsonSchema`,
 `structured?`); the v1 default export has no `format`/`structured`. The adapter therefore imports the v2
@@ -915,6 +918,41 @@ self-spawned-server wrapper), **pi** (in-process SDK; no native schema → fence
    (`SessionStats.cost`). **[VERIFY] steps:** whether `--mode json/rpc` gives a cleaner stream than `-p`;
    `AuthStorage`/`agentDir` interaction with a non-inheriting env. **Verify:** env-allowlist asserted on
    the spawn; event-bus output capture matches today's fenced-JSON contract.
+   *Landed notes — [VERIFY] resolutions (installed 0.79.1 dist + a live gate on the real binary driven
+   through a local OpenAI-compatible stub provider via a scrubbed-agentDir `models.json`, so no
+   credential was needed):* the adapter drives the **CLI's `--mode json` stream** — the same binary and
+   flag mapping the Python pipeline runs today (`build_runner_command`, `adw/_runner.py:43-50`; the
+   phased Python caller stays in text mode, `json_mode=False` at `adw/_phases.py:534`, so always opting
+   into the json stream is the TS rewrite's deliberate upgrade) — **not** the in-process SDK inside a
+   bespoke child. `--mode json` IS the
+   event bus: print mode `session.subscribe()`s and writes one JSON `AgentSessionEvent` per stdout line
+   (`dist/modes/print-mode.js`), preceded by the session header (`{type:'session', id, cwd}` →
+   `PhaseResult.sessionId`), carrying assistant `text_delta`s, full `message_end` messages with
+   per-message `usage` incl. **native dollars** (`usage.cost.total`, summed per phase),
+   `stopReason`/`errorMessage`, and tool events — so `SessionStats.cost` is never needed; plain `-p`
+   loses usage/cost/stopReason and `--mode rpc` is a long-lived bidirectional protocol, wrong shape for
+   single-shot phases. The CLI choice also keeps the adapter **import-free**: the npm package's engines
+   floor (`node >=22.19.0`) makes pnpm silently skip the optionalDependency on older Node (incl. the CI
+   node-20 leg), which a static SDK type-import would turn into a typecheck break — consequently the pi
+   runner can never raise `RunnerNotInstalledError`; a missing `pi` binary surfaces per-phase as a
+   failed PhaseResult (crashed-CLI parity; `PI_BIN` override, then PATH, both read from the allowlist).
+   `AuthStorage`/`agentDir` vs the non-inheriting env: `getAgentDir()` reads `PI_CODING_AGENT_DIR` else
+   `$HOME/.pi/agent` (`dist/config.js:393-398`); keys resolve auth.json → env
+   (`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`, pi-ai `dist/env-api-keys.js`) → `models.json` fallback — so
+   `PI_CODING_AGENT_DIR`/`PI_CODING_AGENT_SESSION_DIR` joined the pi allowlist row (Section 4.4
+   mitigation, CODEX_HOME/XDG_DATA_HOME parallel; verified live: auth.json + sessions land in the
+   scrubbed dir, the scrubbed HOME stays untouched). Headless quirks handled: in `--mode json` the
+   process **exits 0 even when the turn failed** (the stopReason check in print-mode.js is text-mode
+   only) — the adapter derives failure from the last assistant message's `stopReason`
+   ('error'/'aborted' → rc 1, signal 'none', so the invoker's single nudge applies; verified live
+   against a dead provider port) — and project trust resolves silently to **untrusted** headless (no
+   UI, no `--approve`), which only skips project-local `.pi` settings/extensions — nothing load-bearing
+   (the orchestrator inlines the full prompt) and the safer default. Abort = SIGTERM (print mode's own
+   handler disposes and exits 143) with an unref'd SIGKILL escalation so a wedged child cannot hang the
+   phase. transcriptText stays assistant-text-only (deltas streamed live, reconciled against the
+   authoritative `message_end` text by written-length tracking; tool/stderr/non-JSON-stdout notes are
+   file-only), keeping the trailing-fenced-JSON contract parseable. Token counts are finite-checked and
+   cost degrades to sticky `null` on any unpriceable message, never NaN (step-7/8 lessons).
 10. **Wire `MX_AGENT_ENGINE` + `MX_AGENT_RUNNER` selection.** `ts` engine binds the selected runner into
     `orchestrator.run`; unknown values throw. **Verify:** orchestrator parity tests pass under the `ts`
     engine with each shipped runner via the mock + real adapters; equivalent `state.json`.
@@ -951,8 +989,9 @@ Every uncertain runner fact is a **[VERIFY]** roadmap step, not an assertion.
   unit test + lint gate, and by asserting the secret-withholding test on the **SDK-built child env**
   (catches an `apiKey`-routed `CODEX_API_KEY` even when the env allowlist omits it). → step 7.
 - **pi has no native JSON-schema output.** Only remaining pi weakness (the SDK is otherwise full-featured:
-  `createAgentSession`, `AuthStorage`/`agentDir`, `SessionStats.cost`). Mitigated by the fenced-JSON+nudge
-  path (exactly today's behavior) and event-bus output capture (`prompt()` returns void). → step 9.
+  `createAgentSession`, `AuthStorage`/`agentDir`, per-message `usage.cost`). Mitigated by the
+  fenced-JSON+nudge path (exactly today's behavior) and the `--mode json` event-stream capture. → step 9
+  (landed).
 - **Coarse permission control on codex** (sandbox + `approvalPolicy:'never'` only; no per-tool veto).
   Recorded in `caps.perToolHook=false`; the parity line is "withholds secrets AND sandboxed", not
   "per-tool callback". → step 7.
@@ -977,8 +1016,9 @@ Every uncertain runner fact is a **[VERIFY]** roadmap step, not an assertion.
   than relying solely on stdout scraping. → step 8.
 - **HOME-reachable credential files** (`~/.pi/agent/auth.json`, `~/.codex/auth.json`,
   `~/.local/share/opencode/auth.json`) are a residual exfiltration surface the env allowlist alone does
-  not close. Decide per runner whether HOME is required / point it (and pi's `agentDir`/`authStorage`) at
-  a scrubbed throwaway dir. → steps 7/8/9.
+  not close. Decide per runner whether HOME is required / point it at a scrubbed throwaway dir — landed
+  as the per-runner allowlist rows `CODEX_HOME` (step 7), `XDG_DATA_HOME` (step 8), and
+  `PI_CODING_AGENT_DIR`/`PI_CODING_AGENT_SESSION_DIR` (step 9). → steps 7/8/9 (landed).
 - **Single-chokepoint discipline** degrades the instant any adapter hand-builds an env or spreads
   `process.env`. Mitigated by the env-isolation unit test + a lint/grep gate against `...process.env` in
   runner modules.
@@ -1010,15 +1050,19 @@ Every uncertain runner fact is a **[VERIFY]** roadmap step, not an assertion.
   `opencode server listening on <url>`; `directory` is an explicit query param on the v2 POSTs and is
   honored. New finding: `--port 0` is not ephemeral (falls back to 4096) → random-port + retry instead
   (see the step-8 roadmap entry).
-- Does pi's `--mode json/rpc` give a cleaner stream than `-p`, and how do `AuthStorage`/`agentDir`
-  interact with a non-inheriting env? → step 9. *(Resolved already: pi ships a full in-process SDK with
-  `createAgentSession`/`AuthStorage`/`agentDir`; `SessionStats.cost` is native; `prompt()` returns void
-  and emits via the event bus; no native schema — no longer "dark / CLI-only".)*
+- ~~Does pi's `--mode json/rpc` give a cleaner stream than `-p`, and how do `AuthStorage`/`agentDir`
+  interact with a non-inheriting env?~~ **Resolved in step 9 (installed 0.79.1 + live gate on the real
+  binary):** `--mode json` is the cleaner stream — print mode relays every `AgentSessionEvent` as
+  JSON-per-line with per-message usage/cost/stopReason and the session header, while `-p` prints final
+  text only and `rpc` is a long-lived interactive protocol; `getAgentDir()` reads `PI_CODING_AGENT_DIR`
+  (else `$HOME/.pi/agent`) and keys resolve auth.json → allowlisted env vars → models.json, so the
+  scrubbed-agentDir mitigation rides the allowlist (see the step-9 roadmap entry).
 - Per-runner cost/usage reporting schema and `pricing.ts` coverage for the token-only backends? →
   steps 4/7. *(Codex covered in step 7: the three tiers are priced; codex counts are remapped to the
   disjoint PhaseUsage convention before pricing.)*
 - Can transcript/output be streamed from all four runners, or must some be captured post-hoc? → steps
-  6–9. *(pi is post-hoc via the event bus.)*
+  6–9. *(All four stream; pi streams `text_delta`s live off the `--mode json` line stream, reconciled
+  against the authoritative `message_end` text.)*
 
 ---
 

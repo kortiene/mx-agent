@@ -8,7 +8,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: vi.fn() }));
 vi.mock('@openai/codex-sdk', () => ({ Codex: vi.fn() }));
 vi.mock('@opencode-ai/sdk/v2/client', () => ({ createOpencodeClient: vi.fn() }));
 
-import { AdwError, RunnerNotInstalledError } from '../src/errors.js';
+import { AdwError } from '../src/errors.js';
 import { RUNNER_IDS } from '../src/invoker.js';
 import { DEFAULT_RUNNER, loadRunner, resolveRunnerId } from '../src/registry.js';
 
@@ -44,12 +44,14 @@ describe('resolveRunnerId', () => {
 });
 
 describe('loadRunner', () => {
-  it('loads the shipped adapters (claude: step 6; codex: step 7; opencode: step 8)', async () => {
+  it('loads every shipped adapter (claude: step 6; codex: step 7; opencode: step 8; pi: step 9)', async () => {
     const SHIPPED = {
       claude: 'explicit-no-inherit',
       codex: 'explicit-no-inherit',
       opencode: 'subprocess-allowlist',
+      pi: 'subprocess-allowlist',
     } as const;
+    expect(Object.keys(SHIPPED).sort()).toEqual([...RUNNER_IDS].sort());
     for (const [id, envIsolation] of Object.entries(SHIPPED)) {
       const runner = await loadRunner(id as keyof typeof SHIPPED);
       expect(runner.id).toBe(id);
@@ -58,21 +60,16 @@ describe('loadRunner', () => {
     }
   });
 
-  // The remaining adapter lands in roadmap step 9; until then its id
-  // must surface the typed not-installed error — the step-3 verify
-  // criterion. When an adapter ships, move its id out of this loop.
-  it('surfaces an absent adapter/SDK as RunnerNotInstalledError, not a module-load crash', async () => {
-    for (const id of RUNNER_IDS.filter((candidate) => candidate === 'pi')) {
-      const err: unknown = await loadRunner(id).then(
-        () => null,
-        (e: unknown) => e,
-      );
-      expect(err, `loadRunner('${id}')`).toBeInstanceOf(RunnerNotInstalledError);
-      const typed = err as RunnerNotInstalledError;
-      expect(typed).toBeInstanceOf(AdwError); // catchable as the base type
-      expect(typed.runner).toBe(id);
-      expect(typed.message).toContain(typed.sdkPackage);
-      expect(typed.cause).toBeDefined(); // original loader error preserved for debugging
-    }
+  // The pi adapter drives the CLI's --mode json stream and imports no SDK,
+  // so it loads even where the optionalDependency was skipped (its engines
+  // floor is node >=22.19): RunnerNotInstalledError can never apply to pi —
+  // a missing `pi` BINARY surfaces per-phase as a failed PhaseResult instead.
+  // The absent-SDK path for the other runners (the step-3 verify criterion)
+  // is covered in registry-not-installed.test.ts, which needs its own file
+  // because the SDK mock there must THROW module-not-found at import time.
+  it('loads pi without touching any SDK package', async () => {
+    const runner = await loadRunner('pi');
+    expect(runner.id).toBe('pi');
+    expect(runner.caps.nativeSchema).toBe(false);
   });
 });
