@@ -169,6 +169,37 @@ describe('the SDK-built child env (the load-bearing boundary)', () => {
     expect(env['GH_TOKEN']).toBeUndefined();
   });
 
+  it('keeps the boundary on the production-default path (no CODEX_BIN → SDK binary resolution)', async () => {
+    // Without the override the real CodexExec resolves the vendored lockstep
+    // binary in its constructor and may prepend its vendor dirs to the child
+    // PATH — the one SDK-side env mutation the CODEX_BIN tests never reach.
+    // Where the platform package is absent (e.g. a CI matrix without the
+    // optional dep), the constructor throws and the adapter must fail CLOSED
+    // as a failed PhaseResult without ever spawning.
+    vi.stubEnv('PATH', '/poisoned/parent/path');
+    const allowlist = safeSubprocessEnv({
+      allowGhToken: false,
+      runner: 'codex',
+      source: { HOME: join(tmp, 'home'), PATH: join(tmp, 'bin') },
+    });
+    const req = makeReq(allowlist);
+    const result = await runner.runPhase(req);
+
+    if (spawnMock.mock.calls.length === 0) {
+      expect(result.ok).toBe(false);
+      expect(result.rc).toBe(1);
+      expect(result.signal).toBe('none');
+    } else {
+      const env = spawnedEnv();
+      expect(env['GH_TOKEN']).toBeUndefined();
+      expect(env['PATH']).toContain(join(tmp, 'bin'));
+      expect(env['PATH']).not.toContain('/poisoned/parent/path');
+      const extras = Object.keys(env).filter((key) => !(key in allowlist) && key !== 'PATH');
+      expect(extras).toEqual(['CODEX_INTERNAL_ORIGINATOR_OVERRIDE']);
+      expect(result.ok).toBe(true);
+    }
+  });
+
   it('passes the planned coarse-sandbox argv to the real CLI surface', async () => {
     const allowlist = safeSubprocessEnv({
       allowGhToken: false,

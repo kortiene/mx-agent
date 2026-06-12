@@ -306,6 +306,32 @@ describe('result mapping', () => {
           changes: [{ kind: 'update', path: 'src/x.ts' }],
         },
       },
+      {
+        type: 'item.completed',
+        item: {
+          id: 'mcp1',
+          type: 'mcp_tool_call',
+          server: 'fs',
+          tool: 'read',
+          arguments: {},
+          status: 'failed',
+          error: { message: 'denied' },
+        },
+      },
+      { type: 'item.completed', item: { id: 'w1', type: 'web_search', query: 'codex docs' } },
+      {
+        type: 'item.completed',
+        item: {
+          id: 't1',
+          type: 'todo_list',
+          items: [
+            { text: 'read file', completed: true },
+            { text: 'write reply', completed: false },
+          ],
+        },
+      },
+      { type: 'item.completed', item: { id: 'e1', type: 'error', message: 'tool exploded' } },
+      { type: 'error', message: 'stream hiccup' },
       agentMessage('{"ok":true}'),
       turnCompleted(),
     ]);
@@ -317,6 +343,29 @@ describe('result mapping', () => {
     expect(log).toContain('[command completed rc 0] pnpm test\nok\n');
     expect(log).toContain('[reasoning] thinking');
     expect(log).toContain('[file_change completed] update src/x.ts');
+    expect(log).toContain('[mcp fs.read failed] denied');
+    expect(log).toContain('[web_search] codex docs');
+    expect(log).toContain('[todo] [x] read file; [ ] write reply');
+    expect(log).toContain('[codex error] tool exploded');
+    expect(log).toContain('[codex stream error] stream hiccup');
+  });
+
+  it('degrades missing/garbage usage fields to undefined instead of NaN (lockstep-drift guard)', async () => {
+    scriptedEvents([
+      agentMessage('{"ok":true}'),
+      { type: 'turn.completed', usage: { output_tokens: 50, cached_input_tokens: 'oops' } },
+    ]);
+    const result = await runner.runPhase(makeReq());
+
+    expect(result.ok).toBe(true);
+    expect(result.usage.inputTokens).toBeUndefined();
+    expect(result.usage.cachedInputTokens).toBeUndefined();
+    expect(result.usage.outputTokens).toBe(50);
+    // Output-only usage is still priceable; nothing in the pair may be NaN.
+    expect(result.usage.costUsd).toBeCloseTo((50 * 30) / 1_000_000, 12);
+    for (const value of Object.values(result.usage)) {
+      expect(Number.isNaN(value as number)).toBe(false);
+    }
   });
 
   it("maps turn.failed to a plain failure (signal 'none' → invoker nudges), message teed file-only", async () => {

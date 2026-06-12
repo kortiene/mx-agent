@@ -14,9 +14,15 @@
 import type { RunnerId } from './invoker.js';
 
 /**
- * Base variables every runner legitimately needs (adw/_exec.py:97-112).
- * PATH/HOME stay here so each SDK can locate and spawn its runtime
- * (PLAN.md Section 4.3-1).
+ * Base variables every runner legitimately needs. PATH/HOME stay here so
+ * each SDK can locate and spawn its runtime (PLAN.md Section 4.3-1).
+ *
+ * Python's flat _BASE_ENV_ALLOW (adw/_exec.py:97-112) also carried the
+ * provider credentials and the claude/pi config knobs, because its only
+ * runners were claude and pi. Here those keys live in RUNNER_ENV_ALLOW
+ * instead, so one provider's agent never receives another provider's
+ * credential (e.g. ANTHROPIC_API_KEY must not reach the codex child); for
+ * claude/pi, base ∪ runner row still equals the Python allowlist.
  */
 export const BASE_ENV_ALLOW = [
   'HOME',
@@ -27,29 +33,24 @@ export const BASE_ENV_ALLOW = [
   'LANG',
   'LC_ALL',
   'TMPDIR',
-  'ANTHROPIC_API_KEY',
-  'PI_BIN',
-  'CLAUDE_BIN',
-  'CLAUDE_CODE_PATH',
-  'PI_MODEL',
-  'PI_THINKING',
 ] as const;
 
 /** Never forwarded to the agent, even via extraAllow (adw/_exec.py:115). */
 export const ENV_DENY_PREFIXES = ['MATRIX_', 'MX_AGENT_'] as const;
 
 /**
- * Per-runner credential keys layered on top of the base allowlist
- * (PLAN.md Section 4.3). Keys already in BASE_ENV_ALLOW are not repeated.
+ * Per-runner credential/config keys layered on top of the base allowlist
+ * (PLAN.md Section 4.3). opencode and pi are any-provider backends, so they
+ * carry both provider keys; claude and codex get exactly their own.
  */
 export const RUNNER_ENV_ALLOW: Record<RunnerId, readonly string[]> = {
-  claude: ['ANTHROPIC_AUTH_TOKEN'],
+  claude: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_BIN', 'CLAUDE_CODE_PATH'],
   // CODEX_BIN mirrors CLAUDE_BIN (binary override); CODEX_HOME lets callers
   // point the CLI's config/auth dir (default ~/.codex) at a scrubbed
   // throwaway dir — the residual-surface mitigation of PLAN.md Section 4.4.
   codex: ['CODEX_API_KEY', 'OPENAI_API_KEY', 'CODEX_BIN', 'CODEX_HOME'],
-  opencode: ['OPENAI_API_KEY', 'OPENCODE_SERVER_PASSWORD'],
-  pi: ['OPENAI_API_KEY'],
+  opencode: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENCODE_SERVER_PASSWORD'],
+  pi: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'PI_BIN', 'PI_MODEL', 'PI_THINKING'],
 };
 
 export interface SafeEnvOptions {

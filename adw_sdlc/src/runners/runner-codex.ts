@@ -84,14 +84,28 @@ export function resolveCodexBin(env: Record<string, string | undefined>): string
  * excludes cache reads), so subtract before mapping — costUsd() then prices
  * non-cached input + cache reads + output without double counting, and
  * reasoningTokens stays an informational subset of outputTokens.
+ *
+ * Counts come from the CLI's JSONL stream, not from code the lockstep pin
+ * controls at runtime, so each field is checked like the claude adapter
+ * checks its SDK usage — a drifted/missing field degrades to undefined
+ * instead of NaN-poisoning the token math and the priced cost.
  */
 function usageOf(usage: Usage, model: string): PhaseUsage {
-  const phaseUsage: PhaseUsage = {
-    inputTokens: Math.max(0, usage.input_tokens - usage.cached_input_tokens),
-    outputTokens: usage.output_tokens,
-    cachedInputTokens: usage.cached_input_tokens,
-    reasoningTokens: usage.reasoning_output_tokens,
+  const raw = usage as unknown as Partial<Record<string, unknown>>;
+  const count = (key: string): number | undefined => {
+    const value = raw[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
   };
+  const input = count('input_tokens');
+  const cached = count('cached_input_tokens');
+  const output = count('output_tokens');
+  const reasoning = count('reasoning_output_tokens');
+
+  const phaseUsage: PhaseUsage = {};
+  if (input !== undefined) phaseUsage.inputTokens = Math.max(0, input - (cached ?? 0));
+  if (output !== undefined) phaseUsage.outputTokens = output;
+  if (cached !== undefined) phaseUsage.cachedInputTokens = cached;
+  if (reasoning !== undefined) phaseUsage.reasoningTokens = reasoning;
   phaseUsage.costUsd = costUsd(model, phaseUsage);
   return phaseUsage;
 }
@@ -131,9 +145,13 @@ function itemNote(item: ThreadItem): string {
         .map((change) => `${change.kind} ${change.path}`)
         .join(', ')}\n`;
     case 'mcp_tool_call':
-      return `[mcp ${item.server}.${item.tool} ${item.status}]\n`;
+      return `[mcp ${item.server}.${item.tool} ${item.status}]${
+        item.error !== undefined ? ` ${item.error.message}` : ''
+      }\n`;
     case 'web_search':
       return `[web_search] ${item.query}\n`;
+    case 'todo_list':
+      return `[todo] ${item.items.map((todo) => `${todo.completed ? '[x]' : '[ ]'} ${todo.text}`).join('; ')}\n`;
     case 'error':
       return `[codex error] ${item.message}\n`;
     default:

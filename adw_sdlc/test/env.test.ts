@@ -45,7 +45,7 @@ describe('safeSubprocessEnv', () => {
     const env = safeSubprocessEnv({ allowGhToken: false, source: POISONED });
     expect(env['HOME']).toBe('/home/u');
     expect(env['PATH']).toBe('/bin');
-    expect(env['ANTHROPIC_API_KEY']).toBe('sk-ant-x');
+    expect(env).not.toHaveProperty('ANTHROPIC_API_KEY'); // provider keys are per-runner, not base
     expect(env).not.toHaveProperty('SHELL'); // allowlisted but absent from source
   });
 
@@ -59,9 +59,9 @@ describe('safeSubprocessEnv', () => {
   });
 
   it('layers per-runner credential keys onto the base allowlist', () => {
-    expect(safeSubprocessEnv({ allowGhToken: false, runner: 'claude', source: POISONED })).toHaveProperty(
-      'ANTHROPIC_AUTH_TOKEN',
-    );
+    const claude = safeSubprocessEnv({ allowGhToken: false, runner: 'claude', source: POISONED });
+    expect(claude['ANTHROPIC_API_KEY']).toBe('sk-ant-x');
+    expect(claude['ANTHROPIC_AUTH_TOKEN']).toBe('tok');
     const codex = safeSubprocessEnv({ allowGhToken: false, runner: 'codex', source: POISONED });
     expect(codex['CODEX_API_KEY']).toBe('sk-codex-x');
     expect(codex['OPENAI_API_KEY']).toBe('sk-oai-x');
@@ -76,6 +76,21 @@ describe('safeSubprocessEnv', () => {
     }
   });
 
+  it("never hands one provider's credential to another provider's runner", () => {
+    // Step-7 review finding: provider keys are per-runner, so the codex
+    // (OpenAI) child must not see the Anthropic key or claude/pi knobs, and
+    // the claude child must not see the OpenAI/Codex keys. opencode and pi
+    // are any-provider backends and legitimately carry both provider keys.
+    const codex = safeSubprocessEnv({ allowGhToken: false, runner: 'codex', source: POISONED });
+    for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_BIN', 'PI_BIN', 'PI_MODEL']) {
+      expect(codex, key).not.toHaveProperty(key);
+    }
+    const claude = safeSubprocessEnv({ allowGhToken: false, runner: 'claude', source: POISONED });
+    for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_HOME', 'PI_BIN']) {
+      expect(claude, key).not.toHaveProperty(key);
+    }
+  });
+
   it('silently drops deny-prefixed keys requested via extraAllow', () => {
     const env = safeSubprocessEnv({
       allowGhToken: false,
@@ -87,22 +102,15 @@ describe('safeSubprocessEnv', () => {
     expect(env['RANDOM_SECRET']).toBe('leakme'); // explicit, non-denied extra is honored
   });
 
-  it('keeps the base allowlist aligned with adw/_exec.py', () => {
-    expect(BASE_ENV_ALLOW).toEqual([
-      'HOME',
-      'USER',
-      'PATH',
-      'SHELL',
-      'TERM',
-      'LANG',
-      'LC_ALL',
-      'TMPDIR',
-      'ANTHROPIC_API_KEY',
-      'PI_BIN',
-      'CLAUDE_BIN',
-      'CLAUDE_CODE_PATH',
-      'PI_MODEL',
-      'PI_THINKING',
-    ]);
+  it('keeps base ∪ runner row aligned with the flat adw/_exec.py allowlist for the ported runners', () => {
+    expect(BASE_ENV_ALLOW).toEqual(['HOME', 'USER', 'PATH', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR']);
+    // Python's _BASE_ENV_ALLOW (adw/_exec.py:97-112) = base + these six; its
+    // runners are claude and pi, so each of their TS unions must still cover
+    // every key the Python pipeline would have forwarded to that runner.
+    const pythonExtras = ['ANTHROPIC_API_KEY', 'PI_BIN', 'CLAUDE_BIN', 'CLAUDE_CODE_PATH', 'PI_MODEL', 'PI_THINKING'];
+    const union = new Set([...RUNNER_ENV_ALLOW.claude, ...RUNNER_ENV_ALLOW.pi]);
+    for (const key of pythonExtras) {
+      expect(union.has(key), key).toBe(true);
+    }
   });
 });

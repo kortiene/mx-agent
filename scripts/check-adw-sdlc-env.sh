@@ -22,21 +22,37 @@ if grep -rnE '\.\.\.[[:space:]]*process\.env' "$runners_dir" --include='*.ts'; t
   exit 1
 fi
 
+# Inside runner modules, never hand the parent env to a child under the env:
+# key either (a cast like `env: process.env as Record<string,string>` would
+# satisfy tsc). The orchestrator legitimately holds process.env as the SOURCE
+# safeSubprocessEnv reads from (OrchestratorDeps.env), so this stays scoped
+# to where child envs are constructed.
+if grep -rnE 'env[[:space:]]*:[[:space:]]*process\.env' "$runners_dir" --include='*.ts'; then
+  echo "error: never pass process.env as a child env; build it via safeSubprocessEnv() only" >&2
+  exit 1
+fi
+
 # Codex always-pass-env gate (PLAN.md Sections 4.3-2 / 9): omitting
 # CodexOptions.env flips the SDK from no-inherit to full process.env inherit
-# (@openai/codex-sdk 0.139.0 dist/index.js:234-239). Every `new Codex(...)`
-# construction must pass an explicit env key. The spawn-level unit test
-# asserts the SDK-built child env; this tripwire catches a bad construction
-# even before tests run.
+# (@openai/codex-sdk 0.139.0 dist/index.js:234-239). The spawn-level unit
+# test asserts the SDK-built child env; this tripwire catches a bad
+# construction even before tests run. It FAILS CLOSED: every `new Codex`
+# anywhere in adw_sdlc/src must use the one canonical shape — an inline
+# object literal whose FIRST key is env — and the class must never be
+# aliased (an alias would evade the pattern).
 codex_violations=$(perl -0777 -ne '
-  while (/new\s+Codex\s*\(((?:[^()]|\([^()]*\))*)\)/gs) {
-    my $args = $1;
-    print "new Codex(...) without an explicit env key: $args\n" unless $args =~ /\benv\s*:/;
-  }' "$runners_dir"/*.ts)
+  print "$ARGV: aliasing the Codex class is not allowed (it evades this gate)\n"
+    if /\bCodex\s+as\s+\w/ || /=\s*Codex\s*[;,)\s]/;
+  while (/\bnew\s+Codex\b(?=(.{0,80}))/gs) {
+    my $head = $1;
+    $head =~ s/\s+/ /g;
+    print "$ARGV: new Codex must take an inline literal starting with env: (saw: new Codex$head)\n"
+      unless $head =~ /^\s*\(\s*\{\s*env\s*:/;
+  }' $(find adw_sdlc/src -name '*.ts'))
 if [ -n "$codex_violations" ]; then
   echo "$codex_violations" >&2
   echo "error: the codex adapter must ALWAYS pass CodexOptions.env (omission inherits all of process.env)" >&2
   exit 1
 fi
 
-echo "ok: no process.env spread in $runners_dir; every new Codex(...) passes env"
+echo "ok: no process.env spread/handoff in adw_sdlc/src; every new Codex(...) passes env first"

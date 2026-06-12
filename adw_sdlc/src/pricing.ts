@@ -3,10 +3,9 @@
  *
  * claude, opencode, and pi report dollars natively, so they never consult
  * this table. It exists only for backends that report tokens without cost:
- * the shared Anthropic-SDK classify call today, and codex once its model ids
- * are verified (roadmap step 7 — intentionally absent until then). A missing
- * or stale entry yields a null cost, which is non-fatal: it only disables
- * the parent-side budget gate for that backend.
+ * the shared Anthropic-SDK classify call and the codex tiers (verified in
+ * roadmap step 7). A missing or stale entry yields a null cost, which is
+ * non-fatal: it only disables the parent-side budget gate for that backend.
  */
 
 import type { PhaseUsage } from './invoker.js';
