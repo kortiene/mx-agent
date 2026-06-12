@@ -885,101 +885,109 @@ export async function run(
     ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
   };
 
-  let reviewResult: ReviewResult | null = null;
-  for (const phase of phases) {
-    if (state.isDone(phase)) {
-      note(`skipping ${phase} (already completed)`);
-      continue;
-    }
+  // Runner lifecycle (D6): start/stop are no-ops for the in-process backends;
+  // opencode tears down its self-spawned server in stop(), so it runs in a
+  // finally — a leaked server child would otherwise outlive the run.
+  await runner.start?.();
+  try {
+    let reviewResult: ReviewResult | null = null;
+    for (const phase of phases) {
+      if (state.isDone(phase)) {
+        note(`skipping ${phase} (already completed)`);
+        continue;
+      }
 
-    if (CONDITIONAL_PHASES.has(phase)) {
-      const { runIt, reason } = gateConditional(phase, signal, files);
-      if (!runIt) {
-        progress(phase, `skipped: ${reason}`);
+      if (CONDITIONAL_PHASES.has(phase)) {
+        const { runIt, reason } = gateConditional(phase, signal, files);
+        if (!runIt) {
+          progress(phase, `skipped: ${reason}`);
+          state.markDone(phase);
+          state.save();
+          continue;
+        }
+      }
+
+      if (phase === 'resolve') {
+        await resolveLoop(
+          state,
+          agent,
+          { testCmd: opts.testCmd || DEFAULT_TEST_CMD, maxAttempts: opts.maxResolve, progress },
+          deps,
+        );
         state.markDone(phase);
         state.save();
         continue;
       }
-    }
 
-    if (phase === 'resolve') {
-      await resolveLoop(
+      if (phase === 'patch') {
+        // On a resume the review phase is skipped, so reconstruct its findings
+        // from persisted state rather than silently patching nothing.
+        const findings = reviewResult !== null ? reviewResult.findings : findingsFromState(state);
+        await patchLoop(state, findings, agent, { maxAttempts: opts.maxPatch, progress }, deps);
+        state.markDone(phase);
+        state.save();
+        continue;
+      }
+
+      if (phase === 'classify' && deps.env['MX_AGENT_CLASSIFY_ON_RUNNER'] !== '1') {
+        // D1: classify is the only pure structured phase; it runs on the shared
+        // Anthropic-SDK structured call regardless of the selected runner.
+        const prompt = composePhasePrompt(phase, phaseArgs(phase, issue, state, ctx, files), state, runner.id, false);
+        const phaseDir = state.phaseDir(phase);
+        writeFileSync(join(phaseDir, 'prompt.txt'), prompt, 'utf8');
+        const { value, usage } = await deps.classify(prompt, {
+          ...(opts.timeoutMs > 0 ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+        });
+        writeFileSync(join(phaseDir, 'transcript.log'), `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+        recordUsage(state, usage);
+        applyResult(state, phase, value);
+        state.markDone(phase);
+        state.save();
+        progress(phase, 'done');
+        continue;
+      }
+
+      // Normal agent phase (including classify when MX_AGENT_CLASSIFY_ON_RUNNER=1).
+      const outcome = await deps.runAgentPhase({
+        phase,
+        templateArgs: phaseArgs(phase, issue, state, ctx, files),
         state,
-        agent,
-        { testCmd: opts.testCmd || DEFAULT_TEST_CMD, maxAttempts: opts.maxResolve, progress },
-        deps,
-      );
-      state.markDone(phase);
-      state.save();
-      continue;
-    }
-
-    if (phase === 'patch') {
-      // On a resume the review phase is skipped, so reconstruct its findings
-      // from persisted state rather than silently patching nothing.
-      const findings = reviewResult !== null ? reviewResult.findings : findingsFromState(state);
-      await patchLoop(state, findings, agent, { maxAttempts: opts.maxPatch, progress }, deps);
-      state.markDone(phase);
-      state.save();
-      continue;
-    }
-
-    if (phase === 'classify' && deps.env['MX_AGENT_CLASSIFY_ON_RUNNER'] !== '1') {
-      // D1: classify is the only pure structured phase; it runs on the shared
-      // Anthropic-SDK structured call regardless of the selected runner.
-      const prompt = composePhasePrompt(phase, phaseArgs(phase, issue, state, ctx, files), state, runner.id, false);
-      const phaseDir = state.phaseDir(phase);
-      writeFileSync(join(phaseDir, 'prompt.txt'), prompt, 'utf8');
-      const { value, usage } = await deps.classify(prompt, {
-        ...(opts.timeoutMs > 0 ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+        runner: agent.runner,
+        cliModel: agent.cliModel,
+        env: agent.env,
+        timeoutMs: agent.timeoutMs,
+        ...(agent.maxBudgetUsd !== undefined ? { maxBudgetUsd: agent.maxBudgetUsd } : {}),
       });
-      writeFileSync(join(phaseDir, 'transcript.log'), `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-      recordUsage(state, usage);
-      applyResult(state, phase, value);
+      recordUsage(state, outcome.usage);
+      const result = outcome.data;
+      applyResult(state, phase, result);
+      if (phase === 'review' || phase === 'document') {
+        absorbAuthoredText(state);
+      }
+      if (phase === 'review') {
+        const review = result as ReviewResult;
+        reviewResult = review;
+        // Persist findings so a later --resume can still drive the patch phase.
+        state.reviewFindings = review.findings.map((f) => ({
+          severity: f.severity,
+          description: f.description,
+          location: f.location,
+        }));
+      }
+      if (phase === 'implement') {
+        const implemented = result as ImplementResult;
+        files = implemented.files_changed.length > 0 ? implemented.files_changed : files;
+        signal = `${signal} ${files.join(' ')}`;
+      }
       state.markDone(phase);
       state.save();
       progress(phase, 'done');
-      continue;
     }
 
-    // Normal agent phase (including classify when MX_AGENT_CLASSIFY_ON_RUNNER=1).
-    const outcome = await deps.runAgentPhase({
-      phase,
-      templateArgs: phaseArgs(phase, issue, state, ctx, files),
-      state,
-      runner: agent.runner,
-      cliModel: agent.cliModel,
-      env: agent.env,
-      timeoutMs: agent.timeoutMs,
-      ...(agent.maxBudgetUsd !== undefined ? { maxBudgetUsd: agent.maxBudgetUsd } : {}),
-    });
-    recordUsage(state, outcome.usage);
-    const result = outcome.data;
-    applyResult(state, phase, result);
-    if (phase === 'review' || phase === 'document') {
-      absorbAuthoredText(state);
-    }
-    if (phase === 'review') {
-      const review = result as ReviewResult;
-      reviewResult = review;
-      // Persist findings so a later --resume can still drive the patch phase.
-      state.reviewFindings = review.findings.map((f) => ({
-        severity: f.severity,
-        description: f.description,
-        location: f.location,
-      }));
-    }
-    if (phase === 'implement') {
-      const implemented = result as ImplementResult;
-      files = implemented.files_changed.length > 0 ? implemented.files_changed : files;
-      signal = `${signal} ${files.join(' ')}`;
-    }
-    state.markDone(phase);
-    state.save();
-    progress(phase, 'done');
+    return await finalizeAndMerge(state, opts, { ghBin, repo, issue, agent, progress }, deps);
+  } finally {
+    await runner.stop?.();
   }
-
-  return finalizeAndMerge(state, opts, { ghBin, repo, issue, agent, progress }, deps);
 }
 
 /** Copy the parent env, dropping undefined values (inherit-env mode only). */

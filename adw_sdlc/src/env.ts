@@ -49,7 +49,17 @@ export const RUNNER_ENV_ALLOW: Record<RunnerId, readonly string[]> = {
   // point the CLI's config/auth dir (default ~/.codex) at a scrubbed
   // throwaway dir — the residual-surface mitigation of PLAN.md Section 4.4.
   codex: ['CODEX_API_KEY', 'OPENAI_API_KEY', 'CODEX_BIN', 'CODEX_HOME'],
-  opencode: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENCODE_SERVER_PASSWORD'],
+  // OPENCODE_BIN mirrors CLAUDE_BIN/CODEX_BIN (binary override); XDG_DATA_HOME
+  // lets callers point opencode's data/auth dir (default
+  // ~/.local/share/opencode, incl. auth.json) at a scrubbed throwaway dir —
+  // the residual-surface mitigation of PLAN.md Section 4.4, like CODEX_HOME.
+  opencode: [
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENCODE_SERVER_PASSWORD',
+    'OPENCODE_BIN',
+    'XDG_DATA_HOME',
+  ],
   pi: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'PI_BIN', 'PI_MODEL', 'PI_THINKING'],
 };
 

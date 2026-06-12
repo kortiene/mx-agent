@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
 // Keep this file hermetic (PLAN.md Section 9: every SDK is mocked, optional
-// deps may legitimately be absent): loadRunner('claude'/'codex') pulls in the
-// adapter modules, whose static SDK imports must not load the real packages.
+// deps may legitimately be absent): loadRunner('claude'/'codex'/'opencode')
+// pulls in the adapter modules, whose static SDK imports must not load the
+// real packages.
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: vi.fn() }));
 vi.mock('@openai/codex-sdk', () => ({ Codex: vi.fn() }));
+vi.mock('@opencode-ai/sdk/v2/client', () => ({ createOpencodeClient: vi.fn() }));
 
 import { AdwError, RunnerNotInstalledError } from '../src/errors.js';
 import { RUNNER_IDS } from '../src/invoker.js';
@@ -42,20 +44,25 @@ describe('resolveRunnerId', () => {
 });
 
 describe('loadRunner', () => {
-  it('loads the shipped adapters (claude: step 6; codex: step 7)', async () => {
-    for (const id of ['claude', 'codex'] as const) {
-      const runner = await loadRunner(id);
+  it('loads the shipped adapters (claude: step 6; codex: step 7; opencode: step 8)', async () => {
+    const SHIPPED = {
+      claude: 'explicit-no-inherit',
+      codex: 'explicit-no-inherit',
+      opencode: 'subprocess-allowlist',
+    } as const;
+    for (const [id, envIsolation] of Object.entries(SHIPPED)) {
+      const runner = await loadRunner(id as keyof typeof SHIPPED);
       expect(runner.id).toBe(id);
-      expect(runner.caps.envIsolation).toBe('explicit-no-inherit');
+      expect(runner.caps.envIsolation).toBe(envIsolation);
       expect(typeof runner.runPhase).toBe('function');
     }
   });
 
-  // The remaining adapters land in roadmap steps 8-9; until then their ids
+  // The remaining adapter lands in roadmap step 9; until then its id
   // must surface the typed not-installed error — the step-3 verify
   // criterion. When an adapter ships, move its id out of this loop.
   it('surfaces an absent adapter/SDK as RunnerNotInstalledError, not a module-load crash', async () => {
-    for (const id of RUNNER_IDS.filter((candidate) => candidate !== 'claude' && candidate !== 'codex')) {
+    for (const id of RUNNER_IDS.filter((candidate) => candidate === 'pi')) {
       const err: unknown = await loadRunner(id).then(
         () => null,
         (e: unknown) => e,

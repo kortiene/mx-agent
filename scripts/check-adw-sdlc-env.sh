@@ -56,4 +56,16 @@ if [ -n "$codex_violations" ]; then
   exit 1
 fi
 
-echo "ok: no process.env spread/handoff in adw_sdlc/src; every new Codex(...) passes env first"
+# opencode server-spawn gate (PLAN.md Sections 4.3-3 / 9): the SDK's own
+# createOpencodeServer/createOpencodeTui/createOpencode hardcode a full
+# parent-process-env spread onto the child (@opencode-ai/sdk 1.17.3
+# dist/v2/server.js), so the adapter must self-spawn `opencode serve` with
+# the allowlist. Ban CALLING or IMPORTING the leaking helpers (and the
+# module subpaths that export them) anywhere in adw_sdlc/src; prose mentions
+# in comments stay legal.
+if grep -rnE "createOpencode(Server|Tui)?[[:space:]]*\(|import[^;]*createOpencode(Server|Tui)\b|from[[:space:]]+'@opencode-ai/sdk(/v2)?(/server)?'" adw_sdlc/src --include='*.ts'; then
+  echo "error: never use the SDK's createOpencodeServer/createOpencodeTui/createOpencode or the server-exporting subpaths (they spread process.env); import '@opencode-ai/sdk/v2/client' and self-spawn opencode serve with the allowlist env" >&2
+  exit 1
+fi
+
+echo "ok: no process.env spread/handoff in adw_sdlc/src; every new Codex(...) passes env first; no createOpencodeServer"

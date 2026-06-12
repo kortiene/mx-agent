@@ -402,6 +402,38 @@ describe('run() integration', () => {
     expect(state?.totalCostUsd).toBeCloseTo(0.01);
   });
 
+  it('calls runner.start before the phases and runner.stop in a finally, even when a phase throws (D6 lifecycle)', async () => {
+    const calls: string[] = [];
+    const lifecycleRunner = (): AgentRunner => ({
+      ...createMockRunner(),
+      start: async () => {
+        calls.push('start');
+      },
+      stop: async () => {
+        calls.push('stop');
+      },
+    });
+
+    const okDeps = testDeps({
+      issueState: vi.fn().mockReturnValueOnce('OPEN').mockReturnValueOnce('CLOSED'),
+      runAgentPhase: agentStub(PHASE_RESULTS, () => {}),
+    });
+    await run(5, lifecycleRunner(), { yes: true, noProgress: true }, okDeps);
+    expect(calls).toEqual(['start', 'stop']);
+
+    calls.length = 0;
+    const failingDeps = testDeps({
+      issueState: vi.fn().mockReturnValue('OPEN'),
+      runAgentPhase: (() => {
+        throw new AdwError('phase exploded');
+      }) as unknown as typeof runAgentPhase,
+    });
+    await expect(run(6, lifecycleRunner(), { yes: true, noProgress: true }, failingDeps)).rejects.toThrow(
+      'phase exploded',
+    );
+    expect(calls).toEqual(['start', 'stop']);
+  });
+
   it('resumes by skipping completed phases', async () => {
     const pre = new AdwState({ adwId: 'a1b2c3d4', issueNumber: '5', branchName: 'feat/5-x' });
     for (const ph of ['setup', 'classify', 'plan', 'implement', 'tests', 'resolve', 'e2e', 'review', 'patch', 'document']) {
