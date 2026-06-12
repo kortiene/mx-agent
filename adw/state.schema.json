@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/kortiene/mx-agent/main/adw/state.schema.json",
+  "title": "AdwState",
+  "description": "On-disk contract for agents/{adw_id}/state.json, the sole cross-language boundary between the Python adw/ pipeline and the TypeScript adw_sdlc/ engine. Canonical v1 fields mirror adw/_state.py AdwState. Unknown keys are permitted (additionalProperties) so either engine may add fields additively; the Python reader drops unknown TOP-LEVEL keys and tolerantly coerces nested finding objects, so additions must never be load-bearing for resume.",
+  "type": "object",
+  "required": ["adw_id", "schema_version"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Version of this contract. Bump only on a breaking change; additive fields keep the same version. Readers treat files written before versioning as version 1."
+    },
+    "adw_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}$",
+      "description": "8-char hex run id; also the workspace directory name under agents/."
+    },
+    "issue_number": {
+      "type": ["string", "null"],
+      "description": "GitHub issue number driving the run, as a string."
+    },
+    "issue_class": {
+      "type": ["string", "null"],
+      "description": "Classified change type (feat/fix/docs/chore/...)."
+    },
+    "branch_name": {
+      "type": ["string", "null"],
+      "description": "Git branch the run works on."
+    },
+    "base": {
+      "type": "string",
+      "default": "main",
+      "description": "Base branch for the eventual PR."
+    },
+    "plan_file": {
+      "type": ["string", "null"],
+      "description": "Repo-relative path to the spec produced by the plan phase."
+    },
+    "pr_number": {
+      "type": ["integer", "null"],
+      "description": "Pull request number once created."
+    },
+    "pr_url": {
+      "type": ["string", "null"],
+      "description": "Pull request URL once created."
+    },
+    "commit_message": {
+      "type": ["string", "null"],
+      "description": "Agent-authored commit message, executed by the control plane."
+    },
+    "pr_body": {
+      "type": ["string", "null"],
+      "description": "Agent-authored PR body, executed by the control plane."
+    },
+    "review_findings": {
+      "type": "array",
+      "description": "Review findings as plain objects so they survive --resume and the patch phase can still see blockers.",
+      "items": {
+        "type": "object",
+        "required": ["severity"],
+        "properties": {
+          "severity": { "type": "string", "description": "Load-bearing for the patch gate: blocker findings are the ones patch_loop must fix." },
+          "description": { "type": "string" },
+          "location": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "completed_phases": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered list of completed phase names; drives --resume skipping."
+    }
+  }
+}

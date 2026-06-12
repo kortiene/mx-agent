@@ -92,7 +92,9 @@ Key properties:
 
 - **Run identity + resume.** Each run gets an 8-char `adw_id` and a workspace at
   `agents/{adw_id}/` (git-ignored) holding `state.json` and per-phase transcripts.
-  Re-run with `--adw-id <id> --resume` to skip already-completed phases.
+  Re-run with `--adw-id <id> --resume` to skip already-completed phases. The
+  `state.json` contract is codified in [`state.schema.json`](state.schema.json)
+  (versioned via `schema_version`; unknown keys are tolerated and dropped).
 - **Python owns git; the agent never sees `GH_TOKEN`.** All branch/commit/push/PR/
   CI-watch/merge work runs in Python. The agent only *authors* the commit message and
   PR body; the runner is launched with an env allowlist that withholds `GH_TOKEN`,
