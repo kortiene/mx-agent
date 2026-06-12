@@ -176,6 +176,18 @@ describe('runAgentPhase', () => {
     expect(outcome.data.remaining).toBe(2);
   });
 
+  it('propagates an unpriceable (null) cost from either attempt instead of a false sum', async () => {
+    const runner = createMockRunner({
+      caps: { nativeSchema: false },
+      script: (_req, call) =>
+        call === 0
+          ? { transcriptText: 'no json here', usage: { costUsd: null } }
+          : { transcriptText: '```json\n{"resolved": 1, "remaining": 0}\n```', usage: { costUsd: 0.4 } },
+    });
+    const outcome = await runAgentPhase({ phase: 'resolve', templateArgs: ['x'], state, runner, env: {} });
+    expect(outcome.usage.costUsd).toBeNull();
+  });
+
   it('arms an AbortSignal for the phase timeout', async () => {
     const runner = createMockRunner({ script: () => ({ structured: GOOD_RESOLVE }) });
     await runAgentPhase({

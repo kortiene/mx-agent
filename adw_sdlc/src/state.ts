@@ -78,7 +78,8 @@ export interface AdwStateInit {
   completedPhases?: string[];
   engine?: string;
   runner?: string;
-  totalCostUsd?: number;
+  /** Accumulated run cost; null = some phase could not be priced (unknown). */
+  totalCostUsd?: number | null;
 }
 
 /** Minimal persistent state connecting phased-run steps (adw/_state.py:51). */
@@ -100,7 +101,8 @@ export class AdwState {
   // the Python reader, never load-bearing for resume.
   engine: string | undefined;
   runner: string | undefined;
-  totalCostUsd: number | undefined;
+  /** Accumulated run cost; null = some phase could not be priced (unknown). */
+  totalCostUsd: number | null | undefined;
 
   constructor(init: AdwStateInit) {
     this.adwId = validateAdwId(init.adwId);
@@ -246,7 +248,10 @@ export class AdwState {
           : [],
         engine: typeof doc['engine'] === 'string' ? doc['engine'] : undefined,
         runner: typeof doc['runner'] === 'string' ? doc['runner'] : undefined,
-        totalCostUsd: typeof doc['total_cost_usd'] === 'number' ? doc['total_cost_usd'] : undefined,
+        totalCostUsd:
+          typeof doc['total_cost_usd'] === 'number' || doc['total_cost_usd'] === null
+            ? doc['total_cost_usd']
+            : undefined,
       });
     } catch {
       return null;

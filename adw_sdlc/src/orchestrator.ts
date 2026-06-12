@@ -96,7 +96,13 @@ export interface RunOptions {
   adwId?: string;
   resume?: boolean;
   noProgress?: boolean;
-  /** Give the agent the full parent env (less isolated; mirrors --inherit-env). */
+  /**
+   * EXPLICIT OPT-OUT of the D5 secret boundary: forwards the FULL parent
+   * environment — including GH_TOKEN and MATRIX_*-/MX_AGENT_*-prefixed
+   * secrets — to the runner child. The faithful port of Python's
+   * --inherit-env (adw/_orchestrator.py:594, env=None → full inherit),
+   * documented there as "less isolated". Never set this in unattended runs.
+   */
   inheritEnv?: boolean;
   maxResolve?: number;
   maxPatch?: number;
@@ -294,9 +300,16 @@ export function renderFindings(findings: readonly ReviewFinding[]): string {
     .join('\n');
 }
 
-/** Accumulate a phase's dollars into the run's additive total. */
+/**
+ * Accumulate a phase's dollars into the run's additive total. A null cost
+ * means "could not be priced", which poisons the whole accumulation: the
+ * total sticks to null rather than silently becoming a false partial sum.
+ * An absent (undefined) cost carries no information and is a no-op.
+ */
 function recordUsage(state: AdwState, usage: PhaseUsage): void {
-  if (usage.costUsd !== null && usage.costUsd !== undefined) {
+  if (usage.costUsd === null) {
+    state.totalCostUsd = null;
+  } else if (usage.costUsd !== undefined && state.totalCostUsd !== null) {
     state.totalCostUsd = (state.totalCostUsd ?? 0) + usage.costUsd;
   }
 }
@@ -396,7 +409,12 @@ export async function ciFixLoop(
 ): Promise<boolean> {
   let attempt = 0;
   let polls = 0;
-  let nonePolls = 0; // tolerate a short window where no checks have registered yet
+  // Tolerate a short window where no checks have registered yet. Like the
+  // Python original, this settle counter is deliberately NOT reset after a
+  // fix-push (only `polls` is) — fixing that quirk in one engine would break
+  // the byte-for-byte semantics parity (D4); change both engines together
+  // post-cutover if it ever matters in practice.
+  let nonePolls = 0;
   for (;;) {
     const status = deps.git.ciStatus(pr, config.ghBin, config.repo);
     if (status.state === 'success') {

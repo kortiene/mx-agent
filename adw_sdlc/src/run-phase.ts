@@ -151,10 +151,12 @@ function mergeUsage(a: PhaseUsage, b: PhaseUsage): PhaseUsage {
   if (outputTokens !== undefined) usage.outputTokens = outputTokens;
   if (cachedInputTokens !== undefined) usage.cachedInputTokens = cachedInputTokens;
   if (reasoningTokens !== undefined) usage.reasoningTokens = reasoningTokens;
-  if (a.costUsd != null || b.costUsd != null) {
-    usage.costUsd = (a.costUsd ?? 0) + (b.costUsd ?? 0);
-  } else if (a.costUsd === null || b.costUsd === null) {
+  // null means "could not be priced" (PLAN.md Section 6) — if either attempt
+  // is unpriceable the pair's cost is unknown, never a false partial sum.
+  if (a.costUsd === null || b.costUsd === null) {
     usage.costUsd = null;
+  } else if (a.costUsd !== undefined || b.costUsd !== undefined) {
+    usage.costUsd = (a.costUsd ?? 0) + (b.costUsd ?? 0);
   }
   return usage;
 }

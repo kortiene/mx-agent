@@ -6,7 +6,7 @@
  * withholding, and the merge gate.
  */
 
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -584,6 +584,73 @@ describe('run() integration', () => {
       /pre-merge gate failed: cargo fmt --check/,
     );
     expect(squashMerge).not.toHaveBeenCalled();
+  });
+
+  it('persists classify prompt.txt and transcript.log on the structured-call path', async () => {
+    const deps = testDeps({
+      issueState: vi.fn().mockReturnValueOnce('OPEN').mockReturnValueOnce('CLOSED'),
+      runAgentPhase: agentStub(PHASE_RESULTS),
+    });
+    await run(5, createMockRunner(), { yes: true, noProgress: true }, deps);
+    const dir = join(tmp, loadedId(), 'classify');
+    expect(readFileSync(join(dir, 'prompt.txt'), 'utf8')).toContain('GitHub issue #5');
+    expect(JSON.parse(readFileSync(join(dir, 'transcript.log'), 'utf8'))).toEqual({
+      issue_class: 'feat',
+      reason: 'r',
+    });
+  });
+
+  it('routes classify through the runner when MX_AGENT_CLASSIFY_ON_RUNNER=1', async () => {
+    const order: string[] = [];
+    const classify = vi.fn(async () => ({ value: { issue_class: 'feat' as const, reason: 'r' }, usage: {} }));
+    const deps = testDeps({
+      env: { PATH: '/bin', MX_AGENT_CLASSIFY_ON_RUNNER: '1' },
+      issueState: vi.fn().mockReturnValueOnce('OPEN').mockReturnValueOnce('CLOSED'),
+      classify,
+      runAgentPhase: agentStub(
+        { ...PHASE_RESULTS, classify: { issue_class: 'feat', reason: 'r' } },
+        (opts) => order.push(opts.phase),
+      ),
+    });
+    const rc = await run(5, createMockRunner(), { yes: true, noProgress: true }, deps);
+    expect(rc).toBe(0);
+    expect(classify).not.toHaveBeenCalled();
+    expect(order).toEqual(['classify', 'plan', 'implement', 'tests', 'review']);
+    expect(AdwState.load(loadedId())?.issueClass).toBe('feat');
+  });
+
+  it('inheritEnv is an explicit opt-out that forwards the full parent env (Python --inherit-env parity)', async () => {
+    const poisoned = { GH_TOKEN: 'ghp_secret', PATH: '/bin', MX_AGENT_FOO: 'x' };
+    const seenEnvs: Array<Record<string, string>> = [];
+    const deps = testDeps({
+      env: poisoned,
+      issueState: vi.fn().mockReturnValueOnce('OPEN').mockReturnValueOnce('CLOSED'),
+      runAgentPhase: agentStub(PHASE_RESULTS, (opts) => seenEnvs.push(opts.env)),
+    });
+    const rc = await run(5, createMockRunner(), { yes: true, noProgress: true, inheritEnv: true }, deps);
+    expect(rc).toBe(0);
+    // Opt-OUT: the documented less-isolated mode forwards everything…
+    expect(seenEnvs[0]).toEqual(poisoned);
+    // …and remains strictly opt-in: the same run without the flag is covered
+    // by the 'runs phases in order' test, which asserts GH_TOKEN is absent.
+  });
+
+  it('poisons total_cost_usd to null once any phase cost is unknown', async () => {
+    const costs: Array<number | null | undefined> = [0.02, null, 0.01, undefined];
+    let call = 0;
+    const deps = testDeps({
+      issueState: vi.fn().mockReturnValueOnce('OPEN').mockReturnValueOnce('CLOSED'),
+      classify: async () => ({ value: { issue_class: 'feat', reason: 'r' }, usage: { costUsd: 0.05 } }),
+      runAgentPhase: (async (opts: Parameters<typeof runAgentPhase>[0]) => ({
+        data: PHASE_RESULTS[opts.phase],
+        usage: { costUsd: costs[call++ % costs.length] },
+      })) as typeof runAgentPhase,
+    });
+    const rc = await run(5, createMockRunner(), { yes: true, noProgress: true }, deps);
+    expect(rc).toBe(0);
+    // 0.05 (classify) + 0.02 (plan) accumulate, then null (implement) poisons
+    // the total for good — never a false partial sum.
+    expect(AdwState.load(loadedId())?.totalCostUsd).toBeNull();
   });
 
   it('previews the plan under dry-run without touching anything', async () => {
