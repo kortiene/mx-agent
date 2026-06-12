@@ -296,6 +296,24 @@ describe('server spawn (the D5 boundary)', () => {
 
     expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
   });
+
+  it('does not resurrect a server when stop() lands during the spawn (failed phase, child killed)', async () => {
+    let emitBanner: () => void = () => {};
+    spawnMock.mockImplementation(() => {
+      proc = new FakeProc();
+      emitBanner = () => proc.stdout.emit('data', `opencode server listening on ${SERVER_URL}\n`);
+      return proc;
+    });
+    const pending = runner.runPhase(makeReq());
+    await new Promise((resolve) => setImmediate(resolve));
+    await runner.stop?.();
+    emitBanner();
+    const result = await pending;
+
+    expect(result.ok).toBe(false);
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(sessionCreateMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('request shape', () => {

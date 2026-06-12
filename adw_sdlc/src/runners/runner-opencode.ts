@@ -433,13 +433,25 @@ class OpencodeRunner implements AgentRunner {
     if (this.server !== null) {
       return Promise.resolve(this.server);
     }
-    this.starting ??= this.spawnServer(req).then((server) => {
-      this.server = server;
-      return server;
-    }).catch((err: unknown) => {
-      this.starting = null;
-      throw err;
-    });
+    if (this.starting === null) {
+      const starting = this.spawnServer(req).then((server) => {
+        if (this.starting !== starting) {
+          // stop() ran while the server was starting; don't resurrect it.
+          if (server.proc.exitCode === null && !server.proc.killed) {
+            server.proc.kill('SIGTERM');
+          }
+          throw new Error('opencode runner stopped during server start');
+        }
+        this.server = server;
+        return server;
+      }).catch((err: unknown) => {
+        if (this.starting === starting) {
+          this.starting = null;
+        }
+        throw err;
+      });
+      this.starting = starting;
+    }
     return this.starting;
   }
 
