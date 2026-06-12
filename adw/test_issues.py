@@ -29,12 +29,44 @@ class HelperTests(unittest.TestCase):
             issues_mod.apply_start([15, 16], 99)
 
     def test_issue_flags_forwards_set_options(self) -> None:
-        ns = mock.Mock(runner="claude", model="opus", thinking="", phases="", one_shot=False, log_dir="")
-        self.assertEqual(issues_mod.issue_flags(ns, True), ["--runner", "claude", "--model", "opus", "--yes"])
+        ns = mock.Mock(
+            runner="claude", model="opus", thinking="", phases="", one_shot=False, log_dir="",
+            ci_max_polls=80, ci_poll_interval=None,
+        )
+        self.assertEqual(
+            issues_mod.issue_flags(ns, True),
+            ["--runner", "claude", "--model", "opus", "--ci-max-polls", "80", "--yes"],
+        )
 
     def test_issue_flags_forwards_phases_and_one_shot(self) -> None:
-        ns = mock.Mock(runner="", model="", thinking="", phases="plan,implement", one_shot=True, log_dir="")
-        self.assertEqual(issues_mod.issue_flags(ns, False), ["--phases", "plan,implement", "--one-shot"])
+        ns = mock.Mock(
+            runner="", model="", thinking="", phases="plan,implement", one_shot=True, log_dir="",
+            ci_max_polls=80, ci_poll_interval=None,
+        )
+        self.assertEqual(
+            issues_mod.issue_flags(ns, False),
+            ["--phases", "plan,implement", "--one-shot", "--ci-max-polls", "80"],
+        )
+
+    def test_issue_flags_forwards_ci_budget_overrides(self) -> None:
+        # A higher --ci-max-polls / custom --ci-poll-interval reach each issue.py run;
+        # this is what keeps a batch's merge gate from expiring before the live suite.
+        ns = mock.Mock(
+            runner="", model="", thinking="", phases="", one_shot=False, log_dir="",
+            ci_max_polls=120, ci_poll_interval=45,
+        )
+        self.assertEqual(
+            issues_mod.issue_flags(ns, False),
+            ["--ci-max-polls", "120", "--ci-poll-interval", "45"],
+        )
+
+    def test_issue_flags_omits_unset_ci_max_polls(self) -> None:
+        # default=None means "don't forward; let issue.py keep its own default".
+        ns = mock.Mock(
+            runner="", model="", thinking="", phases="", one_shot=False, log_dir="",
+            ci_max_polls=None, ci_poll_interval=None,
+        )
+        self.assertEqual(issues_mod.issue_flags(ns, False), [])
 
 
 class RenderAndDryRunTests(unittest.TestCase):
@@ -86,13 +118,16 @@ class BatchExecutionTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             calls,
-            [["15", "--adw-id", "aaaaaaaa", "--yes"], ["16", "--adw-id", "aaaaaaaa", "--yes"]],
+            [
+                ["15", "--adw-id", "aaaaaaaa", "--ci-max-polls", "80", "--yes"],
+                ["16", "--adw-id", "aaaaaaaa", "--ci-max-polls", "80", "--yes"],
+            ],
         )
 
     def test_stops_on_first_failure_by_default(self) -> None:
         code, calls = self._run(["15", "16", "--yes"], lambda a: 1)
         self.assertEqual(code, 1)
-        self.assertEqual(calls, [["15", "--adw-id", "aaaaaaaa", "--yes"]])
+        self.assertEqual(calls, [["15", "--adw-id", "aaaaaaaa", "--ci-max-polls", "80", "--yes"]])
 
     def test_keep_going_continues_past_failure(self) -> None:
         code, calls = self._run(["15", "16", "--yes", "--keep-going"], lambda a: 1)
@@ -108,7 +143,12 @@ class BatchExecutionTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             calls,
-            [["221", "--adw-id", "aaaaaaaa", "--runner", "claude", "--yes", "--", "--dangerously-skip-permissions"]],
+            [
+                [
+                    "221", "--adw-id", "aaaaaaaa", "--runner", "claude",
+                    "--ci-max-polls", "80", "--yes", "--", "--dangerously-skip-permissions",
+                ]
+            ],
         )
 
 
