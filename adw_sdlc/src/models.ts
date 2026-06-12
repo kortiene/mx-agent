@@ -28,9 +28,10 @@ export const PHASE_TIER: Record<string, Tier> = {
  * - claude: exact current Claude IDs (PLAN.md Section 6).
  * - pi: bare model names, matching the Python TIER_MODELS verbatim — pi
  *   accepts them and users override via --model / MX_AGENT_MODEL_<PHASE>.
- * - codex: PROVISIONAL — the plan marks the June-2026 -codex tier ids
- *   [VERIFY]; confirm against the Codex models docs in roadmap step 7
- *   before trusting them in a live run.
+ * - codex: verified current in roadmap step 7 (Codex models endpoint cache
+ *   of 2026-05-31 + the OpenAI pricing docs): gpt-5.4-mini / gpt-5.4 /
+ *   gpt-5.5, all supported_in_api with effort low|medium|high|xhigh. The
+ *   newest generations dropped the `-codex` suffix (last was gpt-5.3-codex).
  * - opencode: provider/model strings; Anthropic models by default.
  */
 export const TIER_MODELS: Record<RunnerId, Record<Tier, string>> = {

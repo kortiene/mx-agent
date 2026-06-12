@@ -44,7 +44,10 @@ export const ENV_DENY_PREFIXES = ['MATRIX_', 'MX_AGENT_'] as const;
  */
 export const RUNNER_ENV_ALLOW: Record<RunnerId, readonly string[]> = {
   claude: ['ANTHROPIC_AUTH_TOKEN'],
-  codex: ['CODEX_API_KEY', 'OPENAI_API_KEY'],
+  // CODEX_BIN mirrors CLAUDE_BIN (binary override); CODEX_HOME lets callers
+  // point the CLI's config/auth dir (default ~/.codex) at a scrubbed
+  // throwaway dir — the residual-surface mitigation of PLAN.md Section 4.4.
+  codex: ['CODEX_API_KEY', 'OPENAI_API_KEY', 'CODEX_BIN', 'CODEX_HOME'],
   opencode: ['OPENAI_API_KEY', 'OPENCODE_SERVER_PASSWORD'],
   pi: ['OPENAI_API_KEY'],
 };

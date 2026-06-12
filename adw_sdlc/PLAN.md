@@ -469,7 +469,7 @@ confirmed on disk (Section 12). `costUsd=no` = token-only (parent computes from 
 | **Structured output** | `outputFormat:{json_schema}` → `result.structured_output` | `TurnOptions.outputSchema` → `JSON.parse(turn.finalResponse)` | **v2** `body.format:{json_schema,retryCount}` → `result.structured` | **none** — prompt-and-parse fenced-JSON + nudge-retry |
 | **Env-control mechanism** | `options.env` replace (verified) — boundary is the SDK's own child | `CodexOptions.env` (no-inherit, verified) — **must always pass** | self-spawn `serve` w/ allowlist env | own subprocess w/ allowlist env + `agentDir`/`authStorage` |
 | **Tool/permission control** | `canUseTool` per-tool veto + `permissionMode` | **coarse** sandbox + `approvalPolicy:'never'` (no per-tool veto) | config `permission` allow/deny (avoid `ask`); event hook | `tools`/`excludeTools`/`createCodingTools`; event-bus hook |
-| **Model/provider** | Claude models (per-call `model` string) | OpenAI/Codex (`model` string + `modelReasoningEffort`) **[VERIFY]** ids | `provider/model` per prompt | any of 40+ providers (`--provider`/`--model`) |
+| **Model/provider** | Claude models (per-call `model` string) | OpenAI/Codex (`model` string + `modelReasoningEffort`; tier ids verified in step 7) | `provider/model` per prompt | any of 40+ providers (`--provider`/`--model`) |
 | **Usage/cost** | `total_cost_usd` + `usage` (**costUsd=yes, nativeBudget=yes** via `maxBudgetUsd`) | token-only `Usage` (**costUsd=no**; `pricing.ts`) | `tokens` + `cost` (**costUsd=yes**) | `SessionStats.cost` (**costUsd=yes**) |
 | **Transcript** | terminal `SDKResultMessage`; stream events to log | `runStreamed()` `ThreadEvent`s → log | v2 `event` SSE → log | `subscribe()` `AgentSessionEvent` bus → log (no return value) |
 | **Resume** | `resume=sessionUUID` | `resumeThread(id)` (`~/.codex/sessions`) | session id | `--session` / SDK session |
@@ -485,9 +485,9 @@ A runner that cannot satisfy a parity line (e.g. codex's no per-tool veto, pi's 
 
 Tiers verified at `adw/_phases.py:55-71`. Per-runner model IDs in `models.ts`; override precedence
 preserved: `--model` > `MX_AGENT_MODEL_<PHASE>` env > tier default. Example tier→model (claude):
-capable=`claude-opus-4-8`, mid=`claude-sonnet-4-6`, cheap=`claude-haiku-4-5`. Codex tier ids **[VERIFY]**
-against developers.openai.com/codex/models (e.g. cheap `gpt-5.4-mini` / mid `gpt-5.4` / capable `gpt-5.5`
-with effort low/medium/high); opencode = `provider/model`; pi = any provider.
+capable=`claude-opus-4-8`, mid=`claude-sonnet-4-6`, cheap=`claude-haiku-4-5`. Codex tier ids verified in
+step 7: cheap `gpt-5.4-mini` / mid `gpt-5.4` / capable `gpt-5.5` (effort low/medium/high/xhigh);
+opencode = `provider/model`; pi = any provider.
 
 | Phase | Driver | Tier | Structured output | Usage/cost | Notes |
 |---|---|---|---|---|---|
@@ -832,6 +832,34 @@ self-spawned-server wrapper), **pi** (in-process SDK; no native schema → fence
    ChatGPT-login mode (HOME); native binary install/preflight; outputSchema JSON-only robustness.
    **Verify:** env-no-inherit asserted **on the SDK-built child env** (catches `apiKey`-routed keys);
    coarse permission limit recorded in `caps`; always-passes-env test.
+   *Landed notes — [VERIFY] resolutions:* tier ids `gpt-5.4-mini`/`gpt-5.4`/`gpt-5.5` confirmed
+   current (Codex models endpoint cache of 2026-05-31, all `supported_in_api`, effort
+   low|medium|high|xhigh; the `-codex` suffix is gone — the last suffixed model is `gpt-5.3-codex`)
+   and priced in `pricing.ts` from the OpenAI pricing docs ($0.75/$4.50, $2.50/$15, $5/$30 per MTok,
+   cache read 0.1×, no cache-write charge). ChatGPT-login mode needs only `HOME` (auth.json under
+   `~/.codex`; `CODEX_HOME` is allowlisted so callers can point it at a scrubbed dir — the Section
+   4.4 residual-surface mitigation); API-key mode rides `CODEX_API_KEY`/`OPENAI_API_KEY` on the
+   allowlist, and the SDK `apiKey` option is deliberately **unused** (it injects `CODEX_API_KEY`
+   into the child env *after* the env override is applied, routing a credential around the
+   allowlist). Binary preflight: the `Codex` constructor resolves the lockstep vendored binary and
+   throws when the platform package is absent — constructed inside `runPhase`'s try, so it surfaces
+   as a failed `PhaseResult` (crashed-CLI parity), never an exception out of the seam. `CODEX_BIN`
+   (allowlist) overrides the binary; there is deliberately **no PATH search** — a PATH `codex` can
+   be any version and would silently break the SDK↔binary lockstep pin. `outputSchema` JSON-only
+   output is documented (`AgentMessageItem.text`: "JSON when structured output is requested") but
+   not contractual → the adapter `JSON.parse`s defensively and the invoker fenced-JSON
+   fallback + single nudge own non-conforming replies. Codex token counts are OpenAI-API-shaped
+   (`input_tokens` *includes* `cached_input_tokens`; `output_tokens` *includes*
+   `reasoning_output_tokens`) and are remapped to the disjoint `PhaseUsage` convention before
+   `pricing.ts` prices them. The secret-withholding test asserts on the **SDK-built child env** by
+   driving the real 0.139.0 SDK over a mocked `child_process.spawn`
+   (`runner-codex-spawn.test.ts`; the SDK is inlined in vitest so the mock applies inside it),
+   alongside the mocked-SDK always-passes-env test and a `new Codex(` must-pass-env tripwire in
+   `scripts/check-adw-sdlc-env.sh`. Live smoke: the vendored binary spawned and streamed JSONL
+   through the adapter end-to-end (thread-id capture + `turn.failed`→failed-result mapping verified
+   live), but the phase itself was blocked by a stale ChatGPT refresh token on the dev machine
+   ("refresh token was already used") — **re-run one live phase after `codex login` before trusting
+   the runner on a real issue.**
 8. **Runner #3 = `opencode` (`runner-opencode.ts`).** `start()` self-spawns
    `opencode serve --port N` with `{cwd, env: allowlist}`, scrape readiness banner, connect the **v2
    client** (`@opencode-ai/sdk/v2`); `session.create` → `session.prompt({...,format:{json_schema,retryCount}})`;
@@ -902,9 +930,9 @@ Every uncertain runner fact is a **[VERIFY]** roadmap step, not an assertion.
 - **codex native binary install footprint** (per-platform `@openai/codex`; offline/air-gapped unverified).
   Mitigated by mocking all SDKs in CI (no native installs) + a documented preflight + a separate
   integration lane. → step 7.
-- **Model-tier mapping is per-runner and heterogeneous** (`claude-*`, `gpt-5.x-codex`, `provider/model`,
-  pi any-provider); the exact codex `-codex` ids for June 2026 are `[likely]` not `[verified]`. Re-confirm
-  before hardcoding tiers. → step 7.
+- **Model-tier mapping is per-runner and heterogeneous** (`claude-*`, `gpt-5.x`, `provider/model`,
+  pi any-provider). The codex tier ids were verified in step 7 (models endpoint + pricing docs);
+  they will still drift with future model launches — the tier table is the single place to bump.
 - **Reimplementation drift** (two separate-language control planes can diverge with no compiler to catch
   it). Mitigated by the single `state.schema.json` tested from both languages + the automated
   cross-language state-equivalence fixture test as a cutover gate. → step 1 + step 11.
@@ -932,9 +960,13 @@ Every uncertain runner fact is a **[VERIFY]** roadmap step, not an assertion.
   there is no retries *option* — only the `error_max_structured_output_retries` result subtype. *(Also
   resolved earlier: env replace-vs-merge = replace; SDK spawns a child;
   `pathToClaudeCodeExecutable`/`executable` need PATH on the allowlist.)*
-- Current codex `-codex` model ids for the cheap/mid/capable tiers, and the minimal env for
-  ChatGPT-login mode? → step 7.
-- Does codex `outputSchema` guarantee JSON-only `finalResponse`, or can prose precede it? → step 7.
+- ~~Current codex `-codex` model ids for the cheap/mid/capable tiers, and the minimal env for
+  ChatGPT-login mode?~~ **Resolved in step 7:** `gpt-5.4-mini`/`gpt-5.4`/`gpt-5.5` (the `-codex`
+  suffix is retired); ChatGPT-login needs only `HOME`, API-key mode rides
+  `CODEX_API_KEY`/`OPENAI_API_KEY` (see the step-7 roadmap entry).
+- ~~Does codex `outputSchema` guarantee JSON-only `finalResponse`, or can prose precede it?~~
+  **Resolved in step 7:** documented as JSON but not contractual — the adapter parses defensively
+  and the invoker fallback/nudge owns non-conforming replies.
 - Does the **v2** opencode prompt route (`@opencode-ai/sdk/v2`) return `.structured` against the pinned
   `^1.17.3`; what is the exact readiness-banner string; are `?directory=`/`x-opencode-directory` honored
   on the v2 prompt route? → step 8.
@@ -942,8 +974,9 @@ Every uncertain runner fact is a **[VERIFY]** roadmap step, not an assertion.
   interact with a non-inheriting env? → step 9. *(Resolved already: pi ships a full in-process SDK with
   `createAgentSession`/`AuthStorage`/`agentDir`; `SessionStats.cost` is native; `prompt()` returns void
   and emits via the event bus; no native schema — no longer "dark / CLI-only".)*
-- Per-runner cost/usage reporting schema and `pricing.ts` coverage for the token-only backends? → steps
-  4/7.
+- Per-runner cost/usage reporting schema and `pricing.ts` coverage for the token-only backends? →
+  steps 4/7. *(Codex covered in step 7: the three tiers are priced; codex counts are remapped to the
+  disjoint PhaseUsage convention before pricing.)*
 - Can transcript/output be streamed from all four runners, or must some be captured post-hoc? → steps
   6–9. *(pi is post-hoc via the event bus.)*
 

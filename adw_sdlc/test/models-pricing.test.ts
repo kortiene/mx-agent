@@ -45,14 +45,26 @@ describe('costUsd', () => {
     expect(cost).toBeCloseTo(0.1 + 0.05 + 0.005, 10);
   });
 
+  it('prices the codex tiers from the table (verified in step 7)', () => {
+    // 100k input + 10k output + 50k cache-read on gpt-5.5 ($5/$30/$0.5 per MTok)
+    const cost = costUsd('gpt-5.5', {
+      inputTokens: 100_000,
+      outputTokens: 10_000,
+      cachedInputTokens: 50_000,
+    });
+    expect(cost).toBeCloseTo(0.5 + 0.3 + 0.025, 10);
+  });
+
   it('returns null for unpriced models and empty usage (non-fatal by design)', () => {
-    expect(costUsd('gpt-5.5', { inputTokens: 1000 })).toBeNull(); // codex absent until step-7 verification
+    expect(costUsd('gpt-99-experimental', { inputTokens: 1000 })).toBeNull();
     expect(costUsd('claude-haiku-4-5', {})).toBeNull();
   });
 
   it('table stays scoped to token-only backends', () => {
     // claude/opencode/pi report cost natively; only the anthropic classify
-    // model (and, post step 7, codex) belong here.
-    expect(Object.keys(PRICES)).toEqual(['claude-haiku-4-5']);
+    // model and the codex tiers (token-only, step 7) belong here.
+    expect(Object.keys(PRICES).sort()).toEqual(
+      ['claude-haiku-4-5', ...Object.values(TIER_MODELS.codex)].sort(),
+    );
   });
 });

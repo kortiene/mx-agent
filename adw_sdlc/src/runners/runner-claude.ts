@@ -40,6 +40,7 @@ import type {
   PhaseUsage,
   RunnerCaps,
 } from '../invoker.js';
+import { abortKind, TIMEOUT_RC } from './shared.js';
 
 /** PLAN.md Section 5, claude column. */
 export const CLAUDE_CAPS: RunnerCaps = {
@@ -66,13 +67,6 @@ export const CLAUDE_EDIT_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash
  * falls through to denyGitGh on every call.
  */
 export const CLAUDE_AUTO_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep'] as const;
-
-/**
- * rc reported when the parent's signal killed the run. The TS invoker keys
- * off PhaseResult.signal, never this number; 124 is kept only so transcripts
- * read like today's `timeout`-wrapped CLI runs (adw/_phases.py:479).
- */
-const TIMEOUT_RC = 124;
 
 /**
  * Best-effort guard for a git/gh invocation at a command position (after ^,
@@ -190,18 +184,6 @@ function asStructured(value: unknown): Record<string, unknown> | null {
     return value as Record<string, unknown>;
   }
   return null;
-}
-
-/**
- * Map the parent's abort reason: the invoker's timer aborts with
- * PHASE_TIMEOUT_ABORT_REASON (invoker.ts), and AbortSignal.timeout() raises a
- * 'TimeoutError' — both contain "timeout"; anything else is a cancel.
- */
-function abortKind(signal: AbortSignal): 'timeout' | 'cancelled' {
-  const reason: unknown = signal.reason;
-  const text =
-    reason instanceof Error ? `${reason.name} ${reason.message}` : String(reason ?? '');
-  return text.toLowerCase().includes('timeout') ? 'timeout' : 'cancelled';
 }
 
 class ClaudeRunner implements AgentRunner {

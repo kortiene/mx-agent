@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
 // Keep this file hermetic (PLAN.md Section 9: every SDK is mocked, optional
-// deps may legitimately be absent): loadRunner('claude') pulls in
-// runner-claude.js, whose static SDK import must not load the real package.
+// deps may legitimately be absent): loadRunner('claude'/'codex') pulls in the
+// adapter modules, whose static SDK imports must not load the real packages.
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: vi.fn() }));
+vi.mock('@openai/codex-sdk', () => ({ Codex: vi.fn() }));
 
 import { AdwError, RunnerNotInstalledError } from '../src/errors.js';
 import { RUNNER_IDS } from '../src/invoker.js';
@@ -41,18 +42,20 @@ describe('resolveRunnerId', () => {
 });
 
 describe('loadRunner', () => {
-  it('loads the claude adapter (shipped in roadmap step 6)', async () => {
-    const runner = await loadRunner('claude');
-    expect(runner.id).toBe('claude');
-    expect(runner.caps.envIsolation).toBe('explicit-no-inherit');
-    expect(typeof runner.runPhase).toBe('function');
+  it('loads the shipped adapters (claude: step 6; codex: step 7)', async () => {
+    for (const id of ['claude', 'codex'] as const) {
+      const runner = await loadRunner(id);
+      expect(runner.id).toBe(id);
+      expect(runner.caps.envIsolation).toBe('explicit-no-inherit');
+      expect(typeof runner.runPhase).toBe('function');
+    }
   });
 
-  // The remaining adapters land in roadmap steps 7-9; until then their ids
+  // The remaining adapters land in roadmap steps 8-9; until then their ids
   // must surface the typed not-installed error — the step-3 verify
   // criterion. When an adapter ships, move its id out of this loop.
   it('surfaces an absent adapter/SDK as RunnerNotInstalledError, not a module-load crash', async () => {
-    for (const id of RUNNER_IDS.filter((candidate) => candidate !== 'claude')) {
+    for (const id of RUNNER_IDS.filter((candidate) => candidate !== 'claude' && candidate !== 'codex')) {
       const err: unknown = await loadRunner(id).then(
         () => null,
         (e: unknown) => e,
