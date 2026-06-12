@@ -1,4 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// Keep this file hermetic (PLAN.md Section 9: every SDK is mocked, optional
+// deps may legitimately be absent): loadRunner('claude') pulls in
+// runner-claude.js, whose static SDK import must not load the real package.
+vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: vi.fn() }));
 
 import { AdwError, RunnerNotInstalledError } from '../src/errors.js';
 import { RUNNER_IDS } from '../src/invoker.js';
@@ -36,11 +41,18 @@ describe('resolveRunnerId', () => {
 });
 
 describe('loadRunner', () => {
-  // No adapter modules exist yet (they land in roadmap steps 6-9), so every
-  // id must surface the typed not-installed error — the step-3 verify
+  it('loads the claude adapter (shipped in roadmap step 6)', async () => {
+    const runner = await loadRunner('claude');
+    expect(runner.id).toBe('claude');
+    expect(runner.caps.envIsolation).toBe('explicit-no-inherit');
+    expect(typeof runner.runPhase).toBe('function');
+  });
+
+  // The remaining adapters land in roadmap steps 7-9; until then their ids
+  // must surface the typed not-installed error — the step-3 verify
   // criterion. When an adapter ships, move its id out of this loop.
   it('surfaces an absent adapter/SDK as RunnerNotInstalledError, not a module-load crash', async () => {
-    for (const id of RUNNER_IDS) {
+    for (const id of RUNNER_IDS.filter((candidate) => candidate !== 'claude')) {
       const err: unknown = await loadRunner(id).then(
         () => null,
         (e: unknown) => e,

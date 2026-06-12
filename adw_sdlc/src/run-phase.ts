@@ -20,6 +20,7 @@ import { join } from 'node:path';
 
 import { parseJson, REPO_ROOT } from './common.js';
 import { AdwError } from './errors.js';
+import { PHASE_TIMEOUT_ABORT_REASON } from './invoker.js';
 import type { AgentRunner, PhaseResult, PhaseUsage } from './invoker.js';
 import { modelForPhase } from './models.js';
 import { composePhasePrompt, type AgentPhase } from './phases.js';
@@ -81,7 +82,9 @@ export async function runAgentPhase<P extends SchemaPhase>(
     const controller = new AbortController();
     const timeoutMs = options.timeoutMs ?? 0;
     const timer =
-      timeoutMs > 0 ? setTimeout(() => controller.abort(new Error('phase timeout')), timeoutMs) : null;
+      timeoutMs > 0
+        ? setTimeout(() => controller.abort(new Error(PHASE_TIMEOUT_ABORT_REASON)), timeoutMs)
+        : null;
     try {
       const request = {
         phase,
