@@ -57,6 +57,31 @@ jobs:
       - name: ADW Python unit tests
         run: python -m unittest discover -s adw -p 'test_*.py'
 
+  adw-sdlc:
+    # Hermetic checks for the TypeScript ADW engine scaffold (adw_sdlc/):
+    # frozen-lockfile install, the env-spread lint gate, typecheck, and the
+    # vitest suite. No network APIs, no keys, no runner binaries are
+    # exercised — runner SDKs are optionalDependencies and tests mock them.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      - name: Env-spread lint gate (runner modules never inherit process.env)
+        run: bash scripts/check-adw-sdlc-env.sh
+      - name: Typecheck
+        run: pnpm --filter adw-sdlc run typecheck
+      - name: Unit tests
+        run: pnpm --filter adw-sdlc run test
+
   rust:
     runs-on: ubuntu-latest
     steps:
