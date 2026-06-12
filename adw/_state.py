@@ -52,6 +52,10 @@ class AdwState:
     """Minimal persistent state connecting phased-run steps."""
 
     adw_id: str
+    # Version of the on-disk state.json contract (adw/state.schema.json). Bump
+    # only on a breaking change; additive fields keep the same version. Files
+    # written before versioning load as 1 via this default.
+    schema_version: int = 1
     issue_number: Optional[str] = None
     issue_class: Optional[str] = None  # feat/fix/docs/chore/...
     branch_name: Optional[str] = None
