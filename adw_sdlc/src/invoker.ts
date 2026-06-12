@@ -17,6 +17,14 @@ export type RunnerId = (typeof RUNNER_IDS)[number];
 /** A JSON Schema document (produced from Zod via `z.toJSONSchema()`). */
 export type JsonSchema = Record<string, unknown>;
 
+/**
+ * Abort-reason message the invoker uses when the per-phase timer fires.
+ * Adapters classify an abort whose reason mentions "timeout" as
+ * `PhaseResult.signal:'timeout'` (vs 'cancelled'); producer, adapters, and
+ * tests all reference this constant so the contract cannot drift silently.
+ */
+export const PHASE_TIMEOUT_ABORT_REASON = 'phase timeout';
+
 /** Tier→effort hint; a runner maps it to its native knob or ignores it. */
 export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high';
 

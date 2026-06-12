@@ -361,8 +361,11 @@ Today the agent **is** an external CLI with full-fs access; it reads and edits t
 Each runner must be granted **equivalent unattended read/edit capability**, or `implement`/`tests`/
 `resolve`/`patch`/`document` become no-ops:
 
-- `claude` — `allowedTools: ["Read","Write","Edit","Glob","Grep","Bash"]`, `permissionMode:"acceptEdits"`
-  (or a `canUseTool` allow/deny callback), `cwd=worktree`.
+- `claude` — `allowedTools: ["Read","Write","Edit","Glob","Grep"]` **plus** a `canUseTool` callback that
+  mediates Bash (denies git/gh, allows the rest) and fails closed on tools outside the grant;
+  `permissionMode:"acceptEdits"`, `cwd=worktree`. Bash is deliberately **not** in `allowedTools`: an
+  allowedTools entry is an allow *rule* that resolves before `canUseTool`, which would make the git/gh
+  veto dead code (verified by live probe in step 6).
 - `codex` — `sandboxMode:"workspace-write"`, `approvalPolicy:"never"`, `workingDirectory=worktree`,
   `skipGitRepoCheck:true`. (Tool control is **coarse** — sandbox + policy only; no per-tool veto.)
 - `opencode` — `config.permission` `{"*":"allow", "bash":{"rm *":"deny", ...}}`; **never** `"ask"`
@@ -808,12 +811,19 @@ self-spawned-server wrapper), **pi** (in-process SDK; no native schema → fence
    shape incl. tool grants + `env`, result mapping); env-isolation (assert `options.env`) + tool-grant
    tests; live smoke on one phase.
    *Landed notes:* `canUseTool` denies Bash git/gh at a command position (best-effort; GH_TOKEN absence
-   stays the load-bearing control) and allows the granted tools; binary resolution ports
+   stays the load-bearing control), allows non-git/gh Bash, and fails closed on tools outside the grant;
+   **Bash is excluded from `allowedTools`** because an allow rule resolves before `canUseTool` — with
+   Bash listed, the veto is dead code (adversarial review caught this; the corrected wiring is verified
+   by a live probe: git denied with the veto's message, benign Bash allowed). Binary resolution ports
    `adw/_exec.py:201-213` but reads the ALLOWLIST env and returns undefined instead of raising when
    nothing resolves (the SDK then uses its built-in executable); a non-abort SDK throw maps to a failed
    `PhaseResult` (rc 1, output kept) mirroring a crashed CLI run, never an exception, so the bounded
-   loops see it exactly as today. Live smoke verified: native `structured_output`, `total_cost_usd`,
-   `session_id`, transcript tee.
+   loops see it exactly as today. An abort that lands after the terminal result still passes
+   `structured_output` through (signal stays 'timeout'/'cancelled'; the invoker owns the parse-first
+   policy); SDK `errors[]` are teed to the transcript file (file only — transcriptText stays
+   assistant-text-only so the trailing-fenced-JSON fallback keeps parsing); the invoker's timeout abort
+   reason is the shared `PHASE_TIMEOUT_ABORT_REASON` constant (invoker.ts). Live smoke verified: native
+   `structured_output`, `total_cost_usd`, `session_id`, transcript tee.
 7. **Runner #2 = `codex` (`runner-codex.ts`).** `new Codex({env: allowlist, apiKey})` →
    `startThread({model, modelReasoningEffort, workingDirectory, sandboxMode:'workspace-write',
    approvalPolicy:'never', skipGitRepoCheck:true})` → `thread.run(prompt, {outputSchema, signal})`;

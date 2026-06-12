@@ -59,6 +59,15 @@ export const CLAUDE_CAPS: RunnerCaps = {
 export const CLAUDE_EDIT_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash'] as const;
 
 /**
+ * Tools auto-allowed via `allowedTools` WITHOUT consulting canUseTool. Bash is
+ * deliberately absent: an allowedTools entry is an allow RULE that resolves
+ * before the canUseTool callback (sdk.d.ts: "auto-allowed without prompting"),
+ * so listing Bash there would make the git/gh veto dead code. Bash instead
+ * falls through to denyGitGh on every call.
+ */
+export const CLAUDE_AUTO_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep'] as const;
+
+/**
  * rc reported when the parent's signal killed the run. The TS invoker keys
  * off PhaseResult.signal, never this number; 124 is kept only so transcripts
  * read like today's `timeout`-wrapped CLI runs (adw/_phases.py:479).
@@ -74,11 +83,20 @@ const TIMEOUT_RC = 124;
 const GIT_GH_COMMAND = /(^|[\n;&|]|\$\(|`)\s*(?:command\s+|builtin\s+|env\s+(?:\w+=\S*\s+)*)?(?:git|gh)\b/;
 
 /**
- * Per-tool veto (caps.perToolHook): auto-allow the granted tools, deny Bash
- * commands that invoke git/gh — the orchestrator owns all git/gh (PLAN.md
- * Section 3.3; mirrors the PHASE_PREAMBLE_SHARED contract).
+ * Per-tool veto (caps.perToolHook), reached for every call NOT covered by an
+ * allow rule — i.e. Bash and anything outside the grant. Denies Bash commands
+ * that invoke git/gh (the orchestrator owns all git/gh, PLAN.md Section 3.3;
+ * mirrors the PHASE_PREAMBLE_SHARED contract) and fails closed on tools
+ * outside CLAUDE_EDIT_TOOLS — matching today's `claude -p`, where a
+ * permission-needing tool with no prompt route is denied.
  */
 export const denyGitGh: CanUseTool = (toolName, input) => {
+  if (!(CLAUDE_EDIT_TOOLS as readonly string[]).includes(toolName)) {
+    return Promise.resolve({
+      behavior: 'deny',
+      message: `Tool '${toolName}' is outside this phase's grant (${CLAUDE_EDIT_TOOLS.join(', ')}).`,
+    });
+  }
   if (toolName === 'Bash') {
     const command = typeof input['command'] === 'string' ? (input['command'] as string) : '';
     if (GIT_GH_COMMAND.test(command)) {
@@ -174,7 +192,11 @@ function asStructured(value: unknown): Record<string, unknown> | null {
   return null;
 }
 
-/** Map the parent's abort reason: only the phase timer says "timeout"; anything else is a cancel. */
+/**
+ * Map the parent's abort reason: the invoker's timer aborts with
+ * PHASE_TIMEOUT_ABORT_REASON (invoker.ts), and AbortSignal.timeout() raises a
+ * 'TimeoutError' — both contain "timeout"; anything else is a cancel.
+ */
 function abortKind(signal: AbortSignal): 'timeout' | 'cancelled' {
   const reason: unknown = signal.reason;
   const text =
@@ -212,7 +234,7 @@ class ClaudeRunner implements AgentRunner {
       // Verbatim allowlist; the SDK passes it to its child as the ENTIRE env.
       env: req.env,
       abortController,
-      allowedTools: [...CLAUDE_EDIT_TOOLS],
+      allowedTools: [...CLAUDE_AUTO_ALLOWED_TOOLS],
       permissionMode: 'acceptEdits',
       canUseTool: denyGitGh,
       // Today's `claude -p` runs with Claude Code's default system prompt and
@@ -278,6 +300,11 @@ class ClaudeRunner implements AgentRunner {
     // every other error subtype (error_during_execution, error_max_turns,
     // error_max_structured_output_retries) stays 'none' so the invoker's
     // single nudge-retry applies exactly as to a failed CLI run.
+    // The SDK's failure reasons go to the transcript FILE only: appending them
+    // to transcriptText would break the trailing-fenced-JSON fallback parse
+    // when the assistant did finish its reply before the error.
+    const reasons = Array.isArray(result.errors) ? result.errors.join('\n') : '';
+    tee(`\n[claude result ${result.subtype}] ${reasons}\n`);
     return {
       ok: false,
       structured: null,
@@ -297,7 +324,15 @@ class ClaudeRunner implements AgentRunner {
   ): PhaseResult {
     return {
       ok: false,
-      structured: null,
+      // A terminal success result that arrived before the abort/teardown error
+      // still carries the agent's structured payload; pass it through so the
+      // invoker's parse-first semantics (run-phase.ts, mirroring
+      // adw/_phases.py:507-513) can accept a completed run — the signal still
+      // reports the abort and the invoker stays the policy owner.
+      structured:
+        result !== undefined && result.subtype === 'success'
+          ? asStructured(result.structured_output)
+          : null,
       transcriptText,
       usage: result !== undefined ? usageOf(result) : {},
       rc,

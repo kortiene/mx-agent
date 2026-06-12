@@ -20,10 +20,11 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 
 import { safeSubprocessEnv } from '../src/env.js';
+import { PHASE_TIMEOUT_ABORT_REASON } from '../src/invoker.js';
 import type { AgentRunner, PhaseRequest } from '../src/invoker.js';
 import {
+  CLAUDE_AUTO_ALLOWED_TOOLS,
   CLAUDE_CAPS,
-  CLAUDE_EDIT_TOOLS,
   createRunner,
   denyGitGh,
   resolveClaudeBin,
@@ -127,7 +128,10 @@ describe('request shape', () => {
     expect(options.env).toBe(req.env);
     expect(options.cwd).toBe(req.cwd);
     expect(options.model).toBe('claude-opus-4-8');
-    expect(options.allowedTools).toEqual([...CLAUDE_EDIT_TOOLS]);
+    expect(options.allowedTools).toEqual([...CLAUDE_AUTO_ALLOWED_TOOLS]);
+    // An allowedTools entry is an allow rule that resolves BEFORE canUseTool;
+    // Bash must stay out of it or the git/gh veto becomes dead code.
+    expect(options.allowedTools).not.toContain('Bash');
     expect(options.permissionMode).toBe('acceptEdits');
     expect(typeof options.canUseTool).toBe('function');
     expect(options.systemPrompt).toEqual({ type: 'preset', preset: 'claude_code' });
@@ -212,11 +216,23 @@ describe('result mapping', () => {
     expect(result.sessionId).toBe('sess-1');
   });
 
-  it('tees assistant text to the transcript file as it streams', async () => {
-    scriptedQuery([assistantMsg('first'), assistantMsg('second'), successResult()]);
+  it('tees assistant text to the transcript file as it streams, not at the end', async () => {
     const req = makeReq();
+    let midStream = '';
+    queryMock.mockImplementation(
+      () =>
+        (async function* () {
+          yield assistantMsg('first') as never;
+          // Observed between yields: the tee must already have flushed
+          // (invoker.ts: "adapters tee output here during the run").
+          midStream = readFileSync(req.transcriptPath, 'utf8');
+          yield assistantMsg('second') as never;
+          yield successResult() as never;
+        })() as never,
+    );
     const result = await runner.runPhase(req);
 
+    expect(midStream).toBe('first\n');
     expect(result.transcriptText).toBe('first\nsecond\n');
     expect(readFileSync(req.transcriptPath, 'utf8')).toBe('first\nsecond\n');
   });
@@ -237,6 +253,48 @@ describe('result mapping', () => {
     expect(result.ok).toBe(false);
     expect(result.rc).not.toBe(0);
     expect(result.signal).toBe('budget');
+    // The failed attempt's spend still reaches mergeUsage and resume.
+    expect(result.usage).toEqual({
+      inputTokens: 100,
+      outputTokens: 50,
+      cachedInputTokens: 10,
+      costUsd: 0.42,
+    });
+    expect(result.sessionId).toBe('sess-1');
+  });
+
+  it('reports a success-subtype result with is_error true as a failed run', async () => {
+    scriptedQuery([successResult({ is_error: true })]);
+    const result = await runner.runPhase(makeReq());
+
+    expect(result.ok).toBe(false);
+    expect(result.rc).toBe(1);
+    expect(result.signal).toBe('none');
+  });
+
+  it('normalizes non-object structured_output to null (seam contract)', async () => {
+    for (const payload of [[1, 2], 'a string', 7, true]) {
+      queryMock.mockReset();
+      scriptedQuery([successResult({ structured_output: payload })]);
+      const result = await runner.runPhase(makeReq());
+      expect(result.structured, JSON.stringify(payload)).toBeNull();
+    }
+    queryMock.mockReset();
+    scriptedQuery([successResult()]); // structured_output absent
+    expect((await runner.runPhase(makeReq())).structured).toBeNull();
+  });
+
+  it('tees the error subtype and SDK failure reasons to the transcript file only', async () => {
+    scriptedQuery([assistantMsg('tried things'), errorResult('error_during_execution')]);
+    const req = makeReq();
+    const result = await runner.runPhase(req);
+
+    expect(readFileSync(req.transcriptPath, 'utf8')).toContain(
+      '[claude result error_during_execution] boom',
+    );
+    // transcriptText stays assistant-text-only so a trailing fenced JSON
+    // block, when present, still parses in the invoker fallback.
+    expect(result.transcriptText).toBe('tried things\n');
   });
 
   it("maps schema-retry exhaustion to a plain failure (signal 'none' → invoker nudges)", async () => {
@@ -287,7 +345,8 @@ describe('timeout / cancellation', () => {
       () =>
         (async function* () {
           yield assistantMsg('working') as never;
-          controller.abort(new Error('phase timeout'));
+          // The real producer string (run-phase.ts) — drift breaks this test.
+          controller.abort(new Error(PHASE_TIMEOUT_ABORT_REASON));
           throw new Error('This operation was aborted');
         })() as never,
     );
@@ -298,6 +357,40 @@ describe('timeout / cancellation', () => {
     expect(result.rc).toBe(124);
     expect(result.ok).toBe(false);
     expect(result.transcriptText).toBe('working\n');
+  });
+
+  it("maps an abort observed after a clean stream end (no result) to 'timeout', never success", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error(PHASE_TIMEOUT_ABORT_REASON));
+    // The mocked stream ignores the abort and ends cleanly without a result:
+    // the post-loop signal check must still report the timeout.
+    scriptedQuery([assistantMsg('working')]);
+    const result = await runner.runPhase(makeReq({ signal: controller.signal }));
+
+    expect(result.ok).toBe(false);
+    expect(result.rc).toBe(124);
+    expect(result.signal).toBe('timeout');
+    expect(result.structured).toBeNull();
+  });
+
+  it('keeps the structured payload when the abort lands after the terminal result (parse-first parity)', async () => {
+    const controller = new AbortController();
+    queryMock.mockImplementation(
+      () =>
+        (async function* () {
+          yield successResult({ structured_output: { done: true } }) as never;
+          controller.abort(new Error(PHASE_TIMEOUT_ABORT_REASON));
+        })() as never,
+    );
+    const result = await runner.runPhase(makeReq({ signal: controller.signal }));
+
+    // The abort is still reported — the invoker owns the parse-first policy
+    // (run-phase.ts extracts before consulting signal, like adw/_phases.py).
+    expect(result.signal).toBe('timeout');
+    expect(result.ok).toBe(false);
+    expect(result.structured).toEqual({ done: true });
+    expect(result.usage.costUsd).toBe(0.42);
+    expect(result.sessionId).toBe('sess-1');
   });
 
   it("maps a non-timeout abort to signal 'cancelled'", async () => {
@@ -359,6 +452,16 @@ describe('denyGitGh (caps.perToolHook)', () => {
       }
     }
   });
+
+  it('fails closed on tools outside the grant (the prompt path must not widen it)', async () => {
+    for (const tool of ['WebSearch', 'WebFetch', 'NotebookEdit']) {
+      const verdict = await denyGitGh(tool, {}, { signal: new AbortController().signal, toolUseID: 't1' });
+      expect(verdict.behavior, tool).toBe('deny');
+      if (verdict.behavior === 'deny') {
+        expect(verdict.message).toContain('outside this phase');
+      }
+    }
+  });
 });
 
 describe('resolveClaudeBin (adw/_exec.py:201-213 parity)', () => {
@@ -378,6 +481,19 @@ describe('resolveClaudeBin (adw/_exec.py:201-213 parity)', () => {
     const bin = join(local, 'claude');
     writeFileSync(bin, '#!/bin/sh\n', { mode: 0o755 });
     expect(resolveClaudeBin({ PATH: join(tmp, 'bin'), HOME: join(tmp, 'home') })).toBe(bin);
+  });
+
+  it('finds ~/.local/bin/claude alone, and prefers ~/.claude/local when both exist', () => {
+    // Same candidate list and order as adw/_exec.py:210.
+    const second = join(tmp, 'home', '.local', 'bin', 'claude');
+    mkdirSync(join(tmp, 'home', '.local', 'bin'), { recursive: true });
+    writeFileSync(second, '#!/bin/sh\n', { mode: 0o755 });
+    expect(resolveClaudeBin({ PATH: join(tmp, 'bin'), HOME: join(tmp, 'home') })).toBe(second);
+
+    const first = join(tmp, 'home', '.claude', 'local', 'claude');
+    mkdirSync(join(tmp, 'home', '.claude', 'local'), { recursive: true });
+    writeFileSync(first, '#!/bin/sh\n', { mode: 0o755 });
+    expect(resolveClaudeBin({ PATH: join(tmp, 'bin'), HOME: join(tmp, 'home') })).toBe(first);
   });
 
   it('returns undefined when nothing resolves (SDK falls back to its built-in)', () => {

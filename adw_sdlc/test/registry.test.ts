@@ -1,4 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// Keep this file hermetic (PLAN.md Section 9: every SDK is mocked, optional
+// deps may legitimately be absent): loadRunner('claude') pulls in
+// runner-claude.js, whose static SDK import must not load the real package.
+vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: vi.fn() }));
 
 import { AdwError, RunnerNotInstalledError } from '../src/errors.js';
 import { RUNNER_IDS } from '../src/invoker.js';
