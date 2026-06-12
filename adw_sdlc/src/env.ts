@@ -60,7 +60,22 @@ export const RUNNER_ENV_ALLOW: Record<RunnerId, readonly string[]> = {
     'OPENCODE_BIN',
     'XDG_DATA_HOME',
   ],
-  pi: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'PI_BIN', 'PI_MODEL', 'PI_THINKING'],
+  // PI_BIN mirrors CLAUDE_BIN/CODEX_BIN (binary override); PI_MODEL and
+  // PI_THINKING are carried for Python-allowlist parity (the Python CLI layer
+  // reads them as flag defaults, adw/issue.py:93-97). PI_CODING_AGENT_DIR /
+  // PI_CODING_AGENT_SESSION_DIR let callers point pi's config/auth dir
+  // (default ~/.pi/agent, incl. auth.json) and session store at scrubbed
+  // throwaway dirs — the residual-surface mitigation of PLAN.md Section 4.4,
+  // like CODEX_HOME and opencode's XDG_DATA_HOME.
+  pi: [
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'PI_BIN',
+    'PI_MODEL',
+    'PI_THINKING',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ],
 };
 
 export interface SafeEnvOptions {
