@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
-    "lint:env": "bash ../scripts/check-adw-sdlc-env.sh"
+    "lint:env": "bash ../scripts/check-adw-sdlc-env.sh",
+    "issue": "tsx src/cli.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
