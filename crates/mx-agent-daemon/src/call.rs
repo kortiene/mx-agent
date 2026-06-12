@@ -514,6 +514,17 @@ async fn start_call_matrix_inner(
         .min_by(|a, b| a.agent_id.cmp(&b.agent_id))
         .ok_or_else(|| "local agent is not registered in the target room".to_string())?;
 
+    // Resolve the executing agent's Matrix user id so the response is pinned to
+    // it: a `call.response` from any other room member can never satisfy the
+    // wait, even if it carries the right `request_id` (issue #304). Fail closed
+    // when the target agent is not registered in the room. Resolved before the
+    // request is built so the (moved) `target_agent` is still borrowable here.
+    let expected_sender = crate::agent::read_agent_state(&room, &target_agent)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("target agent {target_agent:?} is not registered in the room"))?
+        .matrix_user_id;
+
     let signing = load_or_create_signing_key(&paths).map_err(|e| e.to_string())?;
     let nonce = mx_agent_protocol::id::generate_request_id();
     let created_at = crate::exec_ipc::rfc3339_after(Duration::ZERO);
@@ -534,16 +545,31 @@ async fn start_call_matrix_inner(
         },
     )
     .map_err(|e| e.to_string())?;
+
     room.send_raw(CALL_REQUEST, content)
         .await
         .map_err(|e| e.to_string())?;
 
-    wait_for_call_response(&client, request_id, Duration::from_secs(60)).await
+    wait_for_call_response(
+        &client,
+        request_id,
+        &expected_sender,
+        Duration::from_secs(60),
+    )
+    .await
 }
 
+/// Wait for the `com.mxagent.call.response.v1` matching `request_id`, accepting
+/// it only when its Matrix sender equals `expected_sender`.
+///
+/// Sender pinning (issue #304): a response whose `sender` is not the resolved
+/// executing agent is skipped before the `request_id` match, so a forged
+/// response from another room member cannot resolve the call. The pin mirrors
+/// the request plane, which already verifies the requester's identity.
 async fn wait_for_call_response(
     client: &matrix_sdk::Client,
     request_id: &str,
+    expected_sender: &str,
     timeout: Duration,
 ) -> Result<CallResponse, String> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -558,11 +584,23 @@ async fn wait_for_call_response(
             .await
             .map_err(|e| e.to_string())?;
         for event in crate::event_router::events_from_sync_response(&response) {
-            if event.event_type == CALL_RESPONSE {
-                if let Ok(response) = serde_json::from_value::<CallResponse>(event.content) {
-                    if response.request_id == request_id {
-                        return Ok(response);
-                    }
+            if event.event_type != CALL_RESPONSE {
+                continue;
+            }
+            // Deny-by-default: drop a response from an unexpected sender before
+            // matching the request id. Log only non-sensitive metadata.
+            if event.sender != expected_sender {
+                tracing::debug!(
+                    sender = %event.sender,
+                    request_id = %request_id,
+                    reason = "untrusted_sender",
+                    "dropping call.response from a non-executing sender"
+                );
+                continue;
+            }
+            if let Ok(response) = serde_json::from_value::<CallResponse>(event.content) {
+                if response.request_id == request_id {
+                    return Ok(response);
                 }
             }
         }

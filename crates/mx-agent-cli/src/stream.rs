@@ -1099,4 +1099,92 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert!(missing.is_empty());
     }
+
+    #[test]
+    fn non_strict_mode_ignores_sha256_mismatch() {
+        // In default (non-strict) mode a chunk with a mismatched sha256 is
+        // tolerated: output still renders and integrity_failure is NOT set.
+        // This guards the boundary between strict and default behaviour (issue
+        // #304): strict mode is the only path that raises an integrity failure
+        // for a bad digest.
+        let mut bad = chunk_seq(StreamKind::Stdout, 0, "utf-8", "hello\n", false);
+        bad.sha256 = Some("AAAA_wrong_digest".to_string());
+        let frames = vec![
+            StreamFrame::Chunk(bad),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert!(
+            !outcome.integrity_failure,
+            "non-strict must not flag a digest mismatch as an integrity failure"
+        );
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(String::from_utf8(out).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn strict_mode_accepts_matching_sha256_on_base64_chunk() {
+        // The sha256 digest must cover the **decoded** bytes, not the base64
+        // string. The CLI decodes the payload before hashing; this test verifies
+        // that a producer-populated digest over the raw bytes passes (issue #304).
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let raw = [0xde, 0xad, 0xbe, 0xef];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(raw));
+        let config = RenderConfig {
+            strict: true,
+            ..Default::default()
+        };
+        let mut good = chunk_seq(StreamKind::Stdout, 0, "base64", &b64, false);
+        good.sha256 = Some(digest);
+        let frames = vec![
+            StreamFrame::Chunk(good),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream_with(frames, config, &mut out, &mut err).unwrap();
+        assert!(
+            !outcome.integrity_failure,
+            "a matching base64 chunk digest must pass strict validation"
+        );
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn strict_mode_fails_on_sha256_mismatch_for_base64_chunk() {
+        // A base64 chunk whose declared sha256 covers the encoded string (not the
+        // decoded bytes) must fail strict validation — producer and consumer must
+        // agree that the digest covers the decoded bytes (issue #304).
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let raw = [0xde, 0xad, 0xbe, 0xef];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        // Wrong: digest of the base64 string, not the decoded bytes.
+        let wrong_digest =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(b64.as_bytes()));
+        let config = RenderConfig {
+            strict: true,
+            ..Default::default()
+        };
+        let mut bad = chunk_seq(StreamKind::Stdout, 0, "base64", &b64, false);
+        bad.sha256 = Some(wrong_digest);
+        let frames = vec![
+            StreamFrame::Chunk(bad),
+            StreamFrame::Finished(finished(Some(0), None)),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream_with(frames, config, &mut out, &mut err).unwrap();
+        assert!(
+            outcome.integrity_failure,
+            "a digest over the base64 string (not decoded bytes) must fail"
+        );
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("sha256 digest mismatch"));
+    }
 }

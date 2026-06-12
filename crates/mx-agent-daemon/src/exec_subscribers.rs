@@ -10,6 +10,14 @@
 //! The registry is deliberately in-memory. A disconnected CLI is removed and
 //! misses future live stream events, which matches normal terminal stream
 //! semantics and avoids persisting potentially sensitive output payloads.
+//!
+//! Each subscription is **pinned to the executing agent's Matrix user id**
+//! ([`ExecSubscriberRegistry::subscribe`]'s `expected_sender`). A routed result
+//! event is forwarded only when its Matrix sender matches that pin, so a forged
+//! `stream.chunk` / `exec.finished` / `call.response` published by any other
+//! room member is dropped before it reaches a waiting consumer (architecture
+//! §1.2, §13; issue #304). The result plane therefore never trusts mere room
+//! presence — the same deny-by-default stance the request plane already takes.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -70,12 +78,20 @@ pub struct ForwardStats {
     pub delivered: usize,
     /// Number of disconnected subscribers pruned while publishing.
     pub pruned: usize,
+    /// Number of subscribers the event was withheld from because its Matrix
+    /// sender did not match the subscriber's pinned executing agent (a forged or
+    /// foreign result event — see [`ExecSubscriberRegistry::publish`]).
+    pub filtered: usize,
 }
 
 #[derive(Debug)]
 struct Subscriber {
     id: u64,
-    sender: mpsc::UnboundedSender<ForwardedExecEvent>,
+    /// Matrix user id of the agent this subscription expects results from. The
+    /// dispatcher resolves this from the target agent's `matrix_user_id` before
+    /// subscribing; only events whose `sender` equals it are delivered.
+    expected_sender: String,
+    tx: mpsc::UnboundedSender<ForwardedExecEvent>,
 }
 
 #[derive(Debug, Default)]
@@ -96,14 +112,21 @@ impl ExecSubscriberRegistry {
         Self::default()
     }
 
-    /// Subscribe to events for `key`.
+    /// Subscribe to events for `key`, pinned to `expected_sender`.
+    ///
+    /// `expected_sender` is the Matrix user id of the agent the dispatcher
+    /// targeted (resolved from its `matrix_user_id`). [`publish`](Self::publish)
+    /// delivers an event only when its Matrix sender equals this value, so a
+    /// result/stream event forged by any other room member is dropped before it
+    /// reaches the waiting consumer — room membership is never execution
+    /// permission (architecture §1.2, §13).
     ///
     /// The returned [`ExecSubscription`] is a lease: dropping it unregisters the
     /// subscriber. Receivers are unbounded because producers are the daemon sync
     /// loop and consumers are local IPC writers; disconnected or lagging
     /// receivers are pruned on the next publish/drop.
-    pub fn subscribe(&self, key: ExecSubscriptionKey) -> ExecSubscription {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    pub fn subscribe(&self, key: ExecSubscriptionKey, expected_sender: String) -> ExecSubscription {
+        let (tx, receiver) = mpsc::unbounded_channel();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let id = inner.next_id;
         inner.next_id = inner.next_id.saturating_add(1);
@@ -111,7 +134,11 @@ impl ExecSubscriberRegistry {
             .subscribers
             .entry(key.clone())
             .or_default()
-            .push(Subscriber { id, sender });
+            .push(Subscriber {
+                id,
+                expected_sender,
+                tx,
+            });
         ExecSubscription {
             key,
             id,
@@ -120,11 +147,16 @@ impl ExecSubscriberRegistry {
         }
     }
 
-    /// Publish `event` to all subscribers with the event's key.
+    /// Publish `event` (sent by Matrix user `sender`) to its subscribers.
     ///
-    /// Disconnected subscribers are removed. Payload contents are not logged;
-    /// callers may log only the returned counts and key/category metadata.
-    pub fn publish(&self, event: ForwardedExecEvent) -> ForwardStats {
+    /// Deny-by-default sender pinning: the event is delivered only to subscribers
+    /// whose pinned `expected_sender` equals `sender`. A mismatch is counted as
+    /// [`ForwardStats::filtered`] and the subscriber is retained (the legitimate
+    /// executor's event may still arrive) — a forged result from a non-executing
+    /// member can never satisfy a waiting consumer. Disconnected subscribers are
+    /// removed. Payload contents are not logged; callers may log only the
+    /// returned counts and key/category metadata.
+    pub fn publish(&self, event: ForwardedExecEvent, sender: &str) -> ForwardStats {
         let key = event.key();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(list) = inner.subscribers.get_mut(&key) else {
@@ -132,14 +164,20 @@ impl ExecSubscriberRegistry {
         };
 
         let mut stats = ForwardStats::default();
-        list.retain(|sub| match sub.sender.send(event.clone()) {
-            Ok(()) => {
-                stats.delivered += 1;
-                true
+        list.retain(|sub| {
+            if sub.expected_sender != sender {
+                stats.filtered += 1;
+                return true;
             }
-            Err(_) => {
-                stats.pruned += 1;
-                false
+            match sub.tx.send(event.clone()) {
+                Ok(()) => {
+                    stats.delivered += 1;
+                    true
+                }
+                Err(_) => {
+                    stats.pruned += 1;
+                    false
+                }
             }
         });
         if list.is_empty() {
@@ -227,14 +265,59 @@ mod tests {
         })
     }
 
+    const EXEC: &str = "@exec:hs";
+    const MEMBER: &str = "@member:hs";
+
+    fn cancelled(invocation_id: &str) -> ForwardedExecEvent {
+        ForwardedExecEvent::ExecCancelled(ExecCancelled {
+            invocation_id: invocation_id.to_string(),
+            signal_sent: "SIGTERM".to_string(),
+            killed_process_group: false,
+            finished_at: "2026-06-06T00:00:00Z".to_string(),
+            extra: Extra::default(),
+        })
+    }
+
+    fn rejected(invocation_id: &str) -> ForwardedExecEvent {
+        ForwardedExecEvent::ExecRejected(ExecRejected {
+            invocation_id: invocation_id.to_string(),
+            reason: "policy_denied".to_string(),
+            extra: Extra::default(),
+        })
+    }
+
+    fn artifact(invocation_id: &str) -> ForwardedExecEvent {
+        ForwardedExecEvent::StreamArtifact(StreamArtifact {
+            invocation_id: invocation_id.to_string(),
+            stream: StreamKind::Stdout,
+            name: "stdout.log".to_string(),
+            mime_type: "text/plain".to_string(),
+            size_bytes: 0,
+            sha256: String::new(),
+            mxc_uri: "mxc://s/a".to_string(),
+            tail_preview: String::new(),
+            extra: Extra::default(),
+        })
+    }
+
+    fn call_response(request_id: &str) -> ForwardedExecEvent {
+        ForwardedExecEvent::CallResponse(CallResponse {
+            request_id: request_id.to_string(),
+            ok: true,
+            result: None,
+            error: None,
+            extra: Extra::default(),
+        })
+    }
+
     #[test]
     fn subscribe_publish_and_drop_cleans_up() {
         let registry = ExecSubscriberRegistry::new();
         let key = ExecSubscriptionKey::Invocation("inv_1".to_string());
-        let mut sub = registry.subscribe(key.clone());
+        let mut sub = registry.subscribe(key.clone(), EXEC.to_string());
         assert_eq!(registry.subscriber_count(&key), 1);
 
-        let stats = registry.publish(chunk("inv_1", 0, StreamKind::Stdout));
+        let stats = registry.publish(chunk("inv_1", 0, StreamKind::Stdout), EXEC);
         assert_eq!(stats.delivered, 1);
         assert_eq!(stats.pruned, 0);
         assert!(matches!(
@@ -250,10 +333,16 @@ mod tests {
     #[test]
     fn publish_only_delivers_to_matching_invocation() {
         let registry = ExecSubscriberRegistry::new();
-        let mut wanted = registry.subscribe(ExecSubscriptionKey::Invocation("inv_1".to_string()));
-        let mut other = registry.subscribe(ExecSubscriptionKey::Invocation("inv_2".to_string()));
+        let mut wanted = registry.subscribe(
+            ExecSubscriptionKey::Invocation("inv_1".to_string()),
+            EXEC.to_string(),
+        );
+        let mut other = registry.subscribe(
+            ExecSubscriptionKey::Invocation("inv_2".to_string()),
+            EXEC.to_string(),
+        );
 
-        let stats = registry.publish(chunk("inv_1", 0, StreamKind::Stderr));
+        let stats = registry.publish(chunk("inv_1", 0, StreamKind::Stderr), EXEC);
         assert_eq!(stats.delivered, 1);
         assert!(wanted.try_recv().is_ok());
         assert!(matches!(
@@ -263,13 +352,65 @@ mod tests {
     }
 
     #[test]
+    fn publish_drops_events_from_an_unexpected_sender() {
+        // A forged result event whose Matrix sender is not the pinned executing
+        // agent must never reach the waiting consumer (issue #304): it is counted
+        // as filtered, the subscription survives, and a later legitimate event
+        // from the real executor is still delivered.
+        let registry = ExecSubscriberRegistry::new();
+        let key = ExecSubscriptionKey::Invocation("inv_1".to_string());
+        let mut sub = registry.subscribe(key.clone(), EXEC.to_string());
+
+        let forged = registry.publish(chunk("inv_1", 0, StreamKind::Stdout), MEMBER);
+        assert_eq!(forged.delivered, 0);
+        assert_eq!(forged.filtered, 1);
+        assert!(matches!(
+            sub.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        // The subscription is retained so the real executor can still resolve it.
+        assert_eq!(registry.subscriber_count(&key), 1);
+
+        let legit = registry.publish(chunk("inv_1", 1, StreamKind::Stdout), EXEC);
+        assert_eq!(legit.delivered, 1);
+        assert!(sub.try_recv().is_ok());
+    }
+
+    #[test]
+    fn publish_drops_forged_terminal_finished_event() {
+        // A faked exec.finished (e.g. a forged exit status) from a non-executing
+        // member must not be delivered as the invocation's terminal frame.
+        let registry = ExecSubscriberRegistry::new();
+        let key = ExecSubscriptionKey::Invocation("inv_1".to_string());
+        let mut sub = registry.subscribe(key.clone(), EXEC.to_string());
+        let finished = ForwardedExecEvent::ExecFinished(ExecFinished {
+            invocation_id: "inv_1".to_string(),
+            exit_code: Some(0),
+            signal: None,
+            duration_ms: 1,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            truncated: false,
+            artifact_mxc: None,
+            extra: Extra::default(),
+        });
+        let stats = registry.publish(finished, MEMBER);
+        assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.filtered, 1);
+        assert!(matches!(
+            sub.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
     fn disconnected_subscribers_are_pruned_on_publish() {
         let registry = ExecSubscriberRegistry::new();
         let key = ExecSubscriptionKey::Invocation("inv_1".to_string());
-        let mut sub = registry.subscribe(key.clone());
+        let mut sub = registry.subscribe(key.clone(), EXEC.to_string());
         sub.receiver.close();
 
-        let stats = registry.publish(chunk("inv_1", 0, StreamKind::Stdout));
+        let stats = registry.publish(chunk("inv_1", 0, StreamKind::Stdout), EXEC);
         assert_eq!(stats.delivered, 0);
         assert_eq!(stats.pruned, 1);
         assert_eq!(registry.subscriber_count(&key), 0);
@@ -307,5 +448,112 @@ mod tests {
             finished.key(),
             ExecSubscriptionKey::Invocation("inv_1".to_string())
         );
+    }
+
+    #[test]
+    fn publish_drops_forged_exec_cancelled_from_unexpected_sender() {
+        // A faked exec.cancelled from a non-executing room member must be dropped
+        // before reaching a waiting subscriber (issue #304).
+        let registry = ExecSubscriberRegistry::new();
+        let key = ExecSubscriptionKey::Invocation("inv_1".to_string());
+        let mut sub = registry.subscribe(key.clone(), EXEC.to_string());
+        let stats = registry.publish(cancelled("inv_1"), MEMBER);
+        assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.filtered, 1);
+        assert!(matches!(
+            sub.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        // Subscription retained for the legitimate executor.
+        assert_eq!(registry.subscriber_count(&key), 1);
+    }
+
+    #[test]
+    fn publish_drops_forged_exec_rejected_from_unexpected_sender() {
+        // A faked exec.rejected (e.g. a forged policy denial) from a non-executing
+        // member must not be delivered — a subscriber must not terminate believing
+        // the exec was rejected when it was not (issue #304).
+        let registry = ExecSubscriberRegistry::new();
+        let key = ExecSubscriptionKey::Invocation("inv_1".to_string());
+        let mut sub = registry.subscribe(key.clone(), EXEC.to_string());
+        let stats = registry.publish(rejected("inv_1"), MEMBER);
+        assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.filtered, 1);
+        assert!(matches!(
+            sub.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn publish_drops_forged_stream_artifact_from_unexpected_sender() {
+        // A forged stream.artifact from a non-executing member (a shadowed artifact
+        // announcement) must be dropped; only the legitimate executor's artifact
+        // notification is delivered (issue #304).
+        let registry = ExecSubscriberRegistry::new();
+        let key = ExecSubscriptionKey::Invocation("inv_1".to_string());
+        let mut sub = registry.subscribe(key.clone(), EXEC.to_string());
+        let stats = registry.publish(artifact("inv_1"), MEMBER);
+        assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.filtered, 1);
+        assert!(matches!(
+            sub.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        // Legitimate artifact from the executing agent is still delivered.
+        let legit = registry.publish(artifact("inv_1"), EXEC);
+        assert_eq!(legit.delivered, 1);
+        assert!(matches!(
+            sub.try_recv(),
+            Ok(ForwardedExecEvent::StreamArtifact(_))
+        ));
+    }
+
+    #[test]
+    fn publish_drops_forged_call_response_from_unexpected_sender() {
+        // A forged call.response from a non-executing member must be filtered out
+        // before reaching the waiting subscriber: room membership does not confer
+        // the right to resolve a call (issue #304).
+        let registry = ExecSubscriberRegistry::new();
+        let key = ExecSubscriptionKey::Request("req_1".to_string());
+        let mut sub = registry.subscribe(key.clone(), EXEC.to_string());
+        let forged = registry.publish(call_response("req_1"), MEMBER);
+        assert_eq!(forged.delivered, 0);
+        assert_eq!(forged.filtered, 1);
+        assert!(matches!(
+            sub.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        // The subscription is retained so the legitimate executor's response can
+        // still arrive later.
+        assert_eq!(registry.subscriber_count(&key), 1);
+        let legit = registry.publish(call_response("req_1"), EXEC);
+        assert_eq!(legit.delivered, 1);
+        assert!(matches!(
+            sub.try_recv(),
+            Ok(ForwardedExecEvent::CallResponse(_))
+        ));
+    }
+
+    #[test]
+    fn publish_selective_delivery_with_different_expected_senders() {
+        // Two subscribers on the same key but pinned to different executing agents:
+        // an event from EXEC is delivered only to the EXEC-pinned subscriber and
+        // filtered for the MEMBER-pinned one. This verifies sender pinning is
+        // per-subscriber, not per-key (issue #304).
+        let registry = ExecSubscriberRegistry::new();
+        let key = ExecSubscriptionKey::Invocation("inv_1".to_string());
+        let mut sub_exec = registry.subscribe(key.clone(), EXEC.to_string());
+        let mut sub_member = registry.subscribe(key.clone(), MEMBER.to_string());
+        assert_eq!(registry.subscriber_count(&key), 2);
+
+        let stats = registry.publish(chunk("inv_1", 0, StreamKind::Stdout), EXEC);
+        assert_eq!(stats.delivered, 1);
+        assert_eq!(stats.filtered, 1);
+        assert!(sub_exec.try_recv().is_ok());
+        assert!(matches!(
+            sub_member.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

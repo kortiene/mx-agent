@@ -121,6 +121,14 @@ pub struct FetchContextOptions {
     /// Maximum number of recent timeline events to scan when locating the
     /// share.
     pub limit: u32,
+    /// Matrix user id of the agent expected to have produced the share. Shares
+    /// are not invocation-linked, so when this is `None` (the default)
+    /// [`fetch_context`] accepts a share only if every event carrying the
+    /// `context_id` comes from the *same* sender; two senders for one
+    /// `context_id` is an ambiguous shadowing attempt and is rejected. Set it to
+    /// pin the producer explicitly and resolve such collisions (issue #304).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sender: Option<String>,
 }
 
 impl Default for FetchContextOptions {
@@ -129,6 +137,7 @@ impl Default for FetchContextOptions {
             room: String::new(),
             context_id: String::new(),
             limit: DEFAULT_FETCH_SCAN_LIMIT,
+            expected_sender: None,
         }
     }
 }
@@ -488,17 +497,26 @@ pub async fn share_env(
     share_context(client, &ctx).await
 }
 
-/// List recent context shares in a workspace room, newest first.
+/// A context share scanned from the room timeline, paired with the Matrix user
+/// id (`sender`) that published it. The producer travels independently of the
+/// (attacker-controllable) event content, so it is the value the sender-pin is
+/// checked against (issue #304).
+struct ScannedShare {
+    /// The parsed share content.
+    share: ContextShare,
+    /// Matrix user id of the event sender.
+    producer: String,
+}
+
+/// Scan up to `limit` recent timeline events in `room` for context shares,
+/// pairing each with the Matrix `sender` that published it (newest first).
 ///
-/// Scans up to `options.limit` recent timeline events and returns the parsed
-/// content of every `com.mxagent.context.share.v1` event among them.
-pub async fn list_context_shares(
-    client: &Client,
-    options: &ListSharesOptions,
-) -> Result<Vec<ContextShare>, WorkspaceError> {
-    let room = sync_and_get_room(client, &options.room).await?;
+/// The `sender` is read from the raw event (not from its content). A share
+/// missing a `sender` is skipped — a share whose producer cannot be established
+/// is never returned.
+async fn scan_context_shares(room: &Room, limit: u32) -> Result<Vec<ScannedShare>, WorkspaceError> {
     let mut request = MessagesOptions::backward();
-    request.limit = matrix_sdk::ruma::UInt::from(options.limit);
+    request.limit = matrix_sdk::ruma::UInt::from(limit);
     let messages = room.messages(request).await.map_err(WorkspaceError::from)?;
 
     let mut shares = Vec::new();
@@ -506,39 +524,97 @@ pub async fn list_context_shares(
         let raw = event.raw();
         let is_share =
             raw.get_field::<String>("type").ok().flatten().as_deref() == Some(CONTEXT_SHARE);
-        if is_share {
-            if let Ok(Some(content)) = raw.get_field::<ContextShare>("content") {
-                shares.push(content);
-            }
+        if !is_share {
+            continue;
+        }
+        let producer = raw.get_field::<String>("sender").ok().flatten();
+        if let (Ok(Some(share)), Some(producer)) =
+            (raw.get_field::<ContextShare>("content"), producer)
+        {
+            shares.push(ScannedShare { share, producer });
         }
     }
     Ok(shares)
 }
 
+/// Pin the producer of the share with `context_id` among `shares`.
+///
+/// With an explicit `expected_sender`, only a share from that producer is
+/// accepted. Without one, the share is accepted only when every event carrying
+/// `context_id` has the *same* sender; two distinct senders is an ambiguous
+/// shadowing attempt and is rejected so a room member cannot shadow a legitimate
+/// share (issue #304). A missing `context_id` is
+/// [`WorkspaceError::ContextNotFound`].
+fn select_share(
+    shares: Vec<ScannedShare>,
+    context_id: &str,
+    expected_sender: Option<&str>,
+) -> Result<ContextShare, WorkspaceError> {
+    let matches: Vec<ScannedShare> = shares
+        .into_iter()
+        .filter(|s| s.share.context_id == context_id)
+        .collect();
+    if matches.is_empty() {
+        return Err(WorkspaceError::ContextNotFound(context_id.to_string()));
+    }
+    if let Some(expected) = expected_sender.filter(|s| !s.is_empty()) {
+        return matches
+            .into_iter()
+            .find(|s| s.producer == expected)
+            .map(|s| s.share)
+            .ok_or_else(|| WorkspaceError::ContextNotFound(context_id.to_string()));
+    }
+    // No explicit producer: accept only when every matching share is from one
+    // sender. Distinct senders for a single context_id is a shadow attempt.
+    let first = &matches[0].producer;
+    if matches.iter().all(|s| &s.producer == first) {
+        Ok(matches.into_iter().next().expect("non-empty").share)
+    } else {
+        Err(WorkspaceError::ContextRetrievalFailed(format!(
+            "multiple shares with context_id {context_id:?} from different senders; \
+             pin the expected producer to disambiguate"
+        )))
+    }
+}
+
+/// List recent context shares in a workspace room, newest first.
+///
+/// Scans up to `options.limit` recent timeline events and returns the parsed
+/// content of every `com.mxagent.context.share.v1` event among them. This is a
+/// display lister; [`fetch_context`] applies the sender-pin when actually
+/// retrieving a share's bytes.
+pub async fn list_context_shares(
+    client: &Client,
+    options: &ListSharesOptions,
+) -> Result<Vec<ContextShare>, WorkspaceError> {
+    let room = sync_and_get_room(client, &options.room).await?;
+    Ok(scan_context_shares(&room, options.limit)
+        .await?
+        .into_iter()
+        .map(|s| s.share)
+        .collect())
+}
+
 /// Retrieve and verify a single context artifact from a workspace room.
 ///
 /// Locates the share with `options.context_id` among the recent timeline events,
-/// retrieves its bytes — downloading the Matrix media for a large share or
-/// decoding the inline payload for a small one — and verifies them against the
-/// share's [`sha256`](ContextShare::sha256). A digest mismatch is reported as
-/// [`WorkspaceError::ContextIntegrity`]; an unknown ID as
+/// pinned to its producer (issue #304), retrieves its bytes — downloading the
+/// Matrix media for a large share or decoding the inline payload for a small one
+/// — and verifies them against the share's [`sha256`](ContextShare::sha256). A
+/// digest mismatch is reported as [`WorkspaceError::ContextIntegrity`]; an
+/// unknown ID (or one only published by an unexpected sender) as
 /// [`WorkspaceError::ContextNotFound`].
 pub async fn fetch_context(
     client: &Client,
     options: &FetchContextOptions,
 ) -> Result<FetchedContext, WorkspaceError> {
-    let shares = list_context_shares(
-        client,
-        &ListSharesOptions {
-            room: options.room.clone(),
-            limit: options.limit,
-        },
-    )
-    .await?;
-    let share = shares
-        .into_iter()
-        .find(|s| s.context_id == options.context_id)
-        .ok_or_else(|| WorkspaceError::ContextNotFound(options.context_id.clone()))?;
+    let room = sync_and_get_room(client, &options.room).await?;
+    let shares = scan_context_shares(&room, options.limit).await?;
+    let share = select_share(
+        shares,
+        &options.context_id,
+        options.expected_sender.as_deref(),
+    )?;
 
     let data = match &share.mxc_uri {
         Some(mxc_uri) => download_media(client, mxc_uri).await?,
@@ -713,6 +789,69 @@ mod tests {
         ));
     }
 
+    fn scanned_share(context_id: &str, producer: &str) -> ScannedShare {
+        ScannedShare {
+            share: build_inline_share(
+                context_id.to_string(),
+                "note.txt".to_string(),
+                "text/plain".to_string(),
+                b"hello",
+            ),
+            producer: producer.to_string(),
+        }
+    }
+
+    #[test]
+    fn select_share_accepts_a_single_producer() {
+        let shares = vec![scanned_share("ctx_1", "@exec:hs")];
+        let share = select_share(shares, "ctx_1", None).expect("a single-producer share is picked");
+        assert_eq!(share.context_id, "ctx_1");
+    }
+
+    #[test]
+    fn select_share_rejects_an_unexpected_producer_when_pinned() {
+        // With an explicit expected producer, a same-context_id share from any
+        // other sender must not be returned (issue #304).
+        let shares = vec![scanned_share("ctx_1", "@member:hs")];
+        let err = select_share(shares, "ctx_1", Some("@exec:hs"))
+            .expect_err("a share from an unexpected sender must be rejected");
+        assert!(matches!(err, WorkspaceError::ContextNotFound(_)));
+    }
+
+    #[test]
+    fn select_share_pins_to_the_expected_producer_amid_a_shadow() {
+        // The legitimate producer's share is selected even when a foreign member
+        // republished the same context_id first (newest-first ordering).
+        let shares = vec![
+            scanned_share("ctx_1", "@member:hs"),
+            scanned_share("ctx_1", "@exec:hs"),
+        ];
+        let share = select_share(shares, "ctx_1", Some("@exec:hs"))
+            .expect("the expected producer's share is selected past the shadow");
+        assert_eq!(share.context_id, "ctx_1");
+    }
+
+    #[test]
+    fn select_share_rejects_ambiguous_same_id_collisions() {
+        // Without an explicit producer, two distinct senders sharing one
+        // context_id is a shadow attempt and is rejected — fail closed.
+        let shares = vec![
+            scanned_share("ctx_1", "@member:hs"),
+            scanned_share("ctx_1", "@exec:hs"),
+        ];
+        let err = select_share(shares, "ctx_1", None)
+            .expect_err("ambiguous same-id shares must be rejected");
+        assert!(matches!(err, WorkspaceError::ContextRetrievalFailed(_)));
+    }
+
+    #[test]
+    fn select_share_reports_unknown_context_id() {
+        let shares = vec![scanned_share("ctx_1", "@exec:hs")];
+        let err =
+            select_share(shares, "ctx_missing", None).expect_err("an unknown context id is absent");
+        assert!(matches!(err, WorkspaceError::ContextNotFound(_)));
+    }
+
     #[test]
     fn verify_digest_accepts_matching_bytes() {
         let data = b"verify me";
@@ -793,5 +932,65 @@ mod tests {
             .expect("os is a string");
         assert!(os.contains(std::env::consts::OS));
         assert!(os.contains(std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn select_share_empty_expected_sender_falls_back_to_ambiguity_detection() {
+        // An empty string for `expected_sender` must be treated as unpinned (same
+        // as `None`), so the ambiguity-detection path applies when two senders
+        // publish the same context_id. This exercises the `filter(|s|
+        // !s.is_empty())` guard in `select_share` (issue #304).
+        let shares = vec![
+            scanned_share("ctx_1", "@member:hs"),
+            scanned_share("ctx_1", "@exec:hs"),
+        ];
+        // An explicit empty string is treated as if no pin was supplied, so
+        // two distinct senders for the same context_id must be rejected.
+        let err = select_share(shares, "ctx_1", Some(""))
+            .expect_err("empty expected_sender must fall back to ambiguity detection");
+        assert!(
+            matches!(err, WorkspaceError::ContextRetrievalFailed(_)),
+            "two distinct senders without a pin must produce ContextRetrievalFailed"
+        );
+    }
+
+    #[test]
+    fn select_share_empty_expected_sender_accepts_single_producer() {
+        // When expected_sender is the empty string and only one sender published
+        // the context_id, it is accepted (the single-producer path of the
+        // ambiguity check) (issue #304).
+        let shares = vec![scanned_share("ctx_1", "@exec:hs")];
+        let share = select_share(shares, "ctx_1", Some(""))
+            .expect("empty expected_sender with a single producer should succeed");
+        assert_eq!(share.context_id, "ctx_1");
+    }
+
+    #[test]
+    fn select_share_accepts_duplicate_events_from_same_producer() {
+        // When the executing agent republishes the same context_id (e.g., a
+        // retransmission), both events have the same sender, so the ambiguity
+        // check passes and the first (newest-first) event is returned.  A room
+        // member's shadow attempt would add a *different* sender, which is what
+        // the ambiguity check actually blocks (issue #304).
+        let shares = vec![
+            scanned_share("ctx_1", "@exec:hs"),
+            scanned_share("ctx_1", "@exec:hs"),
+        ];
+        let share =
+            select_share(shares, "ctx_1", None).expect("two copies from the same producer are OK");
+        assert_eq!(share.context_id, "ctx_1");
+    }
+
+    #[test]
+    fn select_share_pinned_picks_first_match_among_duplicates() {
+        // With an explicit producer pin, duplicate events from that producer
+        // return the first match (newest-first) without ambiguity error.
+        let shares = vec![
+            scanned_share("ctx_1", "@exec:hs"),
+            scanned_share("ctx_1", "@exec:hs"),
+        ];
+        let share = select_share(shares, "ctx_1", Some("@exec:hs"))
+            .expect("pinned producer with duplicates should return the first match");
+        assert_eq!(share.context_id, "ctx_1");
     }
 }

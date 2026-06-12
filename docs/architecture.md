@@ -97,6 +97,27 @@ gate and can only add a denial (the optional `require_verified_device` knob,
 sending device is unverified still executes (TOFU on the device; authority comes
 from the signing key) and the daemon logs a non-sensitive advisory.
 
+The same "room membership ≠ authority" rule binds the **result plane**, not just
+the request plane (issue #304). The results a dispatch produces — `stream.chunk`,
+`stream.artifact`, `exec.rejected`, `exec.finished`, `exec.cancelled`,
+`call.response`, and `context.share` — are **sender-pinned** to the executing /
+producing agent: the daemon resolves the targeted agent's `matrix_user_id` (for
+artifacts, via the invocation's `target`) and accepts a result only when the
+event's Matrix `sender` matches. A `call.response`, faked `exec.finished` exit
+status, injected output chunk, or shadowed artifact/share from any other room
+member is dropped before it reaches the waiting consumer, fail-closed — so a
+member who merely learns an in-flight `request_id`/`invocation_id` cannot forge a
+result. `stream.chunk` additionally carries a populated `sha256` digest of its
+decoded bytes, which the CLI verifies in strict mode so a tampered chunk is
+rejected. Sender-pinning uses the homeserver-asserted `sender`: a cheap,
+always-on, transport-level denial that defeats other room members. Rooting the
+highest-stakes result events (`exec.finished` / `call.response`) in Ed25519 +
+the local trust store as well — mirroring the request plane and `ApprovalDecision`
+(§12) so authority never rests on the homeserver-asserted `sender` against a
+hostile homeserver — is the tracked next step; the cross-build/mixed-fleet
+rollout of result signing is deferred so a pre-upgrade remote executor's results
+still interoperate.
+
 ---
 
 ## 2. CLI Command Surface
@@ -596,6 +617,16 @@ reports `truncated: true` on `exec.finished`. The capped child keeps running (it
 is bounded only by the exec timeout); capping drops forwarded output, it never
 kills the process.
 
+The `sha256` field is **populated by mx-agent producers** (the buffered stream
+encoder and the PTY emitter): it is the base64 SHA-256 of the chunk's *decoded*
+bytes — the exact bytes the consumer reconstructs from `data`/`encoding`. The CLI
+recomputes it and, in strict mode (`--strict-stream`), rejects a chunk whose
+digest does not match (exit `132`, `EXIT_STREAM_INTEGRITY`). It is an *integrity*
+guard, not authenticity: chunk authenticity comes from the sender-pin (§1.2), and
+the signed-result roadmap's `exec.finished` carries the authoritative byte
+totals/exit status that bound the whole stream. The EOF marker carries no payload
+and so carries no digest.
+
 ### 7.4 Finished Event
 
 ```json
@@ -613,6 +644,15 @@ kills the process.
   }
 }
 ```
+
+`exec.finished` and the other result events are **sender-pinned**: the dispatcher
+delivers a terminal/stream/rejected/cancelled event to the waiting consumer only
+when its Matrix `sender` is the executing agent it dispatched to (resolved from
+that agent's `com.mxagent.agent.v1` `matrix_user_id`). A faked exit status from
+another room member never resolves the invocation — it is dropped, fail-closed
+(§1.2, issue #304). The same pin guards `call.response` (matched to the targeted
+agent before the `request_id`) and artifact/share retrieval (matched to the
+invocation's `target`, or to an explicitly supplied producer).
 
 ### 7.5 Stdin and Cancellation
 
@@ -904,9 +944,13 @@ and remains stateless (architecture §10).
 
 > **Planned.** The remaining liveness signals (room membership, Matrix presence,
 > key status) described in the original §9.1 aspiration are not yet implemented.
-> The heartbeat sender is not yet pinned, so a room member could spoof a heartbeat
-> to inflate a displayed verdict (liveness is advisory, never an authorization
-> input — dispatch authority remains signature → trust → policy → approval).
+> The **heartbeat** sender is not yet pinned, so a room member could spoof a
+> heartbeat to inflate a displayed verdict (liveness is advisory, never an
+> authorization input — dispatch authority remains signature → trust → policy →
+> approval; issue #312). This caveat is now **scoped to heartbeats only**: the
+> result/stream/artifact/share plane *is* sender-pinned to the executing/producing
+> agent (§1.2, §7.3–§7.4, issue #304), so a member can no longer forge a result,
+> exit status, output chunk, or shadow an artifact.
 
 The `com.mxagent.heartbeat.v1` timeline event carries:
 

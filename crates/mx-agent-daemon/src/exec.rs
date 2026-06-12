@@ -1426,6 +1426,12 @@ async fn terminate_then_kill(
 /// `room`, advancing `seq`.
 async fn emit_pty_chunk(room: &Room, invocation_id: &str, data: &[u8], eof: bool, seq: &mut u64) {
     use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+    // Populate the per-chunk integrity digest over the raw bytes (the same bytes
+    // the CLI reconstructs by base64-decoding `data`), so a tampered chunk fails
+    // the CLI's strict `sha256` check (issue #304). The EOF marker has no payload.
+    let sha256 = (!data.is_empty())
+        .then(|| base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data)));
     let chunk = StreamChunk {
         invocation_id: invocation_id.to_string(),
         stream: StreamKind::Pty,
@@ -1434,7 +1440,7 @@ async fn emit_pty_chunk(room: &Room, invocation_id: &str, data: &[u8], eof: bool
         data: base64::engine::general_purpose::STANDARD.encode(data),
         eof,
         compressed: false,
-        sha256: None,
+        sha256,
         timestamp: rfc3339_now(),
         extra: Default::default(),
     };
