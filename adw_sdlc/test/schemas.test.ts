@@ -92,6 +92,11 @@ describe('phase schemas', () => {
     expect(ClassifySchema.safeParse({ issue_class: '' }).success).toBe(false);
   });
 
+  it('trims whitespace-padded issue_class like Python to_result (adw/_phases.py:299)', () => {
+    expect(parsePhaseResult('classify', { issue_class: ' feat ', reason: 'r' }).issue_class).toBe('feat');
+    expect(() => parsePhaseResult('classify', { issue_class: '   ' })).toThrow();
+  });
+
   it('review findings default severity to skippable, never crash on extras', () => {
     const parsed = ReviewResultSchema.parse({
       findings: [{ description: 'no severity recorded', extra_key: 'ignored' }],

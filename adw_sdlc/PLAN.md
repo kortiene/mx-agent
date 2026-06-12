@@ -223,13 +223,17 @@ mx-agent/
 │   ├── tsconfig.json          # target ES2022, moduleResolution nodenext, declaration
 │   ├── tsconfig.build.json
 │   ├── src/
-│   │   ├── orchestrator.ts     # run, resolveLoop, patchLoop, ciFixLoop, gates, no-retry-on-timeout (D4)
-│   │   ├── phases.ts           # AGENT_PHASES, PHASE_TIER, TEMPLATE, OUTPUT_CONTRACT, gates,
+│   │   ├── orchestrator.ts     # run, resolveLoop, patchLoop, ciFixLoop, gates; seams via OrchestratorDeps (D4)
+│   │   ├── phases.ts           # AGENT_PHASES, TEMPLATE, OUTPUT_CONTRACT, gates,
 │   │   │                       #   composePhasePrompt, buildFooter, templatePath, ARTIFACT_PHASES
-│   │   ├── state.ts            # AdwState type (+ schema_version, additive fields), load/save, workspace
+│   │   ├── state.ts            # AdwState (+ schema_version, additive fields), load/save, workspace
 │   │   ├── git.ts              # ALL git/gh via child_process (mirrors adw._git semantics)            (D5)
 │   │   ├── env.ts              # safeSubprocessEnv, BASE_ENV_ALLOW, ENV_DENY_PREFIXES, per-runner keys (D5)
-│   │   ├── invoker.ts          # AgentRunner / PhaseRequest / PhaseResult / RunnerCaps; nudge+timeout (D6)
+│   │   ├── common.ts           # REPO_ROOT, template render/substitution, fenced-JSON parse (adw/common.py)
+│   │   ├── exec.ts             # capture/ghJson, console notes, progress comments, gh/repo queries (adw/_exec.py)
+│   │   ├── issue.ts            # deriveBranch/slugify/fetchIssue/setStatus (adw/work_issue.py helpers)
+│   │   ├── invoker.ts          # AgentRunner / PhaseRequest / PhaseResult / RunnerCaps types         (D6)
+│   │   ├── run-phase.ts        # the invoker layer over runPhase: single nudge + no-retry-on-timeout (D6)
 │   │   ├── structured-call.ts  # structuredCall<T>() on @anthropic-ai/sdk for classify                (D1)
 │   │   ├── registry.ts         # MX_AGENT_RUNNER -> dynamic import() of the adapter (optionalDeps)     (D3)
 │   │   ├── models.ts           # tier->modelId per runner; exact model-ID constants
@@ -783,6 +787,11 @@ self-spawned-server wrapper), **pi** (in-process SDK; no native schema → fence
    state machine, bounded loops, gates, no-retry-on-timeout, and the env-allowlist builder under mocks
    (no real agent). **Verify:** orchestrator parity tests green; env-isolation test green;
    `safeSubprocessEnv` excludes `GH_TOKEN`/`MATRIX_*`/`MX_AGENT_*`.
+   *Landed notes:* the port added the Python-analogue modules `common.ts`/`exec.ts`/`issue.ts` and split
+   the nudge/timeout invoker logic into `run-phase.ts` (invoker.ts stays types-only); external effects
+   are injected via an explicit `OrchestratorDeps` object (the TS analogue of the module seams the
+   Python tests patch) rather than module patching; `resolve_runner_bin` was deliberately not ported —
+   binary resolution is per-adapter and lands with each runner (steps 6–9).
 6. **Runner #1 = `claude` (`runner-claude.ts`).** `query({prompt, options:{model, cwd, env: allowlist,
    pathToClaudeCodeExecutable: resolvedBin, allowedTools, permissionMode:'acceptEdits',
    outputFormat:{json_schema}, maxBudgetUsd, abortController}})`; read terminal `SDKResultMessage`

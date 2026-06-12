@@ -140,6 +140,11 @@ export function parsePhaseResult<P extends SchemaPhase>(
     }
     normalized[key] = value;
   }
+  if (typeof normalized['issue_class'] === 'string') {
+    // Python strips issue_class before validating (adw/_phases.py:299);
+    // without this, " feat " would pass the py engine and fail the ts one.
+    normalized['issue_class'] = normalized['issue_class'].trim();
+  }
   if (phase === 'review' && Array.isArray(normalized['findings'])) {
     normalized['findings'] = normalized['findings'].filter(
       (f) => typeof f === 'object' && f !== null && !Array.isArray(f),
