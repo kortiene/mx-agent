@@ -867,7 +867,10 @@ struct ApprovalDecideArgs {
     /// Approval request ID to decide.
     #[arg(value_name = "REQUEST_ID")]
     request_id: String,
-    /// Identity to record as the decision-maker (defaults to the logged-in user).
+    /// Display-only label recorded as the decision-maker in the emitted event
+    /// (defaults to the logged-in user). This is NOT an authentication input: the
+    /// authoritative approver identity is the daemon's verified Matrix sender plus
+    /// an Ed25519 signature from a locally-trusted key (issue #309).
     #[arg(long = "by", value_name = "IDENTITY")]
     by: Option<String>,
 }

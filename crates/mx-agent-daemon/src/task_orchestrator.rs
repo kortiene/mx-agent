@@ -1594,6 +1594,14 @@ impl<R> QueueApprovalGate<R> {
     /// admit the burned nonce is recorded so a lost optimistic-claim race can
     /// un-burn it (see
     /// [`compensate_lost_claim`](TaskApprovalGate::compensate_lost_claim)).
+    ///
+    /// Decision **expiry** is no longer the cache's sole responsibility: it is
+    /// enforced upstream at read time by
+    /// [`verification_failure`](crate::approval::verification_failure) (issue
+    /// #309, reason `decision_expired`), so an expired decision never reaches this
+    /// gate even on a cache-less path. This cache (when attached) still burns the
+    /// single-use nonce on the releasing pass as defense-in-depth, but the
+    /// cache-less `return true` branch is safe because expiry already held.
     fn admit_decision_nonce(&mut self, decision: &ApprovalDecision) -> bool {
         let Some(cache) = &self.replay_cache else {
             return true;

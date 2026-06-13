@@ -236,7 +236,13 @@ mod tests {
     #[test]
     fn tampered_approval_decision_fails_verification() {
         let key = test_key();
-        for tamper in ["decision", "request_id", "nonce", "expires_at"] {
+        for tamper in [
+            "decision",
+            "request_id",
+            "nonce",
+            "expires_at",
+            "approved_by",
+        ] {
             let mut decision = approval_decision();
             sign_approval_decision(&key, "mxagent-ed25519:test", &mut decision).unwrap();
             match tamper {
@@ -244,6 +250,7 @@ mod tests {
                 "request_id" => decision.request_id = "approval:other".to_string(),
                 "nonce" => decision.nonce = Some("nonce-evil".to_string()),
                 "expires_at" => decision.expires_at = Some("2099-01-01T00:00:00Z".to_string()),
+                "approved_by" => decision.approved_by = "@attacker:server".to_string(),
                 _ => unreachable!(),
             }
             assert_eq!(

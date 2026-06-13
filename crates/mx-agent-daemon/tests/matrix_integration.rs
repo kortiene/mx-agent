@@ -70,6 +70,24 @@
 //! subscriber sender-pin → consumer, proving "room membership ≠ execution
 //! permission" for the result plane (fake exit status **and** injected output).
 //!
+//! Four new tests (issue #309) prove the trust-store anchor for approval
+//! decisions end-to-end against a real homeserver:
+//! [`live_scheduler_rejects_decision_with_untrusted_key`] — a decision signed
+//! by a key that IS published in `com.mxagent.agent.v1` room state but is NOT
+//! in Alice's local trust store is rejected (`untrusted_key`) and the held task
+//! is never released, proving room-published state is never the sole key anchor;
+//! [`live_scheduler_rejects_expired_decision`] — a decision signed with the
+//! daemon's own key but stamped with an `expires_at` in the past is rejected
+//! (`decision_expired`) cache-independently (the check lives in
+//! `verification_failure`, before any replay cache is consulted);
+//! [`live_approval_window_expiry_blocks_task`] — a held task whose queued
+//! `expires_at` has already passed transitions to `blocked(approval_expired)`
+//! without any decision being issued; and
+//! [`live_approver_allowlist_releases_task`] — a non-daemon Matrix user
+//! configured in the room's `approvers` policy can release a task when their
+//! signing key is locally trusted, while the daemon's own account remains the
+//! authorized default when no allowlist is configured.
+//!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
 //!
@@ -113,21 +131,23 @@ use serde_json::{json, Value};
 
 use mx_agent_daemon::session::ENV_DATA_DIR;
 use mx_agent_daemon::{
-    authorize_call_request, authorize_exec_request, build_signed_call_request,
-    build_signed_call_request_for_target, build_signed_exec_request, cancel_task_for_session,
-    create_task, create_task_for_session, create_workspace, decide_approval_for_session,
-    emit_heartbeat, get_invocation, grant_workspace, list_agents, list_pending_approvals,
+    approval_decision_for, authorize_call_request, authorize_exec_request,
+    build_signed_call_request, build_signed_call_request_for_target, build_signed_exec_request,
+    cancel_task_for_session, create_task, create_task_for_session, create_workspace,
+    decide_approval_for_session, emit_approval_decision, emit_heartbeat, encode_verifying_key,
+    get_invocation, grant_workspace, key_id_for_verifying_key, list_agents, list_pending_approvals,
     list_tasks, load_or_create_signing_key, load_sync_token, login_password,
     read_latest_heartbeats, register_agent, restore_client, run_matrix_sync,
     run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, show_agent,
-    sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, BackoffConfig,
-    CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions, CreateWorkspaceOptions,
-    DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams,
-    ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent, GrantWorkspaceOptions,
-    HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig,
-    PtyWinsize, RegisterAgentOptions, SasAdvance, SessionPaths, SyncHealth, SyncState,
-    TaskDispatchMode, TrustStore, WorkspaceError, WorkspaceVisibility, DECISION_APPROVED,
-    DECISION_DENIED, HEARTBEAT_SCAN_LIMIT, WORKSPACE_AGENT_PL,
+    sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, ApprovalQueue,
+    BackoffConfig, CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions,
+    CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
+    ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent,
+    GrantWorkspaceOptions, HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness,
+    LivenessConfig, MatrixConfig, PendingApproval, PtyWinsize, RegisterAgentOptions, SasAdvance,
+    SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceError,
+    WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
+    WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -6674,5 +6694,1266 @@ allow_cwd = ["{cwd}"]
         "forged stream.chunk from a non-executing room member must not be delivered \
          to the waiting subscriber — sender-pin gate is broken for stream.chunk (issue #304); \
          received chunks: {received_chunk_data:?}"
+    );
+}
+
+/// Live trust-store anchor: a decision signed by a key published in
+/// `com.mxagent.agent.v1` room state but absent from the local trust store is
+/// rejected with `untrusted_key` and the held task is never released (issue #309).
+///
+/// The attack scenario: an adversary with room-state write access publishes a
+/// fake `com.mxagent.agent.v1` event carrying their own Ed25519 key, then sends
+/// a signed `approved` decision. Before #309 the verifying-key lookup used
+/// room-published state as the sole anchor, so the fake key would resolve. After
+/// #309 the trust store is also consulted: a key not in the operator's local store
+/// is rejected regardless of what is in room state.
+///
+/// Steps:
+/// 1. A throwaway Ed25519 key is created and published as room state under a fake
+///    agent entry, but is NOT added to Alice's trust store.
+/// 2. Bob creates a `requires_approval` task; the scheduler holds it fail-closed.
+/// 3. Alice (the daemon's own Matrix user) publishes a decision signed with the
+///    throwaway key — sender passes, key resolves in room state, but `untrusted_key`
+///    fires before the decision can release the task.
+/// 4. The positive path confirms the daemon's real signing key still releases it.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_scheduler_rejects_decision_with_untrusted_key() {
+    use ed25519_dalek::SigningKey as Ed25519SigningKey;
+    use mx_agent_protocol::signing::sign_approval_decision;
+
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("untrusted-key-approval-ran");
+    let approver = "@approver:mx-agent.test";
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent untrusted-key approval security test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    // ── Throwaway key: room-published but NOT in the trust store ──
+    //
+    // A key in `verifying_keys` resolves check 3 (`unresolved_key`) but the
+    // trust store gate (check 4, `untrusted_key`) still rejects it. This is the
+    // issue #309 guarantee: room state alone is never the sole key anchor.
+    let throwaway_raw = Ed25519SigningKey::from_bytes(&[33u8; 32]);
+    let throwaway_key_id = key_id_for_verifying_key(&throwaway_raw.verifying_key());
+    let throwaway_key_b64 = encode_verifying_key(&throwaway_raw.verifying_key());
+
+    // Alice publishes the fake agent state so the throwaway key resolves in
+    // `verifying_keys` (built from every `com.mxagent.agent.v1` state event).
+    let alice_room_for_state = alice.get_room(&room_id).expect("alice has room");
+    alice_room_for_state
+        .send_state_event_raw(
+            mx_agent_protocol::events::state::AGENT,
+            "throwaway-agent-309",
+            json!({
+                "agent_id": "throwaway-agent-309",
+                "kind": "pi",
+                "matrix_user_id": alice_id.as_str(),
+                "device_id": "THROWAWAY",
+                "signing_key_id": &throwaway_key_id,
+                "signing_public_key": &throwaway_key_b64,
+                "status": "active",
+                "capabilities": [],
+                "tools": [],
+                "load": { "running_invocations": 0, "max_invocations": 1 },
+                "workspace": {
+                    "cwd": cwd.to_string_lossy(),
+                    "project_id": "test",
+                    "git_commit": ""
+                },
+                "last_seen_ts": 0,
+                "state_rev": 0
+            }),
+        )
+        .await
+        .expect("alice publishes throwaway agent state");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    // Trust store: ONLY the daemon's real signing key — the throwaway key is not
+    // added, so `is_key_trusted(throwaway_key_id)` returns false.
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{approver}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            approver = approver,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let task_id = "task-untrusted-key";
+    let approval_id = format!("approval:{task_id}");
+    create_task(
+        &bob,
+        &signed_exec_task(
+            room_id.as_str(),
+            task_id,
+            &["sh", "-c", &format!("touch {}", sentinel.to_string_lossy())],
+            &cwd,
+            Vec::new(),
+            &signing,
+            approver,
+        ),
+    )
+    .await
+    .expect("create approval-required task");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+    let scheduler = {
+        let alice = alice.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            run_scheduler_loop(
+                alice,
+                ExecSubscriberRegistry::new(),
+                TaskDispatchMode::Local,
+                running,
+                Duration::from_secs(1),
+            );
+        })
+    };
+
+    let list_opts = ListTasksOptions {
+        room: room_id.to_string(),
+        state: None,
+        assigned_to: None,
+    };
+
+    // Wait for scheduler to hold the task.
+    let queue_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if pending.iter().any(|p| p.request_id() == approval_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < queue_deadline,
+            "scheduler should enqueue the pending approval within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ── Security negative test (issue #309): untrusted-key decision is dropped ──
+    //
+    // Alice (daemon's own Matrix user) sends a properly structured decision signed
+    // with the throwaway key. The sender check passes (Alice = local_user), the key
+    // resolves in verifying_keys (published in room state above), but check 4
+    // (`untrusted_key`) fires because the trust store has no entry for it.
+    let mut untrusted_decision = approval_decision_for(
+        &approval_id,
+        DECISION_APPROVED,
+        alice_id.as_str(),
+        "2026-06-13T10:00:00Z",
+    );
+    untrusted_decision.nonce = Some(format!("untrusted-key-nonce-{}", std::process::id()));
+    untrusted_decision.expires_at = Some("2099-01-01T00:00:00Z".to_string());
+    sign_approval_decision(&throwaway_raw, &throwaway_key_id, &mut untrusted_decision)
+        .expect("sign with throwaway key");
+
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice pre-emit sync");
+    let alice_room = alice.get_room(&room_id).expect("alice has room after sync");
+    emit_approval_decision(&alice_room, &untrusted_decision)
+        .await
+        .expect("alice emits untrusted-key decision");
+
+    // Allow 10+ scheduler passes (1 s interval) for the untrusted decision to be
+    // acted on if the fix were absent. The task must stay held.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert!(
+        !sentinel.exists(),
+        "decision signed by a room-published but untrusted key must not spawn the command \
+         (issue #309 trust-store anchor)"
+    );
+    let held_state = list_tasks(&bob, &list_opts)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|t| t.task_id == task_id)
+        .map(|t| t.state);
+    assert_ne!(
+        held_state.as_deref(),
+        Some("succeeded"),
+        "decision with an untrusted signing key must not release the task; state: {held_state:?}"
+    );
+
+    // ── Positive path: daemon's own signing key releases the task ──
+    decide_approval_for_session(
+        &alice_session,
+        &paths,
+        &approval_id,
+        DECISION_APPROVED,
+        alice_id.as_str(),
+    )
+    .await
+    .expect("daemon approves the task");
+
+    let approved_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut final_state = None;
+    loop {
+        if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+            if let Some(t) = tasks.iter().find(|t| t.task_id == task_id) {
+                final_state = Some(t.state.clone());
+                if t.state == "succeeded" {
+                    break;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= approved_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    running.store(false, Ordering::SeqCst);
+    scheduler.join().expect("scheduler thread joins");
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    assert_eq!(
+        final_state.as_deref(),
+        Some("succeeded"),
+        "task approved with a trusted signing key must run to succeeded; state: {final_state:?}"
+    );
+    assert!(
+        sentinel.exists(),
+        "legitimately approved task must spawn its command"
+    );
+}
+
+/// Live cache-less expiry: a decision signed by the real daemon key but carrying
+/// an `expires_at` timestamp in the past is rejected with `decision_expired` and
+/// never releases the held task (issue #309).
+///
+/// The `decision_expired` check lives in `verification_failure`, which runs before
+/// `ReplayCache::admit_at` is consulted, so a cache-less pass (companion issue
+/// #305) cannot bypass it. This test confirms the guard holds end-to-end against a
+/// real homeserver.
+///
+/// Steps:
+/// 1. A `requires_approval` task is created; the scheduler holds it fail-closed.
+/// 2. Alice emits a decision signed with the daemon's own key but stamped with an
+///    `expires_at` value well in the past (`2020-01-01T00:00:00Z`).
+/// 3. The scheduler rejects it (`decision_expired`) and the task stays held.
+/// 4. A fresh, properly-stamped decision from the positive path releases the task.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_scheduler_rejects_expired_decision() {
+    use mx_agent_protocol::signing::sign_approval_decision;
+
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("expired-decision-approval-ran");
+    let approver = "@approver:mx-agent.test";
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent expired-decision approval security test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{approver}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            approver = approver,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let task_id = "task-expired-decision";
+    let approval_id = format!("approval:{task_id}");
+    create_task(
+        &bob,
+        &signed_exec_task(
+            room_id.as_str(),
+            task_id,
+            &["sh", "-c", &format!("touch {}", sentinel.to_string_lossy())],
+            &cwd,
+            Vec::new(),
+            &signing,
+            approver,
+        ),
+    )
+    .await
+    .expect("create approval-required task");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+    let scheduler = {
+        let alice = alice.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            run_scheduler_loop(
+                alice,
+                ExecSubscriberRegistry::new(),
+                TaskDispatchMode::Local,
+                running,
+                Duration::from_secs(1),
+            );
+        })
+    };
+
+    let list_opts = ListTasksOptions {
+        room: room_id.to_string(),
+        state: None,
+        assigned_to: None,
+    };
+
+    // Wait for scheduler to hold the task.
+    let queue_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if pending.iter().any(|p| p.request_id() == approval_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < queue_deadline,
+            "scheduler should enqueue the pending approval within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ── Security negative test (issue #309): expired decision is dropped ──
+    //
+    // The decision is signed with the daemon's own signing key (passes sender +
+    // key-resolution + trust-store checks), but its `expires_at` is `2020-01-01`
+    // — well in the past. `verification_failure` check 7 fires (`decision_expired`)
+    // before the replay cache is consulted, so this guard is cache-independent.
+    let mut expired_decision = approval_decision_for(
+        &approval_id,
+        DECISION_APPROVED,
+        alice_id.as_str(),
+        "2026-06-13T10:00:00Z",
+    );
+    expired_decision.nonce = Some(format!("expired-nonce-{}", std::process::id()));
+    // Deliberately past timestamp — must be rejected even though the key is trusted.
+    expired_decision.expires_at = Some("2020-01-01T00:00:00Z".to_string());
+    sign_approval_decision(
+        signing.signing_key(),
+        signing.key_id(),
+        &mut expired_decision,
+    )
+    .expect("sign expired decision");
+
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice pre-emit sync");
+    let alice_room = alice.get_room(&room_id).expect("alice has room after sync");
+    emit_approval_decision(&alice_room, &expired_decision)
+        .await
+        .expect("alice emits expired decision");
+
+    // Allow 10+ passes; the task must stay held (decision_expired).
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert!(
+        !sentinel.exists(),
+        "decision with a past expires_at must not spawn the command (issue #309 cache-less expiry)"
+    );
+    let held_state = list_tasks(&bob, &list_opts)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|t| t.task_id == task_id)
+        .map(|t| t.state);
+    assert_ne!(
+        held_state.as_deref(),
+        Some("succeeded"),
+        "an expired decision must not release the task; state: {held_state:?}"
+    );
+
+    // ── Positive path: fresh decision with far-future expires_at releases the task ──
+    decide_approval_for_session(
+        &alice_session,
+        &paths,
+        &approval_id,
+        DECISION_APPROVED,
+        alice_id.as_str(),
+    )
+    .await
+    .expect("daemon approves the task with a fresh decision");
+
+    let approved_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut final_state = None;
+    loop {
+        if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+            if let Some(t) = tasks.iter().find(|t| t.task_id == task_id) {
+                final_state = Some(t.state.clone());
+                if t.state == "succeeded" {
+                    break;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= approved_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    running.store(false, Ordering::SeqCst);
+    scheduler.join().expect("scheduler thread joins");
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    assert_eq!(
+        final_state.as_deref(),
+        Some("succeeded"),
+        "task released by a fresh decision must run to succeeded; state: {final_state:?}"
+    );
+    assert!(
+        sentinel.exists(),
+        "legitimately approved task must spawn its command"
+    );
+}
+
+/// Live approval-window expiry: a `requires_approval` task whose request window
+/// lapses transitions to `blocked` with reason `approval_expired` without any
+/// decision being issued (issue #309, follow-on from #265).
+///
+/// The approval queue (`approvals.json`) carries the request's `expires_at`. When
+/// `approval_request_expired` returns `true` the scheduler blocks the task via
+/// `block_approval_expired` and never spawns its command.
+///
+/// To force the expiry without waiting an hour, the test pre-populates the
+/// approval queue with an entry whose `expires_at` is `2020-01-01T00:00:00Z`
+/// before starting the scheduler. The first scheduler pass reads the expired
+/// deadline and blocks the task.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_approval_window_expiry_blocks_task() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("approval-window-expiry-ran");
+    let approver = "@approver:mx-agent.test";
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester = bob.user_id().expect("bob user id").to_string();
+
+    let room = create_public_room(&bob, "mx-agent approval-window expiry test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{approver}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            approver = approver,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let task_id = "task-window-expiry";
+    let approval_id = format!("approval:{task_id}");
+    create_task(
+        &bob,
+        &signed_exec_task(
+            room_id.as_str(),
+            task_id,
+            &["sh", "-c", &format!("touch {}", sentinel.to_string_lossy())],
+            &cwd,
+            Vec::new(),
+            &signing,
+            approver,
+        ),
+    )
+    .await
+    .expect("create approval-required task");
+
+    // ── Pre-populate the approval queue with an already-expired entry ──
+    //
+    // `QueueApprovalGate::evaluate` reads the deadline from the on-disk queue entry
+    // first (falling back to the per-pass stamp only when no entry exists). By
+    // writing an entry with `expires_at` in the past before the scheduler starts,
+    // the first pass will find the expired deadline and immediately block the task
+    // instead of waiting a full APPROVAL_REQUEST_TTL (one hour).
+    let mut pre_queue = ApprovalQueue::default();
+    pre_queue.enqueue(PendingApproval {
+        room_id: room_id.to_string(),
+        request: ApprovalRequest {
+            request_id: approval_id.clone(),
+            invocation_id: String::new(),
+            requester: approver.to_string(),
+            target: TARGET_AGENT.to_string(),
+            summary: format!("Run exec action for task {task_id}"),
+            risk: "medium".to_string(),
+            expires_at: "2020-01-01T00:00:00Z".to_string(),
+            extra: Default::default(),
+        },
+    });
+    pre_queue
+        .save(&paths)
+        .expect("save pre-expired approval queue");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+    let scheduler = {
+        let alice = alice.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            run_scheduler_loop(
+                alice,
+                ExecSubscriberRegistry::new(),
+                TaskDispatchMode::Local,
+                running,
+                Duration::from_secs(1),
+            );
+        })
+    };
+
+    let list_opts = ListTasksOptions {
+        room: room_id.to_string(),
+        state: None,
+        assigned_to: None,
+    };
+
+    // Wait for scheduler to detect the expired window and block the task.
+    let expiry_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let final_task = loop {
+        if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+            if let Some(t) = tasks.iter().find(|t| t.task_id == task_id) {
+                if t.state == "blocked" {
+                    break t.clone();
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < expiry_deadline,
+            "scheduler should block the task as approval_expired within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    running.store(false, Ordering::SeqCst);
+    scheduler.join().expect("scheduler thread joins");
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    assert!(
+        !sentinel.exists(),
+        "approval-expired task must never spawn its command"
+    );
+    let task = final_task;
+    assert_eq!(
+        task.state, "blocked",
+        "task whose approval window expired must be blocked; state: {}",
+        task.state
+    );
+    let reason = task
+        .result
+        .as_ref()
+        .and_then(|r| r.get("reason"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        reason,
+        Some("approval_expired"),
+        "blocked task must carry reason 'approval_expired'; result: {:?}",
+        task.result
+    );
+}
+
+/// Live approver allowlist: a non-daemon Matrix user configured in the room's
+/// `approvers` policy can release a held task when their signing key is trusted;
+/// the daemon's own account also remains authorized (issue #309).
+///
+/// Steps:
+/// 1. Bob's Matrix user id is added to the room policy `approvers` list.
+/// 2. Bob generates a signing key and publishes it via a `com.mxagent.agent.v1`
+///    state event; Alice's trust store is updated to trust Bob's key.
+/// 3. Bob publishes a decision for the held task signed with his trusted key.
+/// 4. The scheduler verifies sender (Bob in approvers), key resolves, key trusted,
+///    signature valid, replay material present and unexpired — releases the task.
+/// 5. The task runs to `succeeded` and the sentinel is created.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_approver_allowlist_releases_task() {
+    use ed25519_dalek::SigningKey as Ed25519SigningKey;
+    use mx_agent_protocol::signing::sign_approval_decision;
+
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("approver-allowlist-ran");
+    let approver_agent = "@approver:mx-agent.test";
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester = bob.user_id().expect("bob user id").to_string();
+    let bob_id = bob.user_id().expect("bob user id").to_owned();
+
+    let room = create_public_room(&bob, "mx-agent approver-allowlist test").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob_id.as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice and bob");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    // ── Bob's signing identity: trusted key, published in room state ──
+    //
+    // Bob is a room member who is also a configured approver. His Ed25519 key is
+    // distinct from Alice's daemon key — it must be trusted in Alice's trust store
+    // and published via `com.mxagent.agent.v1` so it resolves in `verifying_keys`.
+    let bob_signing_raw = Ed25519SigningKey::from_bytes(&[44u8; 32]);
+    let bob_key_id = key_id_for_verifying_key(&bob_signing_raw.verifying_key());
+    let bob_key_b64 = encode_verifying_key(&bob_signing_raw.verifying_key());
+
+    // Bob publishes his agent state so his key is room-published.
+    bob.sync_once(SyncSettings::default())
+        .await
+        .expect("bob sync before state event");
+    let bob_room = bob.get_room(&room_id).expect("bob has room");
+    bob_room
+        .send_state_event_raw(
+            mx_agent_protocol::events::state::AGENT,
+            "bob-approver-agent",
+            json!({
+                "agent_id": "bob-approver-agent",
+                "kind": "pi",
+                "matrix_user_id": bob_id.as_str(),
+                "device_id": "BOB-DEV",
+                "signing_key_id": &bob_key_id,
+                "signing_public_key": &bob_key_b64,
+                "status": "active",
+                "capabilities": [],
+                "tools": [],
+                "load": { "running_invocations": 0, "max_invocations": 1 },
+                "workspace": {
+                    "cwd": cwd.to_string_lossy(),
+                    "project_id": "test",
+                    "git_commit": ""
+                },
+                "last_seen_ts": 0,
+                "state_rev": 0
+            }),
+        )
+        .await
+        .expect("bob publishes his agent state with his signing key");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    // Trust store: daemon key (for task-action verification) AND Bob's key (so
+    // `is_key_trusted(bob_key_id)` returns true and his decision is admitted).
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.approve(
+        "bob-approver-agent",
+        &bob_key_id,
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+
+    // Policy: `approvers` includes Bob's Matrix user id (union with daemon default).
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+approvers = ["{bob}"]
+
+[rooms."{room}".agents."{approver}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            bob = bob_id.as_str(),
+            approver = approver_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy with approver allowlist");
+
+    let task_id = "task-approver-allowlist";
+    let approval_id = format!("approval:{task_id}");
+    create_task(
+        &bob,
+        &signed_exec_task(
+            room_id.as_str(),
+            task_id,
+            &["sh", "-c", &format!("touch {}", sentinel.to_string_lossy())],
+            &cwd,
+            Vec::new(),
+            &signing,
+            approver_agent,
+        ),
+    )
+    .await
+    .expect("create approval-required task");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+    let scheduler = {
+        let alice = alice.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            run_scheduler_loop(
+                alice,
+                ExecSubscriberRegistry::new(),
+                TaskDispatchMode::Local,
+                running,
+                Duration::from_secs(1),
+            );
+        })
+    };
+
+    let list_opts = ListTasksOptions {
+        room: room_id.to_string(),
+        state: None,
+        assigned_to: None,
+    };
+
+    // Wait for scheduler to hold the task (approval entry queued).
+    let queue_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if pending.iter().any(|p| p.request_id() == approval_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < queue_deadline,
+            "scheduler should enqueue the pending approval within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ── Positive test: Bob (configured approver) releases the task ──
+    //
+    // Bob sends a decision from his own Matrix user, signed with his trusted key.
+    // The scheduler verifies: sender in {local_user} ∪ {bob_id} (passes), key
+    // resolves (room-published), key trusted (trust store), signature valid, replay
+    // material present and unexpired — releases the task.
+    let mut bob_decision = approval_decision_for(
+        &approval_id,
+        DECISION_APPROVED,
+        bob_id.as_str(),
+        "2026-06-13T10:00:00Z",
+    );
+    bob_decision.nonce = Some(format!("allowlist-nonce-{}", std::process::id()));
+    bob_decision.expires_at = Some("2099-01-01T00:00:00Z".to_string());
+    sign_approval_decision(&bob_signing_raw, &bob_key_id, &mut bob_decision)
+        .expect("bob signs the decision");
+
+    bob.sync_once(SyncSettings::default())
+        .await
+        .expect("bob pre-emit sync");
+    let bob_room_for_decision = bob.get_room(&room_id).expect("bob has room for decision");
+    emit_approval_decision(&bob_room_for_decision, &bob_decision)
+        .await
+        .expect("bob emits approval decision");
+
+    let approved_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut final_state = None;
+    loop {
+        if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+            if let Some(t) = tasks.iter().find(|t| t.task_id == task_id) {
+                final_state = Some(t.state.clone());
+                if t.state == "succeeded" {
+                    break;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= approved_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Dump task states for CI diagnostics.
+    if let Ok(tasks) = list_tasks(&bob, &list_opts).await {
+        for t in &tasks {
+            eprintln!(
+                "DIAG task={} state={} result={}",
+                t.task_id,
+                t.state,
+                t.result
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "null".to_string())
+            );
+        }
+    }
+
+    running.store(false, Ordering::SeqCst);
+    scheduler.join().expect("scheduler thread joins");
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    assert_eq!(
+        final_state.as_deref(),
+        Some("succeeded"),
+        "task approved by a configured allowlist approver must run to succeeded; \
+         state: {final_state:?}"
+    );
+    assert!(
+        sentinel.exists(),
+        "task released by a configured non-daemon approver must spawn its command"
     );
 }

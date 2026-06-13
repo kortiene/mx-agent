@@ -2376,7 +2376,7 @@ mx-agent [GLOBAL] approval approve <REQUEST_ID> [--by <IDENTITY>]
 | Option | Value | Required | Default | Description |
 |---|---|---|---|---|
 | `<REQUEST_ID>` | string | Yes | — | Unique identifier of the approval request to approve |
-| `--by` | `<IDENTITY>` | No | logged-in user | Matrix user ID (e.g., `@alice:example.org`) to record as the decision-maker; daemon uses its own user ID if omitted |
+| `--by` | `<IDENTITY>` | No | logged-in user | **Display-only** label (e.g., `@alice:example.org`) recorded as `approved_by` for human/audit context; daemon uses its own user ID if omitted. **Not** an authentication input — see the display-only note below |
 
 **Behavior**
 
@@ -2388,8 +2388,11 @@ JSON output is the `ApprovalDecision` object that was emitted, with fields:
 
 - `request_id`: the approved request
 - `decision`: the string `"approved"`
-- `approved_by`: the identity that made the decision
+- `approved_by`: the identity recorded as the decision-maker (**display-only**, see note below)
 - `created_at`: RFC 3339 UTC timestamp
+- `nonce`: single-use replay nonce stamped by the daemon (issue #285)
+- `expires_at`: RFC 3339 UTC deadline after which the decision can no longer release a held task (issue #285)
+- `signature`: detached Ed25519 signature (`{ alg, key_id, sig }`) over the decision's canonical bytes, verified against the local trust store before a held task is released (issues #285, #309)
 
 **Exit codes**
 
@@ -2414,6 +2417,8 @@ mx-agent approval approve req_01HZ5V --json
 - **Idempotent queue:** If the same request is approved twice, the second approval is still emitted but removes the request from the queue only once; further attempts fail with "request not found".
 - **Matrix publication:** The decision is published into the workspace room so other agents and observers can see it. The decision survives daemon restarts (it is part of the Matrix timeline) but is not duplicated in the local queue.
 - **Fail-closed scheduling:** Only an explicit `approved` decision lets a held task proceed; any other decision (or absence of a decision) keeps it indefinitely held.
+- **`approved_by`/`--by` are display-only (issue #309):** Decision verification never reads `approved_by`. The authoritative approver identity is the Matrix `sender` whose decision is Ed25519-signed by a key present in the daemon's local trust store and matched against the room's `approvers` allowlist (see the `approvers` policy field below). The stateless CLI never owns Matrix credentials or the signing key, so `--by` cannot grant approval authority — it is recorded only for human/audit context.
+- **Trust-anchored release (issue #309):** Before a held `requires_approval` task is released, the daemon verifies the decision against the **local trust store** (not room-published state alone): the signing key must be locally `Trusted`, the sender must be an authorized approver, and the decision must be unexpired. The daemon's own signing key is trusted automatically on agent registration, so the daemon-only default needs no extra setup.
 
 ---
 
@@ -2432,7 +2437,7 @@ mx-agent [GLOBAL] approval deny <REQUEST_ID> [--by <IDENTITY>]
 | Option | Value | Required | Default | Description |
 |---|---|---|---|---|
 | `<REQUEST_ID>` | string | Yes | — | Unique identifier of the approval request to deny |
-| `--by` | `<IDENTITY>` | No | logged-in user | Matrix user ID (e.g., `@alice:example.org`) to record as the decision-maker; daemon uses its own user ID if omitted |
+| `--by` | `<IDENTITY>` | No | logged-in user | **Display-only** label (e.g., `@alice:example.org`) recorded as `approved_by` for human/audit context; daemon uses its own user ID if omitted. **Not** an authentication input — see the display-only note under `approval approve` |
 
 **Behavior**
 
@@ -2444,8 +2449,11 @@ JSON output is the `ApprovalDecision` object with:
 
 - `request_id`: the denied request
 - `decision`: the string `"denied"` (or any non-`"approved"` value)
-- `approved_by`: the identity that made the decision
+- `approved_by`: the identity recorded as the decision-maker (**display-only**, see the note under `approval approve`)
 - `created_at`: RFC 3339 UTC timestamp
+- `nonce`: single-use replay nonce stamped by the daemon (issue #285)
+- `expires_at`: RFC 3339 UTC deadline carried on the decision (issue #285)
+- `signature`: detached Ed25519 signature (`{ alg, key_id, sig }`) over the decision's canonical bytes (issues #285, #309)
 
 **Exit codes**
 
@@ -3077,6 +3085,7 @@ env_allowlist = ["CARGO_HOME"]        # Additional safe env vars to pass to chil
 trusted = true                        # Enable privileged request evaluation in this room
 raw_exec_default = "deny"             # allow | deny — default for raw exec when no agent rule matches
 require_verified_device = false       # Additive: when true, every agent in room requires device verification
+approvers = ["@alice:example.org"]    # Extra Matrix user ids allowed to decide approvals (issue #309)
 
 [rooms."!abc:matrix.org".agents."@claude:matrix.org"]
 allow_exec = true                     # Permit raw exec for this agent
@@ -3104,6 +3113,7 @@ require_verified_device = false       # When true, Matrix device must be verifie
 | `rooms."ROOM_ID".trusted` | room | bool | Must have Matrix room ID starting with `!` |
 | `rooms."ROOM_ID".raw_exec_default` | room | enum | `allow` or `deny`; default when no agent rule applies |
 | `rooms."ROOM_ID".require_verified_device` | room | bool | Room-level override for device verification gate |
+| `rooms."ROOM_ID".approvers` | room | list | Matrix user ids (start with `@`) authorized to decide approvals, in addition to the daemon's own account. Empty (default) ⇒ daemon-only. Necessary-not-sufficient: an approver still needs an Ed25519 signature from a locally-trusted key (issue #309) |
 | `rooms."ROOM_ID".agents."AGENT_ID".allow_exec` | agent | bool | Permit raw `exec` for this agent |
 | `rooms."ROOM_ID".agents."AGENT_ID".allow_tools` | agent | list | Tool names; non-empty validated |
 | `rooms."ROOM_ID".agents."AGENT_ID".allow_commands` | agent | list | Command basenames; non-empty validated |

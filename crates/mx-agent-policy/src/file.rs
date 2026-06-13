@@ -218,6 +218,16 @@ pub struct RoomPolicy {
     /// default `false`. See [`AgentPolicy::require_verified_device`].
     #[serde(default)]
     pub require_verified_device: bool,
+    /// Matrix user ids authorized to decide approvals in this room, in addition
+    /// to the daemon's own account (issue #309).
+    ///
+    /// Empty (the default) preserves the daemon-only behavior: only the host
+    /// daemon's own Matrix account may release a held `requires_approval` task. A
+    /// configured approver still must publish a decision Ed25519-signed by a key
+    /// present in the local trust store; membership here is necessary but never
+    /// sufficient. Older policy files without this key parse unchanged.
+    #[serde(default)]
+    pub approvers: Vec<String>,
     /// Per-agent rules keyed by Matrix user ID.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentPolicy>,
@@ -300,6 +310,17 @@ impl Policy {
                         "room id {room_id:?} must be a Matrix room id starting with '!'"
                     ),
                 });
+            }
+
+            for (idx, approver) in room.approvers.iter().enumerate() {
+                if !approver.starts_with('@') {
+                    return Err(PolicyError::Validation {
+                        path: format!("{room_path}.approvers[{idx}]"),
+                        message: format!(
+                            "approver id {approver:?} must be a Matrix user id starting with '@'"
+                        ),
+                    });
+                }
             }
 
             for (agent_id, agent) in &room.agents {
@@ -472,6 +493,70 @@ network = "deny"
     fn empty_policy_is_valid() {
         let policy = Policy::parse("").expect("empty policy parses");
         assert!(policy.rooms.is_empty());
+    }
+
+    #[test]
+    fn approvers_parse_and_default_empty() {
+        // Configured approvers populate the room field (issue #309).
+        let policy = Policy::parse("[rooms.\"!r:s\"]\napprovers = [\"@alice:s\", \"@bob:s\"]\n")
+            .expect("approvers parse");
+        let room = policy.rooms.get("!r:s").expect("room present");
+        assert_eq!(room.approvers, ["@alice:s", "@bob:s"]);
+
+        // Omitting the key keeps the daemon-only default: an empty approver set.
+        let bare = Policy::parse("[rooms.\"!r:s\"]\ntrusted = true\n").expect("bare room parses");
+        assert!(bare
+            .rooms
+            .get("!r:s")
+            .expect("room present")
+            .approvers
+            .is_empty());
+    }
+
+    #[test]
+    fn bad_approver_id_reports_precise_path() {
+        let err =
+            Policy::parse("[rooms.\"!r:s\"]\napprovers = [\"@ok:s\", \"nope\"]\n").unwrap_err();
+        match err {
+            PolicyError::Validation { path, message } => {
+                assert_eq!(path, "rooms.\"!r:s\".approvers[1]");
+                assert!(
+                    message.contains("must be a Matrix user id"),
+                    "got {message}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approvers_empty_string_is_invalid() {
+        // An empty string does not start with '@', so it must fail validation
+        // with the precise dotted path (issue #309).
+        let err = Policy::parse("[rooms.\"!r:s\"]\napprovers = [\"@ok:s\", \"\"]\n").unwrap_err();
+        match err {
+            PolicyError::Validation { path, message } => {
+                assert_eq!(path, "rooms.\"!r:s\".approvers[1]");
+                assert!(
+                    message.contains("must be a Matrix user id"),
+                    "got {message}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approvers_default_empty_in_sample_policy() {
+        // The SAMPLE policy has no `approvers` key; the field must default to
+        // empty, preserving daemon-only behavior for existing policy files (issue
+        // #309 backward compat).
+        let policy = Policy::parse(SAMPLE).expect("sample policy should parse");
+        let room = policy.rooms.get("!abc:matrix.org").expect("room present");
+        assert!(
+            room.approvers.is_empty(),
+            "omitting `approvers` must default to empty (daemon-only behavior)"
+        );
     }
 
     #[test]

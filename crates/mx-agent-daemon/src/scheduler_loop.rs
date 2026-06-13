@@ -41,7 +41,8 @@ use mx_agent_policy::{Allowance, Policy};
 use mx_agent_protocol::schema::{ApprovalDecision, InvocationState, TaskAction, TaskState};
 
 use crate::approval::{
-    approval_request_expiry, read_verified_approval_decisions, ApprovalQueue, APPROVAL_REQUEST_TTL,
+    approval_request_expiry, read_verified_approval_decisions, ApprovalQueue, DecisionVerification,
+    APPROVAL_REQUEST_TTL,
 };
 use crate::audit::AuditLog;
 use crate::scheduler::TaskScheduler;
@@ -392,6 +393,17 @@ fn scheduler_pass(
         return;
     }
 
+    // Load policy and the local trust store once per pass (every owned agent
+    // reads the same files). Deny-by-default fallbacks: an absent/invalid policy
+    // denies every action and an unreadable trust store trusts nothing. The trust
+    // store is also the authority anchoring approval-decision verification (issue
+    // #309), so it is read here and threaded into both the per-room decision
+    // verification and each agent's orchestrator.
+    let policy = Policy::default_path()
+        .and_then(|path| Policy::load(path).ok())
+        .unwrap_or_default();
+    let trust = TrustStore::load(paths).unwrap_or_default();
+
     // The on-disk approval queue is daemon-global. Load it once per pass behind a
     // shared handle each gate enqueues/removes through, then persist if it
     // changed. The published `com.mxagent.approval.decision.v1` event is the
@@ -465,16 +477,33 @@ fn scheduler_pass(
             matches!(task.state.as_str(), STATE_PENDING | STATE_ASSIGNED)
                 && owned_ids.contains(task.assigned_to.as_str())
         });
-        // Only sender- and signature-verified decisions are admitted (issue #264):
-        // a forged `approved` event from any room member other than this daemon,
-        // or one without a valid signature from a resolvable key, is dropped here
-        // and never reaches the gate, so it cannot release a held task.
+        // The extra approvers configured for this room (issue #309). The
+        // authorized set is the union `{local_user} ∪ approvers`, applied inside
+        // `verification_failure` via the `local_user` field, so this set holds
+        // only the additional approvers (empty ⇒ daemon-only, the secure default).
+        let approvers: BTreeSet<String> = policy
+            .rooms
+            .get(&room_id)
+            .map(|r| r.approvers.iter().cloned().collect())
+            .unwrap_or_default();
+
+        // Only authorized, signature- AND trust-verified, unexpired decisions are
+        // admitted (issues #264, #309): a forged or untrusted-key `approved` event
+        // — even one published in room state — is dropped here and never reaches
+        // the gate, so it cannot release a held task. The signing key must be
+        // locally `Trusted`, not merely room-published.
+        let verification = DecisionVerification {
+            local_user: &local_user,
+            approvers: &approvers,
+            verifying_keys: &verifying_keys,
+            trust: &trust,
+            now_unix: approval_now_unix,
+        };
         let decisions: HashMap<String, ApprovalDecision> = if has_runnable_candidate {
             match runtime.block_on(read_verified_approval_decisions(
                 &room,
                 APPROVAL_DECISIONS_SCAN_LIMIT,
-                &local_user,
-                &verifying_keys,
+                &verification,
             )) {
                 Ok(found) => found,
                 Err(e) => {
@@ -495,14 +524,16 @@ fn scheduler_pass(
                 &snapshot,
                 &verifying_keys,
                 subscribers,
-                mode,
                 paths,
+                &policy,
+                &trust,
                 attempted,
                 claimed_invocations,
                 &decisions,
                 Rc::clone(&approval_queue),
                 &approval_expires_at,
                 approval_now_unix,
+                mode,
             );
         }
     }
@@ -594,21 +625,22 @@ fn scheduler_pass_for_agent(
     snapshot: &[TaskState],
     verifying_keys: &BTreeMap<String, VerifyingKey>,
     subscribers: &ExecSubscriberRegistry,
-    mode: TaskDispatchMode,
     paths: &SessionPaths,
+    policy: &Policy,
+    trust: &TrustStore,
     attempted: &mut HashSet<(String, u64)>,
     claimed_invocations: &mut BTreeSet<String>,
     decisions: &HashMap<String, ApprovalDecision>,
     approval_queue: Rc<RefCell<ApprovalQueue>>,
     approval_expires_at: &str,
     approval_now_unix: i64,
+    mode: TaskDispatchMode,
 ) {
-    // Deny-by-default: when no policy file is present, the default policy denies
-    // every action, so nothing is claimed or dispatched.
-    let policy = Policy::default_path()
-        .and_then(|path| Policy::load(path).ok())
-        .unwrap_or_default();
-    let trust = TrustStore::load(paths).unwrap_or_default();
+    // Policy and the local trust store are loaded once per pass by the caller
+    // ([`scheduler_pass`]) and shared by reference; the orchestrator clones them
+    // in via its by-value `with_policy`/`with_trust_store` API. Deny-by-default:
+    // an absent/invalid policy denies every action and an unreadable trust store
+    // trusts nothing, so nothing is claimed or dispatched.
 
     // Task state is advisory: configuring the trust store and replay cache makes
     // the orchestrator require a valid signed authorization before any
@@ -629,8 +661,8 @@ fn scheduler_pass_for_agent(
     let mut orchestrator = build_scheduler_orchestrator(
         agent.agent_id.clone(),
         room_id,
-        policy,
-        trust,
+        policy.clone(),
+        trust.clone(),
         replay,
         verifying_keys,
         paths,
@@ -1943,6 +1975,56 @@ requires_approval = true
             "policy-allowed action must be audited as allowed: {new_content}"
         );
         assert!(new_content.contains("run_tests"), "{new_content}");
+    }
+
+    #[test]
+    fn build_scheduler_orchestrator_blocks_action_with_untrusted_signing_key() {
+        // Issue #309 wiring: the trust store passed to build_scheduler_orchestrator
+        // is the final authority. When a task's authorization key is present in
+        // `verifying_keys` (room-published state) but absent from the local trust
+        // store, the orchestrator must block the task — room state alone is not
+        // sufficient. This mirrors the `untrusted_key` anchor in the exec/call path.
+        let config_dir = ConfigDirGuard::new("trust-wire");
+        // scheduler_signed_tool_task produces a signed task and an populated
+        // verifying_keys map. We intentionally withhold the trust store so the key
+        // is room-published but not locally trusted.
+        let (_trust, keys, t) = scheduler_signed_tool_task("task-trust-wire", "run_tests");
+        let paths = crate::session::SessionPaths::for_data_dir(
+            std::env::temp_dir().join(format!("mx-agent-sched-trust-wire-{}", std::process::id())),
+        );
+        let orchestrator = build_scheduler_orchestrator(
+            AGENT.to_string(),
+            ROOM,
+            policy(),
+            crate::trust::TrustStore::default(), // empty — key not trusted
+            ReplayCache::load(&paths).expect("replay cache loads"),
+            &keys,
+            &paths,
+        );
+        let mut store_inner = RoomTaskStore::default();
+        store_inner.insert(t.clone());
+        let store_ref = std::cell::RefCell::new(store_inner);
+        let mut ms = MatrixTaskStore::new(ROOM, |opts: UpdateTaskOptions| {
+            store_ref.borrow_mut().apply(opts)
+        });
+        let mut dispatcher = RoutingDispatcher::new(
+            ToolTaskDispatcher::with_runner(|_n, _a, _al, _cwd| {
+                panic!("action with untrusted signing key must never dispatch")
+            }),
+            ExecTaskDispatcher::with_runner(|_r| panic!("no exec")),
+        );
+        let outcome =
+            orchestrator.process_one(&t, std::slice::from_ref(&t), &mut ms, &mut dispatcher);
+        assert!(
+            matches!(outcome, OrchestrationOutcome::Denied { .. }),
+            "task with untrusted signing key must be blocked, not dispatched: {outcome:?}"
+        );
+        assert_eq!(
+            store_ref.borrow().state_of("task-trust-wire"),
+            STATE_BLOCKED,
+            "task must be finalized blocked when its signing key is absent from the trust store"
+        );
+        drop(config_dir);
     }
 
     /// `sleep_interruptible` must wake early when the `running` flag is cleared

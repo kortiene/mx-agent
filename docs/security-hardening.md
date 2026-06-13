@@ -41,7 +41,7 @@ a single byte executes: it must carry a **valid Ed25519 signature**, the signing
 key must be in your **local trust store**, the **policy engine** must explicitly
 allow the room + agent + command + working directory, and — if the request schema
 carries freshness fields — it must be **fresh** (not expired, not a replayed
-nonce). If policy requires human approval, that approval — a **sender-verified, Ed25519-signed** decision emitted by the daemon itself — must also be present (room membership alone cannot release a held task).
+nonce). If policy requires human approval, that approval — a decision from an **authorized approver**, **Ed25519-signed by a key in your local trust store**, and **unexpired** — must also be present (room membership alone cannot release a held task). By default the only authorized approver is the daemon's own account; add others per room with `approvers = ["@alice:server"]` in `policy.toml`. Membership in `approvers` is **necessary but not sufficient**: an approver still needs a signature from a locally-trusted key, so a room member you have not also trusted cannot release a held task (issue #309).
 Every gate is deny-by-default. Removing any one of them (trusting a key you did
 not verify, marking a room `trusted` with a wide `allow_commands` list, running
 with `sandbox = "none"`) widens your exposure; the rest of this guide is about
@@ -369,6 +369,8 @@ env_allowlist   = ["CARGO_HOME", "RUSTUP_HOME"]  # keep this list short
 [rooms."!abc:matrix.org"]
 trusted          = true
 raw_exec_default = "deny"        # deny raw exec unless an agent rule allows it
+# approvers = ["@supervisor:matrix.org"]  # extra approvers beyond the daemon itself (issue #309);
+#                                         # each listed user still needs a locally-trusted signing key
 
 # Per-agent rules, keyed by Matrix user id.
 [rooms."!abc:matrix.org".agents."@claude:matrix.org"]
@@ -408,6 +410,7 @@ network = "deny"
 | `trusted` | `false` | Raw `exec` is only ever evaluated for trusted rooms. |
 | `raw_exec_default` | none | `allow` / `deny` room-wide default for raw exec. |
 | `require_verified_device` | `false` | Room-wide default for the additive verified-device gate (deny-only; see [Device verification](#device-verification-cross-signing-and-key-backup-e2ee)). |
+| `approvers` | `[]` | Matrix user ids (start with `@`) allowed to decide approvals, in addition to the daemon's own account. Empty ⇒ daemon-only. Necessary-not-sufficient: an approver still needs an Ed25519 signature from a locally-trusted key (issue #309). |
 
 `[rooms."<room>".agents."<agent>"]`:
 
@@ -554,6 +557,7 @@ to structured fields here.
 - [ ] `allow_cwd` scoped to a project tree, never `/` or `$HOME`.
 - [ ] `max_runtime_ms` and `max_output_bytes` set for every privileged agent.
 - [ ] `requires_approval = true` for anything not fully constrained.
+- [ ] Non-daemon approvers added to `approvers` in `policy.toml` **only after** running `trust approve` for each; `approvers` is necessary-not-sufficient — an approver still needs a locally-trusted signing key (issue #309).
 - [ ] `default_sandbox` set to `bubblewrap`/`docker`/`podman`; `none` avoided.
 - [ ] `network = "deny"` except where a command genuinely needs it.
 - [ ] `writable_paths` minimal; secrets kept out of `read_only_paths` too.
