@@ -1007,6 +1007,33 @@ self-spawned-server wrapper), **pi** (in-process SDK; no native schema → fence
     cost/usage and structured-output hard-failure rates; assert cross-language state equivalence.
     **Verify:** all checklist boxes ticked for `claude` (cutover gate); other runners' capability-matrix
     rows green or documented.
+    *Landed notes — MOCKED-SEAMS HALF DONE (PR #335, squash `fc6495d`); live real-issue runs still
+    owed:* the step splits cleanly into a mocked-seams half (automatable, now landed) and a live half
+    (real-issue runs per runner — credentials + spend + a human, not autonomously runnable). **Landed
+    (mocked seams):** (a) the named-but-previously-unproven **cutover criterion #2** (cross-language state
+    equivalence) is now an automated cross-language fixture test, tested from BOTH languages since no code
+    is shared across the boundary — `adw/test_cross_language_state.py` + `adw_sdlc/test/
+    cross-language-state.test.ts` each (i) schema-validate both engines' `state.json` against
+    `adw/state.schema.json`, (ii) load the OTHER engine's `state.json` through their own `AdwState.load()`
+    and assert the v1 fields + `completed_phases` + the blocker finding survive (the resume contract; the
+    Python reader drops additive keys), and (iii) assert v1-projection equivalence modulo the TS-additive
+    keys; committed golden fixtures live in `adw/fixtures/cross_language/{py,ts}-produced-state.json` (the
+    shared contract dir next to `state.schema.json`) and are **byte-matched against the real writers** by a
+    per-language drift guard so they cannot silently rot. (b) The Section-10 checklist + Section-8 cutover
+    criteria are materialized in **`adw_sdlc/PARITY.md`**, each box mapped to its proving test, splitting
+    mocked-seams evidence (complete for `claude`) from the human-gated live runs. **Clarification folded
+    in:** the TS engine's realized *top-level* `state.json` additive keys are exactly
+    `engine`/`runner`/`total_cost_usd` — the `session_id`/per-phase `usage` mentioned in §8's additive list
+    are per-phase artifacts, not top-level state fields — so the equivalence tests target precisely those
+    three. `adw/` production code stays untouched (test + fixtures only; the dual-language contract test is
+    mandated by the §8 schema-drift-guard design). Gates: `pytest adw/` 192 passed; `adw-sdlc` typecheck +
+    317 vitest + env-lint green. Adversarial review: 1 confirmed minor (asymmetric fixture key-set guard),
+    fixed. **Still owed (live half):** one real GitHub issue end-to-end per runner recording cost +
+    structured-output hard-failure rate — `claude` done (#304→#331, fix #332); **`codex` blocked** on an
+    OAuth refresh token revoked server-side (unblock with `OPENAI_API_KEY`, which skips the OAuth refresh);
+    `opencode`/`pi` owed (real provider key; pi also needs Node ≥ 22.19). The `claude` cutover gate
+    (criteria 1–6) is met under automated tests + the completed #331 run, so **step 12 is unblocked for
+    `claude` pending the maintainer's sign-off on the live evidence**.
 12. **Cutover:** flip `MX_AGENT_ENGINE` default `py → ts` once the `claude` runner satisfies the cutover
     criteria (Section 8). Keep Python `adw/` as the `py` fallback engine for ≥1 stable release.
 13. **Cleanup (separate PR, after one clean `ts`-default release):** remove Python `adw/` (and retire the
