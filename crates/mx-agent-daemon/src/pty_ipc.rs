@@ -49,6 +49,10 @@ use serde_json::Value;
 
 use mx_agent_ipc::{read_frame, write_frame, Request, Response};
 
+use mx_agent_policy::Allowance;
+
+use crate::exec::{network_for, sandbox_backend};
+use crate::exec_ipc::loopback_execution_allowance;
 use crate::pty::{PtySession, PtyWinsize};
 use crate::runner::RunSpec;
 use crate::stream::{CaptureLimiter, OutputCaps, DEFAULT_PTY_OUTPUT_CAP_BYTES};
@@ -183,6 +187,28 @@ pub(crate) fn write_server_frame(
     write_frame(stream, &bytes)
 }
 
+/// Build the confined [`RunSpec`] for a loopback PTY session from `params` and
+/// the resolved confinement floor `allowance` (issue #307).
+///
+/// Maps `sandbox` / `network` / `env_allowlist` / read-only / writable binds onto
+/// the spec; `PtySession::spawn` then launches the command through that sandbox
+/// backend. No wall-clock timeout is applied — an interactive session runs until
+/// the user ends it (or the output cap bounds a runaway stream). Kept pure so the
+/// allowance-wiring is unit-testable without allocating a PTY.
+fn pty_loopback_run_spec(params: &ExecPtyParams, allowance: &Allowance) -> RunSpec {
+    let cwd = params.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+    RunSpec {
+        command: params.command.clone(),
+        cwd,
+        env_allowlist: allowance.env_allowlist.clone(),
+        sandbox: sandbox_backend(allowance.sandbox),
+        network: network_for(allowance.network),
+        read_only_paths: allowance.read_only_paths.clone(),
+        writable_paths: allowance.writable_paths.clone(),
+        ..Default::default()
+    }
+}
+
 /// Run an interactive PTY `exec` locally (loopback), bridging it to the open IPC
 /// `stream`.
 ///
@@ -197,12 +223,13 @@ pub fn run_pty_loopback(
     stream: &mut UnixStream,
     request_id: &Value,
 ) -> io::Result<()> {
-    let cwd = params.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
-    let spec = RunSpec {
-        command: params.command.clone(),
-        cwd,
-        ..Default::default()
-    };
+    // Resolve and apply the operator's execution-level confinement floor exactly
+    // as loopback exec/`call` do, so the interactive PTY is sandboxed under the
+    // configured backend, network decision, binds, and env allowlist instead of
+    // running with no isolation (issue #307). `PtySession::spawn` routes the spec
+    // through the sandbox backend, so these fields take effect.
+    let allowance = loopback_execution_allowance();
+    let spec = pty_loopback_run_spec(params, &allowance);
     let winsize = PtyWinsize::new(params.rows, params.cols);
     let mut session = match PtySession::spawn(&spec, winsize) {
         Ok(session) => session,
@@ -222,11 +249,13 @@ pub fn run_pty_loopback(
     let out_stream = stream.try_clone()?;
     let in_stream = stream.try_clone()?;
 
-    // The loopback path resolves no policy/allowance, so it falls back to a
-    // generous default cap to bound the merged stream (issue #268). Tests (and
-    // any future flag) can override it via `ExecPtyParams::max_output_bytes`.
+    // Output cap precedence: an explicit per-request override wins, then the
+    // policy's per-invocation `max_output_bytes`, then the generous 64 MiB
+    // fallback that bounds the merged stream when neither is set (issues
+    // #268/#307). The cap drops only forwarded output; it never kills the child.
     let cap = params
         .max_output_bytes
+        .or(allowance.max_output_bytes)
         .or(Some(DEFAULT_PTY_OUTPUT_CAP_BYTES));
     let request_id_out = request_id.clone();
     let output =
@@ -787,6 +816,48 @@ mod tests {
         let value = serde_json::to_value(&frame).unwrap();
         let back: PtyStdinFrame = serde_json::from_value(value).unwrap();
         assert_eq!(back, frame);
+    }
+
+    #[test]
+    fn pty_loopback_run_spec_carries_allowance_confinement_fields() {
+        // The loopback PTY spec must carry the operator's confinement floor so
+        // PtySession::spawn launches the interactive command sandboxed (issue
+        // #307), not with zero isolation.
+        let policy = mx_agent_policy::Policy::parse(
+            r#"
+[execution]
+default_sandbox = "bubblewrap"
+env_allowlist = ["CARGO_HOME"]
+network = "deny"
+read_only_paths = ["/usr"]
+writable_paths = ["/work"]
+"#,
+        )
+        .expect("policy parses");
+        let allowance = policy.execution_allowance();
+        let params: ExecPtyParams = serde_json::from_value(json!({
+            "command": ["bash"],
+        }))
+        .expect("params parse");
+        let spec = pty_loopback_run_spec(&params, &allowance);
+
+        assert_eq!(spec.sandbox, mx_agent_sandbox::Backend::Bubblewrap);
+        assert_eq!(spec.network, mx_agent_sandbox::Network::Deny);
+        assert_eq!(spec.env_allowlist, vec!["CARGO_HOME".to_string()]);
+        assert_eq!(spec.read_only_paths, vec![PathBuf::from("/usr")]);
+        assert_eq!(spec.writable_paths, vec![PathBuf::from("/work")]);
+        // Interactive sessions get no wall-clock kill.
+        assert!(spec.timeout.is_none());
+    }
+
+    #[test]
+    fn pty_loopback_run_spec_default_policy_is_fail_closed() {
+        let allowance = mx_agent_policy::Policy::default().execution_allowance();
+        let params: ExecPtyParams = serde_json::from_value(json!({"command": ["bash"]})).unwrap();
+        let spec = pty_loopback_run_spec(&params, &allowance);
+        assert_eq!(spec.sandbox, mx_agent_sandbox::Backend::None);
+        assert_eq!(spec.network, mx_agent_sandbox::Network::Deny);
+        assert!(spec.env_allowlist.is_empty());
     }
 
     #[test]

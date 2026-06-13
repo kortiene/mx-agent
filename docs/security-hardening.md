@@ -11,10 +11,15 @@ one, **what the safe default is and which options weaken it**.
 > default and become signed Matrix-backed remote operations when `--room`/`--agent`
 > target a registered, trusted, policy-allowed remote agent, with signed
 > stdin/resize/cancel controls for live remote exec. The trust, signing, policy, audit, and
-> sandbox machinery described here is real and already enforced for **batch exec and
-> named tool calls (`call`)** — on the daemon that runs the command, local or remote.
-> Interactive `exec --pty` has only the baseline controls (env scrub, cwd, timeout,
-> output cap); the PTY exec path does not route through the sandbox backend. The output
+> sandbox machinery described here is real. A **remote** `exec`/`call` (`--room`/`--agent`)
+> runs the full receiver-side gate — signature → trust → deny-by-default policy engine →
+> sandbox. A **local loopback** `exec`/`call`/`--pty` (no `--room`/`--agent`) is
+> operator-initiated over the peer-UID-checked socket, so it skips the signature/trust
+> **authorization gate** but still runs under the operator's execution **confinement
+> floor** — the configured sandbox backend, network decision, filesystem binds, env
+> allowlist, plus a default timeout and output cap (parity with `call`; issue #307).
+> Both batch and interactive `exec --pty` route the command through the selected sandbox
+> backend. The output
 > cap for live remote PTY is the agent's `max_output_bytes` from policy (same as batch
 > exec); a loopback PTY (no `--room`/`--agent`) falls back to a 64 MiB hard cap when
 > `max_output_bytes` is unset. When the cap is reached the daemon stops forwarding
@@ -63,7 +68,12 @@ doing that deliberately rather than by accident.
 | Workspace power levels | per-event-type PL 50, `state_default` 100, joiners PL 0 | lowering `state_default`, or a wide `events_default` |
 
 The single most important fact: **with no `policy.toml`, the engine denies every
-`exec` and `call`.** You opt into risk explicitly, never by omission.
+*remote* `exec` and `call`.** You opt into remote-execution risk explicitly, never
+by omission. A *local loopback* `exec`/`call` (no `--room`/`--agent`) does not pass
+through the engine's allow/deny gate — it is operator-initiated on the operator's
+own host — but with no `policy.toml` it still runs under the fail-closed
+confinement floor: no sandbox override, network denied, only the 13 benign env
+vars (secrets scrubbed), and a default timeout/output cap (issue #307).
 
 ## Workspace power levels (state-write integrity)
 
