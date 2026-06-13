@@ -264,6 +264,37 @@ pub enum HeldRequest {
     Call(CallRequest),
 }
 
+impl HeldRequest {
+    /// A copy with the sensitive request payload removed, for the inspection
+    /// surface (issue #306).
+    ///
+    /// The variant and request identity survive — so `list_pending_approvals`
+    /// / `get_pending_approval` callers (the CLI `approval list`/`show` views)
+    /// can still see that a live-resume hold exists — but the content that must
+    /// stay `0600`-at-rest is blanked: an exec's `command`/`env` and a call's
+    /// `args`, plus each request's forward-compat `extra` (a `#[serde(flatten)]`
+    /// escape hatch that could otherwise carry the same secrets to the top
+    /// level). Resume reads the full request from the on-disk queue, never from
+    /// this scrubbed copy, so blanking these costs the release path nothing.
+    fn redacted_for_inspection(&self) -> HeldRequest {
+        match self {
+            HeldRequest::Exec(req) => {
+                let mut redacted = req.clone();
+                redacted.command = Vec::new();
+                redacted.env = Default::default();
+                redacted.extra = Default::default();
+                HeldRequest::Exec(redacted)
+            }
+            HeldRequest::Call(req) => {
+                let mut redacted = req.clone();
+                redacted.args = serde_json::Value::Null;
+                redacted.extra = Default::default();
+                HeldRequest::Call(redacted)
+            }
+        }
+    }
+}
+
 /// A pending approval recorded in the local queue.
 ///
 /// Wraps the [`ApprovalRequest`] content with the room it belongs to, so the
@@ -395,6 +426,20 @@ pub fn list_pending_approvals(
         None => queue.pending().to_vec(),
     };
     pending.sort_by(|a, b| a.request_id().cmp(b.request_id()));
+    // `held_request` carries the full signed request (command/env/args) for
+    // local resume only; it is `0600`-at-rest and must never reach an inspection
+    // surface (this is the CLI `approval list` view). Redact — rather than drop —
+    // the held payload so a caller can still see a live-resume hold *exists*
+    // (`held_request.is_some()`) without its secrets serializing. The internal
+    // release paths read the queue directly via `ApprovalQueue::load`/`get`, so
+    // this keeps persistence and resume intact while preventing the arg leak
+    // (issue #306).
+    for p in &mut pending {
+        p.held_request = p
+            .held_request
+            .as_ref()
+            .map(HeldRequest::redacted_for_inspection);
+    }
     Ok(pending)
 }
 
@@ -403,7 +448,20 @@ pub fn get_pending_approval(
     paths: &SessionPaths,
     request_id: &str,
 ) -> io::Result<Option<PendingApproval>> {
-    Ok(ApprovalQueue::load(paths)?.get(request_id).cloned())
+    // Redact `held_request` on this inspection surface for the same reason as
+    // `list_pending_approvals` (issue #306): the CLI `approval show` view keeps
+    // the "a live-resume hold exists" signal but never the held command/env/args.
+    // Resume reads the queue directly.
+    Ok(ApprovalQueue::load(paths)?
+        .get(request_id)
+        .cloned()
+        .map(|mut p| {
+            p.held_request = p
+                .held_request
+                .as_ref()
+                .map(HeldRequest::redacted_for_inspection);
+            p
+        }))
 }
 
 /// `decision` value approving a request: the held command may now run.
@@ -1398,6 +1456,76 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "queue file must be 0600");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspection_apis_redact_held_request_while_queue_keeps_it() {
+        // The READ surface (issue #306) must satisfy BOTH contracts the live
+        // suite pins on `list_pending_approvals`: the hold's secret payload must
+        // not serialize (`live_named_call_requires_approval_holds_and_enqueues`),
+        // yet `held_request` must remain `Some` so a caller sees a live-resume
+        // hold exists (`live_{exec,call}_held_approval_approve_releases_and_runs`).
+        // So list/get REDACT — keep the variant, blank the secret — rather than
+        // drop. This is the unit-level guard for those live-only tests: the
+        // pre-merge gates run `cargo test`, not the #[ignore]d live suite, so
+        // either regression (leak, or held_request going None) must be catchable
+        // without a homeserver.
+        let dir = tmp_dir("held-redact");
+        let paths = paths_in(&dir);
+        let call = call_request(); // args carry "should_not_appear_in_approval"
+        let mut queue = ApprovalQueue::default();
+        queue.enqueue(PendingApproval {
+            room_id: "!abc:matrix.org".to_string(),
+            request: approval_request_for(&exec_request(), &allowance(true)),
+            held_request: Some(HeldRequest::Call(call)),
+        });
+        queue.save(&paths).unwrap();
+
+        // list: held_request still present (resume signal), secret arg gone.
+        let listed = list_pending_approvals(&paths, None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].held_request.is_some(),
+            "list must keep held_request present so the resume signal survives"
+        );
+        match &listed[0].held_request {
+            Some(HeldRequest::Call(req)) => assert_eq!(
+                req.args,
+                serde_json::Value::Null,
+                "the held call's args must be redacted on the inspection surface"
+            ),
+            other => panic!("expected a redacted held call, got {other:?}"),
+        }
+        let listed_json = serde_json::to_string(&listed).unwrap();
+        assert!(
+            !listed_json.contains("should_not_appear_in_approval"),
+            "held args leaked through list_pending_approvals: {listed_json}"
+        );
+
+        // get: same redaction on the single-fetch surface.
+        let got = get_pending_approval(&paths, "req_01HZ")
+            .unwrap()
+            .expect("queued");
+        assert!(
+            got.held_request.is_some(),
+            "get must keep held_request present"
+        );
+        let got_json = serde_json::to_string(&got).unwrap();
+        assert!(
+            !got_json.contains("should_not_appear_in_approval"),
+            "held args leaked through get_pending_approval: {got_json}"
+        );
+
+        // Resume path is unaffected: the raw queue still recovers the full hold.
+        let reloaded = ApprovalQueue::load(&paths).unwrap();
+        match &reloaded.get("req_01HZ").expect("queued").held_request {
+            Some(HeldRequest::Call(req)) => {
+                assert_eq!(req.args["secret_key"], "should_not_appear_in_approval")
+            }
+            other => panic!("queue must retain the held call for resume, got {other:?}"),
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 
