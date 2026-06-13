@@ -1637,9 +1637,43 @@ both surfaces: a raw `exec` request and a named `call` request (§5.2) are each
 **held — not executed** when their resolved `Allowance` sets `requires_approval`.
 Both enqueue an identically-shaped `PendingApproval` into the local queue and emit
 a `com.mxagent.approval.request.v1`, so `mx-agent approval list/show/approve/deny`
-covers `exec`- and `call`-originated pending approvals uniformly. (Inline resume of
-a *live* held request from a decision event is not wired on either surface today;
-held-action resume exists for task-backed actions via the scheduler.)
+covers `exec`- and `call`-originated pending approvals uniformly.
+
+**Live release (issue #306).** A held *live* `exec`/`call` is released, denied, or
+expired by the same machinery that releases held *tasks*, so `requires_approval`
+is functional end-to-end on both surfaces:
+
+- **Persistence for resume.** Alongside the lossy, no-leak `ApprovalRequest`, the
+  `PendingApproval` persists the original signed request (`HeldRequest::Exec` /
+  `::Call`) locally in `approvals.json` (`0600`, never re-emitted, never logged),
+  so an approving decision can recover the exact request, re-authorize it, and
+  spawn it. Task-backed and legacy holds carry no `HeldRequest` (`None`) and are
+  released by the scheduler, so the task and live paths never collide.
+- **Event-driven consumer.** The `/sync` router dispatches a
+  `com.mxagent.approval.decision.v1` to a live handler that verifies it with the
+  **same rigor** as the scheduler's `read_verified_approval_decisions`
+  (sender-verified, Ed25519-signed by a locally-trusted key, non-replayed,
+  unexpired) and, on an approving decision, **re-runs the full authorize
+  pipeline** (signature → local trust store → deny-by-default policy →
+  verified-device gate) against the recovered request before spawning. A stale
+  hold, a since-revoked key, or a since-tightened policy is denied at release —
+  room membership is never execution permission.
+- **Exactly-once.** The hold is removed from the queue and persisted *before*
+  spawning, so a redelivered decision finds no entry and is a no-op; the sync loop
+  advances its batch token only after the handler returns, so a crash mid-handle
+  releases exactly once on restart. As defense-in-depth the decision's single-use
+  nonce is also burned through the router's **own** shared replay cache (the
+  replay-cache exemption is the pure-authorize call, not a router bypass: the
+  resume path re-runs the authorize pipeline directly, which admits no request
+  nonce, and never re-`admit`s the room-originated request event).
+- **Fail-closed expiry.** A timer-driven scheduler-pass sweep removes any
+  undecided live hold past its `expires_at`, emitting the terminal rejection
+  (`exec.rejected` / `call.response` error with `approval_expired`) and auditing
+  it. Expiry can only ever block a hold, never release one.
+- **Audit.** The audit log distinguishes *held* / *released* / *denied-while-held*
+  / *expired-while-held* from *allow-and-ran* via the `decision` values
+  `held`/`released`/`expired` (deny-while-held reuses `denied` with
+  `policy_rule = deny:approval_denied`).
 
 Policy flag:
 
@@ -2037,6 +2071,18 @@ family when allowed or a stable `deny:<reason>` string when denied:
   "sandbox": "none"
 }
 ```
+
+The `decision` field is `allowed` or `denied` for the immediate allow/deny path.
+The approval-hold lifecycle (issue #306) adds three values so a held request is
+distinguishable from one that ran immediately: `held` (authorized but awaiting a
+decision — nothing ran yet), `released` (a held request re-authorized and run
+after an approving decision), and `expired` (a held request swept fail-closed
+after its approval window passed without a decision). A deny-while-held reuses
+`denied` with `policy_rule = deny:approval_denied`; an expiry records
+`policy_rule = approval_expired` and, like every non-run outcome, omits
+`sandbox`. The release/deny/expiry events are audited themselves, not just the
+original hold, and redact identically (exec via `redact_command`, call by tool
+name only).
 
 The auto-executed task-DAG path is audited the same way: the live scheduler
 attaches an audit log to every task orchestrator it builds, resolving the same

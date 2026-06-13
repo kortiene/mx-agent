@@ -309,6 +309,22 @@ impl EventRouter {
         Self { replay }
     }
 
+    /// Burn an approval **decision** nonce through this router's persistent
+    /// replay cache, as defense-in-depth for the live approval-release path
+    /// (issue #306).
+    ///
+    /// Returns `true` when the nonce was fresh (admitted) and `false` when it was
+    /// already seen — a replayed decision — or its `expires_at` is
+    /// malformed/expired. This is the **single** shared cache the request plane
+    /// admits through ([`route`](Self::route) step 4), so the live decision
+    /// handler must burn here rather than loading a second `ReplayCache`, which
+    /// the router would later clobber on its next whole-file persist. Unlike a
+    /// request nonce, a decision nonce is admitted *only* on the pass that
+    /// actually releases a hold — never while the request is merely held.
+    pub fn admit_decision_nonce(&mut self, nonce: &str, expires_at: &str) -> bool {
+        self.replay.admit(nonce, expires_at).is_ok()
+    }
+
     /// Route a single event, dispatching supported events to `sink`.
     ///
     /// The `sink` is invoked at most once, only for an event that passes every
@@ -920,5 +936,78 @@ mod tests {
         drop(sink);
         // Each frame was dispatched twice — 6 total — and none was blocked.
         assert_eq!(rec.dispatched.len(), 6);
+    }
+
+    // --- admit_decision_nonce (issue #306) ----------------------------------
+
+    #[test]
+    fn admit_decision_nonce_fresh_returns_true() {
+        // A fresh decision nonce with a future expiry is admitted so the live
+        // approval-release path can proceed.
+        let (mut router, _data) = router("admitdec-fresh");
+        assert!(
+            router.admit_decision_nonce("dec-nonce-fresh", "2099-01-01T00:00:00Z"),
+            "a fresh decision nonce must be admitted"
+        );
+    }
+
+    #[test]
+    fn admit_decision_nonce_replayed_returns_false() {
+        // A decision nonce burned a second time is rejected — defense-in-depth
+        // against a captured and replayed `approval.decision` event after the
+        // initial release.
+        let (mut router, _data) = router("admitdec-replay");
+        let nonce = "dec-nonce-replay";
+        let expires = "2099-01-01T00:00:00Z";
+        assert!(
+            router.admit_decision_nonce(nonce, expires),
+            "first burn must succeed"
+        );
+        assert!(
+            !router.admit_decision_nonce(nonce, expires),
+            "replayed decision nonce must be rejected"
+        );
+    }
+
+    #[test]
+    fn admit_decision_nonce_expired_returns_false() {
+        // A decision nonce whose `expires_at` is in the past is rejected before
+        // it ever touches the cache — the admission fails because the nonce's
+        // lifetime has already closed.
+        let (mut router, _data) = router("admitdec-expired");
+        assert!(
+            !router.admit_decision_nonce("dec-nonce-expired", "1971-01-01T00:00:00Z"),
+            "an expired decision nonce must be rejected"
+        );
+    }
+
+    #[test]
+    fn approval_decision_event_dispatches_to_sink() {
+        // Issue #306: the router must dispatch a well-formed `approval.decision`
+        // event to the handler sink so `handle_live_approval_decision` fires.
+        // Before #306 was fixed, `RoutedEvent::ApprovalDecision` fell into the
+        // catch-all "no live handler" arm; this test verifies it now reaches
+        // the sink at the routing layer.
+        let (mut router, _data) = router("approval-decision-dispatch");
+        let mut rec = Recorder::default();
+        let ev = incoming(
+            timeline::APPROVAL_DECISION,
+            serde_json::json!({
+                "request_id": "req_01HZ",
+                "decision": "approved",
+                "approved_by": "@daemon:server",
+                "created_at": "2026-06-10T12:00:00Z",
+            }),
+        );
+        let outcome = {
+            let mut sink = rec.sink();
+            router.route(&ev, &mut sink)
+        };
+        assert_eq!(
+            outcome,
+            RouteOutcome::Dispatched(EventCategory::ApprovalDecision),
+            "approval.decision must be dispatched to the sink (issue #306)"
+        );
+        assert_eq!(rec.dispatched, vec![EventCategory::ApprovalDecision]);
     }
 }

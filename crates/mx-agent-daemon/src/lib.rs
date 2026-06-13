@@ -61,8 +61,8 @@ pub use approval::{
     disposition_for_call, disposition_for_exec, emit_approval_decision, emit_approval_request,
     get_pending_approval, list_pending_approvals, read_approval_decisions,
     read_verified_approval_decisions, verification_failure, ApprovalDecisionRecord, ApprovalQueue,
-    CallDisposition, DecisionVerification, ExecDisposition, PendingApproval, APPROVAL_REQUEST_TTL,
-    DECISION_APPROVED, DECISION_DENIED,
+    CallDisposition, DecisionVerification, ExecDisposition, HeldRequest, PendingApproval,
+    APPROVAL_REQUEST_TTL, DECISION_APPROVED, DECISION_DENIED,
 };
 pub use artifact::{
     list_stream_artifacts, prepare_artifact, retrieve_artifact, retrieve_artifact_for_session,

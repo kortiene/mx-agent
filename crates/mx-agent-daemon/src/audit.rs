@@ -26,14 +26,32 @@ use serde::Serialize;
 /// Default config-relative file name for the audit log.
 pub const AUDIT_FILE_NAME: &str = "audit.log";
 
-/// Whether a privileged request was permitted or rejected.
+/// Whether a privileged request was permitted, rejected, or moved through the
+/// approval-hold lifecycle (architecture §12).
+///
+/// `Allowed`/`Denied` are the original policy-decision values and keep their
+/// stable JSON. The held-lifecycle values (issue #306) let the audit log
+/// distinguish a request that was *authorized and ran immediately* (`Allowed`)
+/// from one that was *authorized but held* (`Held`), later *released* by an
+/// approving decision (`Released`), or *swept after its approval window
+/// expired* (`Expired`). A deny-while-held reuses `Denied` (distinguished by its
+/// `policy_rule`, e.g. `deny:approval_denied`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuditDecision {
-    /// The request was permitted by policy.
+    /// The request was permitted by policy and ran (allow-and-ran).
     Allowed,
-    /// The request was rejected by policy.
+    /// The request was rejected by policy or a post-policy gate.
     Denied,
+    /// The request was authorized but is held pending an approval decision;
+    /// nothing has run yet (allow-and-held).
+    Held,
+    /// A previously-held request was re-authorized and released to run after an
+    /// approval decision approved it.
+    Released,
+    /// A held request was swept fail-closed after its approval window expired
+    /// without a decision; it never ran.
+    Expired,
 }
 
 impl AuditDecision {
@@ -203,6 +221,167 @@ impl AuditRecord {
             tool: Some(tool.to_string()),
             decision: AuditDecision::Denied,
             policy_rule: format!("deny:{deny_reason}"),
+            sandbox: None,
+        }
+    }
+
+    /// Build an audit record for a raw `exec` request that was authorized but is
+    /// **held** pending an approval decision (architecture §12, issue #306).
+    ///
+    /// The request passed the full authorize pipeline, so this records the same
+    /// redacted command, allow-family `policy_rule`, and resolved `sandbox` as
+    /// [`AuditRecord::for_exec`], but with [`AuditDecision::Held`] so the log
+    /// distinguishes allow-and-held from allow-and-ran. `outcome` is the policy
+    /// `Allow` outcome the authorization produced.
+    pub fn for_exec_held(
+        room: &str,
+        requester: &str,
+        target: &str,
+        invocation_id: Option<&str>,
+        command: &[String],
+        outcome: &Outcome,
+    ) -> Self {
+        Self {
+            ts: now_rfc3339(),
+            room: room.to_string(),
+            requester: requester.to_string(),
+            target: target.to_string(),
+            invocation_id: invocation_id.map(str::to_string),
+            request: "exec",
+            command: Some(redact_command(command)),
+            tool: None,
+            decision: AuditDecision::Held,
+            policy_rule: rule_for(outcome, "allow_commands"),
+            sandbox: sandbox_for_outcome(outcome),
+        }
+    }
+
+    /// Build an audit record for a held raw `exec` request that was
+    /// **released** to run after an approving decision re-authorized it (issue
+    /// #306). Like [`AuditRecord::for_exec_held`] but with
+    /// [`AuditDecision::Released`]; `outcome` is the *re-resolved* allowance.
+    pub fn for_exec_released(
+        room: &str,
+        requester: &str,
+        target: &str,
+        invocation_id: Option<&str>,
+        command: &[String],
+        outcome: &Outcome,
+    ) -> Self {
+        Self {
+            ts: now_rfc3339(),
+            room: room.to_string(),
+            requester: requester.to_string(),
+            target: target.to_string(),
+            invocation_id: invocation_id.map(str::to_string),
+            request: "exec",
+            command: Some(redact_command(command)),
+            tool: None,
+            decision: AuditDecision::Released,
+            policy_rule: rule_for(outcome, "allow_commands"),
+            sandbox: sandbox_for_outcome(outcome),
+        }
+    }
+
+    /// Build an audit record for a held raw `exec` request that **expired**
+    /// without a decision and was swept fail-closed (issue #306). Nothing ran,
+    /// so no sandbox is selected; the decision is [`AuditDecision::Expired`] and
+    /// `policy_rule` is the stable `approval_expired` marker.
+    pub fn for_exec_expired(
+        room: &str,
+        requester: &str,
+        target: &str,
+        invocation_id: Option<&str>,
+        command: &[String],
+    ) -> Self {
+        Self {
+            ts: now_rfc3339(),
+            room: room.to_string(),
+            requester: requester.to_string(),
+            target: target.to_string(),
+            invocation_id: invocation_id.map(str::to_string),
+            request: "exec",
+            command: Some(redact_command(command)),
+            tool: None,
+            decision: AuditDecision::Expired,
+            policy_rule: "approval_expired".to_string(),
+            sandbox: None,
+        }
+    }
+
+    /// Build an audit record for a named `call` that was authorized but is
+    /// **held** pending an approval decision (issue #306). Mirrors
+    /// [`AuditRecord::for_exec_held`] but records the `tool` name (no argv).
+    pub fn for_call_held(
+        room: &str,
+        requester: &str,
+        target: &str,
+        invocation_id: Option<&str>,
+        tool: &str,
+        outcome: &Outcome,
+    ) -> Self {
+        Self {
+            ts: now_rfc3339(),
+            room: room.to_string(),
+            requester: requester.to_string(),
+            target: target.to_string(),
+            invocation_id: invocation_id.map(str::to_string),
+            request: "call",
+            command: None,
+            tool: Some(tool.to_string()),
+            decision: AuditDecision::Held,
+            policy_rule: rule_for(outcome, "allow_tools"),
+            sandbox: sandbox_for_outcome(outcome),
+        }
+    }
+
+    /// Build an audit record for a held named `call` that was **released** to run
+    /// after an approving decision re-authorized it (issue #306). Mirrors
+    /// [`AuditRecord::for_exec_released`] but records the `tool` name.
+    pub fn for_call_released(
+        room: &str,
+        requester: &str,
+        target: &str,
+        invocation_id: Option<&str>,
+        tool: &str,
+        outcome: &Outcome,
+    ) -> Self {
+        Self {
+            ts: now_rfc3339(),
+            room: room.to_string(),
+            requester: requester.to_string(),
+            target: target.to_string(),
+            invocation_id: invocation_id.map(str::to_string),
+            request: "call",
+            command: None,
+            tool: Some(tool.to_string()),
+            decision: AuditDecision::Released,
+            policy_rule: rule_for(outcome, "allow_tools"),
+            sandbox: sandbox_for_outcome(outcome),
+        }
+    }
+
+    /// Build an audit record for a held named `call` that **expired** without a
+    /// decision and was swept fail-closed (issue #306). Nothing ran; mirrors
+    /// [`AuditRecord::for_exec_expired`] but records the `tool` name.
+    pub fn for_call_expired(
+        room: &str,
+        requester: &str,
+        target: &str,
+        invocation_id: Option<&str>,
+        tool: &str,
+    ) -> Self {
+        Self {
+            ts: now_rfc3339(),
+            room: room.to_string(),
+            requester: requester.to_string(),
+            target: target.to_string(),
+            invocation_id: invocation_id.map(str::to_string),
+            request: "call",
+            command: None,
+            tool: Some(tool.to_string()),
+            decision: AuditDecision::Expired,
+            policy_rule: "approval_expired".to_string(),
             sandbox: None,
         }
     }
@@ -756,10 +935,178 @@ mod tests {
     }
 
     #[test]
+    fn held_lifecycle_records_have_stable_decisions_and_redact() {
+        // Issue #306: the held lifecycle is distinguishable in the audit log from
+        // allow-and-ran, command argv stays redacted, and each line is compact.
+        let cmd = argv(&["deploy", "--token", "s3cr3t"]);
+        let held = AuditRecord::for_exec_held("!r", "@a", "t", Some("inv-1"), &cmd, &allow());
+        assert_eq!(held.decision, AuditDecision::Held);
+        assert_eq!(held.policy_rule, "allow_commands");
+        assert_eq!(held.sandbox.as_deref(), Some("none"));
+        let json = held.to_json_line();
+        assert!(json.contains("\"decision\":\"held\""), "got {json}");
+        assert!(
+            !json.contains("s3cr3t"),
+            "secret leaked into held audit: {json}"
+        );
+        assert!(!json.contains('\n'));
+
+        let released =
+            AuditRecord::for_exec_released("!r", "@a", "t", Some("inv-1"), &cmd, &allow());
+        assert_eq!(released.decision, AuditDecision::Released);
+        assert!(released
+            .to_json_line()
+            .contains("\"decision\":\"released\""));
+        assert!(!released.to_json_line().contains("s3cr3t"));
+
+        let expired = AuditRecord::for_exec_expired("!r", "@a", "t", Some("inv-1"), &cmd);
+        assert_eq!(expired.decision, AuditDecision::Expired);
+        assert_eq!(expired.policy_rule, "approval_expired");
+        assert_eq!(expired.sandbox, None, "nothing ran, so no sandbox");
+        assert!(expired.to_json_line().contains("\"decision\":\"expired\""));
+        assert!(!expired.to_json_line().contains("s3cr3t"));
+    }
+
+    #[test]
+    fn held_call_lifecycle_records_use_tool_and_omit_argv() {
+        // The call held lifecycle records the tool name (never an argv) so call
+        // args never reach the log (issue #306).
+        let held = AuditRecord::for_call_held("!r", "@a", "t", Some("inv-1"), "deploy", &allow());
+        assert_eq!(held.decision, AuditDecision::Held);
+        assert_eq!(held.policy_rule, "allow_tools");
+        assert_eq!(held.tool.as_deref(), Some("deploy"));
+        assert!(held.command.is_none());
+
+        let released =
+            AuditRecord::for_call_released("!r", "@a", "t", Some("inv-1"), "deploy", &allow());
+        assert_eq!(released.decision, AuditDecision::Released);
+
+        let expired = AuditRecord::for_call_expired("!r", "@a", "t", Some("inv-1"), "deploy");
+        assert_eq!(expired.decision, AuditDecision::Expired);
+        assert_eq!(expired.tool.as_deref(), Some("deploy"));
+        assert!(expired.command.is_none());
+        assert_eq!(expired.sandbox, None);
+    }
+
+    #[test]
     fn timestamp_is_rfc3339() {
         assert_eq!(unix_to_rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(unix_to_rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
         let ts = now_rfc3339();
         assert!(ts.ends_with('Z') && ts.len() == 20, "got {ts}");
+    }
+
+    // --- issue #306: AuditDecision helpers -----------------------------------
+
+    #[test]
+    fn audit_decision_from_outcome_maps_allow_and_deny() {
+        // AuditDecision::from_outcome maps Allow → Allowed and Deny → Denied.
+        // The held-lifecycle variants (Held, Released, Expired) are set directly
+        // by the callers that know a hold occurred — not via from_outcome.
+        assert_eq!(
+            AuditDecision::from_outcome(&Outcome::Allow(Allowance::default())),
+            AuditDecision::Allowed,
+            "Allow outcome must map to Allowed"
+        );
+        assert_eq!(
+            AuditDecision::from_outcome(&Outcome::Deny(DenyReason::ExecNotAllowed)),
+            AuditDecision::Denied,
+            "Deny outcome must map to Denied"
+        );
+        assert_eq!(
+            AuditDecision::from_outcome(&Outcome::Deny(DenyReason::ToolNotAllowed {
+                tool: "wipe".to_string()
+            })),
+            AuditDecision::Denied,
+            "Any Deny reason must map to Denied"
+        );
+    }
+
+    // --- issue #306: held/released lifecycle sandbox recording ---------------
+
+    #[test]
+    fn for_exec_held_records_selected_sandbox() {
+        // A held exec authorized against a bubblewrap allowance records the
+        // sandbox so the audit log captures exactly what would have been used,
+        // mirroring `allowed_exec_records_selected_sandbox` for the Held path.
+        let outcome = Outcome::Allow(Allowance {
+            sandbox: Some(mx_agent_policy::Sandbox::Bubblewrap),
+            ..Allowance::default()
+        });
+        let record =
+            AuditRecord::for_exec_held("!r", "@a", "t", None, &argv(&["cargo", "test"]), &outcome);
+        assert_eq!(record.decision, AuditDecision::Held);
+        assert_eq!(
+            record.sandbox.as_deref(),
+            Some("bubblewrap"),
+            "held exec with bubblewrap allowance must record the sandbox"
+        );
+        let json = record.to_json_line();
+        assert!(json.contains("\"decision\":\"held\""), "got {json}");
+        assert!(json.contains("\"sandbox\":\"bubblewrap\""), "got {json}");
+    }
+
+    #[test]
+    fn for_call_held_records_selected_sandbox() {
+        // A held call authorized against a bubblewrap allowance records the
+        // sandbox, mirroring `for_exec_held_records_selected_sandbox` for the
+        // named-call surface.
+        let outcome = Outcome::Allow(Allowance {
+            sandbox: Some(mx_agent_policy::Sandbox::Bubblewrap),
+            ..Allowance::default()
+        });
+        let record = AuditRecord::for_call_held("!r", "@a", "t", None, "deploy", &outcome);
+        assert_eq!(record.decision, AuditDecision::Held);
+        assert_eq!(
+            record.sandbox.as_deref(),
+            Some("bubblewrap"),
+            "held call with bubblewrap allowance must record the sandbox"
+        );
+        let json = record.to_json_line();
+        assert!(json.contains("\"decision\":\"held\""), "got {json}");
+        assert!(json.contains("\"sandbox\":\"bubblewrap\""), "got {json}");
+    }
+
+    #[test]
+    fn for_exec_released_records_sandbox_from_re_resolved_allowance() {
+        // Released records the sandbox from the *re-resolved* allowance (not the
+        // original hold's). This matters because policy may have tightened in the
+        // time between hold and release — the audit log should reflect what will
+        // actually run.
+        let outcome = Outcome::Allow(Allowance {
+            sandbox: Some(mx_agent_policy::Sandbox::Bubblewrap),
+            ..Allowance::default()
+        });
+        let record = AuditRecord::for_exec_released(
+            "!r",
+            "@a",
+            "t",
+            Some("inv-1"),
+            &argv(&["cargo", "build"]),
+            &outcome,
+        );
+        assert_eq!(record.decision, AuditDecision::Released);
+        assert_eq!(record.sandbox.as_deref(), Some("bubblewrap"));
+        let json = record.to_json_line();
+        assert!(json.contains("\"decision\":\"released\""), "got {json}");
+        assert!(json.contains("\"sandbox\":\"bubblewrap\""), "got {json}");
+    }
+
+    #[test]
+    fn for_call_released_records_tool_and_no_argv() {
+        // A released call record carries the tool name (never an argv) so call
+        // args never reach the log even via the release path (issue #306).
+        let record =
+            AuditRecord::for_call_released("!r", "@a", "t", Some("inv-1"), "deploy", &allow());
+        assert_eq!(record.decision, AuditDecision::Released);
+        assert_eq!(record.tool.as_deref(), Some("deploy"));
+        assert!(
+            record.command.is_none(),
+            "released call record must carry no command argv"
+        );
+        let json = record.to_json_line();
+        assert!(json.contains("\"decision\":\"released\""), "got {json}");
+        assert!(json.contains("\"tool\":\"deploy\""), "got {json}");
+        assert!(!json.contains("\"command\""), "got {json}");
     }
 }

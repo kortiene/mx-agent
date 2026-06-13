@@ -67,6 +67,14 @@ pub enum CallRejection {
     /// the originating Matrix device is not verified (issue #240). Layered after
     /// the authoritative signature → trust → policy gate; can only add a denial.
     UnverifiedDevice,
+    /// A held `requires_approval` call was **denied** by an operator's approval
+    /// decision (issue #306). A terminal, post-policy outcome surfaced to the
+    /// requester so a held call does not hang silently on a deny.
+    ApprovalDenied,
+    /// A held `requires_approval` call **expired** without a decision and was
+    /// swept fail-closed (issue #306). A terminal, post-policy outcome surfaced
+    /// to the requester so a held call does not hang silently on expiry.
+    ApprovalExpired,
 }
 
 impl CallRejection {
@@ -79,6 +87,8 @@ impl CallRejection {
             Self::UntrustedKey { .. } => "untrusted_key".to_string(),
             Self::PolicyDenied(_) => "policy_denied".to_string(),
             Self::UnverifiedDevice => "unverified_device".to_string(),
+            Self::ApprovalDenied => "approval_denied".to_string(),
+            Self::ApprovalExpired => "approval_expired".to_string(),
         }
     }
 }
@@ -94,6 +104,10 @@ impl std::fmt::Display for CallRejection {
             }
             Self::PolicyDenied(reason) => write!(f, "policy denied call: {reason}"),
             Self::UnverifiedDevice => write!(f, "policy requires a verified sending device"),
+            Self::ApprovalDenied => write!(f, "approval-required call was denied"),
+            Self::ApprovalExpired => {
+                write!(f, "approval-required call expired without a decision")
+            }
         }
     }
 }
@@ -667,14 +681,6 @@ pub async fn handle_live_call_request(
     .await
     {
         Ok((authorized, allowance)) => {
-            audit_call_decision(
-                paths,
-                &meta.room_id,
-                &authorized,
-                requesting_agent,
-                target_agent,
-                &Outcome::Allow(allowance.clone()),
-            );
             // Honour the policy's `requires_approval` flag, mirroring the exec
             // path (`exec.rs`): an approval-required call is held — enqueued and
             // emitted as a `com.mxagent.approval.request.v1` — and the tool is
@@ -684,11 +690,32 @@ pub async fn handle_live_call_request(
             // result while holding).
             match crate::approval::disposition_for_call(authorized.clone(), &allowance) {
                 crate::approval::CallDisposition::RequiresApproval { approval, .. } => {
-                    hold_call_for_approval(paths, &room, &meta.room_id, &approval).await;
+                    // Authorized but held (architecture §12): audit *held* (not
+                    // allow-and-ran) and persist the original signed call so an
+                    // approving decision can re-authorize and run it.
+                    audit_call_held(
+                        paths,
+                        &meta.room_id,
+                        &authorized,
+                        requesting_agent,
+                        target_agent,
+                        &allowance,
+                    );
+                    hold_call_for_approval(paths, &room, &meta.room_id, &authorized, &approval)
+                        .await;
                     return;
                 }
                 crate::approval::CallDisposition::Execute(_) => {}
             }
+            // Allowed and running immediately (allow-and-ran).
+            audit_call_decision(
+                paths,
+                &meta.room_id,
+                &authorized,
+                requesting_agent,
+                target_agent,
+                &Outcome::Allow(allowance.clone()),
+            );
             execute_authorized_call(&authorized, &allowance).await
         }
         Err(rejection) => {
@@ -726,14 +753,21 @@ pub async fn handle_live_call_request(
 ///
 /// Extracted from the live handler so the "PendingApproval is enqueued" step is
 /// unit-testable against a temp dir without a live Matrix room.
+///
+/// `request` is the original signed call, persisted as the
+/// [`HeldRequest`](crate::approval::HeldRequest) so an approving decision can
+/// re-authorize and run it (issue #306). It is `0600`-at-rest only and never
+/// leaks into the emitted, no-leak `approval`.
 fn enqueue_call_approval(
     paths: &SessionPaths,
     room_id: &str,
+    request: &CallRequest,
     approval: &mx_agent_protocol::schema::ApprovalRequest,
 ) -> crate::approval::PendingApproval {
     let pending = crate::approval::PendingApproval {
         room_id: room_id.to_string(),
         request: approval.clone(),
+        held_request: Some(crate::approval::HeldRequest::Call(request.clone())),
     };
     let mut queue = crate::approval::ApprovalQueue::load(paths).unwrap_or_default();
     queue.enqueue(pending.clone());
@@ -747,17 +781,133 @@ fn enqueue_call_approval(
 /// `com.mxagent.approval.request.v1` into the room, without executing the tool.
 ///
 /// Mirrors the exec hold path (`exec.rs`): persist the [`PendingApproval`](crate::approval::PendingApproval)
-/// for operator visibility/durability, then ask for a decision. The tool is not
-/// run here; the call stays held (fail closed) until an operator decides.
+/// (including the original signed `request` for live resume) for operator
+/// visibility/durability, then ask for a decision. The tool is not run here; the
+/// call stays held (fail closed) until an operator decides.
 async fn hold_call_for_approval(
     paths: &SessionPaths,
     room: &Room,
     room_id: &str,
+    request: &CallRequest,
     approval: &mx_agent_protocol::schema::ApprovalRequest,
 ) {
-    enqueue_call_approval(paths, room_id, approval);
+    enqueue_call_approval(paths, room_id, request, approval);
     if let Err(e) = crate::approval::emit_approval_request(room, approval).await {
         tracing::warn!(error = %e, request_id = %approval.request_id, "failed to emit call approval request");
+    }
+}
+
+/// Execute an authorized `call` and emit its `com.mxagent.call.response.v1`.
+///
+/// Extracted so both the direct live dispatch and the approval-release path
+/// ([`release_held_call`]) produce the same response lifecycle.
+pub(crate) async fn execute_and_respond_call(
+    room: &Room,
+    request: &CallRequest,
+    allowance: &mx_agent_policy::Allowance,
+) {
+    let response = execute_authorized_call(request, allowance).await;
+    if let Err(e) = emit_call_response(room, &response).await {
+        tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call response");
+    }
+}
+
+/// Re-authorize a previously-held `call` and, if it still passes the **full**
+/// pipeline, run it; otherwise emit a terminal `call.response` error (issue
+/// #306).
+///
+/// Called by the live approval-decision handler on an *approved* decision. It
+/// re-runs [`authorize_live_call`] (signature → trust → deny-by-default policy →
+/// verified-device gate) against the recovered original call, so a stale hold, a
+/// since-revoked key, or a since-tightened policy is denied at release — room
+/// membership is never execution permission. On success it audits *released* and
+/// runs the tool; on denial it audits and emits the rejection. The hold has
+/// already been removed from the queue by the caller, so any failure fails
+/// closed (never runs).
+pub(crate) async fn release_held_call(
+    paths: &SessionPaths,
+    room: &Room,
+    room_id: &str,
+    request: CallRequest,
+) {
+    let requesting_agent = request.requesting_agent.clone().unwrap_or_default();
+    let target_agent = request.target_agent.clone().unwrap_or_default();
+    let content = match serde_json::to_value(&request) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(error = %e, request_id = %request.request_id, "could not reserialize held call request for release");
+            return;
+        }
+    };
+    match authorize_live_call(room, paths, &content, &request, &requesting_agent, room_id).await {
+        Ok((authorized, allowance)) => {
+            audit_call_released(
+                paths,
+                room_id,
+                &authorized,
+                &requesting_agent,
+                &target_agent,
+                &allowance,
+            );
+            execute_and_respond_call(room, &authorized, &allowance).await;
+        }
+        Err(rejection) => {
+            if let Some(record) = call_rejection_audit_record(
+                room_id,
+                &request,
+                &requesting_agent,
+                &target_agent,
+                &rejection,
+            ) {
+                append_audit(paths, &request.invocation_id, record);
+            }
+            let response = rejection_response(request.request_id.clone(), &rejection);
+            if let Err(e) = emit_call_response(room, &response).await {
+                tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call rejection on release");
+            }
+        }
+    }
+}
+
+/// Terminally reject a held `call` whose approval was **denied** by an operator
+/// (issue #306): audit denied-while-held and emit a `call.response` error
+/// (`approval_denied`). Never runs the tool.
+pub(crate) async fn deny_held_call(
+    room: &Room,
+    paths: &SessionPaths,
+    room_id: &str,
+    request: &CallRequest,
+) {
+    let requester = request.requesting_agent.as_deref().unwrap_or_default();
+    let target = request.target_agent.as_deref().unwrap_or_default();
+    let record = AuditRecord::for_call_denied(
+        room_id,
+        requester,
+        target,
+        Some(&request.invocation_id),
+        &request.tool,
+        &CallRejection::ApprovalDenied.reason(),
+    );
+    append_audit(paths, &request.invocation_id, record);
+    let response = rejection_response(request.request_id.clone(), &CallRejection::ApprovalDenied);
+    if let Err(e) = emit_call_response(room, &response).await {
+        tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call.response for denied hold");
+    }
+}
+
+/// Terminally reject a held `call` whose approval window **expired** without a
+/// decision (issue #306): audit *expired-while-held* and emit a `call.response`
+/// error (`approval_expired`). Never runs the tool.
+pub(crate) async fn expire_held_call(
+    room: &Room,
+    paths: &SessionPaths,
+    room_id: &str,
+    request: &CallRequest,
+) {
+    audit_call_expired(paths, room_id, request);
+    let response = rejection_response(request.request_id.clone(), &CallRejection::ApprovalExpired);
+    if let Err(e) = emit_call_response(room, &response).await {
+        tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call.response for expired hold");
     }
 }
 
@@ -827,6 +977,63 @@ fn audit_call_decision(
         Some(&request.invocation_id),
         &request.tool,
         outcome,
+    );
+    append_audit(paths, &request.invocation_id, record);
+}
+
+/// Audit an authorized named `call` that is **held** pending an approval
+/// decision (issue #306): `decision = held`, allow-family rule, resolved sandbox.
+fn audit_call_held(
+    paths: &SessionPaths,
+    room_id: &str,
+    request: &CallRequest,
+    requester: &str,
+    target: &str,
+    allowance: &mx_agent_policy::Allowance,
+) {
+    let record = AuditRecord::for_call_held(
+        room_id,
+        requester,
+        target,
+        Some(&request.invocation_id),
+        &request.tool,
+        &Outcome::Allow(allowance.clone()),
+    );
+    append_audit(paths, &request.invocation_id, record);
+}
+
+/// Audit a held named `call` that was **released** to run after an approving
+/// decision re-authorized it (issue #306): `decision = released`.
+fn audit_call_released(
+    paths: &SessionPaths,
+    room_id: &str,
+    request: &CallRequest,
+    requester: &str,
+    target: &str,
+    allowance: &mx_agent_policy::Allowance,
+) {
+    let record = AuditRecord::for_call_released(
+        room_id,
+        requester,
+        target,
+        Some(&request.invocation_id),
+        &request.tool,
+        &Outcome::Allow(allowance.clone()),
+    );
+    append_audit(paths, &request.invocation_id, record);
+}
+
+/// Audit a held named `call` that **expired** without a decision and was swept
+/// fail-closed (issue #306): `decision = expired`, no sandbox (nothing ran).
+fn audit_call_expired(paths: &SessionPaths, room_id: &str, request: &CallRequest) {
+    let requester = request.requesting_agent.as_deref().unwrap_or_default();
+    let target = request.target_agent.as_deref().unwrap_or_default();
+    let record = AuditRecord::for_call_expired(
+        room_id,
+        requester,
+        target,
+        Some(&request.invocation_id),
+        &request.tool,
     );
     append_audit(paths, &request.invocation_id, record);
 }
@@ -1375,6 +1582,19 @@ allow_tools = ["run_tests", "lint"]
         );
     }
 
+    #[test]
+    fn call_approval_outcome_rejections_have_stable_reasons() {
+        // Issue #306: the terminal post-policy outcomes for a held call carry
+        // stable reason strings that flow into the `call.response` error field.
+        assert_eq!(CallRejection::ApprovalDenied.reason(), "approval_denied");
+        assert_eq!(CallRejection::ApprovalExpired.reason(), "approval_expired");
+        let denied = rejection_response("req_x", &CallRejection::ApprovalDenied);
+        assert!(!denied.ok);
+        assert_eq!(denied.error.as_deref(), Some("approval_denied"));
+        let expired = rejection_response("req_x", &CallRejection::ApprovalExpired);
+        assert_eq!(expired.error.as_deref(), Some("approval_expired"));
+    }
+
     // ── audit routing tests (issue #257) ─────────────────────────────────────
 
     fn call_request_for_audit(tool: &str) -> CallRequest {
@@ -1529,20 +1749,32 @@ allow_tools = ["run_tests", "lint"]
         };
         let approval = approval_request_for_call(&request, &allowance);
 
-        let pending = enqueue_call_approval(&paths, ROOM, &approval);
+        let pending = enqueue_call_approval(&paths, ROOM, &request, &approval);
         assert_eq!(pending.room_id, ROOM);
         assert_eq!(pending.request_id(), "req_audit_test");
 
-        // The pending approval is durable on disk and names only the tool.
+        // The pending approval is durable on disk and its *emitted* ApprovalRequest
+        // names only the tool (no-leak): the args never reach the request content.
         let reloaded = ApprovalQueue::load(&paths).unwrap();
         let queued = reloaded.get("req_audit_test").expect("approval is queued");
         assert_eq!(queued.room_id, ROOM);
         assert_eq!(queued.request.summary, "Call tool deploy");
-        let json = serde_json::to_string(&reloaded).unwrap();
+        let approval_json = serde_json::to_string(&queued.request).unwrap();
         assert!(
-            !json.contains("should_not_appear_in_audit"),
-            "call args must not leak into the queued approval: {json}"
+            !approval_json.contains("should_not_appear_in_audit"),
+            "call args must not leak into the emitted approval request: {approval_json}"
         );
+
+        // The held request retains the *full* original signed call (incl. args)
+        // for re-authorization on approval (issue #306). It is 0600-at-rest only,
+        // never emitted into the room or logged.
+        match &queued.held_request {
+            Some(crate::approval::HeldRequest::Call(held)) => {
+                assert_eq!(held.request_id, "req_audit_test");
+                assert_eq!(held.tool, "deploy");
+            }
+            other => panic!("expected a held Call request, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1660,8 +1892,8 @@ requires_approval = true
         };
         let approval = approval_request_for_call(&request, &allowance);
 
-        enqueue_call_approval(&paths, ROOM, &approval);
-        enqueue_call_approval(&paths, ROOM, &approval);
+        enqueue_call_approval(&paths, ROOM, &request, &approval);
+        enqueue_call_approval(&paths, ROOM, &request, &approval);
 
         let reloaded = ApprovalQueue::load(&paths).unwrap();
         assert_eq!(

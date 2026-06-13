@@ -70,7 +70,24 @@
 //! subscriber sender-pin → consumer, proving "room membership ≠ execution
 //! permission" for the result plane (fake exit status **and** injected output).
 //!
-//! Four new tests (issue #309) prove the trust-store anchor for approval
+//! Five tests (issue #306) prove the live `exec`/`call` approval-release path
+//! end-to-end against a real homeserver:
+//! [`live_exec_held_approval_approve_releases_and_runs`] — approve a held live
+//! `exec` via [`decide_approval_for_session`] → `handle_live_approval_decision`
+//! re-authorizes and spawns it, the sentinel file appears, the queue entry is
+//! removed; [`live_exec_held_approval_deny_never_runs`] — deny a held live `exec`
+//! → the command never spawns, the queue entry is still removed (terminal denial);
+//! [`live_call_held_approval_approve_releases_and_runs`] — approve a held live
+//! `call` → `release_held_call` runs the tool and a `call.response.v1` appears in
+//! the room timeline; [`live_exec_held_forged_decision_ignored`] — Bob emits an
+//! unsigned `approval.decision.v1` for Alice's held exec → the sender check
+//! (`untrusted_sender`) drops it, the hold stays queued, the exec never runs;
+//! [`live_exec_held_expiry_never_runs`] — a pre-injected live exec hold whose
+//! `expires_at` is already past is swept by the scheduler's
+//! `sweep_expired_live_holds` on its first pass, the queue entry is removed, and
+//! the command sentinel is never created (mirrors #291 for task-backed holds).
+//!
+//! Four more tests (issue #309) prove the trust-store anchor for approval
 //! decisions end-to-end against a real homeserver:
 //! [`live_scheduler_rejects_decision_with_untrusted_key`] — a decision signed
 //! by a key that IS published in `com.mxagent.agent.v1` room state but is NOT
@@ -143,15 +160,17 @@ use mx_agent_daemon::{
     BackoffConfig, CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions,
     CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
     ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent,
-    GrantWorkspaceOptions, HeartbeatConfig, ListAgentsOptions, ListTasksOptions, Liveness,
-    LivenessConfig, MatrixConfig, PendingApproval, PtyWinsize, RegisterAgentOptions, SasAdvance,
-    SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceError,
+    GrantWorkspaceOptions, HeartbeatConfig, HeldRequest, ListAgentsOptions, ListTasksOptions,
+    Liveness, LivenessConfig, MatrixConfig, PendingApproval, PtyWinsize, RegisterAgentOptions,
+    SasAdvance, SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceError,
     WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
     WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
-use mx_agent_protocol::schema::{AgentState, ApprovalRequest, StreamKind, TaskAction};
+use mx_agent_protocol::schema::{
+    AgentState, ApprovalRequest, ExecRequest, Signature, StreamKind, TaskAction,
+};
 
 /// Read a required environment variable or fail with an actionable message.
 fn required_env(name: &str) -> String {
@@ -5266,6 +5285,1280 @@ requires_approval = true
     std::env::remove_var("MX_AGENT_CONFIG_DIR");
 }
 
+/// Issue #306: approve a held live `exec` → it executes exactly once.
+///
+/// The sync loop's `RoutedEvent::ApprovalDecision` handler
+/// (`handle_live_approval_decision`) verifies the decision, removes the hold,
+/// re-authorizes the original request through the full pipeline, and spawns
+/// it via `spawn_authorized_live_exec`.
+///
+/// Verifies:
+/// 1. Exec held fail-closed: sentinel not created, PendingApproval queued with
+///    `held_request` set (so the release path can recover the original request).
+/// 2. Approve via [`decide_approval_for_session`] → daemon processes the
+///    decision event, re-authorizes, and spawns the command.
+/// 3. Sentinel file created within 60 s of approval (exactly-once execution).
+/// 4. Queue entry removed after the decision is consumed.
+///
+/// Run via: `scripts/matrix_integration_test.sh`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_exec_held_approval_approve_releases_and_runs() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("approved-exec-ran");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+
+    let room = create_public_room(&bob, "mx-agent exec hold+approve release test (306)").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice sees power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    // Alice's sync loop holds the exec when received and releases it once the
+    // approval decision arrives.
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    // Send the signed exec request directly — `start_exec_matrix` would block
+    // waiting for `exec.accepted`, which is only emitted after approval.
+    let invocation_id = format!("inv_306_approve_{}", std::process::id());
+    let request_id = format!("req_306_approve_{}", std::process::id());
+    save_session(&paths, &bob_session).expect("save requester session");
+    let bob_room = bob.get_room(&room_id).expect("bob sees room");
+    let content = build_signed_exec_request(
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        &request_id,
+        format!("nonce-306-approve-{}", std::process::id()),
+        "2026-06-13T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        &ExecRequestOptions {
+            target_agent: TARGET_AGENT.to_string(),
+            requesting_agent: requester_agent.clone(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", sentinel.to_string_lossy()),
+            ],
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: BTreeMap::new(),
+            stdin: false,
+            stream: false,
+            pty: false,
+            timeout_ms: 30_000,
+            task_id: None,
+        },
+    )
+    .expect("sign exec request");
+    bob_room
+        .send_raw(timeline::EXEC_REQUEST, content)
+        .await
+        .expect("send approval-required exec request");
+
+    // Wait for the daemon to enqueue the hold.
+    let hold_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if pending.iter().any(|p| p.request_id() == request_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < hold_deadline,
+            "daemon should hold the approval-required exec within 60 s (issue #306)"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        !sentinel.exists(),
+        "exec must not spawn while held pending approval (issue #306)"
+    );
+    // `held_request` must carry the original exec so the release path can spawn it.
+    let queued = list_pending_approvals(&paths, Some(room_id.as_str()))
+        .expect("list pending approvals")
+        .into_iter()
+        .find(|p| p.request_id() == request_id)
+        .expect("PendingApproval must be queued for held exec");
+    assert!(
+        queued.held_request.is_some(),
+        "PendingApproval.held_request must be set so the live release path can spawn it (issue #306)"
+    );
+
+    // Approve via the same IPC path as `mx-agent approval approve`.
+    decide_approval_for_session(
+        &alice_session,
+        &paths,
+        &request_id,
+        DECISION_APPROVED,
+        alice_id.as_str(),
+    )
+    .await
+    .expect("approve held exec");
+
+    // The daemon processes the decision on its next sync, re-authorizes, and
+    // spawns the command. Poll for the sentinel (up to 60 s).
+    let release_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if sentinel.exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < release_deadline,
+            "released exec must spawn and create the sentinel within 60 s (issue #306)"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        sentinel.exists(),
+        "sentinel must exist after approved exec executes (issue #306)"
+    );
+    let remaining = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+    assert!(
+        !remaining.iter().any(|p| p.request_id() == request_id),
+        "PendingApproval must be removed from queue after an approved live decision (issue #306)"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
+/// Issue #306: deny a held live `exec` → it never executes and the hold is removed.
+///
+/// Exercises the `denied-while-held` branch of `handle_live_approval_decision`:
+/// `deny_held_exec` emits an `exec.rejected` (`approval_denied`) event and the
+/// sentinel command never spawns.
+///
+/// Verifies:
+/// 1. Exec held fail-closed (sentinel not created, PendingApproval queued).
+/// 2. Deny via [`decide_approval_for_session`] → `deny_held_exec` runs; command
+///    never spawns; queue entry removed.
+/// 3. Sentinel does NOT exist after the denial and a grace period.
+///
+/// Run via: `scripts/matrix_integration_test.sh`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_exec_held_approval_deny_never_runs() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("denied-exec-must-not-run");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+
+    let room = create_public_room(&bob, "mx-agent exec hold+deny test (306)").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice sees power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    let invocation_id = format!("inv_306_deny_{}", std::process::id());
+    let request_id = format!("req_306_deny_{}", std::process::id());
+    save_session(&paths, &bob_session).expect("save requester session");
+    let bob_room = bob.get_room(&room_id).expect("bob sees room");
+    let content = build_signed_exec_request(
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        &request_id,
+        format!("nonce-306-deny-{}", std::process::id()),
+        "2026-06-13T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        &ExecRequestOptions {
+            target_agent: TARGET_AGENT.to_string(),
+            requesting_agent: requester_agent.clone(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", sentinel.to_string_lossy()),
+            ],
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: BTreeMap::new(),
+            stdin: false,
+            stream: false,
+            pty: false,
+            timeout_ms: 30_000,
+            task_id: None,
+        },
+    )
+    .expect("sign exec request");
+    bob_room
+        .send_raw(timeline::EXEC_REQUEST, content)
+        .await
+        .expect("send approval-required exec request");
+
+    // Wait for the hold to be enqueued.
+    let hold_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if pending.iter().any(|p| p.request_id() == request_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < hold_deadline,
+            "daemon should hold the approval-required exec within 60 s (issue #306)"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        !sentinel.exists(),
+        "exec must not spawn while held pending approval (issue #306)"
+    );
+
+    // Deny the hold.
+    decide_approval_for_session(
+        &alice_session,
+        &paths,
+        &request_id,
+        DECISION_DENIED,
+        alice_id.as_str(),
+    )
+    .await
+    .expect("deny held exec");
+
+    // Wait for the deny to be processed (queue entry removed on the daemon side).
+    let deny_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let remaining = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if !remaining.iter().any(|p| p.request_id() == request_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deny_deadline,
+            "PendingApproval must be removed from queue after a denied decision (issue #306)"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // After denial the command must never have spawned. A 3 s grace period is
+    // enough — a spawned `sh -c touch …` finishes in milliseconds.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !sentinel.exists(),
+        "denied exec must never spawn its command (issue #306)"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
+/// Issue #306: approve a held live `call` → it executes and a `call.response`
+/// appears in the room timeline.
+///
+/// Mirrors [`live_exec_held_approval_approve_releases_and_runs`] for the named-call
+/// path: `release_held_call` re-authorizes via `authorize_live_call`, runs the
+/// tool via `execute_and_respond_call`, and emits a `com.mxagent.call.response.v1`
+/// regardless of the tool's exit code.
+///
+/// Verifies:
+/// 1. Call held fail-closed (no `call.response`, PendingApproval queued with
+///    `held_request` set).
+/// 2. Approve via [`decide_approval_for_session`] → `release_held_call` runs the
+///    tool and emits `call.response`.
+/// 3. A `call.response.v1` for our `request_id` appears in the room within 90 s.
+/// 4. Queue entry removed after the decision.
+///
+/// Run via: `scripts/matrix_integration_test.sh`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_call_held_approval_approve_releases_and_runs() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+
+    let room = create_public_room(&bob, "mx-agent call hold+approve release test (306)").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice sees power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["call".to_string()],
+            tools: vec!["run_tests@1.0.0".to_string()],
+            cwd: "/tmp".to_string(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["call".to_string()],
+            tools: vec!["run_tests@1.0.0".to_string()],
+            cwd: "/tmp".to_string(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_tools = ["run_tests"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+        ),
+    )
+    .expect("write policy");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    // Send a signed call request directly — `start_call_matrix` blocks waiting
+    // for `call.response`, which only arrives after the hold is released.
+    let invocation_id = format!("inv_306_call_approve_{}", std::process::id());
+    let request_id = format!("req_306_call_approve_{}", std::process::id());
+    save_session(&paths, &bob_session).expect("save requester session");
+    let bob_room = bob.get_room(&room_id).expect("bob sees room");
+    let content = build_signed_call_request_for_target(
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        &request_id,
+        format!("nonce-306-call-approve-{}", std::process::id()),
+        "2026-06-13T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        "run_tests",
+        // Arg value deliberately distinct to confirm it stays out of the approval queue.
+        json!({ "package": "nonexistent-package-306" }),
+        CallTargeting {
+            requesting_agent: Some(requester_agent.clone()),
+            target_agent: Some(TARGET_AGENT.to_string()),
+        },
+    )
+    .expect("sign call request");
+    bob_room
+        .send_raw(timeline::CALL_REQUEST, content)
+        .await
+        .expect("send approval-required call request");
+
+    // Wait for the hold to be enqueued.
+    let hold_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if pending.iter().any(|p| p.request_id() == request_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < hold_deadline,
+            "daemon should hold the approval-required call within 60 s (issue #306)"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // `held_request` must carry the original call so `release_held_call` can run it.
+    let queued = list_pending_approvals(&paths, Some(room_id.as_str()))
+        .expect("list pending")
+        .into_iter()
+        .find(|p| p.request_id() == request_id)
+        .expect("PendingApproval must be queued for held call");
+    assert!(
+        queued.held_request.is_some(),
+        "PendingApproval.held_request must be set for live call holds (issue #306)"
+    );
+
+    // No `call.response` must have been emitted while the call is held.
+    let mut msg_opts = MessagesOptions::backward();
+    msg_opts.limit = matrix_sdk::ruma::UInt::from(50_u32);
+    let messages = bob_room
+        .messages(msg_opts)
+        .await
+        .expect("paginate timeline");
+    let pre_response = messages.chunk.iter().any(|event| {
+        let raw = event.raw();
+        raw.get_field::<String>("type").ok().flatten().as_deref() == Some(timeline::CALL_RESPONSE)
+            && raw
+                .get_field::<Value>("content")
+                .ok()
+                .flatten()
+                .and_then(|c| {
+                    c.get("request_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == request_id)
+                })
+                .unwrap_or(false)
+    });
+    assert!(
+        !pre_response,
+        "daemon must NOT emit call.response before an approval decision (issue #306)"
+    );
+
+    // Approve.
+    decide_approval_for_session(
+        &alice_session,
+        &paths,
+        &request_id,
+        DECISION_APPROVED,
+        alice_id.as_str(),
+    )
+    .await
+    .expect("approve held call");
+
+    // Poll for the `call.response` to appear in the room timeline. The tool may
+    // fail (cargo test on a nonexistent package) but a response is always emitted
+    // — what matters is that it exists, proving the release happened.
+    let release_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let response_found = loop {
+        let mut poll_opts = MessagesOptions::backward();
+        poll_opts.limit = matrix_sdk::ruma::UInt::from(50_u32);
+        if let Ok(messages) = bob_room.messages(poll_opts).await {
+            let found = messages.chunk.iter().any(|event| {
+                let raw = event.raw();
+                raw.get_field::<String>("type").ok().flatten().as_deref()
+                    == Some(timeline::CALL_RESPONSE)
+                    && raw
+                        .get_field::<Value>("content")
+                        .ok()
+                        .flatten()
+                        .and_then(|c| {
+                            c.get("request_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s == request_id)
+                        })
+                        .unwrap_or(false)
+            });
+            if found {
+                break true;
+            }
+        }
+        if tokio::time::Instant::now() >= release_deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(
+        response_found,
+        "a call.response.v1 must appear in the timeline after approving a held call (issue #306): \
+         request_id={request_id}"
+    );
+
+    let remaining = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+    assert!(
+        !remaining.iter().any(|p| p.request_id() == request_id),
+        "PendingApproval must be removed from queue after an approved live call decision (issue #306)"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
+/// Issue #306: a forged unsigned approval decision from an untrusted sender is
+/// ignored — the hold stays queued and the exec never runs.
+///
+/// Security invariant: `handle_live_approval_decision` checks the event's
+/// **Matrix sender** against the daemon's local user and the room's approver
+/// allowlist before verifying any signature. Bob (the requester) is neither, so
+/// his decision event is dropped at the `untrusted_sender` check without touching
+/// the hold.
+///
+/// Verifies:
+/// 1. Exec held fail-closed (sentinel not created, PendingApproval queued).
+/// 2. Bob emits an unsigned `approval.decision.v1` for Alice's hold.
+/// 3. After a full sync cycle, the hold is still queued and the sentinel does
+///    not exist — the forged decision had no effect.
+///
+/// Run via: `scripts/matrix_integration_test.sh`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_exec_held_forged_decision_ignored() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("forged-decision-must-not-run");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+
+    let room = create_public_room(&bob, "mx-agent exec forged-decision security test (306)").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice sees power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+requires_approval = true
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    let invocation_id = format!("inv_306_forged_{}", std::process::id());
+    let request_id = format!("req_306_forged_{}", std::process::id());
+    save_session(&paths, &bob_session).expect("save requester session");
+    let bob_room = bob.get_room(&room_id).expect("bob sees room");
+    let content = build_signed_exec_request(
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        &request_id,
+        format!("nonce-306-forged-{}", std::process::id()),
+        "2026-06-13T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        &ExecRequestOptions {
+            target_agent: TARGET_AGENT.to_string(),
+            requesting_agent: requester_agent.clone(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", sentinel.to_string_lossy()),
+            ],
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: BTreeMap::new(),
+            stdin: false,
+            stream: false,
+            pty: false,
+            timeout_ms: 30_000,
+            task_id: None,
+        },
+    )
+    .expect("sign exec request");
+    bob_room
+        .send_raw(timeline::EXEC_REQUEST, content)
+        .await
+        .expect("send approval-required exec request");
+
+    // Wait for the hold to be enqueued.
+    let hold_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if pending.iter().any(|p| p.request_id() == request_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < hold_deadline,
+            "daemon should hold the approval-required exec within 60 s (issue #306)"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        !sentinel.exists(),
+        "exec must not spawn while held pending approval (issue #306)"
+    );
+
+    // Bob sends a forged unsigned decision from his own Matrix account. His
+    // sender identity is NOT Alice's local_user, so `handle_live_approval_decision`
+    // drops the event at the `untrusted_sender` check without modifying the hold.
+    bob_room
+        .send_raw(
+            timeline::APPROVAL_DECISION,
+            json!({
+                "request_id": request_id,
+                "decision": DECISION_APPROVED,
+                "approved_by": bob.user_id().expect("bob user id").as_str(),
+                "created_at": "2026-06-13T00:00:00Z",
+            }),
+        )
+        .await
+        .expect("send forged unsigned decision from bob");
+
+    // Give Alice's sync loop time to process the forged event (at least one full
+    // sync cycle). The forged decision should be silently dropped.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // The hold must still be queued — the forged decision had no effect.
+    let pending_after = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+    assert!(
+        pending_after.iter().any(|p| p.request_id() == request_id),
+        "hold must remain queued after a forged decision from an untrusted sender (issue #306)"
+    );
+    assert!(
+        !sentinel.exists(),
+        "exec must not spawn after a forged decision — fail-closed (issue #306)"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
+/// Issue #306: a live exec hold whose approval window has expired is swept by
+/// the scheduler and never runs.
+///
+/// `sweep_expired_live_holds` (called every scheduler pass) detects a live hold
+/// whose persisted `expires_at` is in the past, emits `exec.rejected`
+/// (`approval_expired`), removes the queue entry, and **never** spawns the
+/// command — mirroring #291 for task-backed holds.
+///
+/// A task-backed hold (`held_request == None`) is intentionally skipped by
+/// the sweep (its lifetime is the scheduler gate's responsibility). This test
+/// uses a live hold (`held_request == Some(HeldRequest::Exec(...))`) to prove
+/// the correct branch is taken.
+///
+/// The hold is pre-injected with `expires_at: "2020-01-01T00:00:00Z"` so the
+/// first scheduler pass immediately finds an expired entry without waiting one
+/// hour for APPROVAL_REQUEST_TTL to elapse.
+///
+/// Verifies:
+/// 1. Pre-injected expired live hold is in the queue before scheduler start.
+/// 2. Scheduler sweeps it within 60 s (queue entry removed).
+/// 3. Sentinel file never created — the exec command never spawned.
+///
+/// Run via: `scripts/matrix_integration_test.sh`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_exec_held_expiry_never_runs() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+    let sentinel = cwd.join("expiry-exec-must-not-run");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+
+    let room = create_public_room(&bob, "mx-agent exec hold expiry test (306)").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice sees power levels");
+
+    // Alice registers an agent so the scheduler runs a pass for this room and
+    // calls sweep_expired_live_holds.
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+
+    // Pre-populate the approval queue with an already-expired live exec hold.
+    // The command would touch the sentinel if it ever ran; the expiry sweep
+    // must not spawn it.
+    let invocation_id = format!("inv_306_expiry_{}", std::process::id());
+    let request_id = format!("req_306_expiry_{}", std::process::id());
+    let mut pre_queue = ApprovalQueue::default();
+    pre_queue.enqueue(PendingApproval {
+        room_id: room_id.to_string(),
+        request: ApprovalRequest {
+            request_id: request_id.clone(),
+            invocation_id: invocation_id.clone(),
+            requester: requester_agent.clone(),
+            target: TARGET_AGENT.to_string(),
+            summary: format!(
+                "Run touch sentinel (expiry test) in {}",
+                cwd.to_string_lossy()
+            ),
+            risk: "medium".to_string(),
+            expires_at: "2020-01-01T00:00:00Z".to_string(), // far in the past
+            extra: Default::default(),
+        },
+        // Live hold: held_request carries the original exec. The expiry sweep
+        // selects only holds where held_request.is_some() (task-backed holds
+        // with held_request == None are left to the scheduler gate).
+        held_request: Some(HeldRequest::Exec(ExecRequest {
+            invocation_id: invocation_id.clone(),
+            request_id: request_id.clone(),
+            target_agent: TARGET_AGENT.to_string(),
+            requesting_agent: requester_agent.clone(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", sentinel.to_string_lossy()),
+            ],
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: Default::default(),
+            stdin: false,
+            stream: false,
+            pty: false,
+            timeout_ms: 30_000,
+            task_id: None,
+            created_at: "2020-01-01T00:00:00Z".to_string(),
+            expires_at: "2020-01-01T00:00:00Z".to_string(),
+            nonce: format!("nonce-306-expiry-{}", std::process::id()),
+            idempotency_key: format!("exec:{invocation_id}"),
+            signature: Signature {
+                alg: "ed25519".to_string(),
+                key_id: signing.key_id().to_string(),
+                // Placeholder sig: the expiry path never verifies the held
+                // request's own signature (the decision is already verified);
+                // the command is rejected before any spawn.
+                sig: "placeholder-not-verified-for-expiry-path".to_string(),
+            },
+            extra: Default::default(),
+        })),
+    });
+    pre_queue.save(&paths).expect("save pre-expired live hold");
+
+    // Confirm the hold is queued before the scheduler starts.
+    let before = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+    assert!(
+        before.iter().any(|p| p.request_id() == request_id),
+        "pre-injected expired live hold must be in the queue before the scheduler starts (issue #306)"
+    );
+    assert!(
+        !sentinel.exists(),
+        "sentinel must not exist before the sweep"
+    );
+
+    // Start both the sync loop (provides the room handle) and the scheduler
+    // loop (runs sweep_expired_live_holds every pass).
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+    let scheduler = {
+        let alice = alice.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            run_scheduler_loop(
+                alice,
+                ExecSubscriberRegistry::new(),
+                TaskDispatchMode::Local,
+                running,
+                Duration::from_secs(1),
+            );
+        })
+    };
+
+    // Wait for the scheduler to sweep the expired hold (queue entry removed).
+    let sweep_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let remaining = list_pending_approvals(&paths, Some(room_id.as_str())).unwrap_or_default();
+        if !remaining.iter().any(|p| p.request_id() == request_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < sweep_deadline,
+            "scheduler must sweep the expired live hold within 60 s (issue #306)"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // A 2 s grace period is enough — a spawned `sh -c touch …` finishes in
+    // milliseconds; the expiry path must not spawn it at all.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !sentinel.exists(),
+        "expired live exec hold must never spawn its command (issue #306)"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    scheduler.join().expect("scheduler thread joins");
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
 /// Decrypt-after-restart from the persistent crypto store (issue #260; issue
 /// #240 "Stage 1").
 ///
@@ -7533,6 +8826,9 @@ requires_approval = true
             expires_at: "2020-01-01T00:00:00Z".to_string(),
             extra: Default::default(),
         },
+        // This is a task-backed hold (released by the scheduler), so it carries
+        // no live-resume material (issue #306).
+        held_request: None,
     });
     pre_queue
         .save(&paths)

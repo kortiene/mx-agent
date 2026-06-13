@@ -536,6 +536,20 @@ fn scheduler_pass(
                 mode,
             );
         }
+
+        // Sweep undecided *live* exec/call holds whose approval window has passed
+        // (issue #306, mirroring the task expiry sweep of #265/#291): emit the
+        // terminal rejection and remove them from the queue so they never run.
+        // Cheap and timeline-free — it only compares the persisted `expires_at`
+        // stamp to `now` — so it runs every pass, independent of runnable work.
+        sweep_expired_live_holds(
+            runtime,
+            &room,
+            &room_id,
+            paths,
+            &approval_queue,
+            approval_now_unix,
+        );
     }
 
     // Persist the approval queue only if a gate enqueued or resolved something
@@ -545,6 +559,78 @@ fn scheduler_pass(
             tracing::warn!(error = %e, "scheduler pass could not persist approval queue");
         }
     }
+}
+
+/// Sweep undecided *live* `exec`/`call` holds in `room_id` whose approval window
+/// has expired, removing them from the shared queue fail-closed (issue #306).
+///
+/// Only holds carrying live-resume material (`held_request.is_some()`) are
+/// considered: task-backed holds are the scheduler gate's to expire (#265), and
+/// a `None` hold cannot be resumed regardless. For each expired live hold this
+/// emits the terminal rejection (`exec.rejected` / `call.response` error with
+/// `approval_expired`), audits *expired-while-held*, and removes the entry. The
+/// caller persists the (now shared, mutated) queue once if anything changed.
+/// Expiry can only ever **block** a hold, never release one, so it strengthens
+/// the deny-by-default posture.
+fn sweep_expired_live_holds(
+    runtime: &Arc<tokio::runtime::Runtime>,
+    room: &matrix_sdk::Room,
+    room_id: &str,
+    paths: &SessionPaths,
+    queue: &Rc<RefCell<ApprovalQueue>>,
+    now_unix: i64,
+) {
+    use crate::approval::HeldRequest;
+
+    // Snapshot the expired live holds before mutating, so the immutable borrow is
+    // released before any `remove`. The selection is a pure function, so it is
+    // unit-tested without a live `Room`.
+    let expired = expired_live_holds_in_room(&queue.borrow(), room_id, now_unix);
+
+    for pending in expired {
+        match pending.held_request {
+            Some(HeldRequest::Exec(request)) => {
+                runtime.block_on(crate::exec::expire_held_exec(
+                    room, paths, room_id, &request,
+                ));
+            }
+            Some(HeldRequest::Call(request)) => {
+                runtime.block_on(crate::call::expire_held_call(
+                    room, paths, room_id, &request,
+                ));
+            }
+            // Defensive: the selection above only retains `Some` holds.
+            None => continue,
+        }
+        queue
+            .borrow_mut()
+            .remove(pending.request.request_id.as_str());
+    }
+}
+
+/// Select the *live* holds in `room_id` whose approval window has expired at
+/// `now_unix` (issue #306).
+///
+/// Pure and fail-closed, so the sweep's selection is unit-testable without a
+/// live `Room`. Only holds carrying live-resume material
+/// (`held_request.is_some()`) past their persisted `expires_at` are returned:
+/// task-backed and legacy (`None`) holds are left untouched (the scheduler gate
+/// owns task expiry), and a fresh (unexpired) hold is left to be decided. A
+/// malformed stamp is treated as not-yet-expired (it stays operator-decidable),
+/// matching [`approval_request_expired`](crate::approval::approval_request_expired).
+fn expired_live_holds_in_room(
+    queue: &ApprovalQueue,
+    room_id: &str,
+    now_unix: i64,
+) -> Vec<crate::approval::PendingApproval> {
+    queue
+        .pending_in_room(room_id)
+        .filter(|pending| {
+            pending.held_request.is_some()
+                && crate::approval::approval_request_expired(&pending.request.expires_at, now_unix)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Build the production-configured task orchestrator for `agent_id`: the same
@@ -2046,5 +2132,114 @@ requires_approval = true
             start.elapsed() < Duration::from_secs(2),
             "sleep_interruptible must wake within ~150ms of the flag clear, not after the full 10s"
         );
+    }
+
+    // --- live-hold expiry sweep selection (issue #306) ----------------------
+
+    fn pending_exec_hold(
+        request_id: &str,
+        room: &str,
+        expires_at: &str,
+        live: bool,
+    ) -> crate::approval::PendingApproval {
+        use mx_agent_protocol::schema::{ApprovalRequest, ExecRequest, Signature};
+        let request = ApprovalRequest {
+            request_id: request_id.to_string(),
+            invocation_id: format!("inv_{request_id}"),
+            requester: "@a:s".to_string(),
+            target: "dev-pi".to_string(),
+            summary: "held".to_string(),
+            risk: "medium".to_string(),
+            expires_at: expires_at.to_string(),
+            extra: Default::default(),
+        };
+        let held_request = live.then(|| {
+            crate::approval::HeldRequest::Exec(ExecRequest {
+                invocation_id: format!("inv_{request_id}"),
+                request_id: request_id.to_string(),
+                target_agent: "dev-pi".to_string(),
+                requesting_agent: "@a:s".to_string(),
+                command: vec!["true".to_string()],
+                cwd: "/repo".to_string(),
+                env: Default::default(),
+                stdin: false,
+                stream: false,
+                pty: false,
+                timeout_ms: 1000,
+                task_id: None,
+                created_at: "2026-06-02T12:00:00Z".to_string(),
+                expires_at: expires_at.to_string(),
+                nonce: "n".to_string(),
+                idempotency_key: format!("exec:inv_{request_id}"),
+                signature: Signature {
+                    alg: "ed25519".to_string(),
+                    key_id: "k".to_string(),
+                    sig: "s".to_string(),
+                },
+                extra: Default::default(),
+            })
+        });
+        crate::approval::PendingApproval {
+            room_id: room.to_string(),
+            request,
+            held_request,
+        }
+    }
+
+    #[test]
+    fn expiry_sweep_selects_only_expired_live_holds() {
+        // The sweep selects only live holds (held_request.is_some()) past their
+        // stamp, leaving fresh holds and task/legacy (None) holds untouched, and
+        // restricts to the room it is sweeping.
+        let now = 1_748_865_600; // 2025-06-02T12:00:00Z
+        let mut queue = ApprovalQueue::default();
+        // Expired + live → selected.
+        queue.enqueue(pending_exec_hold(
+            "expired-live",
+            ROOM,
+            "2025-06-02T11:00:00Z",
+            true,
+        ));
+        // Fresh + live → left to be decided.
+        queue.enqueue(pending_exec_hold(
+            "fresh-live",
+            ROOM,
+            "2025-06-02T13:00:00Z",
+            true,
+        ));
+        // Expired but task/legacy (None) → the scheduler gate owns task expiry.
+        queue.enqueue(pending_exec_hold(
+            "expired-task",
+            ROOM,
+            "2025-06-02T11:00:00Z",
+            false,
+        ));
+        // Expired + live but a different room → not swept by this room's pass.
+        queue.enqueue(pending_exec_hold(
+            "expired-other-room",
+            "!other:server",
+            "2025-06-02T11:00:00Z",
+            true,
+        ));
+
+        let selected = expired_live_holds_in_room(&queue, ROOM, now);
+        let ids: Vec<&str> = selected
+            .iter()
+            .map(|p| p.request.request_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["expired-live"], "got {ids:?}");
+    }
+
+    #[test]
+    fn expiry_sweep_is_a_noop_when_nothing_expired() {
+        let now = 1_748_865_600;
+        let mut queue = ApprovalQueue::default();
+        queue.enqueue(pending_exec_hold(
+            "fresh-live",
+            ROOM,
+            "2025-06-02T13:00:00Z",
+            true,
+        ));
+        assert!(expired_live_holds_in_room(&queue, ROOM, now).is_empty());
     }
 }
