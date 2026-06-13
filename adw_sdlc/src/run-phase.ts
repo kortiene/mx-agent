@@ -130,7 +130,15 @@ export async function runAgentPhase<P extends SchemaPhase>(
     if (first.signal === 'cancelled') {
       throw new AdwError(`${phase} phase was cancelled without parseable output`, { cause: err });
     }
-    const second = await invoke(prompt + NUDGE, 'transcript-2.log');
+    // Native-schema backends get the retry WITH the fenced-JSON contract:
+    // their first prompt deliberately omits it (the schema rides the native
+    // channel), but the SDK can return success without a conforming payload
+    // (structured_output is optional on SDKResultSuccess) — and a bare NUDGE
+    // would demand "the required JSON object" the agent was never shown.
+    const retryPrompt = emitJsonContract
+      ? prompt
+      : composePhasePrompt(phase as AgentPhase, options.templateArgs, state, runner.id, true);
+    const second = await invoke(retryPrompt + NUDGE, 'transcript-2.log');
     // Both attempts consumed tokens; report the pair's combined usage.
     return { data: extract(second), usage: mergeUsage(first.usage, second.usage), ...sessionOf(second) };
   }

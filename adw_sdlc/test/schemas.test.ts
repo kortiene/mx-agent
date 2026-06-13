@@ -131,3 +131,69 @@ describe('parsePhaseResult (to_result tolerance parity)', () => {
     expect(() => parsePhaseResult('classify', {})).toThrowError(AdwError);
   });
 });
+
+describe('parsePhaseResult (to_result bool/str coercion parity)', () => {
+  it('coerces booleans via Python truthiness, not JS truthiness', () => {
+    // bool([]) and bool({}) are False in Python; Boolean([]) is true in JS —
+    // the whole reason this is a custom table and not z.coerce.boolean().
+    expect(parsePhaseResult('tests', { tests_added: [] }).tests_added).toBe(false);
+    expect(parsePhaseResult('tests', { tests_added: {} }).tests_added).toBe(false);
+    expect(parsePhaseResult('tests', { tests_added: 0 }).tests_added).toBe(false);
+    expect(parsePhaseResult('tests', { tests_added: '' }).tests_added).toBe(false);
+    expect(parsePhaseResult('tests', { tests_added: 'false' }).tests_added).toBe(true); // bool("false") is True
+    expect(parsePhaseResult('tests', { tests_added: ['a.rs'] }).tests_added).toBe(true);
+    expect(parsePhaseResult('plan', { spec_created: 1 }).spec_created).toBe(true);
+    expect(parsePhaseResult('e2e', { e2e_added: { suite: 'live' } }).e2e_added).toBe(true);
+    expect(parsePhaseResult('document', { docs_updated: 'yes' }).docs_updated).toBe(true);
+    expect(parsePhaseResult('review', { wrote_commit_message: [], wrote_pr_body: 1 })).toMatchObject({
+      wrote_commit_message: false,
+      wrote_pr_body: true,
+    });
+  });
+
+  it('accepts the freestyle final-report shape a native-schema success can leave in the transcript', () => {
+    // The agent answered the skill template's prose "Final report" bullets as
+    // JSON: tests_added as the list of added tests, extra keys everywhere.
+    // Python passes this via bool()/dict.get; the ts engine must too.
+    const result = parsePhaseResult('tests', {
+      target: 'Issue #304 — result-plane sender pinning',
+      files_changed: ['crates/mx-agent-daemon/src/stream.rs', 'crates/mx-agent-daemon/src/context.rs'],
+      tests_added: [
+        { file: 'crates/mx-agent-daemon/src/stream.rs', name: 'chunk_sha256_returns_none_for_empty_slice' },
+        { file: 'crates/mx-agent-daemon/src/context.rs', name: 'select_share_rejects_ambiguous_collisions' },
+      ],
+      bugs_discovered: [],
+      checks_run: [{ check: 'cargo test --all', result: 'all 948 tests passed' }],
+    });
+    expect(result).toEqual({ tests_added: true, summary: '' });
+  });
+
+  it('coerces scalar strings like str(); containers fail loud (deliberate tightening vs repr())', () => {
+    expect(parsePhaseResult('tests', { summary: 42 }).summary).toBe('42');
+    expect(parsePhaseResult('classify', { issue_class: 'fix', reason: true }).reason).toBe('true');
+    expect(() => parsePhaseResult('tests', { summary: { text: 'x' } })).toThrowError(AdwError);
+    expect(() => parsePhaseResult('tests', { summary: ['x'] })).toThrowError(AdwError);
+  });
+
+  it('stringifies scalar list entries and drops containers; a bare string stays an error', () => {
+    const implement = parsePhaseResult('implement', {
+      files_changed: ['a.rs', 2, { path: 'b.rs' }, null, true],
+    });
+    expect(implement.files_changed).toEqual(['a.rs', '2', 'true']);
+    // Python's list("a.rs") would char-split; failing loud beats either behavior.
+    expect(() => parsePhaseResult('implement', { files_changed: 'a.rs' })).toThrowError(AdwError);
+  });
+
+  it('coerces review finding fields, nested nulls fall to defaults', () => {
+    const review = parsePhaseResult('review', {
+      findings: [{ severity: 0, description: 7, location: null }],
+    });
+    expect(review.findings[0]).toEqual({ severity: '0', description: '7', location: '' });
+  });
+
+  it('truncates float counters like int(2.7); decimal strings still fail like int("2.7")', () => {
+    expect(parsePhaseResult('resolve', { resolved: 2.7, remaining: 0 }).resolved).toBe(2);
+    expect(parsePhaseResult('patch', { resolved: 0, remaining: 1.2 }).remaining).toBe(1);
+    expect(() => parsePhaseResult('resolve', { resolved: '2.7' })).toThrowError(AdwError);
+  });
+});

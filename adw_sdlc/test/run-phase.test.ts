@@ -97,6 +97,32 @@ describe('runAgentPhase', () => {
     expect(outcome.usage).toMatchObject({ inputTokens: 21, outputTokens: 3 });
   });
 
+  it('retries a native-schema backend WITH the fenced-JSON contract it never saw', async () => {
+    // A native-schema success can come back without structured_output AND
+    // without parseable text; the retry prompt must then carry the contract
+    // footer the first prompt deliberately omitted, or the nudge demands a
+    // JSON shape the agent was never shown.
+    const runner = createMockRunner({
+      script: (_req, call) =>
+        call === 0
+          ? { transcriptText: 'prose report, no JSON anywhere' }
+          : { transcriptText: '```json\n{"tests_added": true, "summary": "s"}\n```' },
+    });
+    const outcome = await runAgentPhase({
+      phase: 'tests',
+      templateArgs: ['x'],
+      state,
+      runner,
+      env: {},
+    });
+    expect(outcome.data).toEqual({ tests_added: true, summary: 's' });
+    expect(runner.requests).toHaveLength(2);
+    expect(runner.requests[0]!.prompt).not.toContain('## Required output');
+    expect(runner.requests[1]!.prompt).toContain('## Required output');
+    expect(runner.requests[1]!.prompt).toContain('"tests_added"');
+    expect(runner.requests[1]!.prompt.endsWith(NUDGE)).toBe(true);
+  });
+
   it('nudges once when a native-schema backend returns a non-conforming payload', async () => {
     const runner = createMockRunner({
       script: (_req, call) =>
