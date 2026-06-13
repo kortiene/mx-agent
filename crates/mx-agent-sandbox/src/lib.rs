@@ -907,30 +907,34 @@ mod tests {
         if !bwrap_available_or_required() {
             return;
         }
-        if !PathBuf::from("/sys/class/net").exists() {
-            eprintln!("skipping network probe: /sys/class/net absent");
-            return;
-        }
         // With --unshare-net the only interface is a down loopback, so the
-        // sandbox sees no non-loopback interfaces. We read this from /sys, which
-        // needs no extra tooling. The probe prints the count of non-`lo`
-        // interfaces; under network deny that must be zero.
-        let mut ro = base_ro_paths();
-        ro.push(PathBuf::from("/sys"));
+        // sandbox sees no non-loopback interfaces. We read this from the
+        // sandbox's own `/proc/net/dev`, which is namespaced to the unshared
+        // network namespace (the private `--proc /proc` mount makes it reflect the
+        // new netns) — unlike a bind of the host `/sys/class/net`, which would
+        // still show the host's interfaces. The probe prints the count of non-`lo`
+        // interfaces; under network deny that must be zero (issue #310).
         let prepared = BubblewrapSandbox.prepare(
-            argv(&["/bin/sh", "-c", "ls /sys/class/net | grep -vx lo | wc -l"]),
+            // /proc/net/dev: 2 header lines, then "  iface: …" per interface.
+            // Count interface lines whose name is not loopback.
+            argv(&[
+                "/bin/sh",
+                "-c",
+                "awk -F: 'NR>2 {gsub(/ /,\"\",$1); if ($1 != \"lo\") c++} END {print c+0}' /proc/net/dev",
+            ]),
             Restrictions {
                 cwd: std::env::temp_dir(),
-                read_only_paths: ro,
+                read_only_paths: base_ro_paths(),
                 network: Network::Deny,
                 ..Restrictions::default()
             },
         );
         let out = run_prepared(&prepared);
-        if !out.status.success() {
-            eprintln!("skipping network probe: shell failed in sandbox");
-            return;
-        }
+        assert!(
+            out.status.success(),
+            "network probe shell failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let count = String::from_utf8_lossy(&out.stdout).trim().to_string();
         assert_eq!(
             count, "0",
