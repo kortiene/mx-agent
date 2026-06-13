@@ -155,8 +155,8 @@ it here before release.
   for auto-executed task DAGs **and** the interactive `exec --pty` path, which
   routes through the selected backend too. Bubblewrap adds a user namespace,
   `--cap-drop ALL`, private `/proc`/`/dev`/tmpfs, and `--new-session` (batch);
-  containers add `--cap-drop ALL` + `no-new-privileges`. However there is still
-  no seccomp filtering and no rlimit/cgroup resource capping. The built-in
+  containers add `no-new-privileges`. However there is still no seccomp filtering
+  and no rlimit/cgroup resource capping. The built-in
   fallback backend is `none` (zero isolation) — operators must choose
   `bubblewrap`/`docker`/`podman`. Bound the blast radius with policy (cwd, env
   scrub, network, path-bind confinement, runtime/output caps) and a real sandbox

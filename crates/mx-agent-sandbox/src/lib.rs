@@ -349,8 +349,10 @@ const DEFAULT_IMAGE: &str = "debian:stable-slim";
 ///   to this same sanitized map, so values never appear in the argv (host `ps`) —
 ///   only the names do. Secrets are already scrubbed by the caller (architecture
 ///   §13.4).
-/// - `--cap-drop ALL` and `--security-opt no-new-privileges` drop all Linux
-///   capabilities and block privilege escalation inside the container.
+/// - `--security-opt no-new-privileges` blocks privilege escalation inside the
+///   container. (A full `--cap-drop ALL` is deferred: the container runs as root
+///   and dropping `CAP_DAC_OVERRIDE` would block writes to a `writable_paths`
+///   mount owned by the host operator's uid; that needs a `--user` uid mapping.)
 /// - when [`Restrictions::interactive`] is set (an `exec --pty` session) the
 ///   command also gets `-i -t`, allocating a controlling TTY inside the
 ///   container so `isatty` is true and full-screen/interactive programs work.
@@ -412,11 +414,13 @@ impl Sandbox for ContainerSandbox {
             // Read-only root filesystem: only explicitly mounted writable paths
             // can be written (architecture §13.5).
             "--read-only".to_string(),
-            // Drop every Linux capability and block privilege escalation
-            // (`setuid`/`setcap` binaries cannot gain new privileges) as defence
-            // in depth (issue #310).
-            "--cap-drop".to_string(),
-            "ALL".to_string(),
+            // Block privilege escalation: a `setuid`/`setcap` binary cannot gain
+            // privileges beyond the container's starting set (issue #310). Note
+            // we deliberately do NOT `--cap-drop ALL` here: the container runs as
+            // root and a policy `writable_paths` mount is typically owned by the
+            // host operator's (non-root) uid, so dropping CAP_DAC_OVERRIDE would
+            // block legitimate writes to the workspace. Full cap-drop needs a
+            // matching `--user` uid mapping, which is deferred.
             "--security-opt".to_string(),
             "no-new-privileges".to_string(),
         ];
@@ -1102,16 +1106,19 @@ mod tests {
     }
 
     #[test]
-    fn container_includes_capability_and_privilege_hardening() {
-        // Acceptance (issue #310): the container argv drops all capabilities and
-        // blocks privilege escalation.
+    fn container_includes_privilege_hardening() {
+        // The container argv blocks privilege escalation (issue #310). A full
+        // `--cap-drop ALL` is intentionally absent — see prepare for why.
         let prepared = ContainerSandbox::new(Runtime::Docker, "img")
             .prepare(argv(&["true"]), Restrictions::default());
         let flags = container_flags(&prepared, "img").join(" ");
-        assert!(flags.contains("--cap-drop ALL"), "flags: {flags}");
         assert!(
             flags.contains("--security-opt no-new-privileges"),
             "flags: {flags}"
+        );
+        assert!(
+            !flags.contains("--cap-drop"),
+            "container must not --cap-drop while running as root with operator-owned mounts: {flags}"
         );
     }
 
@@ -1254,7 +1261,7 @@ mod tests {
         assert!(!has_tty_flag(flags), "flags: {flags:?}");
         // The full non-interactive argv (`Restrictions::default()` denies the
         // network, so `--network none` is present; no `-i`/`-t` appears anywhere).
-        // Includes the cap-drop / no-new-privileges hardening (issue #310).
+        // Includes the no-new-privileges hardening (issue #310).
         assert_eq!(
             prepared.argv,
             argv(&[
@@ -1262,8 +1269,6 @@ mod tests {
                 "run",
                 "--rm",
                 "--read-only",
-                "--cap-drop",
-                "ALL",
                 "--security-opt",
                 "no-new-privileges",
                 "--network",

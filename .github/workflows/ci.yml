@@ -151,6 +151,13 @@ jobs:
       - name: Install bubblewrap
         if: steps.cargo.outputs.present == 'true'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Allow unprivileged user namespaces (bubblewrap --unshare-user)
+        # Ubuntu 24.04 (ubuntu-latest) restricts unprivileged user namespaces by
+        # default via AppArmor; bwrap's `--unshare-user` then fails. Lift the
+        # restriction so the real-sandbox tests exercise the hardened argv
+        # (issue #310). `|| true` keeps this a no-op on images without the knob.
+        if: steps.cargo.outputs.present == 'true'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - uses: dtolnay/rust-toolchain@stable
         if: steps.cargo.outputs.present == 'true'
       - uses: Swatinem/rust-cache@v2

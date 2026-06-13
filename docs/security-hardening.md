@@ -464,7 +464,7 @@ The sandbox decides *how* an allowed command is isolated. Backends:
 |---|---|
 | `none` | **No isolation.** Only the centralized controls (cwd, env scrub, timeout, output cap) apply. |
 | `bubblewrap` | PID/UTS/IPC/**user** namespaces, `--die-with-parent`, `--cap-drop ALL`, private `/proc` + minimal `/dev` + tmpfs `/tmp`, bind-mounted filesystem, network namespace dropped when `network = "deny"`, and `--new-session` on the batch path (omitted for an interactive `--pty` so Ctrl-C still works). |
-| `docker` / `podman` | Read-only root (`--read-only`), `--cap-drop ALL`, `--security-opt no-new-privileges`, `--network none` when denied, explicit `--volume` mounts, env passed **by name** (`--env KEY`, values never in argv), `--rm` cleanup. The runtime follows the `sandbox` value (`podman` runs `podman run …`); the image is `execution.container_image` (default `debian:stable-slim`). |
+| `docker` / `podman` | Read-only root (`--read-only`), `--security-opt no-new-privileges`, `--network none` when denied, explicit `--volume` mounts, env passed **by name** (`--env KEY`, values never in argv), `--rm` cleanup. The runtime follows the `sandbox` value (`podman` runs `podman run …`); the image is `execution.container_image` (default `debian:stable-slim`). (No `--cap-drop ALL`: the container runs as root and dropping `CAP_DAC_OVERRIDE` would block writes to operator-owned `writable_paths`; that needs a `--user` mapping, deferred.) |
 | `firejail` / `chroot` | **Not implemented — rejected at policy load.** Naming either in `execution.default_sandbox` or an agent `sandbox` fails validation with a dotted-path error (no silent unsandboxed fallthrough). |
 
 **Default backend.** The library's built-in fallback is `Backend::None` (zero
@@ -494,12 +494,13 @@ backend and the missing launcher — it never silently falls back to no isolatio
 
 **What the sandbox does *not* do.** Bubblewrap runs the command in a user
 namespace (`--unshare-user`, so it is not the daemon's privileged identity) and
-drops all capabilities; containers drop all capabilities and block privilege
-escalation (`no-new-privileges`). There is still **no seccomp syscall filtering
-and no rlimit/cgroup resource capping** — runtime and output are bounded by
+drops all capabilities; containers block privilege escalation
+(`no-new-privileges`). There is still **no seccomp syscall filtering and no
+rlimit/cgroup resource capping** — runtime and output are bounded by
 `max_runtime_ms` / `max_output_bytes` from policy, and per-process/memory limits
-(`--pids-limit` / `--memory`) are not yet wired from policy. For stronger
-isolation, prefer a container backend and configure those limits in your runtime.
+(`--pids-limit` / `--memory`) and a container `--cap-drop ALL` (with a `--user`
+mapping) are not yet wired from policy. For stronger isolation, prefer a
+container backend and configure those limits in your runtime.
 
 > **Safe vs unsafe:** `sandbox = "bubblewrap"` (or a container) + `network =
 > "deny"` + tight `writable_paths` is the safe baseline. `sandbox = "none"`,
