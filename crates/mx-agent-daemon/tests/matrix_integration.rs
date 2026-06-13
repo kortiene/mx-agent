@@ -6819,7 +6819,9 @@ async fn live_scheduler_rejects_decision_with_untrusted_key() {
                     "cwd": cwd.to_string_lossy(),
                     "project_id": "test",
                     "git_commit": ""
-                }
+                },
+                "last_seen_ts": 0,
+                "state_rev": 0
             }),
         )
         .await
@@ -7734,7 +7736,9 @@ async fn live_approver_allowlist_releases_task() {
                     "cwd": cwd.to_string_lossy(),
                     "project_id": "test",
                     "git_commit": ""
-                }
+                },
+                "last_seen_ts": 0,
+                "state_rev": 0
             }),
         )
         .await
