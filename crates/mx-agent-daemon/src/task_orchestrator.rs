@@ -200,6 +200,15 @@ pub enum ApprovalDisposition {
 pub trait TaskApprovalGate {
     /// Resolve the approval disposition for `task`'s `action`.
     fn evaluate(&mut self, task: &TaskState, action: &TaskAction) -> ApprovalDisposition;
+
+    /// Un-burn the decision nonce consumed by the most recent `Approved`
+    /// [`evaluate`](Self::evaluate), compensating a lost optimistic-claim race so
+    /// the operator's single-use approval is not permanently spent on an action
+    /// that never dispatched. Called only from the `StaleClaim` path, i.e. after
+    /// approval released the task but the conditional claim lost its race.
+    ///
+    /// The default is a no-op, for gates that consume no nonce.
+    fn compensate_lost_claim(&mut self) {}
 }
 
 /// Store-level failures surfaced by orchestration.
@@ -508,9 +517,31 @@ impl TaskOrchestrator {
         }) {
             Ok(claimed) => claimed,
             Err(TaskStoreError::StaleClaim { .. }) => {
+                // Benign optimistic-concurrency race: the task advanced since we
+                // read it (another daemon claimed first, or an operator cancelled
+                // it). The single-use nonces this pass already burned *before* the
+                // claim — the action nonce here, and the approval decision nonce
+                // inside the gate — must be un-burned so the next pass retries
+                // cleanly instead of wedging the task (`blocked` for the action
+                // nonce, `Pending` forever for the approval nonce). We never
+                // dispatched, and the daemon that won the claim burns its own
+                // copies in its own cache, so un-burning here cannot enable a
+                // replay (see `ReplayCache::forget`).
+                if let (Some(cache), Some(auth)) = (&self.replay_cache, action.authorization()) {
+                    let _ = cache.borrow_mut().forget(&auth.nonce);
+                }
+                // Only an approval-gated task burns a decision nonce, and an
+                // approval-gated task reaching the claim has just admitted *its
+                // own* decision nonce this pass; the guard keeps a later non-gated
+                // stale task from un-burning a prior task's already-executed nonce.
+                if allowance.requires_approval {
+                    if let Some(gate) = &self.approval_gate {
+                        gate.borrow_mut().compensate_lost_claim();
+                    }
+                }
                 return OrchestrationOutcome::StaleClaim {
                     task_id: task.task_id.clone(),
-                }
+                };
             }
             Err(err) => {
                 return OrchestrationOutcome::StoreError {
@@ -941,6 +972,11 @@ impl TaskOrchestrator {
         S: TaskStore,
     {
         let Some(cache) = &self.replay_cache else {
+            // Test-only path: the pure-core unit tests deliberately run the
+            // orchestrator without a cache. Production never reaches here —
+            // `build_scheduler_orchestrator` (the only production constructor)
+            // takes a non-`Option` `ReplayCache` and attaches it unconditionally,
+            // and the scheduler skips the whole pass when the cache cannot load.
             return Ok(());
         };
         // `verify_task_action_authorization` already rejected an unsigned action
@@ -956,6 +992,9 @@ impl TaskOrchestrator {
                 ReplayError::Expired => "expired",
                 ReplayError::Replayed => "replayed",
                 ReplayError::MalformedTimestamp => "malformed_expiry",
+                // Produced only by `ReplayCache::load`, never by `admit`; mapped
+                // here so the match stays exhaustive over the error type.
+                ReplayError::Corrupt => "replay_cache_corrupt",
                 ReplayError::Io(_) => "replay_cache_unavailable",
             };
             return self.block_unauthorized(task, action, invocation_id, reason, store);
@@ -1385,6 +1424,11 @@ pub struct QueueApprovalGate<R> {
     now_unix: i64,
     queue: Rc<RefCell<ApprovalQueue>>,
     replay_cache: Option<Rc<RefCell<ReplayCache>>>,
+    /// Nonce of the decision burned by the most recent successful
+    /// [`admit_decision_nonce`](Self::admit_decision_nonce), recorded so a lost
+    /// optimistic-claim race can un-burn it (see
+    /// [`compensate_lost_claim`](TaskApprovalGate::compensate_lost_claim)).
+    last_admitted_decision_nonce: Option<String>,
     resolve_decision: R,
 }
 
@@ -1420,6 +1464,7 @@ where
             now_unix: 0,
             queue,
             replay_cache: None,
+            last_admitted_decision_nonce: None,
             resolve_decision,
         }
     }
@@ -1517,6 +1562,20 @@ where
             }
         }
     }
+
+    fn compensate_lost_claim(&mut self) {
+        if let (Some(cache), Some(nonce)) =
+            (&self.replay_cache, self.last_admitted_decision_nonce.take())
+        {
+            // The releasing pass lost the optimistic claim, so the approved
+            // action never dispatched. Un-burn the decision's single-use nonce
+            // so the next pass can re-release the task with the same operator
+            // approval instead of hanging it `Pending` forever (the same
+            // verified decision is still in the scan window). Safe: nothing
+            // executed, so this cannot enable a replay (see `ReplayCache::forget`).
+            let _ = cache.borrow_mut().forget(&nonce);
+        }
+    }
 }
 
 impl<R> QueueApprovalGate<R> {
@@ -1527,7 +1586,15 @@ impl<R> QueueApprovalGate<R> {
     /// fresh and within its `expires_at`. Returns `false` — fail-closed — when a
     /// cache is attached but the decision lacks replay material or its nonce is
     /// expired/replayed.
-    fn admit_decision_nonce(&self, decision: &ApprovalDecision) -> bool {
+    ///
+    /// The cache-less branch is **test-only**: production attaches the
+    /// orchestrator's shared cache via
+    /// [`with_replay_cache`](Self::with_replay_cache), wired by
+    /// `build_scheduler_orchestrator` (which requires a cache). On a successful
+    /// admit the burned nonce is recorded so a lost optimistic-claim race can
+    /// un-burn it (see
+    /// [`compensate_lost_claim`](TaskApprovalGate::compensate_lost_claim)).
+    fn admit_decision_nonce(&mut self, decision: &ApprovalDecision) -> bool {
         let Some(cache) = &self.replay_cache else {
             return true;
         };
@@ -1536,7 +1603,12 @@ impl<R> QueueApprovalGate<R> {
         else {
             return false;
         };
-        cache.borrow_mut().admit(nonce, expires_at).is_ok()
+        if cache.borrow_mut().admit(nonce, expires_at).is_ok() {
+            self.last_admitted_decision_nonce = Some(nonce.to_string());
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -3155,6 +3227,143 @@ requires_approval = true
         assert!(
             matches!(&second, OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED),
             "an approved held task must run, not be replay-blocked: {second:?}"
+        );
+    }
+
+    #[test]
+    fn stale_claim_does_not_consume_action_nonce() {
+        // A benign optimistic-claim race must not permanently burn the action's
+        // single-use nonce: the next pass against a non-stale store must run the
+        // same authorization to success, not block it as "replayed".
+        let (t, _action) = signed_tool_action(&future_rfc3339(), "nonce-stale-action");
+        let (cache, dir) = replay_cache("stale-action");
+        let orchestrator = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .with_replay_cache(cache);
+
+        // Pass 1: the store reports a stale claim, so nothing dispatches and the
+        // nonce burned before the claim is un-burned.
+        let mut stale_store = MemoryStore {
+            stale: true,
+            ..MemoryStore::default()
+        };
+        let mut panic_dispatcher = PanicDispatcher;
+        let first = orchestrator.process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut stale_store,
+            &mut panic_dispatcher,
+        );
+        assert!(
+            matches!(first, OrchestrationOutcome::StaleClaim { .. }),
+            "a lost claim race must surface as StaleClaim: {first:?}"
+        );
+        assert!(
+            stale_store.finalized_state.is_none(),
+            "a stale claim must not finalize the task blocked"
+        );
+
+        // Pass 2: a non-stale store now runs the same authorization to success.
+        let mut run_store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let second = orchestrator.process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut run_store,
+            &mut dispatcher,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&second, OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED),
+            "the action nonce must survive a benign stale-claim race: {second:?}"
+        );
+    }
+
+    #[test]
+    fn stale_claim_does_not_consume_approval_nonce() {
+        // A benign optimistic-claim race on an approval-gated task must not
+        // consume the operator's single-use approval decision nonce: the next
+        // pass must re-release the task with the same decision instead of hanging
+        // it pending forever.
+        let (t, _action) = signed_tool_action(&future_rfc3339(), "nonce-stale-approval-action");
+        let (cache, dir) = replay_cache("stale-approval");
+        let decision_expires = future_rfc3339();
+
+        let orchestrator = TaskOrchestrator::new("agent-a")
+            .with_room_id("!room:server")
+            .with_policy(policy_requires_approval())
+            .with_trust_store(trust_store_with_key(true))
+            .with_verifying_key(TEST_KEY_ID, signing_key().verifying_key())
+            .with_replay_cache(cache);
+
+        let shared_queue = Rc::new(RefCell::new(ApprovalQueue::default()));
+        let et = decision_expires.clone();
+        let gate = QueueApprovalGate::new(
+            "!room:server",
+            "agent-a",
+            "2099-01-01T00:00:00Z",
+            Rc::clone(&shared_queue),
+            move |request_id: &str| {
+                Some(ApprovalDecision {
+                    request_id: request_id.to_string(),
+                    decision: "approved".to_string(),
+                    approved_by: "@daemon:server".to_string(),
+                    created_at: "2026-06-10T12:00:00Z".to_string(),
+                    nonce: Some("decision-nonce-stale".to_string()),
+                    expires_at: Some(et.clone()),
+                    signature: None,
+                    extra: Default::default(),
+                })
+            },
+        )
+        // Share the orchestrator's cache so decision and action nonces persist to
+        // one file, exactly as the scheduler wires it.
+        .with_replay_cache(orchestrator.replay_cache_handle());
+        let orchestrator = orchestrator.with_approval_gate(Box::new(gate));
+
+        // Pass 1: approved, but the store reports a stale claim. Both the action
+        // and decision nonces burned before the claim must be un-burned.
+        let mut stale_store = MemoryStore {
+            stale: true,
+            ..MemoryStore::default()
+        };
+        let mut panic_dispatcher = PanicDispatcher;
+        let first = orchestrator.process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut stale_store,
+            &mut panic_dispatcher,
+        );
+        assert!(
+            matches!(first, OrchestrationOutcome::StaleClaim { .. }),
+            "a lost claim race on an approval-gated task must surface as StaleClaim: {first:?}"
+        );
+
+        // Pass 2: the same approving decision (still in the scan window) must
+        // re-release the task and run it, because its nonce was un-burned.
+        let mut run_store = MemoryStore::default();
+        let mut dispatcher = Dispatcher(Ok(TaskExecutionResult {
+            exit_code: Some(0),
+            summary: "tests passed".to_string(),
+            artifact_mxc: None,
+        }));
+        let second = orchestrator.process_one(
+            &t,
+            std::slice::from_ref(&t),
+            &mut run_store,
+            &mut dispatcher,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&second, OrchestrationOutcome::Completed { state, .. } if state == STATE_SUCCEEDED),
+            "a benign stale claim must not consume the approval decision nonce: {second:?}"
         );
     }
 

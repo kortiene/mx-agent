@@ -1004,3 +1004,479 @@ allow_cwd = ["{cwd}"]
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
+
+// --- issue #305: replay protection wired end-to-end through scheduler/orchestrator ---
+//
+// These tests cross the signing → trust → replay-cache → scheduler-tick →
+// dispatch boundary that the existing tests cover only in isolation. They prove
+// that:
+//   1. A signed task action admitted through `run_scheduler_tick` (the real
+//      scheduler entry point) is replay-blocked when the same nonce is
+//      re-presented in a second tick — i.e. the replay cache is correctly
+//      threaded from the orchestrator into the scheduler tick.
+//   2. A benign optimistic-claim race (`StaleClaim`) un-burns the action's
+//      single-use nonce so the next scheduler tick retries cleanly instead of
+//      wedging the task blocked (the regression fixed in issue #305).
+//
+// Neither test requires a live homeserver; they drive `run_scheduler_tick` with
+// an in-memory task store, a real tempdir-backed `ReplayCache`, and a
+// deterministic Ed25519 signing key.
+
+use ed25519_dalek::SigningKey as Ed25519SigningKey;
+use mx_agent_daemon::{
+    key_id_for_verifying_key, sign_task_action, ReplayCache, ReplayError, SessionPaths,
+};
+
+/// Deterministic signing key for issue #305 e2e tests.
+fn key_305() -> Ed25519SigningKey {
+    Ed25519SigningKey::from_bytes(&[55u8; 32])
+}
+
+/// A trust store that approves `PLANNER`'s key, plus the key ID string.
+fn trust_305() -> (mx_agent_daemon::TrustStore, String) {
+    let key = key_305();
+    let key_id = key_id_for_verifying_key(&key.verifying_key());
+    let mut trust = mx_agent_daemon::TrustStore::default();
+    trust.approve(PLANNER, &key_id, None, None, None);
+    (trust, key_id)
+}
+
+/// Build a tool task signed by `key_305` with `nonce` and a far-future expiry.
+fn signed_tool_task_305(task_id: &str, nonce: &str) -> TaskState {
+    let key = key_305();
+    let (_, key_id) = trust_305();
+    let base_action = TaskAction::Tool {
+        tool: "run_tests".to_string(),
+        args: json!({}),
+        authorization: None,
+    };
+    let auth = sign_task_action(
+        &key,
+        &key_id,
+        task_id,
+        &base_action,
+        PLANNER,
+        LOCAL_AGENT,
+        "2026-06-12T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        nonce,
+    )
+    .expect("sign task action");
+    TaskState {
+        task_id: task_id.to_string(),
+        title: task_id.to_string(),
+        description: String::new(),
+        state: STATE_PENDING.to_string(),
+        assigned_to: LOCAL_AGENT.to_string(),
+        created_by: PLANNER.to_string(),
+        depends_on: Vec::new(),
+        blocks: Vec::new(),
+        invocation_id: None,
+        created_at: "2026-06-12T00:00:00Z".to_string(),
+        updated_at: "2026-06-12T00:00:00Z".to_string(),
+        state_rev: 1,
+        previous_event_id: None,
+        result: None,
+        action: Some(TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: json!({}),
+            authorization: Some(auth),
+        }),
+        extra: Extra::default(),
+    }
+}
+
+/// Create a tempdir-backed `ReplayCache` for use across multiple scheduler ticks.
+fn tempdir_replay_cache(tag: &str) -> (ReplayCache, std::path::PathBuf) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "mx-agent-replay-e2e-{}-{}-{}",
+        tag,
+        std::process::id(),
+        nanos,
+    ));
+    std::fs::create_dir_all(&dir).expect("create replay dir");
+    let paths = SessionPaths::for_data_dir(dir.clone());
+    let cache = ReplayCache::load_with_capacity(&paths, 64).expect("replay cache loads");
+    (cache, dir)
+}
+
+/// A `TaskStore` whose `claim` always returns `StaleClaim` (another daemon won).
+struct StaleClaimStore {
+    task: TaskState,
+}
+
+impl mx_agent_daemon::TaskStore for StaleClaimStore {
+    fn claim(
+        &mut self,
+        options: mx_agent_daemon::UpdateTaskOptions,
+    ) -> Result<TaskState, mx_agent_daemon::TaskStoreError> {
+        Err(mx_agent_daemon::TaskStoreError::StaleClaim {
+            task_id: options.task_id,
+            expected: options.expected_state_rev.unwrap_or(1),
+            current: options.expected_state_rev.unwrap_or(1) + 1,
+        })
+    }
+    fn finalize(
+        &mut self,
+        _options: mx_agent_daemon::UpdateTaskOptions,
+    ) -> Result<TaskState, mx_agent_daemon::TaskStoreError> {
+        Ok(self.task.clone())
+    }
+}
+
+/// A signed task action is admitted through `run_scheduler_tick` (the entry
+/// point the live daemon loop uses) and the replay cache correctly blocks a
+/// re-presentation of the same nonce in a subsequent tick.
+///
+/// Crosses the signing → trust → policy → replay-cache → scheduler-tick →
+/// dispatch boundary. Proves:
+/// - The replay cache is correctly threaded from the orchestrator into the
+///   scheduler tick (the nonce burned in tick 1 persists to disk and is still
+///   known on tick 2).
+/// - A replayed nonce produces `STATE_BLOCKED` (not just a policy denial), and
+///   the block result carries the "replayed" reason string.
+#[test]
+fn signed_task_action_is_replay_enforced_end_to_end() {
+    let task_id = "task-replay-e2e";
+    let nonce = "nonce-replay-e2e-unique";
+    let t = signed_tool_task_305(task_id, nonce);
+
+    let (cache, replay_dir) = tempdir_replay_cache("replay-e2e");
+    let (trust, key_id) = trust_305();
+    let key = key_305();
+
+    let orchestrator = TaskOrchestrator::new(LOCAL_AGENT)
+        .with_room_id(ROOM_ID)
+        .with_policy(tool_policy())
+        .with_trust_store(trust)
+        .with_verifying_key(key_id, key.verifying_key())
+        .with_replay_cache(cache);
+
+    let scheduler = TaskScheduler::new(LOCAL_AGENT, 4);
+
+    // --- Tick 1: fresh nonce → task runs to succeeded. -----------------------
+    let mut store1 = RoomTaskStore::default();
+    store1.insert(t.clone());
+    let mut dispatcher1 = ToolTaskDispatcher::with_runner(|_name, _args, _al, _cwd| {
+        Ok(ToolResult {
+            exit_code: 0,
+            summary: "signed task ran".to_string(),
+        })
+    });
+    let outcomes1 = tick(&scheduler, &orchestrator, &mut store1, &mut dispatcher1);
+
+    assert_eq!(
+        store1.get(task_id).state,
+        STATE_SUCCEEDED,
+        "signed task must succeed on the first tick: {outcomes1:?}"
+    );
+
+    // --- Tick 2: same nonce replayed → task must be blocked (not executed). --
+    //
+    // Re-insert the task at pending/state_rev=1 to simulate a second delivery
+    // of the same signed authorization. The replay cache persists to disk, so
+    // the nonce burned in tick 1 is still known after the orchestrator is
+    // reused on tick 2.
+    let mut store2 = RoomTaskStore::default();
+    store2.insert(t.clone());
+    let mut panic_dispatcher = ToolTaskDispatcher::with_runner(|_name, _args, _al, _cwd| {
+        panic!("replayed task must never reach the runner")
+    });
+    let outcomes2 = tick(
+        &scheduler,
+        &orchestrator,
+        &mut store2,
+        &mut panic_dispatcher,
+    );
+
+    assert_eq!(
+        store2.get(task_id).state,
+        STATE_BLOCKED,
+        "a replayed signed nonce must be blocked, not executed: {outcomes2:?}"
+    );
+    let result = store2
+        .get(task_id)
+        .result
+        .as_ref()
+        .expect("blocked task has result");
+    assert!(
+        result
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("replayed")),
+        "blocked result summary must mention 'replayed': {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&replay_dir);
+}
+
+/// A benign optimistic-claim race (`StaleClaim`) must not permanently burn the
+/// action's single-use nonce. After the failed claim, the nonce is un-burned so
+/// the next scheduler tick can re-authorize and run the task, instead of
+/// wedging it blocked as "replayed" forever.
+///
+/// Two-pass scenario driven via `run_scheduler_tick`:
+///   1. A store that always returns `StaleClaim` on `claim()` — the nonce is
+///      burned inside `admit_task_action_replay` before the claim attempt, then
+///      `ReplayCache::forget` compensates it when the claim fails.
+///   2. A normal `RoomTaskStore` — the un-burned nonce is admitted again and
+///      the task completes successfully.
+///
+/// Tests the end-to-end integration of `ReplayCache::forget`, the `StaleClaim`
+/// compensation arm in `run_one`, and `run_scheduler_tick`.
+#[test]
+fn stale_claim_does_not_wedge_signed_task_through_scheduler() {
+    let task_id = "task-stale-e2e";
+    let nonce = "nonce-stale-e2e-unique";
+    let t = signed_tool_task_305(task_id, nonce);
+
+    let (cache, replay_dir) = tempdir_replay_cache("stale-e2e");
+    let (trust, key_id) = trust_305();
+    let key = key_305();
+
+    let orchestrator = TaskOrchestrator::new(LOCAL_AGENT)
+        .with_room_id(ROOM_ID)
+        .with_policy(tool_policy())
+        .with_trust_store(trust)
+        .with_verifying_key(key_id, key.verifying_key())
+        .with_replay_cache(cache);
+
+    let scheduler = TaskScheduler::new(LOCAL_AGENT, 4);
+
+    // --- Tick 1: claim fails with StaleClaim → nonce must be un-burned. ------
+    let snapshot1 = vec![t.clone()];
+    let mut stale_store = StaleClaimStore { task: t.clone() };
+    let mut panic_dispatcher = ToolTaskDispatcher::with_runner(|_name, _args, _al, _cwd| {
+        panic!("a stale-claim pass must never dispatch to the runner")
+    });
+    let mut claimed1 = std::collections::BTreeSet::new();
+    let mut attempted1 = std::collections::HashSet::new();
+    let outcomes1 = mx_agent_daemon::run_scheduler_tick(
+        &scheduler,
+        &orchestrator,
+        &snapshot1,
+        &std::collections::BTreeMap::new(),
+        &mut claimed1,
+        &mut stale_store,
+        &mut panic_dispatcher,
+        &mut attempted1,
+    );
+    assert!(
+        outcomes1
+            .iter()
+            .any(|o| matches!(o, OrchestrationOutcome::StaleClaim { .. })),
+        "stale-claim store must produce StaleClaim outcome: {outcomes1:?}"
+    );
+
+    // --- Tick 2: normal store → un-burned nonce is admitted, task succeeds. --
+    let mut store2 = RoomTaskStore::default();
+    store2.insert(t.clone());
+    let mut dispatcher2 = ToolTaskDispatcher::with_runner(|_name, _args, _al, _cwd| {
+        Ok(ToolResult {
+            exit_code: 0,
+            summary: "task ran after stale-claim retry".to_string(),
+        })
+    });
+    let outcomes2 = tick(&scheduler, &orchestrator, &mut store2, &mut dispatcher2);
+
+    assert_eq!(
+        store2.get(task_id).state,
+        STATE_SUCCEEDED,
+        "task must succeed after a benign stale-claim race (nonce must be un-burned): \
+         {outcomes2:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&replay_dir);
+}
+
+/// Burned nonces persist to disk and survive a simulated daemon restart.
+///
+/// Tick 1 runs a signed task to completion (nonce burned, cache file persisted).
+/// A second orchestrator is then constructed by loading the replay cache from the
+/// same disk path, simulating what happens when the daemon restarts. Tick 2 with
+/// the new orchestrator re-presents the same signed authorization → blocked as
+/// replayed, proving the persistence-across-reload guarantee that prevents a
+/// restarted daemon from reprocessing signed requests it already handled.
+///
+/// Crosses the Ed25519 signing → orchestrator → scheduler-tick → disk-persistence
+/// → orchestrator-reload → replay-check boundary.
+#[test]
+fn replay_protection_survives_simulated_daemon_restart() {
+    let task_id = "task-persist-replay-e2e";
+    let nonce = "nonce-persist-restart-unique";
+    let t = signed_tool_task_305(task_id, nonce);
+
+    let (cache, replay_dir) = tempdir_replay_cache("persist-restart");
+    let (trust, key_id) = trust_305();
+    let key = key_305();
+    let paths = SessionPaths::for_data_dir(replay_dir.clone());
+
+    let orchestrator_a = TaskOrchestrator::new(LOCAL_AGENT)
+        .with_room_id(ROOM_ID)
+        .with_policy(tool_policy())
+        .with_trust_store(trust.clone())
+        .with_verifying_key(key_id.clone(), key.verifying_key())
+        .with_replay_cache(cache);
+
+    let scheduler = TaskScheduler::new(LOCAL_AGENT, 4);
+
+    // --- Tick 1 with orchestrator A: task runs to succeeded, nonce burned. ---
+    let mut store1 = RoomTaskStore::default();
+    store1.insert(t.clone());
+    let mut dispatcher1 = ToolTaskDispatcher::with_runner(|_, _, _, _| {
+        Ok(ToolResult {
+            exit_code: 0,
+            summary: "ran on first orchestrator".to_string(),
+        })
+    });
+    let outcomes1 = tick(&scheduler, &orchestrator_a, &mut store1, &mut dispatcher1);
+    assert_eq!(
+        store1.get(task_id).state,
+        STATE_SUCCEEDED,
+        "tick 1 must succeed on the first orchestrator: {outcomes1:?}"
+    );
+
+    // --- Simulate daemon restart: rebuild the orchestrator from disk. ---------
+    let cache_b = ReplayCache::load_with_capacity(&paths, 64)
+        .expect("replay cache must reload successfully after tick 1");
+    let orchestrator_b = TaskOrchestrator::new(LOCAL_AGENT)
+        .with_room_id(ROOM_ID)
+        .with_policy(tool_policy())
+        .with_trust_store(trust)
+        .with_verifying_key(key_id, key.verifying_key())
+        .with_replay_cache(cache_b);
+
+    // --- Tick 2 with orchestrator B: same nonce must still be blocked. --------
+    let mut store2 = RoomTaskStore::default();
+    store2.insert(t.clone());
+    let mut panic_dispatcher = ToolTaskDispatcher::with_runner(|_, _, _, _| {
+        panic!("replayed task must not reach the runner after a daemon restart")
+    });
+    let outcomes2 = tick(
+        &scheduler,
+        &orchestrator_b,
+        &mut store2,
+        &mut panic_dispatcher,
+    );
+
+    assert_eq!(
+        store2.get(task_id).state,
+        STATE_BLOCKED,
+        "nonce burned before restart must still block after reload (disk persistence holds): \
+         {outcomes2:?}"
+    );
+    let result2 = store2
+        .get(task_id)
+        .result
+        .as_ref()
+        .expect("blocked task must have a result");
+    assert!(
+        result2
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("replayed")),
+        "blocked result must mention 'replayed': {result2:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&replay_dir);
+}
+
+/// A corrupt replay cache file fails closed across the full orchestrator lifecycle.
+///
+/// After a successful scheduler tick (nonce burned, cache file persisted), the
+/// cache file is externally corrupted (simulating a partial write or truncation).
+/// The next attempt to load the cache via `ReplayCache::load` must:
+///
+/// 1. Return `Err(ReplayError::Corrupt)` — fail closed, not silently reset.
+/// 2. Quarantine the corrupt bytes at `replay_cache.json.corrupt` so an operator
+///    can inspect them (architecture §13; issue #305 acceptance criterion).
+/// 3. Leave the original path absent — the daemon cannot load an empty cache on
+///    top of the corrupt bytes and silently forget every burned nonce.
+///
+/// After operator recovery (removing the quarantine file) a subsequent load
+/// succeeds with a fresh empty cache, making the trade-off explicit: recovery
+/// from corruption is possible but only after an operator-visible error.
+///
+/// Crosses the orchestrator → scheduler-tick → disk-write → file-corruption →
+/// `ReplayCache::load` → quarantine boundary.
+#[test]
+fn corrupt_replay_cache_fails_closed_and_quarantines() {
+    let task_id = "task-corrupt-e2e";
+    let nonce = "nonce-corrupt-e2e-unique";
+    let t = signed_tool_task_305(task_id, nonce);
+
+    let (cache, replay_dir) = tempdir_replay_cache("corrupt-e2e");
+    let (trust, key_id) = trust_305();
+    let key = key_305();
+    let paths = SessionPaths::for_data_dir(replay_dir.clone());
+    let cache_file = replay_dir.join("replay_cache.json");
+    let quarantine_file = replay_dir.join("replay_cache.json.corrupt");
+
+    let orchestrator = TaskOrchestrator::new(LOCAL_AGENT)
+        .with_room_id(ROOM_ID)
+        .with_policy(tool_policy())
+        .with_trust_store(trust)
+        .with_verifying_key(key_id, key.verifying_key())
+        .with_replay_cache(cache);
+
+    let scheduler = TaskScheduler::new(LOCAL_AGENT, 4);
+
+    // --- Tick 1: task succeeds, nonce burned, cache file written to disk. ----
+    let mut store1 = RoomTaskStore::default();
+    store1.insert(t.clone());
+    let mut dispatcher1 = ToolTaskDispatcher::with_runner(|_, _, _, _| {
+        Ok(ToolResult {
+            exit_code: 0,
+            summary: "ran before corruption".to_string(),
+        })
+    });
+    tick(&scheduler, &orchestrator, &mut store1, &mut dispatcher1);
+    assert_eq!(
+        store1.get(task_id).state,
+        STATE_SUCCEEDED,
+        "tick 1 must succeed before corruption"
+    );
+    assert!(cache_file.exists(), "cache file must exist after tick 1");
+
+    // --- Corrupt the cache file (simulate partial write or truncation). ------
+    std::fs::write(&cache_file, b"{ not valid json at all").expect("corrupt write");
+
+    // --- Reload attempt fails closed (Err(Corrupt)), not silently. -----------
+    let load_result = ReplayCache::load_with_capacity(&paths, 64);
+    assert!(
+        matches!(load_result, Err(ReplayError::Corrupt)),
+        "a corrupt cache file must fail closed (Err(Corrupt)); \
+         silently resetting to empty would forget every burned nonce: {load_result:?}"
+    );
+
+    // The corrupt bytes are quarantined so the operator can inspect them.
+    assert!(
+        quarantine_file.exists(),
+        "corrupt bytes must be quarantined at replay_cache.json.corrupt for operator inspection"
+    );
+    // The original path is absent — not silently reset to an empty cache.
+    assert!(
+        !cache_file.exists(),
+        "original path must be vacated (moved to quarantine), not silently reset in place"
+    );
+
+    // --- Operator recovery: remove the quarantine file. ----------------------
+    std::fs::remove_file(&quarantine_file).expect("remove quarantine");
+
+    // After recovery, a fresh load succeeds with an empty cache. The burned
+    // nonces are lost — this is the documented risk that the operator-visible
+    // error (Err(Corrupt) + quarantine) makes explicit.
+    let recovered = ReplayCache::load_with_capacity(&paths, 64).expect(
+        "load after operator recovery must succeed (quarantine cleared → NotFound → empty)",
+    );
+    assert!(
+        recovered.is_empty(),
+        "recovered cache must be empty (burned nonces lost after corruption — operator-visible)"
+    );
+
+    let _ = std::fs::remove_dir_all(&replay_dir);
+}

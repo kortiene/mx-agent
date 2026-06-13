@@ -116,7 +116,7 @@ A *local* exec follows the **same path** as a remote one: the daemon signs an ev
 
 mx-agent is **zero-trust and deny-by-default**: room membership grants nothing on its own.
 
-- Every privileged request is **Ed25519-signed** and checked against **local policy** before running anything; request types that carry nonce/expiry fields are also replay/expiry checked.
+- Every privileged request is **Ed25519-signed** and checked against **local policy** before running anything; request types that carry nonce/expiry fields are also replay/expiry checked. Replay protection **fails closed** — if the replay cache cannot be loaded or is corrupt, the daemon skips the work (routes nothing / skips the scheduler pass) rather than running unchecked — and live control frames (`exec.stdin`/`exec.cancel`/`pty.resize`) are replay-checked **per live session**.
 - The **result plane is sender-pinned** too: stream output, exit status, call responses, and artifacts/shares are accepted only from the executing/producing agent's Matrix identity, so another room member cannot forge a result, fake an exit status, inject output, or shadow an artifact (stream chunks also carry a verified `sha256` integrity digest).
 - The coding agent **never sees** Matrix tokens or device keys — they stay inside the daemon (`0600`, user-owned).
 - Child processes start from an **environment allowlist** with secret scrubbing (`GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_*`, …).

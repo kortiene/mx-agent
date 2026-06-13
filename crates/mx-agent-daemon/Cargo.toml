@@ -43,6 +43,7 @@ getrandom = { workspace = true }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "test-util"] }
+ed25519-dalek.workspace = true
 # The local Matrix integration test (tests/matrix_integration.rs) creates rooms
 # and sends events against a live homeserver. It is `#[ignore]`d by default; see
 # scripts/matrix_integration_test.sh. The crypto stack it needs

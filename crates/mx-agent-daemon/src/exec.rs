@@ -28,9 +28,9 @@
 //! any rejection it emits a `com.mxagent.exec.rejected.v1` carrying a stable,
 //! machine-readable reason and spawns nothing.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -72,6 +72,14 @@ struct LiveExecControl {
     /// Live terminal-resize channel for an interactive PTY invocation; `None`
     /// for non-PTY exec, which has no terminal to resize.
     resize: Option<tokio::sync::mpsc::Sender<PtyWinsize>>,
+    /// Nonces of control frames (`exec.stdin` / `exec.cancel` / `pty.resize`)
+    /// already applied to this live session. Shared across clones — handlers
+    /// operate on a clone of the control — so a re-delivered (replayed) frame
+    /// carrying a previously seen nonce is dropped for the session lifetime
+    /// (issue #305). In-memory only and not persisted: a daemon restart kills
+    /// every live session, so a post-restart control replay is already dropped
+    /// at the no-live-control guard.
+    seen_control_nonces: Arc<Mutex<HashSet<String>>>,
 }
 
 static LIVE_EXEC_CONTROLS: OnceLock<Mutex<HashMap<String, LiveExecControl>>> = OnceLock::new();
@@ -100,6 +108,25 @@ fn live_exec_control(invocation_id: &str) -> Option<LiveExecControl> {
         .unwrap_or_else(|e| e.into_inner())
         .get(invocation_id)
         .cloned()
+}
+
+/// Record `nonce` as seen for this live session, returning `true` when it is
+/// fresh (first seen this session) and `false` when it is a replay.
+///
+/// Only frames that already passed [`authorize_live_control`] (signature →
+/// trust → ownership) reach here, so an attacker cannot pre-seed the seen-set to
+/// block a legitimate requester's future (random) nonce, and a denied frame
+/// leaves the set unchanged — mirroring the replay cache's side-effect-free
+/// denials. Per-session dedup (rather than the router's bounded, persistent
+/// request-plane cache) avoids thrashing that cache and evicting legitimate
+/// `exec.request` / `call.request` nonces when an interactive PTY emits a
+/// control frame per keystroke (issue #305).
+fn admit_control_nonce(control: &LiveExecControl, nonce: &str) -> bool {
+    control
+        .seen_control_nonces
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(nonce.to_string())
 }
 
 /// Why an incoming `com.mxagent.exec.request.v1` was rejected.
@@ -621,6 +648,7 @@ pub async fn handle_live_exec_request(
             stdin: stdin_tx,
             cancel: cancel_tx,
             resize: request.pty.then_some(resize_tx),
+            seen_control_nonces: Arc::new(Mutex::new(HashSet::new())),
         },
     );
 
@@ -755,6 +783,17 @@ pub async fn handle_live_exec_stdin(
         );
         return;
     }
+    // Replay-check per session, after authorization and before applying the
+    // frame: a re-delivered stdin frame carrying a previously seen nonce is
+    // dropped so a room actor cannot replay already-authorized bytes (e.g. a
+    // duplicate stdin line or a premature EOF) into a still-live session (#305).
+    if !admit_control_nonce(&control, &stdin.nonce) {
+        tracing::warn!(
+            invocation_id = %stdin.invocation_id,
+            "dropped replayed exec stdin control frame (nonce already seen this session)"
+        );
+        return;
+    }
     use base64::Engine as _;
     let data = match base64::engine::general_purpose::STANDARD.decode(&stdin.data) {
         Ok(data) => data,
@@ -795,6 +834,16 @@ pub async fn handle_live_exec_cancel(
             invocation_id = %cancel.invocation_id,
             requester_agent = %control.requester_agent,
             "rejected unauthorized exec cancel control"
+        );
+        return;
+    }
+    // Replay-check per session: a re-delivered cancel carrying a seen nonce is
+    // dropped so a replayed control frame cannot re-signal an already-handled
+    // (or still-live) session (issue #305).
+    if !admit_control_nonce(&control, &cancel.nonce) {
+        tracing::warn!(
+            invocation_id = %cancel.invocation_id,
+            "dropped replayed exec cancel control frame (nonce already seen this session)"
         );
         return;
     }
@@ -1531,10 +1580,10 @@ pub async fn send_pty_resize(
 /// `exec.stdin` / `exec.cancel`: only the invocation's original requester, using
 /// a locally trusted signing key, may resize its terminal. Room membership or a
 /// spoofed Matrix sender alone never resizes another agent's session, and a
-/// resize for an unknown or non-PTY invocation is silently ignored. Resize is
-/// idempotent (it only sets the current window size and executes nothing), so it
-/// is not router-replay-checked — a replayed resize at most re-applies the same
-/// dimensions.
+/// resize for an unknown or non-PTY invocation is silently ignored. Like the
+/// other live controls, resize is **replay-checked per session** (issue #305): a
+/// re-delivered frame carrying a nonce already seen this session is dropped
+/// rather than re-applied.
 pub async fn handle_live_pty_resize(
     room: &Room,
     paths: &crate::SessionPaths,
@@ -1558,6 +1607,15 @@ pub async fn handle_live_pty_resize(
             invocation_id = %resize.invocation_id,
             requester_agent = %control.requester_agent,
             "rejected unauthorized pty resize control"
+        );
+        return;
+    }
+    // Replay-check per session: a re-delivered resize carrying a seen nonce is
+    // dropped so a replayed frame cannot flap an already-running terminal (#305).
+    if !admit_control_nonce(&control, &resize.nonce) {
+        tracing::warn!(
+            invocation_id = %resize.invocation_id,
+            "dropped replayed pty resize control frame (nonce already seen this session)"
         );
         return;
     }
@@ -2108,6 +2166,36 @@ allow_cwd = ["/home/me/code/project"]
         let request = authorize(&content, &key, &trust).expect("authorized");
         assert_eq!(request.invocation_id, "inv_01HZ");
         assert_eq!(request.command, vec!["cargo", "test"]);
+    }
+
+    /// A control-frame nonce is admitted once per live session; a re-delivered
+    /// (replayed) frame carrying a seen nonce is dropped, and the seen-set is
+    /// shared across clones (handlers operate on a clone of the control).
+    #[test]
+    fn replayed_control_nonce_is_dropped() {
+        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::channel::<StdinFrame>(1);
+        let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        let control = LiveExecControl {
+            requester_agent: AGENT.to_string(),
+            stdin: stdin_tx,
+            cancel: cancel_tx,
+            resize: None,
+            seen_control_nonces: Arc::new(Mutex::new(HashSet::new())),
+        };
+
+        // First sight of a nonce is fresh; the same nonce again is a replay.
+        assert!(admit_control_nonce(&control, "nonce-1"));
+        assert!(!admit_control_nonce(&control, "nonce-1"));
+        // A distinct nonce is still fresh.
+        assert!(admit_control_nonce(&control, "nonce-2"));
+
+        // A clone shares the seen-set: already-seen nonces stay denied through it,
+        // and a fresh nonce recorded via the clone is denied on the original.
+        let cloned = control.clone();
+        assert!(!admit_control_nonce(&cloned, "nonce-1"));
+        assert!(!admit_control_nonce(&cloned, "nonce-2"));
+        assert!(admit_control_nonce(&cloned, "nonce-3"));
+        assert!(!admit_control_nonce(&control, "nonce-3"));
     }
 
     /// Regression test for the stdin-registration race: stdin (and its EOF)

@@ -127,6 +127,31 @@ The data directory itself is created `0700`. Files are written with the
 write-to-temp-then-rename pattern so the mode is correct before the data is
 visible.
 
+**Replay cache fail-closed behavior (issue #305).** The daemon enforces
+replay/expiry checks on all privileged requests; this check is **mandatory, not
+best-effort**:
+
+- A genuine IO error reading `replay_cache.json` (not `NotFound`) causes the
+  scheduler to skip the pass entirely (no claim, dispatch, or approval release)
+  and the sync router to route nothing — the daemon waits for the next sync cycle
+  rather than running unchecked.
+- A corrupt or truncated `replay_cache.json` is **quarantined** by renaming it
+  to a sibling `replay_cache.json.corrupt` so the bytes survive for inspection.
+  The daemon keeps failing closed on every subsequent load while the quarantine
+  file exists — a missing `replay_cache.json` alone does *not* silently yield a
+  fresh empty cache when the quarantine sentinel is present.
+- On first run, `NotFound` is normal and produces a fresh empty cache.
+
+To recover from a corrupt cache incident: inspect `replay_cache.json.corrupt`,
+then remove it. The next load will start from a fresh empty cache. Nonces burned
+before the corruption are lost, but the quarantine makes this an explicit
+operator decision rather than a silent reset.
+
+Live control frames (`exec.stdin`, `exec.cancel`, `pty.resize`) are not burned
+into the shared bounded request-plane cache. They are replay-checked **per live
+session** in their handlers using an in-memory seen-nonce set scoped to the
+invocation lifetime (architecture §7.5–§7.7).
+
 **Tokens never leak into output.** Access and refresh tokens are wrapped in a
 `Secret` type whose `Debug` and `Display` render `***redacted***`. The telemetry
 layer independently redacts any structured field whose key looks sensitive
@@ -223,8 +248,11 @@ any room-published "trusted".
 
 **Where signatures sit in the pipeline.** For a raw `exec` the daemon checks, in
 order: signature valid → request routed to this agent → key trusted → replay/
-freshness → policy. A tool `call` is the same minus the routing check. Any
-failure denies the request, and the denial is recorded in the audit log.
+freshness → policy. A tool `call` is the same minus the routing check. The
+replay/freshness check is **fail-closed**: a cache load error or corrupt file
+causes the daemon to skip the work entirely rather than run unchecked (see
+[Replay cache fail-closed behavior](#token-isolation-model) above). Any failure
+denies the request, and the denial is recorded in the audit log.
 
 ## Device verification, cross-signing, and key backup (E2EE)
 
