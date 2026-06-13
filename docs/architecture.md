@@ -675,6 +675,13 @@ Requester may stream stdin to a live invocation with signed control events:
 `data` is base64-encoded raw stdin bytes. `eof=true` closes stdin after any
 bytes in the frame are written. The target accepts stdin only when the signature
 verifies against a trusted agent key and that agent is the invocation requester.
+Like `exec.cancel` and `pty.resize`, each `exec.stdin` frame is also
+**replay-checked per live session**: the target records every nonce it has
+applied to the invocation in an in-memory set, so a re-delivered frame carrying
+a previously seen nonce is dropped rather than re-applied (duplicate line,
+premature EOF). The seen-set is freed when the session ends and is not persisted;
+a daemon restart kills every live session, so a post-restart replay finds no live
+control and is dropped.
 
 Requester sends cancellation:
 
@@ -763,10 +770,14 @@ advisory and `0` when the local terminal does not report them. Resize is
 authorized exactly like `exec.stdin` / `exec.cancel`: the target accepts it only
 when the signature verifies against a trusted agent key and that agent is the
 invocation requester (signature → trust → ownership). Room membership or a
-spoofed Matrix sender alone never resizes another agent's session. Resize is
-idempotent — it only sets the current window size and executes nothing — so,
-like the other live controls, it is not router replay/expiry-checked; a replayed
-resize at most re-applies the same dimensions.
+spoofed Matrix sender alone never resizes another agent's session. Like the
+other live controls, resize is **replay-checked per session**: each control
+frame carries a `nonce`, and the target records the nonces it has applied to a
+live invocation, so a re-delivered (replayed) `pty.resize` / `exec.stdin` /
+`exec.cancel` frame carrying a previously seen nonce is dropped rather than
+re-applied. The seen-set is in-memory and scoped to the live invocation — it is
+freed when the session ends, and a daemon restart kills every live session, so a
+post-restart control replay finds no live invocation and is dropped anyway.
 
 ---
 
@@ -1067,6 +1078,13 @@ revoked, expired, or replayed task action is blocked and never executes. The
 single-use replay/expiry nonce is consumed only on the pass that actually
 proceeds to execute, so a task held pending approval (below) is checked at
 execution time and is not falsely rejected as a replay when it later resumes.
+Replay protection is **mandatory**, not best-effort: if the scheduler cannot
+load the replay cache (IO error or a corrupt cache file), it **fails closed**
+and skips the pass — no claim, dispatch, or approval release — matching the sync
+router, rather than running cache-less. A corrupt cache file is quarantined
+(renamed aside) and surfaced as an operator-visible error rather than silently
+reset to empty, so previously burned nonces are never forgotten without a
+signal.
 
 After signature/trust verification, the daemon scheduler parses the task action
 and checks local deny-by-default policy against the task creator and requested
@@ -1090,7 +1108,12 @@ configured the daemon fails closed and does not run the action. The claim is an 
 guarded by the observed `state_rev`: it transitions `pending`/`assigned` ->
 `executing`, records this agent as the owner (`assigned_to`), and attaches a
 generated `invocation_id` atomically. If another daemon claimed first, the
-conditional update is stale and this daemon does not execute. A policy denial is audited locally, does not spawn, and
+conditional update is stale and this daemon does not execute; because the
+single-use nonces (the task action's, and an approval-gated task's decision
+nonce) are burned just before the claim, a lost claim race **un-burns** them so
+the task stays runnable on the next pass instead of wedging `blocked` or hanging
+`pending` — the daemon that won the claim burns its own copies, so single-use is
+still enforced per execution. A policy denial is audited locally, does not spawn, and
 moves the task to a safe non-runnable state with `reason = "policy_denied"`.
 When policy permits execution, the daemon claims the pending task with the
 observed `state_rev`, sets `state = "executing"`, and attaches a generated
@@ -1332,7 +1355,13 @@ event passes, so it is deliberately conservative:
   without panicking and without dispatch;
 - privileged `exec.request` and `call.request` events are
   **replay/expiry-checked** through the persistent replay cache before dispatch
-  (both carry a signed `nonce` and `expires_at`);
+  (both carry a signed `nonce` and `expires_at`); the router **fails closed** if
+  that cache cannot be loaded (IO error or a corrupt cache file) — it routes
+  nothing rather than dispatching unchecked requests, while `/sync` health
+  tracking continues. Live control frames (`exec.stdin` / `exec.cancel` /
+  `pty.resize`) are *not* burned into this shared request-plane cache (one frame
+  per keystroke would thrash it and evict legitimate request nonces); they are
+  replay-checked **per live session** in their handlers instead;
 - only non-sensitive metadata is logged (event type, room, sender, IDs,
   category, reason) — never event content.
 

@@ -344,6 +344,13 @@ impl EventRouter {
         let replay = match &routed {
             RoutedEvent::ExecRequest(req) => Some((req.nonce.as_str(), req.expires_at.as_str())),
             RoutedEvent::CallRequest(req) => Some((req.nonce.as_str(), req.expires_at.as_str())),
+            // Control frames (`exec.stdin` / `exec.cancel` / `pty.resize`) carry a
+            // nonce too, but it is replay-checked **per live session** in their
+            // handlers (see `exec::admit_control_nonce`), NOT routed into this
+            // shared, bounded request-plane cache: an interactive PTY emits a
+            // control frame per keystroke, so burning each here would thrash the
+            // persisted cache and evict legitimate `exec.request`/`call.request`
+            // nonces. Do not add control frames to this match (issue #305).
             _ => None,
         };
         if let Some((nonce, expires_at)) = replay {
@@ -823,5 +830,95 @@ mod tests {
         assert!(!EventCategory::Heartbeat.is_privileged());
         assert!(!EventCategory::Task.is_privileged());
         assert!(!EventCategory::ExecFinished.is_privileged());
+    }
+
+    /// Control frames (`exec.stdin`, `exec.cancel`, `pty.resize`) carry nonces
+    /// but are NOT replay-checked against the shared, bounded request-plane
+    /// cache (issue #305): per-session dedup happens in `exec::admit_control_nonce`
+    /// instead. This test verifies the router dispatches these frames every time
+    /// they arrive, even when the same nonce is reused — the router must NOT
+    /// consume the shared cache for control frames (which would thrash it and
+    /// evict legitimate `exec.request`/`call.request` nonces). Replay prevention
+    /// for control frames is the caller's (exec handler's) responsibility.
+    #[test]
+    fn control_frames_bypass_request_plane_cache() {
+        let (mut router, _data) = router("ctrl-replay");
+        let mut rec = Recorder::default();
+        let sig = signature();
+
+        let stdin = incoming(
+            timeline::EXEC_STDIN,
+            json!({
+                "invocation_id": "inv_ctrl",
+                "data": "dGVzdA==",
+                "eof": false,
+                "created_at": "2026-06-02T12:00:00Z",
+                "nonce": "ctrl-stdin-nonce",
+                "signature": sig,
+            }),
+        );
+        let cancel = incoming(
+            timeline::EXEC_CANCEL,
+            json!({
+                "invocation_id": "inv_ctrl",
+                "reason": "user_requested",
+                "created_at": "2026-06-02T12:00:00Z",
+                "nonce": "ctrl-cancel-nonce",
+                "signature": sig,
+            }),
+        );
+        let resize = incoming(
+            timeline::PTY_RESIZE,
+            json!({
+                "invocation_id": "inv_ctrl",
+                "rows": 24,
+                "cols": 80,
+                "pixel_width": 0,
+                "pixel_height": 0,
+                "created_at": "2026-06-02T12:00:00Z",
+                "nonce": "ctrl-resize-nonce",
+                "signature": sig,
+            }),
+        );
+
+        let mut sink = rec.sink();
+        // Each control frame dispatches on first delivery.
+        assert_eq!(
+            router.route(&stdin, &mut sink),
+            RouteOutcome::Dispatched(EventCategory::ExecStdin),
+            "exec.stdin must dispatch on first delivery"
+        );
+        assert_eq!(
+            router.route(&cancel, &mut sink),
+            RouteOutcome::Dispatched(EventCategory::ExecCancel),
+            "exec.cancel must dispatch on first delivery"
+        );
+        assert_eq!(
+            router.route(&resize, &mut sink),
+            RouteOutcome::Dispatched(EventCategory::PtyResize),
+            "pty.resize must dispatch on first delivery"
+        );
+        // Re-delivery of the same frames (same nonces) also dispatches: the
+        // router does NOT consume the shared request-plane cache for control
+        // frames. The exec handler's per-session admit_control_nonce is
+        // responsible for dedup.
+        assert_eq!(
+            router.route(&stdin, &mut sink),
+            RouteOutcome::Dispatched(EventCategory::ExecStdin),
+            "re-delivered exec.stdin must still dispatch (router does not cache-check control frames)"
+        );
+        assert_eq!(
+            router.route(&cancel, &mut sink),
+            RouteOutcome::Dispatched(EventCategory::ExecCancel),
+            "re-delivered exec.cancel must still dispatch"
+        );
+        assert_eq!(
+            router.route(&resize, &mut sink),
+            RouteOutcome::Dispatched(EventCategory::PtyResize),
+            "re-delivered pty.resize must still dispatch"
+        );
+        drop(sink);
+        // Each frame was dispatched twice — 6 total — and none was blocked.
+        assert_eq!(rec.dispatched.len(), 6);
     }
 }

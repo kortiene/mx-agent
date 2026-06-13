@@ -527,6 +527,13 @@ fn scheduler_pass(
 /// decisions and direct exec/call decisions land in one audit log. The fallback
 /// guarantees a path, so the production orchestrator is always audited.
 ///
+/// The replay cache is **required**, not optional: replay/expiry enforcement is
+/// part of the privileged-action verify pipeline, not a best-effort layer.
+/// Taking a non-`Option` [`ReplayCache`] makes it impossible to construct the
+/// production orchestrator (or its approval gate, which shares the handle)
+/// cache-less; the caller obtains the cache via [`load_pass_replay_cache`] and
+/// skips the whole pass when it cannot load.
+///
 /// Extracted from [`scheduler_pass_for_agent`] so the audit-log wiring is
 /// unit-testable without a live Matrix `Room`.
 pub(crate) fn build_scheduler_orchestrator(
@@ -534,7 +541,7 @@ pub(crate) fn build_scheduler_orchestrator(
     room_id: &str,
     policy: Policy,
     trust: TrustStore,
-    replay: Option<ReplayCache>,
+    replay: ReplayCache,
     verifying_keys: &BTreeMap<String, VerifyingKey>,
     paths: &SessionPaths,
 ) -> TaskOrchestrator {
@@ -546,14 +553,35 @@ pub(crate) fn build_scheduler_orchestrator(
         .with_room_id(room_id.to_string())
         .with_policy(policy)
         .with_trust_store(trust)
-        .with_audit_log(audit_log);
-    if let Some(replay) = replay {
-        orchestrator = orchestrator.with_replay_cache(replay);
-    }
+        .with_audit_log(audit_log)
+        .with_replay_cache(replay);
     for (key_id, key) in verifying_keys {
         orchestrator = orchestrator.with_verifying_key(key_id.clone(), *key);
     }
     orchestrator
+}
+
+/// Load the replay cache for a scheduler pass, or `None` to skip the pass.
+///
+/// Replay/expiry enforcement is part of the privileged-action verify pipeline,
+/// not an optional layer, so a load error — IO or a corrupt/truncated cache
+/// file ([`ReplayError::Corrupt`](crate::replay::ReplayError::Corrupt)) — is
+/// logged loudly and **fails closed**: the caller must not claim, dispatch, or
+/// release a held approval without replay protection. This mirrors the sync
+/// router, which routes nothing when the cache cannot load (`sync.rs`). The
+/// `/sync` health loop is separate and keeps running.
+fn load_pass_replay_cache(paths: &SessionPaths) -> Option<ReplayCache> {
+    match ReplayCache::load(paths) {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "could not load replay cache; skipping scheduler pass \
+                 (no claim, dispatch, or approval release this pass)"
+            );
+            None
+        }
+    }
 }
 
 /// Tick the orchestrator for a single local `agent` against a room snapshot.
@@ -582,13 +610,22 @@ fn scheduler_pass_for_agent(
         .unwrap_or_default();
     let trust = TrustStore::load(paths).unwrap_or_default();
 
-    // Task state is advisory: configuring the trust store (and replay cache when
-    // available) makes the orchestrator require a valid signed authorization
-    // before any claim/dispatch, so an unsigned/untrusted/expired/replayed task
-    // action is blocked rather than executed. The audit log is attached here so
-    // every policy decision (allow and deny) leaves a trace, matching the direct
+    // Task state is advisory: configuring the trust store and replay cache makes
+    // the orchestrator require a valid signed authorization before any
+    // claim/dispatch, so an unsigned/untrusted/expired/replayed task action is
+    // blocked rather than executed. The audit log is attached here so every
+    // policy decision (allow and deny) leaves a trace, matching the direct
     // exec/call path (issue #266).
-    let replay = ReplayCache::load(paths).ok();
+    //
+    // Replay protection is mandatory: if the cache cannot be loaded (IO error or
+    // a corrupt cache file) we fail closed and skip this agent's pass entirely —
+    // no claim, dispatch, or approval release — rather than running cache-less
+    // (issue #305). Every owned agent loads the same shared cache file, so a
+    // persistent load error skips them all, equivalent to skipping the pass,
+    // while the separate `/sync` health loop keeps running.
+    let Some(replay) = load_pass_replay_cache(paths) else {
+        return;
+    };
     let mut orchestrator = build_scheduler_orchestrator(
         agent.agent_id.clone(),
         room_id,
@@ -1639,6 +1676,66 @@ requires_approval = true
         );
     }
 
+    #[test]
+    fn load_pass_replay_cache_skips_on_corrupt() {
+        // Fail-closed decision (issue #305): a corrupt cache file makes the
+        // scheduler pass skip (returns `None`), while an absent/valid file loads.
+        let dir = std::env::temp_dir().join(format!(
+            "mx-agent-sched-replay-load-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = SessionPaths::for_data_dir(dir.clone());
+
+        // Absent file: a fresh empty cache loads, so the pass proceeds.
+        assert!(
+            load_pass_replay_cache(&paths).is_some(),
+            "an absent cache file must load a fresh cache, not skip the pass"
+        );
+
+        // Corrupt file: fail closed — skip the pass.
+        std::fs::write(dir.join("replay_cache.json"), b"not valid json").unwrap();
+        assert!(
+            load_pass_replay_cache(&paths).is_none(),
+            "a corrupt replay cache must skip the scheduler pass (fail closed)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_pass_replay_cache_skips_on_io_error() {
+        // Fail-closed decision (issue #305): a genuine (non-NotFound) IO error
+        // loading the cache file also makes the scheduler pass skip (returns
+        // `None`), not just a corrupt-JSON case. Regression guard: the error
+        // arm of `load_pass_replay_cache` must match ALL `Err(_)` variants, not
+        // only `ReplayError::Corrupt`.
+        let dir = std::env::temp_dir().join(format!(
+            "mx-agent-sched-replay-ioerr-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = SessionPaths::for_data_dir(dir.clone());
+
+        // Make `replay_cache.json` a directory so `fs::read` returns a
+        // non-NotFound IO error (IsADirectory / EISDIR on Unix).
+        std::fs::create_dir(dir.join("replay_cache.json")).unwrap();
+        assert!(
+            load_pass_replay_cache(&paths).is_none(),
+            "an IO error reading the replay cache must skip the scheduler pass (fail closed)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- build_scheduler_orchestrator audit-log wiring (issue #266) -----------
 
     /// Build a signed tool action and the trust artifacts needed to validate it,
@@ -1716,7 +1813,7 @@ requires_approval = true
             ROOM,
             policy(),
             crate::trust::TrustStore::default(),
-            None,
+            ReplayCache::load(&paths).expect("replay cache loads"),
             &BTreeMap::new(),
             &paths,
         );
@@ -1747,7 +1844,7 @@ requires_approval = true
             ROOM,
             policy(),
             trust,
-            None,
+            ReplayCache::load(&paths).expect("replay cache loads"),
             &keys,
             &paths,
         );
@@ -1806,7 +1903,7 @@ requires_approval = true
             ROOM,
             policy(),
             trust,
-            None,
+            ReplayCache::load(&paths).expect("replay cache loads"),
             &keys,
             &paths,
         );

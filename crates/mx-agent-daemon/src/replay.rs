@@ -48,6 +48,12 @@ pub enum ReplayError {
     Replayed,
     /// The `expires_at` timestamp was not a valid RFC 3339 instant.
     MalformedTimestamp,
+    /// The persisted cache file exists but could not be parsed. The daemon
+    /// fails closed (refuses to admit) rather than silently resetting to an
+    /// empty cache and forgetting every previously burned nonce; the corrupt
+    /// file is quarantined for inspection. Produced only by
+    /// [`ReplayCache::load`].
+    Corrupt,
     /// Persisting the cache to disk failed.
     Io(io::ErrorKind),
 }
@@ -58,6 +64,7 @@ impl fmt::Display for ReplayError {
             Self::Expired => write!(f, "privileged request has expired"),
             Self::Replayed => write!(f, "privileged request nonce was already used"),
             Self::MalformedTimestamp => write!(f, "expires_at is not a valid RFC 3339 timestamp"),
+            Self::Corrupt => write!(f, "replay cache file is corrupt"),
             Self::Io(kind) => write!(f, "replay cache I/O error: {kind:?}"),
         }
     }
@@ -95,14 +102,50 @@ impl ReplayCache {
     /// cache exists yet. A capacity of zero is treated as one entry.
     pub fn load_with_capacity(paths: &SessionPaths, capacity: usize) -> Result<Self, ReplayError> {
         let path = paths.data_dir.join(REPLAY_CACHE_FILE);
+
+        // A prior corrupt load moved the cache aside to a sibling
+        // `replay_cache.json.corrupt` and failed closed. Keep failing closed
+        // while that sentinel exists: otherwise this load would find the
+        // original path absent (the `NotFound` branch below), silently return a
+        // fresh empty cache, and forget every previously burned nonce — exactly
+        // the silent reset the quarantine exists to prevent (and which sibling
+        // agents later in the same scheduler pass would also inherit). The
+        // daemon stays fail-closed until an operator clears the quarantined
+        // file.
+        let quarantine = quarantine_path(&path);
+        if quarantine.exists() {
+            tracing::error!(
+                path = %quarantine.display(),
+                "quarantined corrupt replay cache present; refusing to admit (fail closed). \
+                 Move the quarantined file aside to reset replay protection."
+            );
+            return Err(ReplayError::Corrupt);
+        }
+
         let now = now_unix();
         let mut cache = match fs::read(&path) {
             Ok(bytes) => {
-                let stored: StoredCache =
-                    serde_json::from_slice(&bytes).unwrap_or_else(|_| StoredCache {
-                        capacity,
-                        nonces: HashMap::new(),
-                    });
+                let stored: StoredCache = match serde_json::from_slice(&bytes) {
+                    Ok(stored) => stored,
+                    Err(_) => {
+                        // Do NOT silently reset to an empty cache: that would
+                        // forget every previously burned nonce with no
+                        // operator-visible signal, weakening replay protection
+                        // for every caller (the otherwise fail-closed sync
+                        // router included). Quarantine the corrupt bytes for
+                        // inspection — rather than overwriting them on the next
+                        // persist — and fail closed; callers (router, scheduler)
+                        // then skip routing/dispatch until an operator moves the
+                        // quarantined file aside.
+                        quarantine_corrupt(&path);
+                        tracing::error!(
+                            path = %path.display(),
+                            "replay cache file is corrupt; refusing to admit (fail closed). \
+                             Move the quarantined file aside to reset replay protection."
+                        );
+                        return Err(ReplayError::Corrupt);
+                    }
+                };
                 Self {
                     path,
                     capacity: stored.capacity.max(1),
@@ -189,6 +232,26 @@ impl ReplayCache {
         self.persist()
     }
 
+    /// Remove a previously admitted nonce, persisting the change. A no-op (still
+    /// `Ok`) when the nonce is absent.
+    ///
+    /// # Safety invariant
+    ///
+    /// `forget` must only ever be called for a nonce whose action **did not
+    /// execute** — specifically, to compensate a lost optimistic-claim race
+    /// (`StaleClaim`) in which the nonce was burned before the claim but the
+    /// action was never dispatched. Because the action never ran, re-admitting
+    /// its single-use nonce on a later pass cannot enable a real replay: the
+    /// daemon that *won* the claim burns its own copy in its own cache, so
+    /// single-use is preserved per execution. Calling `forget` on a nonce whose
+    /// action *did* execute would reopen a replay window and is a bug.
+    pub fn forget(&mut self, nonce: &str) -> Result<(), ReplayError> {
+        if self.nonces.remove(nonce).is_some() {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
     /// Remove all entries whose expiry is at or before `now`.
     fn prune_expired(&mut self, now: i64) {
         self.nonces.retain(|_, &mut exp| exp > now);
@@ -214,6 +277,36 @@ impl ReplayCache {
         }
         fs::rename(&tmp, &self.path).map_err(|e| ReplayError::Io(e.kind()))?;
         Ok(())
+    }
+}
+
+/// Path of the quarantine sentinel for the cache at `path`: a sibling
+/// `replay_cache.json.corrupt`. Its presence makes [`ReplayCache::load`] fail
+/// closed (returning [`ReplayError::Corrupt`]) until an operator clears it.
+/// Centralized so the load-time check and the rename-aside can never drift.
+fn quarantine_path(path: &Path) -> PathBuf {
+    path.with_extension("json.corrupt")
+}
+
+/// Best-effort: move a corrupt cache file aside to the sibling
+/// [`quarantine_path`] so its bytes survive for inspection instead of being
+/// silently overwritten by the next `persist`.
+///
+/// Never panics and never logs file contents (only the path, architecture
+/// §13.6); a failed rename is logged at `debug` and the caller still fails
+/// closed. After a successful rename the original path is absent, but
+/// [`ReplayCache::load`] keeps failing closed because it returns
+/// [`ReplayError::Corrupt`] while the quarantine sentinel exists — it never
+/// treats the now-missing path as a fresh empty cache. Replay protection is
+/// re-established only once an operator clears the quarantined file.
+fn quarantine_corrupt(path: &Path) {
+    let quarantine = quarantine_path(path);
+    if let Err(e) = fs::rename(path, &quarantine) {
+        tracing::debug!(
+            path = %path.display(),
+            error = %e,
+            "could not quarantine corrupt replay cache file"
+        );
     }
 }
 
@@ -494,6 +587,149 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// A corrupt/truncated cache file fails closed (`Err(Corrupt)`) instead of
+    /// silently resetting to an empty cache and forgetting every burned nonce.
+    #[test]
+    fn corrupt_file_fails_closed() {
+        let data = TempData::new("corrupt");
+        let paths = data.paths();
+        ensure_dir(&paths.data_dir).unwrap();
+        fs::write(
+            paths.data_dir.join(REPLAY_CACHE_FILE),
+            b"{ this is not valid json",
+        )
+        .unwrap();
+        assert!(matches!(
+            ReplayCache::load(&paths),
+            Err(ReplayError::Corrupt)
+        ));
+    }
+
+    /// After a failed corrupt load the original bytes survive at
+    /// `replay_cache.json.corrupt` and no empty cache was written over them.
+    #[test]
+    fn corrupt_file_is_quarantined_not_overwritten() {
+        let data = TempData::new("quarantine");
+        let paths = data.paths();
+        ensure_dir(&paths.data_dir).unwrap();
+        let file = paths.data_dir.join(REPLAY_CACHE_FILE);
+        let corrupt_bytes = b"not json at all".to_vec();
+        fs::write(&file, &corrupt_bytes).unwrap();
+
+        assert!(matches!(
+            ReplayCache::load(&paths),
+            Err(ReplayError::Corrupt)
+        ));
+
+        // The corrupt bytes are preserved aside, not overwritten with an empty
+        // cache, so an operator can inspect them.
+        let quarantined = paths.data_dir.join("replay_cache.json.corrupt");
+        assert_eq!(fs::read(&quarantined).unwrap(), corrupt_bytes);
+        // The original path is not left holding a silently reset empty cache.
+        assert!(
+            !file.exists(),
+            "corrupt file must be moved aside, not reset in place"
+        );
+    }
+
+    /// Regression: once a corrupt load has quarantined the cache, every
+    /// subsequent load keeps failing closed. The renamed-aside original path
+    /// must NOT be read as `NotFound` and silently resolved to a fresh empty
+    /// cache — that would forget every previously burned nonce (and, within a
+    /// scheduler pass, leak the emptied cache to sibling agents loading after
+    /// the first).
+    #[test]
+    fn corrupt_quarantine_keeps_failing_closed_on_reload() {
+        let data = TempData::new("requarantine");
+        let paths = data.paths();
+        ensure_dir(&paths.data_dir).unwrap();
+        fs::write(
+            paths.data_dir.join(REPLAY_CACHE_FILE),
+            b"{ truncated not json",
+        )
+        .unwrap();
+
+        // First load quarantines the corrupt file and fails closed.
+        assert!(matches!(
+            ReplayCache::load(&paths),
+            Err(ReplayError::Corrupt)
+        ));
+        // The original path is now absent (renamed to the sentinel), yet every
+        // later load must STILL fail closed rather than yield an empty cache.
+        assert!(
+            !paths.data_dir.join(REPLAY_CACHE_FILE).exists(),
+            "corrupt file was moved aside"
+        );
+        for _ in 0..3 {
+            assert!(
+                matches!(ReplayCache::load(&paths), Err(ReplayError::Corrupt)),
+                "load must keep failing closed while the quarantine sentinel exists"
+            );
+        }
+    }
+
+    /// Operator escape hatch: clearing the quarantined file lets `load` resume
+    /// with a fresh (empty) cache, re-establishing replay protection.
+    #[test]
+    fn clearing_quarantine_resets_to_fresh_cache() {
+        let data = TempData::new("clearquarantine");
+        let paths = data.paths();
+        ensure_dir(&paths.data_dir).unwrap();
+        fs::write(paths.data_dir.join(REPLAY_CACHE_FILE), b"not json").unwrap();
+        assert!(matches!(
+            ReplayCache::load(&paths),
+            Err(ReplayError::Corrupt)
+        ));
+
+        // The operator moves the quarantined file aside.
+        fs::remove_file(paths.data_dir.join("replay_cache.json.corrupt")).unwrap();
+
+        // Now load succeeds with a fresh empty cache and can admit again.
+        let mut cache = ReplayCache::load(&paths).unwrap();
+        assert!(cache.is_empty());
+        assert_eq!(
+            cache.admit_at("nonce-after-reset", "2099-01-01T00:00:00Z", 100),
+            Ok(())
+        );
+    }
+
+    /// A genuine (non-`NotFound`) IO error surfaces as `Err(Io(..))` rather than
+    /// being treated as an empty cache.
+    #[test]
+    fn load_io_error_surfaces_err() {
+        let data = TempData::new("ioerr");
+        let paths = data.paths();
+        ensure_dir(&paths.data_dir).unwrap();
+        // Make the cache path a directory so `fs::read` fails with a
+        // non-`NotFound` IO error instead of yielding bytes to parse.
+        fs::create_dir(paths.data_dir.join(REPLAY_CACHE_FILE)).unwrap();
+        assert!(matches!(ReplayCache::load(&paths), Err(ReplayError::Io(_))));
+    }
+
+    /// `forget` removes a burned nonce (persisting the change) so the action can
+    /// be re-admitted; forgetting an absent nonce is a no-op `Ok`.
+    #[test]
+    fn forget_removes_and_persists() {
+        let data = TempData::new("forget");
+        let mut cache = ReplayCache::load(&data.paths()).unwrap();
+        cache
+            .admit_at("nonce-f", "2099-01-01T00:00:00Z", 100)
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+        // Forgetting an absent nonce is a no-op and still `Ok`.
+        assert_eq!(cache.forget("never-seen"), Ok(()));
+        assert_eq!(cache.len(), 1);
+        // Forgetting the burned nonce removes it and persists the change.
+        assert_eq!(cache.forget("nonce-f"), Ok(()));
+        assert!(cache.is_empty());
+        // A reload confirms the persisted removal: the nonce is admissible again.
+        let mut reloaded = ReplayCache::load(&data.paths()).unwrap();
+        assert_eq!(
+            reloaded.admit_at("nonce-f", "2099-01-01T00:00:00Z", 100),
+            Ok(())
+        );
     }
 
     #[test]
