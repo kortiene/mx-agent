@@ -108,10 +108,9 @@ pub use exec::{
     ExecRequestOptions,
 };
 pub use exec_ipc::{
-    handle_exec_cancel_loopback, handle_exec_stdin_loopback, send_exec_cancel_matrix,
-    send_exec_stdin_matrix, start_exec_loopback, start_exec_matrix, ExecCancelParams,
-    ExecControlResult, ExecErrorKind, ExecFrame, ExecNotification, ExecOutcome, ExecStartParams,
-    ExecStartResult, ExecStdinParams,
+    send_exec_cancel_matrix, send_exec_stdin_matrix, start_exec_loopback, start_exec_matrix,
+    ExecCancelParams, ExecControlResult, ExecErrorKind, ExecFrame, ExecNotification, ExecOutcome,
+    ExecStartParams, ExecStartResult, ExecStdinParams, LOOPBACK_CONTROL_UNSUPPORTED,
 };
 pub use exec_subscribers::{
     ExecSubscriberRegistry, ExecSubscription, ExecSubscriptionKey, ForwardStats, ForwardedExecEvent,

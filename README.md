@@ -110,7 +110,7 @@ The daemon owns all long-lived state at rest (Matrix session, keys, policy). The
                           Matrix homeserver + federation  ◀──▶  remote daemon ──▶ verify → policy → process
 ```
 
-A *local* exec follows the **same path** as a remote one: the daemon signs an event, publishes it, and its own `/sync` loop receives it back through the full verify → policy → runner pipeline. See [Core Concepts](https://github.com/kortiene/mx-agent/wiki/Core-Concepts) and [Architecture](docs/architecture.md).
+A *local loopback* exec (no `--room`/`--agent`) runs in-process in the daemon under the operator's policy **confinement floor** — the configured sandbox, network decision, filesystem binds, environment allowlist, plus a default timeout and output cap — the same floor a built-in `call` gets. It does **not** perform the signed Matrix verify round-trip; targeting a remote agent with `--room`/`--agent` is what routes through the full sign → verify → trust → policy → runner pipeline. See [Core Concepts](https://github.com/kortiene/mx-agent/wiki/Core-Concepts) and [Architecture](docs/architecture.md).
 
 ## Security posture
 

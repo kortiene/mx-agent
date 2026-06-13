@@ -27,10 +27,11 @@
 //!   here.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use mx_agent_policy::{Allowance, Policy};
 use mx_agent_protocol::events::timeline::EXEC_REQUEST;
 use mx_agent_protocol::id::{generate_invocation_id, generate_request_id};
 use mx_agent_protocol::schema::{
@@ -39,9 +40,23 @@ use mx_agent_protocol::schema::{
 };
 
 use crate::artifact::{prepare_artifact, ArtifactConfig};
+use crate::exec::{network_for, sandbox_backend};
 use crate::exec_subscribers::{ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent};
 use crate::runner::{run, RunError, RunSpec};
-use crate::stream::{capture_child_output, StreamCaptureConfig};
+use crate::stream::{
+    capture_child_output, OutputCaps, StreamCaptureConfig, DEFAULT_PTY_OUTPUT_CAP_BYTES,
+};
+
+/// Default wall-clock timeout applied to a **loopback** batch exec when the
+/// resolved policy carries no per-agent runtime cap (issue #307).
+///
+/// `Policy::execution_allowance()` only carries the workspace execution-level
+/// defaults, never the per-agent `max_runtime_ms`, so a loopback command would
+/// otherwise run unbounded. This mirrors the remote exec request default
+/// (`timeout_ms: 600_000`) so a runaway local command is terminated by the
+/// runner's process-group timeout rather than running forever — the timeout is
+/// the mitigation for the synchronous loopback path having no live cancel.
+pub const DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS: u64 = 600_000;
 
 /// Parameters for the `exec.start` IPC method.
 ///
@@ -213,39 +228,34 @@ pub enum ExecNotification {
     ExecCancelled(ExecCancelled),
 }
 
-/// Loopback `exec.stdin` response.
+/// Human-readable explanation returned when a live exec control method
+/// (`exec.stdin` / `exec.cancel`) is attempted without a remote `--room` target.
 ///
-/// The current loopback `exec.start` runs to completion in one request, so there
-/// is no live stdin pipe to address. The method exists now so clients and future
-/// remote/streaming handlers share a stable API.
-pub fn handle_exec_stdin_loopback(params: &ExecStdinParams) -> ExecControlResult {
-    ExecControlResult {
-        invocation_id: params.invocation_id.clone(),
-        accepted: false,
-        message: "exec.stdin is only available for live streaming exec invocations".to_string(),
-    }
-}
-
-/// Loopback `exec.cancel` response.
-///
-/// The current loopback `exec.start` is synchronous and returns only after the
-/// child has finished, so there is no daemon-side live invocation table to
-/// cancel yet. The method is part of the IPC API for later streaming/remote exec.
-pub fn handle_exec_cancel_loopback(params: &ExecCancelParams) -> ExecControlResult {
-    ExecControlResult {
-        invocation_id: params.invocation_id.clone(),
-        accepted: false,
-        message: "exec.cancel is only available for live streaming exec invocations".to_string(),
-    }
-}
+/// Loopback batch exec runs to completion in a single IPC request, so there is no
+/// concurrent control channel and no live invocation table to address: mid-run
+/// stdin and cancel apply only to the remote (`--room`/`--agent`) path. Runaway
+/// loopback commands are bounded by the default timeout instead
+/// ([`DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS`]); interactive local sessions use
+/// `exec --pty` (issue #307).
+pub const LOOPBACK_CONTROL_UNSUPPORTED: &str =
+    "exec control (stdin/cancel) requires a remote --room/--agent target; \
+local loopback exec is synchronous and cannot be controlled mid-run \
+(use `exec --pty` for an interactive local session)";
 
 /// Send an `exec.stdin` IPC request over Matrix when `room` is supplied.
 ///
-/// Without `room`, this preserves the local loopback response (`accepted:
-/// false`) because synchronous local exec has no live stdin pipe.
+/// Without `room` this is a usage error — synchronous loopback exec has no live
+/// stdin pipe — surfaced as a non-accepted result carrying
+/// [`LOOPBACK_CONTROL_UNSUPPORTED`]. The daemon dispatch rejects the no-`--room`
+/// case with a JSON-RPC error before reaching here; this guard keeps the helper
+/// honest if called directly.
 pub async fn send_exec_stdin_matrix(params: &ExecStdinParams) -> ExecControlResult {
     let Some(room_target) = params.room.as_deref() else {
-        return handle_exec_stdin_loopback(params);
+        return ExecControlResult {
+            invocation_id: params.invocation_id.clone(),
+            accepted: false,
+            message: LOOPBACK_CONTROL_UNSUPPORTED.to_string(),
+        };
     };
     match send_control_room(room_target).await {
         Ok((room, signing)) => match crate::send_exec_stdin(
@@ -279,11 +289,18 @@ pub async fn send_exec_stdin_matrix(params: &ExecStdinParams) -> ExecControlResu
 
 /// Send an `exec.cancel` IPC request over Matrix when `room` is supplied.
 ///
-/// Without `room`, this preserves the local loopback response (`accepted:
-/// false`) because synchronous local exec has no live process handle.
+/// Without `room` this is a usage error — synchronous loopback exec has no live
+/// process handle — surfaced as a non-accepted result carrying
+/// [`LOOPBACK_CONTROL_UNSUPPORTED`]. The daemon dispatch rejects the no-`--room`
+/// case with a JSON-RPC error before reaching here; this guard keeps the helper
+/// honest if called directly.
 pub async fn send_exec_cancel_matrix(params: &ExecCancelParams) -> ExecControlResult {
     let Some(room_target) = params.room.as_deref() else {
-        return handle_exec_cancel_loopback(params);
+        return ExecControlResult {
+            invocation_id: params.invocation_id.clone(),
+            accepted: false,
+            message: LOOPBACK_CONTROL_UNSUPPORTED.to_string(),
+        };
     };
     match send_control_room(room_target).await {
         Ok((room, signing)) => match crate::send_exec_cancel(
@@ -578,18 +595,72 @@ pub(crate) fn rfc3339_after(offset: Duration) -> String {
     format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// Resolve the operator's execution-level confinement floor for a loopback exec,
+/// exactly as [`crate::call_ipc`]'s live `call` path does: load the policy if one
+/// exists and fall back to the safe defaults otherwise.
+///
+/// The returned [`Allowance`] carries the workspace `sandbox` / `network` /
+/// `env_allowlist` / read-only / writable binds; the per-agent `max_runtime_ms` /
+/// `max_output_bytes` stay `None` (loopback has no remote requester to evaluate),
+/// so [`loopback_run_spec`] supplies a default timeout and the cap defaults to
+/// [`DEFAULT_PTY_OUTPUT_CAP_BYTES`].
+///
+/// Shared with the loopback PTY path ([`crate::pty_ipc`]) so both loopback exec
+/// entry points apply the identical confinement floor.
+pub(crate) fn loopback_execution_allowance() -> Allowance {
+    Policy::default_path()
+        .and_then(|path| Policy::load(path).ok())
+        .unwrap_or_default()
+        .execution_allowance()
+}
+
+/// Build the confined [`RunSpec`] for a loopback batch exec from `params` and the
+/// resolved confinement floor `allowance` (issue #307).
+///
+/// Maps `sandbox` / `network` / `env_allowlist` / read-only / writable binds onto
+/// the spec exactly as the live exec path does ([`crate::exec`]'s
+/// `run_controlled_exec`), and applies a default wall-clock timeout
+/// ([`DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS`]) when the allowance sets no per-agent
+/// runtime cap. Kept pure so the allowance-wiring is unit-testable without
+/// spawning, mirroring `call_ipc::run_loopback_with`.
+fn loopback_run_spec(params: &ExecStartParams, allowance: &Allowance) -> RunSpec {
+    let cwd = match &params.cwd {
+        Some(cwd) => cwd.clone(),
+        None => PathBuf::new(),
+    };
+    RunSpec {
+        command: params.command.clone(),
+        cwd,
+        stdin: params.stdin.clone(),
+        env_allowlist: allowance.env_allowlist.clone(),
+        timeout: Some(Duration::from_millis(
+            allowance
+                .max_runtime_ms
+                .unwrap_or(DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS),
+        )),
+        sandbox: sandbox_backend(allowance.sandbox),
+        network: network_for(allowance.network),
+        read_only_paths: allowance.read_only_paths.clone(),
+        writable_paths: allowance.writable_paths.clone(),
+        ..Default::default()
+    }
+}
+
 /// Execute an `exec.start` request locally (loopback), without Matrix.
 ///
 /// Mints fresh `invocation_id`/`request_id`, runs the command through the
-/// daemon's process runner, and packages the captured output as ordered
-/// [`ExecFrame`]s ending in a single `Finished` frame.
+/// daemon's process runner under the operator's execution-level confinement floor
+/// ([`Policy::execution_allowance`], resolved like loopback `call`), and packages
+/// the captured output as ordered [`ExecFrame`]s ending in a single `Finished`
+/// frame carrying the real `duration_ms` and the truthful `truncated` flag.
 pub async fn start_exec_loopback(params: &ExecStartParams) -> ExecStartResult {
     let invocation_id = params
         .invocation_id
         .clone()
         .unwrap_or_else(generate_invocation_id);
     let request_id = generate_request_id();
-    let outcome = run_loopback(&invocation_id, params).await;
+    let allowance = loopback_execution_allowance();
+    let outcome = run_loopback_with(&invocation_id, params, &allowance).await;
     ExecStartResult {
         invocation_id,
         request_id,
@@ -597,17 +668,18 @@ pub async fn start_exec_loopback(params: &ExecStartParams) -> ExecStartResult {
     }
 }
 
-async fn run_loopback(invocation_id: &str, params: &ExecStartParams) -> ExecOutcome {
-    let cwd = match &params.cwd {
-        Some(cwd) => cwd.clone(),
-        None => PathBuf::new(),
-    };
-    let spec = RunSpec {
-        command: params.command.clone(),
-        cwd,
-        stdin: params.stdin.clone(),
-        ..Default::default()
-    };
+/// Core loopback executor with the confinement floor `allowance` injected.
+///
+/// Separated from [`start_exec_loopback`] so the output-cap/truncation behavior
+/// can be driven in tests with a small `max_output_bytes` without a policy file,
+/// mirroring `call_ipc::run_loopback_with`.
+async fn run_loopback_with(
+    invocation_id: &str,
+    params: &ExecStartParams,
+    allowance: &Allowance,
+) -> ExecOutcome {
+    let spec = loopback_run_spec(params, allowance);
+    let started = Instant::now();
     let output = match run(&spec).await {
         Ok(output) => output,
         Err(err) => {
@@ -617,9 +689,17 @@ async fn run_loopback(invocation_id: &str, params: &ExecStartParams) -> ExecOutc
             };
         }
     };
+    let duration_ms = started.elapsed().as_millis() as u64;
 
     let artifact_config = ArtifactConfig::default();
     let total_output = output.stdout.len() + output.stderr.len();
+    // Cap the inline-chunk path at the policy's per-invocation byte budget,
+    // falling back to the same generous 64 MiB cap as the loopback PTY when the
+    // floor allowance sets none (issue #307). The artifact path preserves the
+    // full log, so it is never truncated.
+    let output_cap = allowance
+        .max_output_bytes
+        .unwrap_or(DEFAULT_PTY_OUTPUT_CAP_BYTES);
 
     let mut frames = Vec::new();
     let (truncated, artifact_mxc) = if artifact_config.should_switch(total_output) {
@@ -648,12 +728,16 @@ async fn run_loopback(invocation_id: &str, params: &ExecStartParams) -> ExecOutc
         let stderr_bytes = output.stderr.clone();
         let invocation = invocation_id.to_string();
         // Capture concurrently so a full channel never deadlocks the drain.
+        let config = StreamCaptureConfig::batch().with_caps(OutputCaps {
+            max_output_bytes: Some(output_cap),
+            max_events_per_second: None,
+        });
         let capture = tokio::spawn(async move {
             capture_child_output(
                 &stdout_bytes[..],
                 &stderr_bytes[..],
                 &invocation,
-                StreamCaptureConfig::batch(),
+                config,
                 tx,
             )
             .await
@@ -669,7 +753,7 @@ async fn run_loopback(invocation_id: &str, params: &ExecStartParams) -> ExecOutc
         invocation_id: invocation_id.to_string(),
         exit_code: output.exit_code,
         signal: output.signal.and_then(signal_name),
-        duration_ms: 0,
+        duration_ms,
         stdout_bytes: output.stdout.len() as u64,
         stderr_bytes: output.stderr.len() as u64,
         truncated,
@@ -834,26 +918,128 @@ mod tests {
         assert_eq!(value["exit_code"], 0);
     }
 
-    #[test]
-    fn stdin_and_cancel_loopback_return_stable_not_live_result() {
-        let stdin = handle_exec_stdin_loopback(&ExecStdinParams {
+    #[tokio::test]
+    async fn loopback_control_without_room_is_unsupported() {
+        // The Matrix-send helpers guard the no-`--room` case (the dispatch
+        // rejects it earlier): a missing room is a usage error, never a live
+        // accept (issue #307).
+        let stdin = send_exec_stdin_matrix(&ExecStdinParams {
             room: None,
             invocation_id: "inv_1".to_string(),
             data: b"hello".to_vec(),
             eof: true,
-        });
+        })
+        .await;
         assert_eq!(stdin.invocation_id, "inv_1");
         assert!(!stdin.accepted);
-        assert!(stdin.message.contains("live streaming"));
+        assert_eq!(stdin.message, LOOPBACK_CONTROL_UNSUPPORTED);
 
-        let cancel = handle_exec_cancel_loopback(&ExecCancelParams {
+        let cancel = send_exec_cancel_matrix(&ExecCancelParams {
             room: None,
             invocation_id: "inv_1".to_string(),
             reason: Some("test".to_string()),
-        });
+        })
+        .await;
         assert_eq!(cancel.invocation_id, "inv_1");
         assert!(!cancel.accepted);
-        assert!(cancel.message.contains("live streaming"));
+        assert_eq!(cancel.message, LOOPBACK_CONTROL_UNSUPPORTED);
+    }
+
+    // --- confinement floor wiring (issue #307) --------------------------------
+    //
+    // Loopback exec must carry the operator's execution-level confinement floor
+    // (sandbox/network/binds/env_allowlist) resolved from
+    // Policy::execution_allowance, plus a default timeout and output cap — parity
+    // with loopback `call`. These assert the pure loopback_run_spec mapping and
+    // the output-cap truncation without depending on a policy file.
+
+    #[test]
+    fn loopback_run_spec_carries_allowance_confinement_fields() {
+        let policy = Policy::parse(
+            r#"
+[execution]
+default_sandbox = "bubblewrap"
+env_allowlist = ["CARGO_HOME"]
+network = "deny"
+read_only_paths = ["/usr"]
+writable_paths = ["/work"]
+"#,
+        )
+        .expect("policy parses");
+        let allowance = policy.execution_allowance();
+        let spec = loopback_run_spec(&params(&["echo", "hi"]), &allowance);
+
+        assert_eq!(spec.sandbox, mx_agent_sandbox::Backend::Bubblewrap);
+        assert_eq!(spec.network, mx_agent_sandbox::Network::Deny);
+        assert_eq!(spec.env_allowlist, vec!["CARGO_HOME".to_string()]);
+        assert_eq!(spec.read_only_paths, vec![PathBuf::from("/usr")]);
+        assert_eq!(spec.writable_paths, vec![PathBuf::from("/work")]);
+    }
+
+    #[test]
+    fn loopback_run_spec_default_policy_is_fail_closed() {
+        // No policy file → Policy::default().execution_allowance(): no sandbox
+        // override, network denied (Backend::None ignores it but the spec still
+        // records the fail-closed decision), empty env allowlist so daemon
+        // secrets stay stripped, and the default timeout bounds the run.
+        let allowance = Policy::default().execution_allowance();
+        let spec = loopback_run_spec(&params(&["true"]), &allowance);
+
+        assert_eq!(spec.sandbox, mx_agent_sandbox::Backend::None);
+        assert_eq!(spec.network, mx_agent_sandbox::Network::Deny);
+        assert!(spec.env_allowlist.is_empty());
+        assert!(spec.read_only_paths.is_empty());
+        assert!(spec.writable_paths.is_empty());
+        assert_eq!(
+            spec.timeout,
+            Some(Duration::from_millis(DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS))
+        );
+    }
+
+    #[test]
+    fn loopback_run_spec_honors_policy_runtime_cap_over_default() {
+        // When the allowance carries a per-agent runtime cap, the loopback spec
+        // uses it instead of the default (the mapping reads the allowance so it
+        // stays correct if execution_allowance ever surfaces max_runtime_ms).
+        let allowance = Allowance {
+            max_runtime_ms: Some(5_000),
+            ..Allowance::default()
+        };
+        let spec = loopback_run_spec(&params(&["true"]), &allowance);
+        assert_eq!(spec.timeout, Some(Duration::from_millis(5_000)));
+    }
+
+    #[tokio::test]
+    async fn loopback_output_cap_reports_truncated() {
+        // With a small output cap and output that fits the inline-chunk path
+        // (under the 256 KiB artifact threshold) but exceeds the cap, the
+        // Finished frame must report truncated: true (issue #268 parity).
+        let allowance = Allowance {
+            max_output_bytes: Some(64),
+            ..Allowance::default()
+        };
+        // Print ~2 KiB: well under the artifact threshold, well over the cap.
+        let p = params(&["sh", "-c", "head -c 2048 /dev/zero | tr '\\0' a"]);
+        let outcome = run_loopback_with("inv_cap", &p, &allowance).await;
+        let f = finished(&outcome);
+        assert!(
+            f.truncated,
+            "output beyond the cap must be marked truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_reports_real_duration() {
+        // A ~50 ms sleep must surface a real, nonzero duration — not the
+        // hardcoded 0 the loopback used to report (issue #307).
+        let p = params(&["sh", "-c", "sleep 0.05"]);
+        let result = start_exec_loopback(&p).await;
+        let f = finished(&result.outcome);
+        assert!(
+            f.duration_ms >= 40,
+            "expected a real duration around 50ms, got {}",
+            f.duration_ms
+        );
     }
 
     #[test]

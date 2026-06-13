@@ -250,6 +250,55 @@ fn architecture_advisory_lock_and_issue_269_documented() {
     );
 }
 
+// ── Issue #307: loopback exec/PTY policy confinement floor — doc drift guards ──
+//
+// Before #307, loopback `exec`/`--pty` ran with no sandbox/timeout/output cap and
+// the docs claimed local exec followed the same verify→policy→runner pipeline as a
+// remote one. The fix applies the operator's execution confinement floor to the
+// loopback path and corrects the docs. These guard against regressing to the
+// stale, over-claiming wording.
+
+/// README must no longer claim a local exec follows the *same path* (full
+/// verify→policy→runner pipeline) as a remote one — that was false for loopback.
+/// It must instead describe the loopback **confinement floor**.
+#[test]
+fn readme_loopback_exec_describes_confinement_floor_not_same_path() {
+    // Negative: the stale over-claim must be gone.
+    assert!(
+        !README.contains("follows the **same path** as a remote one"),
+        "README must not claim a local exec follows the same verify→policy→runner \
+         pipeline as a remote one (false for the loopback path; issue #307)"
+    );
+    // Positive: the corrected description names the confinement floor.
+    assert!(
+        README.contains("confinement floor"),
+        "README must describe the loopback exec confinement floor (issue #307)"
+    );
+}
+
+/// security-hardening must no longer assert the PTY path skips the sandbox
+/// backend, and must document the loopback confinement floor + the remote-only
+/// scope of the engine's deny-by-default gate.
+#[test]
+fn security_hardening_loopback_floor_and_pty_sandbox_corrected() {
+    // Negative: the stale "PTY does not route through the sandbox backend" claim
+    // must be gone (both batch and PTY route through the backend now).
+    assert!(
+        !SECURITY_HARDENING.contains("PTY exec path does not route through the sandbox backend"),
+        "security-hardening must not claim the PTY exec path skips the sandbox backend (issue #307)"
+    );
+    // Positive: the loopback confinement floor must be documented.
+    assert!(
+        SECURITY_HARDENING.contains("confinement floor"),
+        "security-hardening must document the loopback execution confinement floor (issue #307)"
+    );
+    // Positive: the deny-by-default engine fact must be scoped to *remote* exec/call.
+    assert!(
+        SECURITY_HARDENING.contains("*remote* `exec` and `call`"),
+        "security-hardening must scope the deny-by-default engine claim to remote exec/call (issue #307)"
+    );
+}
+
 /// The `ipc.rs` module doc must name the `auth`/`trust` carve-out so a reader
 /// of that file cannot conclude that ALL commands are daemon-IPC-mediated.
 ///

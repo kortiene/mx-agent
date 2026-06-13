@@ -897,30 +897,43 @@ fn control_runtime(_req: &Request) -> Result<tokio::runtime::Runtime, String> {
 }
 
 fn dispatch_exec_stdin(req: &Request, params: &crate::ExecStdinParams) -> Response {
-    if params.room.is_some() {
-        let runtime = match control_runtime(req) {
-            Ok(runtime) => runtime,
-            Err(message) => return Response::error(req.id.clone(), INTERNAL_ERROR, message),
-        };
-        dispatch_exec_control_result(req, runtime.block_on(crate::send_exec_stdin_matrix(params)))
-    } else {
-        dispatch_exec_control_result(req, crate::handle_exec_stdin_loopback(params))
+    if params.room.is_none() {
+        // Loopback batch exec is synchronous (one IPC request runs to
+        // completion), so there is no live stdin pipe to address. Reject the
+        // no-`--room` case honestly instead of returning a permanently-dead
+        // `accepted: false` result (issue #307).
+        return Response::error(
+            req.id.clone(),
+            INVALID_PARAMS,
+            crate::LOOPBACK_CONTROL_UNSUPPORTED.to_string(),
+        );
     }
+    let runtime = match control_runtime(req) {
+        Ok(runtime) => runtime,
+        Err(message) => return Response::error(req.id.clone(), INTERNAL_ERROR, message),
+    };
+    dispatch_exec_control_result(req, runtime.block_on(crate::send_exec_stdin_matrix(params)))
 }
 
 fn dispatch_exec_cancel(req: &Request, params: &crate::ExecCancelParams) -> Response {
-    if params.room.is_some() {
-        let runtime = match control_runtime(req) {
-            Ok(runtime) => runtime,
-            Err(message) => return Response::error(req.id.clone(), INTERNAL_ERROR, message),
-        };
-        dispatch_exec_control_result(
-            req,
-            runtime.block_on(crate::send_exec_cancel_matrix(params)),
-        )
-    } else {
-        dispatch_exec_control_result(req, crate::handle_exec_cancel_loopback(params))
+    if params.room.is_none() {
+        // Loopback batch exec has no live process handle to cancel; a runaway
+        // command is bounded by the default timeout instead. Reject the
+        // no-`--room` case honestly (issue #307).
+        return Response::error(
+            req.id.clone(),
+            INVALID_PARAMS,
+            crate::LOOPBACK_CONTROL_UNSUPPORTED.to_string(),
+        );
     }
+    let runtime = match control_runtime(req) {
+        Ok(runtime) => runtime,
+        Err(message) => return Response::error(req.id.clone(), INTERNAL_ERROR, message),
+    };
+    dispatch_exec_control_result(
+        req,
+        runtime.block_on(crate::send_exec_cancel_matrix(params)),
+    )
 }
 
 fn dispatch_exec_start(
@@ -1563,18 +1576,23 @@ mod tests {
     }
 
     #[test]
-    fn exec_control_methods_return_structured_loopback_status() {
+    fn exec_control_methods_reject_loopback_without_room() {
+        // Synchronous loopback exec has no live stdin pipe or process handle, so
+        // exec.stdin/exec.cancel without a `--room` target are rejected with a
+        // JSON-RPC error rather than a permanently-dead `accepted: false` result
+        // (issue #307).
         let stdin_req = Request::new(
             json!(1),
             "exec.stdin",
             json!({"invocation_id":"inv_1","data":[104,105],"eof":true}),
         );
         let stdin_response = dispatch(&stdin_req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
-        assert!(stdin_response.error.is_none());
-        let stdin: crate::ExecControlResult =
-            serde_json::from_value(stdin_response.result.unwrap()).unwrap();
-        assert_eq!(stdin.invocation_id, "inv_1");
-        assert!(!stdin.accepted);
+        assert!(stdin_response.result.is_none());
+        let error = stdin_response
+            .error
+            .expect("stdin without room is an error");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("loopback exec is synchronous"));
 
         let cancel_req = Request::new(
             json!(2),
@@ -1582,11 +1600,12 @@ mod tests {
             json!({"invocation_id":"inv_1","reason":"test"}),
         );
         let cancel_response = dispatch(&cancel_req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
-        assert!(cancel_response.error.is_none());
-        let cancel: crate::ExecControlResult =
-            serde_json::from_value(cancel_response.result.unwrap()).unwrap();
-        assert_eq!(cancel.invocation_id, "inv_1");
-        assert!(!cancel.accepted);
+        assert!(cancel_response.result.is_none());
+        let error = cancel_response
+            .error
+            .expect("cancel without room is an error");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("loopback exec is synchronous"));
     }
 
     #[test]
