@@ -309,12 +309,23 @@ pub async fn run_matrix_sync_with_subscribers(
             match client.sync_once(settings).await {
                 Ok(response) => {
                     let routed = if let Some(router) = &router {
-                        let mut router = router.lock().unwrap_or_else(|e| e.into_inner());
-                        route_sync_response(&mut router, &response)
+                        let mut guard = router.lock().unwrap_or_else(|e| e.into_inner());
+                        route_sync_response(&mut guard, &response)
                     } else {
                         Vec::new()
                     };
-                    handle_routed_events(client, paths, subscribers.as_ref(), routed).await;
+                    // Thread the router's shared replay cache into the handler so
+                    // the live approval-decision consumer can burn a decision
+                    // nonce through the *same* cache the request plane admits
+                    // through (issue #306) — never a second, clobber-prone cache.
+                    handle_routed_events(
+                        client,
+                        paths,
+                        subscribers.as_ref(),
+                        router.as_ref(),
+                        routed,
+                    )
+                    .await;
                     Ok(response.next_batch)
                 }
                 Err(e) => {
@@ -382,6 +393,7 @@ async fn handle_routed_events(
     client: &matrix_sdk::Client,
     paths: &SessionPaths,
     subscribers: Option<&ExecSubscriberRegistry>,
+    router: Option<&Arc<Mutex<EventRouter>>>,
     events: Vec<(EventMeta, RoutedEvent)>,
 ) {
     for (meta, routed) in events {
@@ -445,6 +457,16 @@ async fn handle_routed_events(
             }
             RoutedEvent::CallResponse(event) => {
                 publish_forwarded(subscribers, &meta, ForwardedExecEvent::CallResponse(*event));
+            }
+            RoutedEvent::ApprovalDecision(decision) => {
+                // Consume a decision for a held live exec/call (issue #306):
+                // verify it with scheduler parity, then release / deny / ignore
+                // the hold. Task-backed holds (held_request == None) are the
+                // scheduler's and are ignored here.
+                crate::approval::handle_live_approval_decision(
+                    client, paths, router, &meta, &decision,
+                )
+                .await;
             }
             other => {
                 tracing::debug!(

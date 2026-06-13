@@ -159,6 +159,14 @@ pub enum ExecRejection {
     /// applied *after* the authoritative signature → trust → policy checks pass;
     /// it can only add a denial, never authorize execution.
     UnverifiedDevice,
+    /// A held `requires_approval` exec was **denied** by an operator's approval
+    /// decision (issue #306). A terminal, post-policy outcome surfaced to the
+    /// requester so a held invocation does not hang silently on a deny.
+    ApprovalDenied,
+    /// A held `requires_approval` exec **expired** without a decision and was
+    /// swept fail-closed (issue #306). A terminal, post-policy outcome surfaced
+    /// to the requester so a held invocation does not hang silently on expiry.
+    ApprovalExpired,
 }
 
 impl ExecRejection {
@@ -172,6 +180,8 @@ impl ExecRejection {
             Self::UntrustedKey { .. } => "untrusted_key".to_string(),
             Self::PolicyDenied(_) => "policy_denied".to_string(),
             Self::UnverifiedDevice => "unverified_device".to_string(),
+            Self::ApprovalDenied => "approval_denied".to_string(),
+            Self::ApprovalExpired => "approval_expired".to_string(),
         }
     }
 }
@@ -191,6 +201,10 @@ impl std::fmt::Display for ExecRejection {
             Self::PolicyDenied(reason) => write!(f, "policy denied exec: {reason}"),
             Self::UnverifiedDevice => {
                 write!(f, "policy requires a verified sending device")
+            }
+            Self::ApprovalDenied => write!(f, "approval-required exec was denied"),
+            Self::ApprovalExpired => {
+                write!(f, "approval-required exec expired without a decision")
             }
         }
     }
@@ -592,19 +606,18 @@ pub async fn handle_live_exec_request(
     };
     let (request, allowance) = authorized;
 
-    audit_exec_decision(
-        paths,
-        &meta.room_id,
-        &request,
-        &Outcome::Allow(allowance.clone()),
-    );
-
     match crate::approval::disposition_for_exec(request.clone(), &allowance) {
         crate::approval::ExecDisposition::RequiresApproval { approval, .. } => {
+            // Authorized but held pending an operator decision (architecture §12):
+            // audit *held* (not allow-and-ran) and persist the original signed
+            // request so an approving decision can re-authorize and spawn it. The
+            // held request stays out of the emitted, no-leak `ApprovalRequest`.
+            audit_exec_held(paths, &meta.room_id, &request, &allowance);
             let mut queue = crate::approval::ApprovalQueue::load(paths).unwrap_or_default();
             queue.enqueue(crate::approval::PendingApproval {
                 room_id: meta.room_id.clone(),
                 request: approval.clone(),
+                held_request: Some(crate::approval::HeldRequest::Exec(request.clone())),
             });
             if let Err(e) = queue.save(paths) {
                 tracing::warn!(error = %e, request_id = %approval.request_id, "failed to persist approval request");
@@ -617,18 +630,41 @@ pub async fn handle_live_exec_request(
         crate::approval::ExecDisposition::Execute(_) => {}
     }
 
-    if let Err(e) = emit_exec_accepted(&room, request.invocation_id.clone()).await {
+    // Allowed and running immediately (allow-and-ran).
+    audit_exec_decision(
+        paths,
+        &meta.room_id,
+        &request,
+        &Outcome::Allow(allowance.clone()),
+    );
+    spawn_authorized_live_exec(client, &room, request, allowance).await;
+}
+
+/// Spawn an authorized live `exec` invocation: emit accepted → running, register
+/// the live-control channels, drive the PTY or controlled run to completion, and
+/// publish invocation state throughout (architecture §7.2–§7.5).
+///
+/// Extracted from [`handle_live_exec_request`] so both the direct live dispatch
+/// and the approval-release path ([`release_held_exec`]) produce byte-for-byte
+/// the same lifecycle. Behaviour-preserving: the non-approval path is unchanged.
+pub(crate) async fn spawn_authorized_live_exec(
+    client: &matrix_sdk::Client,
+    room: &Room,
+    request: ExecRequest,
+    allowance: Allowance,
+) {
+    if let Err(e) = emit_exec_accepted(room, request.invocation_id.clone()).await {
         tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec accepted");
     }
     let now = rfc3339_now();
     let mut state = invocation_state_for(&request, now.clone());
-    if let Err(e) = publish_invocation_state(&room, &state).await {
+    if let Err(e) = publish_invocation_state(room, &state).await {
         tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to publish accepted invocation state");
     }
     state.state = crate::invocation::STATE_RUNNING.to_string();
     state.updated_at = rfc3339_now();
     state.state_rev = state.state_rev.saturating_add(1);
-    if let Err(e) = publish_invocation_state(&room, &state).await {
+    if let Err(e) = publish_invocation_state(room, &state).await {
         tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to publish running invocation state");
     }
 
@@ -754,6 +790,97 @@ pub async fn handle_live_exec_request(
         state.state_rev = state.state_rev.saturating_add(1);
         let _ = publish_invocation_state(&room, &state).await;
     });
+}
+
+/// Re-authorize a previously-held `exec` request and, if it still passes the
+/// **full** pipeline, spawn it; otherwise emit a terminal rejection (issue #306).
+///
+/// Called by the live approval-decision handler on an *approved* decision. It
+/// re-runs [`authorize_live_exec`] (signature → trust → deny-by-default policy →
+/// verified-device gate) against the recovered original request, so a stale
+/// hold, a since-revoked key, or a since-tightened policy is denied at release —
+/// room membership is never execution permission. On success it audits *released*
+/// and spawns via [`spawn_authorized_live_exec`]; on denial it audits and emits
+/// `exec.rejected`. The hold has already been removed from the queue by the
+/// caller, so any failure fails closed (never runs).
+pub(crate) async fn release_held_exec(
+    client: &matrix_sdk::Client,
+    paths: &crate::SessionPaths,
+    room: &Room,
+    room_id: &str,
+    request: ExecRequest,
+) {
+    let content = match serde_json::to_value(&request) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "could not reserialize held exec request for release");
+            return;
+        }
+    };
+    match authorize_live_exec(room, paths, &content, &request, room_id).await {
+        Ok((request, allowance)) => {
+            audit_exec_released(paths, room_id, &request, &allowance);
+            spawn_authorized_live_exec(client, room, request, allowance).await;
+        }
+        Err(rejection) => {
+            match &rejection {
+                ExecRejection::PolicyDenied(reason) => {
+                    audit_exec_decision(paths, room_id, &request, &Outcome::Deny(reason.clone()))
+                }
+                ExecRejection::UnverifiedDevice => {
+                    audit_exec_rejection(paths, room_id, &request, &rejection)
+                }
+                _ => {}
+            }
+            if let Err(e) =
+                emit_exec_rejected(room, request.invocation_id.clone(), &rejection).await
+            {
+                tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec rejection on release");
+            }
+        }
+    }
+}
+
+/// Terminally reject a held `exec` whose approval was **denied** by an operator
+/// (issue #306): audit denied-while-held and emit `exec.rejected`
+/// (`approval_denied`). Never runs the command.
+pub(crate) async fn deny_held_exec(
+    room: &Room,
+    paths: &crate::SessionPaths,
+    room_id: &str,
+    request: &ExecRequest,
+) {
+    audit_exec_rejection(paths, room_id, request, &ExecRejection::ApprovalDenied);
+    if let Err(e) = emit_exec_rejected(
+        room,
+        request.invocation_id.clone(),
+        &ExecRejection::ApprovalDenied,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.rejected for denied hold");
+    }
+}
+
+/// Terminally reject a held `exec` whose approval window **expired** without a
+/// decision (issue #306): audit *expired-while-held* and emit `exec.rejected`
+/// (`approval_expired`). Never runs the command.
+pub(crate) async fn expire_held_exec(
+    room: &Room,
+    paths: &crate::SessionPaths,
+    room_id: &str,
+    request: &ExecRequest,
+) {
+    audit_exec_expired(paths, room_id, request);
+    if let Err(e) = emit_exec_rejected(
+        room,
+        request.invocation_id.clone(),
+        &ExecRejection::ApprovalExpired,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.rejected for expired hold");
+    }
 }
 
 /// Handle a routed signed stdin frame for a live invocation running on this daemon.
@@ -1718,6 +1845,57 @@ fn audit_exec_rejection(
         Some(&request.invocation_id),
         &request.command,
         &rejection.reason(),
+    );
+    append_audit(paths, &request.invocation_id, record);
+}
+
+/// Audit an authorized exec that is **held** pending an approval decision
+/// (issue #306): `decision = held`, allow-family rule, resolved sandbox.
+fn audit_exec_held(
+    paths: &crate::SessionPaths,
+    room_id: &str,
+    request: &ExecRequest,
+    allowance: &Allowance,
+) {
+    let record = AuditRecord::for_exec_held(
+        room_id,
+        &request.requesting_agent,
+        &request.target_agent,
+        Some(&request.invocation_id),
+        &request.command,
+        &Outcome::Allow(allowance.clone()),
+    );
+    append_audit(paths, &request.invocation_id, record);
+}
+
+/// Audit a held exec that was **released** to run after an approving decision
+/// re-authorized it (issue #306): `decision = released`.
+fn audit_exec_released(
+    paths: &crate::SessionPaths,
+    room_id: &str,
+    request: &ExecRequest,
+    allowance: &Allowance,
+) {
+    let record = AuditRecord::for_exec_released(
+        room_id,
+        &request.requesting_agent,
+        &request.target_agent,
+        Some(&request.invocation_id),
+        &request.command,
+        &Outcome::Allow(allowance.clone()),
+    );
+    append_audit(paths, &request.invocation_id, record);
+}
+
+/// Audit a held exec that **expired** without a decision and was swept
+/// fail-closed (issue #306): `decision = expired`, no sandbox (nothing ran).
+fn audit_exec_expired(paths: &crate::SessionPaths, room_id: &str, request: &ExecRequest) {
+    let record = AuditRecord::for_exec_expired(
+        room_id,
+        &request.requesting_agent,
+        &request.target_agent,
+        Some(&request.invocation_id),
+        &request.command,
     );
     append_audit(paths, &request.invocation_id, record);
 }
@@ -2926,5 +3104,18 @@ allow_cwd = ["/home/me/code/project"]
             msg.contains("verified"),
             "display should mention 'verified': {msg}"
         );
+    }
+
+    #[test]
+    fn approval_outcome_rejections_have_stable_reasons() {
+        // Issue #306: the terminal post-policy outcomes surfaced to a held
+        // exec's requester carry stable, machine-readable reason strings so the
+        // emitted `exec.rejected` is parseable.
+        assert_eq!(ExecRejection::ApprovalDenied.reason(), "approval_denied");
+        assert_eq!(ExecRejection::ApprovalExpired.reason(), "approval_expired");
+        assert!(ExecRejection::ApprovalDenied.to_string().contains("denied"));
+        assert!(ExecRejection::ApprovalExpired
+            .to_string()
+            .contains("expired"));
     }
 }

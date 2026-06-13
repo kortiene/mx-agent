@@ -173,6 +173,19 @@ max_output_bytes  = 2000000
 requires_approval = true
 ```
 
+When `requires_approval` is set, a privileged live `exec` or `call` is **held**
+fail-closed (enqueued, an approval request emitted, nothing run) until an
+operator runs `mx-agent approval approve` / `deny`. The decision is single-use,
+Ed25519-signed by a locally-trusted key, and time-bounded; the daemon honours it
+only after sender + signature + trust + non-replay + expiry checks pass — room
+membership is never execution permission. On approval the daemon **re-runs the
+full authorize pipeline** (signature → trust → deny-by-default policy →
+verified-device gate) against the original request before spawning, so a
+since-revoked key or tightened policy is denied at release. A held request the
+operator never decides is swept **fail-closed** once its window expires. The
+held request is stored locally `0600` for resume and never re-emitted; the
+emitted approval request stays no-leak (no command/args). (Issue #306.)
+
 ### Defense-in-depth summary
 
 | Control | What it stops | Where |
@@ -249,6 +262,8 @@ Every privileged decision is logged locally, without secrets, to `~/.local/share
   "policy_rule": "rooms.!aBcDeF123.agents.@claude.allow_commands"
 }
 ```
+
+The `decision` field takes one of five values: `allowed` (ran immediately), `denied` (rejected by policy or gate), `held` (authorized but awaiting an approval decision — nothing ran yet), `released` (a held request re-authorized and run after an approving decision), or `expired` (a held request swept fail-closed after its approval window expired without a decision). The release, deny-while-held, and expiry events are each audited, so the log is a complete trail of every disposition a held request went through. Audit records redact command argv (exec) and omit call args (call, tool name only) in all cases. See [architecture §13.6](../docs/architecture.md) for the full schema.
 
 ---
 

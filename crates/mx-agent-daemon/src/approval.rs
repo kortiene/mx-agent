@@ -28,19 +28,21 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::{Client, Room};
-use mx_agent_policy::{Allowance, NetworkPolicy, Sandbox};
+use mx_agent_policy::{Allowance, NetworkPolicy, Policy, Sandbox};
 use mx_agent_protocol::events::timeline::{APPROVAL_DECISION, APPROVAL_REQUEST};
 use mx_agent_protocol::id::generate_request_id;
 use mx_agent_protocol::schema::{ApprovalDecision, ApprovalRequest, CallRequest, ExecRequest};
 use mx_agent_protocol::signing::{sign_approval_decision, verify_approval_decision};
 use serde::{Deserialize, Serialize};
 
+use crate::event_router::{EventMeta, EventRouter};
 use crate::matrix::restore_client;
 use crate::session::{SessionPaths, StoredSession};
 use crate::signing::load_or_create_signing_key;
@@ -237,6 +239,31 @@ pub async fn emit_approval_request(
     Ok(())
 }
 
+/// The original signed live request held pending an approval decision (issue
+/// #306).
+///
+/// Persisted locally alongside a [`PendingApproval`] (in the `0600`
+/// `approvals.json`, never re-emitted) so an approving
+/// `com.mxagent.approval.decision.v1` can recover the exact request, re-run the
+/// full authorize pipeline, and spawn it. `None` for task-backed holds (released
+/// by the scheduler via `QueueApprovalGate`) and for holds written by an older
+/// daemon, which the live handler cannot auto-resume → the operator re-issues
+/// (fail-closed).
+///
+/// The variant is the daemon's externally-tagged JSON (`{"exec": {…}}` /
+/// `{"call": {…}}`); this is daemon-private state, so the representation only
+/// needs to round-trip locally, not federate. It carries the full signed
+/// request — including `command`/`env`/`args` — so it is `0600`-at-rest only and
+/// is **never** logged or copied into the emitted no-leak `ApprovalRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HeldRequest {
+    /// A held raw `exec` request.
+    Exec(ExecRequest),
+    /// A held named `call` request.
+    Call(CallRequest),
+}
+
 /// A pending approval recorded in the local queue.
 ///
 /// Wraps the [`ApprovalRequest`] content with the room it belongs to, so the
@@ -247,6 +274,13 @@ pub struct PendingApproval {
     pub room_id: String,
     /// The approval request content awaiting a decision.
     pub request: ApprovalRequest,
+    /// The original signed live request to resume on an approving decision
+    /// (issue #306); local-only, `0600`-at-rest, never emitted or logged. `None`
+    /// for task-backed holds (released by the scheduler) and legacy holds, which
+    /// the live decision handler ignores so the task and live release paths never
+    /// collide. Additive and `#[serde(default)]`, so older queues load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_request: Option<HeldRequest>,
 }
 
 impl PendingApproval {
@@ -717,7 +751,8 @@ async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, Worksp
 }
 
 /// Decide a queued approval: emit a `com.mxagent.approval.decision.v1` event into
-/// the request's room and take it off the local pending queue.
+/// the request's room and, for task/legacy holds, take it off the local pending
+/// queue.
 ///
 /// `decision` is [`DECISION_APPROVED`] or [`DECISION_DENIED`]; `approved_by` is
 /// the identity recording the decision (typically the operator's Matrix user ID).
@@ -726,6 +761,11 @@ async fn sync_and_get_room(client: &Client, target: &str) -> Result<Room, Worksp
 /// known without the caller supplying it. The decision is emitted before the
 /// queue is updated, so a failure to publish leaves the request pending for a
 /// retry rather than silently dropping it.
+///
+/// A *live* hold (`held_request` set) is intentionally left queued: its original
+/// request lives only in the queue entry, so [`handle_live_approval_decision`]
+/// must still find it to spawn (approve) or reject (deny) it. Only that handler
+/// (or the expiry sweep) removes a live hold.
 pub async fn decide_approval_for_session(
     session: &StoredSession,
     paths: &SessionPaths,
@@ -763,14 +803,212 @@ pub async fn decide_approval_for_session(
     .map_err(|e| WorkspaceError::Io(io::Error::other(e.to_string())))?;
     emit_approval_decision(&room, &content).await?;
 
-    // Only drop the request from the queue once the decision is published.
-    queue.remove(request_id);
-    queue.save(paths)?;
+    // Only drop the request from the queue once the decision is published — and
+    // only for task/legacy holds (`held_request == None`), which the scheduler
+    // releases from the decision event alone. A *live* hold carries its original
+    // request solely in this queue entry (`held_request`, never emitted on the
+    // wire), so removing it here would leave `handle_live_approval_decision` with
+    // nothing to look up: it would return early and an approved exec/call would
+    // never spawn while a denied one would never emit its terminal rejection
+    // (issue #306). Leave live holds queued for the handler's own
+    // remove-then-resume (and the expiry sweep as a backstop).
+    if pending.held_request.is_none() {
+        queue.remove(request_id);
+        queue.save(paths)?;
+    }
 
     Ok(ApprovalDecisionRecord {
         decision: content,
         room_id: pending.room_id,
     })
+}
+
+/// Burn an approval **decision** nonce through the sync router's own shared
+/// replay cache, returning whether the live release may proceed (issue #306).
+///
+/// Defense-in-depth on top of the queue-removal exactly-once guarantee: a
+/// captured valid decision re-delivered after the first release is dropped here.
+/// The burn must go through the **router's single** cache instance (passed down
+/// from [`crate::sync::run_matrix_sync`]) — loading a second `ReplayCache` would
+/// be silently clobbered the next time the router persists its in-memory copy
+/// (whole-file overwrite). When no router is attached (the cache failed to load,
+/// so no events were routed at all) the decision handler is never reached, but
+/// this still fails open to `true`: queue-removal-before-spawn is the primary
+/// exactly-once guard and `verification_failure` already enforced expiry
+/// cache-independently.
+fn burn_decision_nonce(
+    router: Option<&Arc<Mutex<EventRouter>>>,
+    decision: &ApprovalDecision,
+) -> bool {
+    let (Some(nonce), Some(expires_at)) =
+        (decision.nonce.as_deref(), decision.expires_at.as_deref())
+    else {
+        // `verification_failure` already requires both; defensive fail-closed.
+        return false;
+    };
+    match router {
+        Some(router) => {
+            let mut guard = router.lock().unwrap_or_else(|e| e.into_inner());
+            guard.admit_decision_nonce(nonce, expires_at)
+        }
+        None => true,
+    }
+}
+
+/// Consume a live `com.mxagent.approval.decision.v1` for a held `exec`/`call`
+/// hold and release, deny, or ignore it (issue #306).
+///
+/// This is the receive-side consumer the live path was missing: the scheduler
+/// already releases held *tasks*, but held *live* requests had no handler. It
+/// honours a decision only with the same rigor as the scheduler's
+/// [`read_verified_approval_decisions`] — sender-verified, Ed25519-signed by a
+/// **locally-trusted** key, non-replayed, and unexpired — then, on approval,
+/// re-runs the *full* authorize pipeline (signature → trust → deny-by-default
+/// policy → verified-device gate) against the recovered original request before
+/// spawning. Matrix room membership is never execution permission.
+///
+/// Fail-closed throughout: a missing/legacy hold, an unavailable room, a load
+/// error, a verification failure, a replayed decision, or a re-authorize denial
+/// all leave the hold queued or drop it **without running**. Logs carry only
+/// non-sensitive metadata (`sender`, `request_id`, `reason`) — never the held
+/// request content.
+pub(crate) async fn handle_live_approval_decision(
+    client: &Client,
+    paths: &SessionPaths,
+    router: Option<&Arc<Mutex<EventRouter>>>,
+    meta: &EventMeta,
+    decision: &ApprovalDecision,
+) {
+    // 1. Match a live hold by request_id. A task/legacy hold (held_request ==
+    //    None) is the scheduler's to release — do nothing here so the two paths
+    //    never double-fire on one decision.
+    let pending = match ApprovalQueue::load(paths) {
+        Ok(queue) => queue.get(&decision.request_id).cloned(),
+        Err(e) => {
+            tracing::warn!(error = %e, request_id = %decision.request_id, "could not load approval queue for live decision");
+            return;
+        }
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    let Some(held) = pending.held_request.clone() else {
+        return;
+    };
+
+    // 2. Resolve the room the decision arrived in.
+    let room_id = match matrix_sdk::ruma::RoomId::parse(&meta.room_id) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, room = %meta.room_id, "invalid room id in routed approval decision");
+            return;
+        }
+    };
+    let Some(room) = client.get_room(&room_id) else {
+        tracing::warn!(room = %meta.room_id, "room for routed approval decision is unavailable");
+        return;
+    };
+
+    // 3. Resolve verification inputs, identical to the scheduler's anchors: the
+    //    local user, room-published verifying keys, the local trust store, the
+    //    room's approver allowlist, and "now".
+    let local_user = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+    let agents = match crate::agent::read_all_agent_states(&room).await {
+        Ok(agents) => agents,
+        Err(e) => {
+            tracing::warn!(error = %e, room = %meta.room_id, "could not read agent states for approval decision");
+            return;
+        }
+    };
+    let mut verifying_keys: BTreeMap<String, VerifyingKey> = BTreeMap::new();
+    for agent in &agents {
+        if agent.signing_key_id.is_empty() {
+            continue;
+        }
+        if let Ok(key) = crate::call::verifying_key_from_agent_state(agent) {
+            verifying_keys.insert(agent.signing_key_id.clone(), key);
+        }
+    }
+    let trust = TrustStore::load(paths).unwrap_or_default();
+    let policy = Policy::default_path()
+        .and_then(|path| Policy::load(path).ok())
+        .unwrap_or_default();
+    let approvers: BTreeSet<String> = policy
+        .rooms
+        .get(&meta.room_id)
+        .map(|r| r.approvers.iter().cloned().collect())
+        .unwrap_or_default();
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let verification = DecisionVerification {
+        local_user: &local_user,
+        approvers: &approvers,
+        verifying_keys: &verifying_keys,
+        trust: &trust,
+        now_unix,
+    };
+
+    // 4. Verify the decision with scheduler parity. The `sender` is the top-level
+    //    event sender (never the attacker-controlled content). Any failure leaves
+    //    the hold queued — fail-closed.
+    if let Some(reason) = verification_failure(decision, &meta.sender, &verification) {
+        tracing::warn!(
+            sender = %meta.sender,
+            request_id = %decision.request_id,
+            reason,
+            "rejecting unverified live approval decision"
+        );
+        return;
+    }
+
+    // 5. Burn the decision nonce (defense-in-depth) through the router's shared
+    //    cache. A replayed decision is dropped before any release.
+    if !burn_decision_nonce(router, decision) {
+        tracing::warn!(
+            request_id = %decision.request_id,
+            "live approval decision nonce already seen; not releasing"
+        );
+        return;
+    }
+
+    // 6. Remove-then-resume so a redelivered decision finds no entry (exactly
+    //    once). The hold leaves the queue here for both deny and approve; the
+    //    sync loop only advances its batch token after this returns, so a crash
+    //    mid-handle re-reads the decision and the still-queued entry releases
+    //    exactly once.
+    let mut queue = ApprovalQueue::load(paths).unwrap_or_default();
+    queue.remove(&decision.request_id);
+    if let Err(e) = queue.save(paths) {
+        tracing::warn!(error = %e, request_id = %decision.request_id, "could not persist approval queue after live decision");
+    }
+
+    // 7. Deny (or any non-"approved"): emit the terminal rejection and audit
+    //    denied-while-held; never run.
+    if !decision_permits_spawn(decision) {
+        match held {
+            HeldRequest::Exec(request) => {
+                crate::exec::deny_held_exec(&room, paths, &meta.room_id, &request).await
+            }
+            HeldRequest::Call(request) => {
+                crate::call::deny_held_call(&room, paths, &meta.room_id, &request).await
+            }
+        }
+        return;
+    }
+
+    // 8. Approved: re-run the full authorize pipeline against the recovered
+    //    request and spawn it (or emit a terminal rejection if policy/trust now
+    //    deny it). The hold is already removed → fail-closed, never re-held.
+    match held {
+        HeldRequest::Exec(request) => {
+            crate::exec::release_held_exec(client, paths, &room, &meta.room_id, request).await
+        }
+        HeldRequest::Call(request) => {
+            crate::call::release_held_call(paths, &room, &meta.room_id, request).await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -963,6 +1201,7 @@ mod tests {
         queue.enqueue(PendingApproval {
             room_id: "!abc:matrix.org".to_string(),
             request: approval,
+            held_request: None,
         });
         queue.save(&paths).unwrap();
 
@@ -1000,6 +1239,7 @@ mod tests {
         let pending = PendingApproval {
             room_id: "!abc:matrix.org".to_string(),
             request: approval.clone(),
+            held_request: None,
         };
         queue.enqueue(pending.clone());
         queue.enqueue(pending);
@@ -1017,6 +1257,7 @@ mod tests {
         queue.enqueue(PendingApproval {
             room_id: "!abc:matrix.org".to_string(),
             request: approval_request_for(&exec_request(), &allowance(true)),
+            held_request: None,
         });
         let removed = queue.remove("req_01HZ").expect("present");
         assert_eq!(removed.request_id(), "req_01HZ");
@@ -1037,6 +1278,7 @@ mod tests {
         queue.enqueue(PendingApproval {
             room_id: "!abc:matrix.org".to_string(),
             request: approval_request_for(&exec_request(), &allowance(true)),
+            held_request: None,
         });
         queue.save(&paths).unwrap();
 
@@ -1067,10 +1309,12 @@ mod tests {
         queue.enqueue(PendingApproval {
             room_id: "!one:matrix.org".to_string(),
             request: approval_request_for(&a, &allowance(true)),
+            held_request: None,
         });
         queue.enqueue(PendingApproval {
             room_id: "!two:matrix.org".to_string(),
             request: approval_request_for(&b, &allowance(true)),
+            held_request: None,
         });
         queue.save(&paths).unwrap();
 
@@ -1102,6 +1346,88 @@ mod tests {
         let paths = paths_in(&dir);
         assert!(list_pending_approvals(&paths, None).unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- held-request persistence/recovery (issue #306) ---------------------
+
+    #[test]
+    fn held_request_round_trips_for_both_surfaces() {
+        // The original signed request is recoverable from a HeldRequest for both
+        // live surfaces, so an approving decision can re-authorize and spawn it.
+        let exec = HeldRequest::Exec(exec_request());
+        let back: HeldRequest =
+            serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
+        assert_eq!(back, exec);
+        match back {
+            HeldRequest::Exec(req) => {
+                assert_eq!(req.command, vec!["npm".to_string(), "test".to_string()])
+            }
+            HeldRequest::Call(_) => panic!("expected exec variant"),
+        }
+
+        let call = HeldRequest::Call(call_request());
+        let back: HeldRequest =
+            serde_json::from_str(&serde_json::to_string(&call).unwrap()).unwrap();
+        assert_eq!(back, call);
+    }
+
+    #[test]
+    fn pending_approval_recovers_held_request_from_queue() {
+        // Persistence/recovery: a held exec recovers the *exact* original signed
+        // request from the on-disk queue (0600), so release re-authorizes the
+        // real request rather than the lossy ApprovalRequest summary.
+        let dir = tmp_dir("held-recover");
+        let paths = paths_in(&dir);
+        let original = exec_request();
+        let mut queue = ApprovalQueue::default();
+        queue.enqueue(PendingApproval {
+            room_id: "!abc:matrix.org".to_string(),
+            request: approval_request_for(&original, &allowance(true)),
+            held_request: Some(HeldRequest::Exec(original.clone())),
+        });
+        queue.save(&paths).unwrap();
+
+        let reloaded = ApprovalQueue::load(&paths).unwrap();
+        let pending = reloaded.get("req_01HZ").expect("queued");
+        match &pending.held_request {
+            Some(HeldRequest::Exec(req)) => assert_eq!(req, &original),
+            other => panic!("expected a held exec, got {other:?}"),
+        }
+        let mode = fs::metadata(approval_queue_file(&paths))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "queue file must be 0600");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_approval_loads_legacy_queue_without_held_request() {
+        // Forward/backward compatibility: a queue written by an older daemon (no
+        // `held_request` field) still loads; the field defaults to None, which
+        // the live decision handler ignores (task/legacy holds are not resumed).
+        let json = r#"{"pending":[{"room_id":"!abc:matrix.org","request":{
+            "request_id":"req_old","invocation_id":"inv_old","requester":"a",
+            "target":"b","summary":"s","risk":"medium",
+            "expires_at":"2026-06-02T12:05:00Z"}}]}"#;
+        let queue: ApprovalQueue = serde_json::from_str(json).unwrap();
+        let pending = queue.get("req_old").expect("legacy entry loads");
+        assert!(
+            pending.held_request.is_none(),
+            "a legacy hold carries no live-resume material"
+        );
+    }
+
+    #[test]
+    fn held_request_never_leaks_into_emitted_approval_request() {
+        // No-leak: the emitted ApprovalRequest carries no structured
+        // command/env (exec) fields and no `held_request`, even though the queue
+        // persists the full signed request at rest (0600).
+        let approval = approval_request_for(&exec_request(), &allowance(true));
+        let json = serde_json::to_string(&approval).unwrap();
+        assert!(!json.contains("held_request"), "got {json}");
+        assert!(!json.contains("\"command\""), "got {json}");
+        assert!(!json.contains("\"env\""), "got {json}");
     }
 
     #[test]
@@ -1616,5 +1942,337 @@ mod tests {
             Some("untrusted_sender"),
             "@charlie is not in the approvers set and must be rejected"
         );
+    }
+
+    // --- burn_decision_nonce (issue #306) -----------------------------------
+
+    /// Build a minimal [`ApprovalDecision`] for `burn_decision_nonce` tests.
+    /// No signature is needed because `burn_decision_nonce` only reads the
+    /// `nonce` and `expires_at` fields; signature verification happens in
+    /// `verification_failure` before the caller reaches the burn step.
+    fn burn_decision(nonce: Option<&str>, expires_at: Option<&str>) -> ApprovalDecision {
+        ApprovalDecision {
+            request_id: "req-burn-test".to_string(),
+            decision: DECISION_APPROVED.to_string(),
+            approved_by: "@daemon:server".to_string(),
+            created_at: "2026-06-13T12:00:00Z".to_string(),
+            nonce: nonce.map(str::to_string),
+            expires_at: expires_at.map(str::to_string),
+            signature: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// A future expiry used in burn tests so the cache admission does not
+    /// reject the nonce on the grounds of being expired.
+    const BURN_FUTURE_EXPIRY: &str = "2099-01-01T00:00:00Z";
+
+    /// Create an `Arc<Mutex<EventRouter>>` backed by a fresh temp data dir for
+    /// `burn_decision_nonce` tests. Returns the dir so the caller can clean up.
+    fn make_router_for_burn(tag: &str) -> (Arc<Mutex<EventRouter>>, PathBuf) {
+        use crate::replay::ReplayCache;
+        let dir = tmp_dir(&format!("burn-router-{tag}"));
+        let paths = paths_in(&dir);
+        let cache = ReplayCache::load(&paths).unwrap();
+        (Arc::new(Mutex::new(EventRouter::new(cache))), dir)
+    }
+
+    #[test]
+    fn burn_decision_nonce_missing_nonce_fails_closed() {
+        // A decision without a nonce fails closed regardless of the router.
+        // This is a defensive check; `verification_failure` should have already
+        // rejected such a decision before `burn_decision_nonce` is called.
+        let d = burn_decision(None, Some(BURN_FUTURE_EXPIRY));
+        assert!(
+            !burn_decision_nonce(None, &d),
+            "missing nonce must fail closed without a router"
+        );
+        let (router, dir) = make_router_for_burn("no-nonce");
+        assert!(
+            !burn_decision_nonce(Some(&router), &d),
+            "missing nonce must fail closed even with a router"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn burn_decision_nonce_missing_expires_at_fails_closed() {
+        // A decision without `expires_at` fails closed: the cache cannot
+        // enforce a lifetime bound without knowing when the nonce expires.
+        let d = burn_decision(Some("nonce-no-expiry"), None);
+        assert!(!burn_decision_nonce(None, &d));
+        let (router, dir) = make_router_for_burn("no-expiry");
+        assert!(!burn_decision_nonce(Some(&router), &d));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn burn_decision_nonce_without_router_fails_open() {
+        // When no router is attached (cache failed to load at startup, so no
+        // events were routed at all), the burn fails OPEN (returns true). This
+        // is safe: queue-removal-before-spawn is the primary exactly-once guard
+        // and `verification_failure` already enforced expiry cache-independently.
+        let d = burn_decision(Some("nonce-no-router"), Some(BURN_FUTURE_EXPIRY));
+        assert!(
+            burn_decision_nonce(None, &d),
+            "router=None must return true when nonce and expires_at are both present"
+        );
+    }
+
+    #[test]
+    fn burn_decision_nonce_with_router_admits_fresh_nonce() {
+        // The first call for a fresh nonce must be admitted (true) so the
+        // approval-decision release path proceeds.
+        let (router, dir) = make_router_for_burn("admit-fresh");
+        let d = burn_decision(Some("nonce-fresh-dec"), Some(BURN_FUTURE_EXPIRY));
+        assert!(
+            burn_decision_nonce(Some(&router), &d),
+            "a fresh decision nonce must be admitted through the router's cache"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn burn_decision_nonce_with_router_rejects_replay() {
+        // Defense-in-depth: a captured valid decision re-delivered after the
+        // first release is blocked by the nonce cache. Even if the approval
+        // queue somehow retained the entry, the replayed nonce prevents a
+        // second release.
+        let (router, dir) = make_router_for_burn("replay-dec");
+        let d = burn_decision(Some("nonce-replay-dec"), Some(BURN_FUTURE_EXPIRY));
+        assert!(
+            burn_decision_nonce(Some(&router), &d),
+            "first burn must succeed"
+        );
+        assert!(
+            !burn_decision_nonce(Some(&router), &d),
+            "replayed decision nonce must be rejected"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- held call persistence/recovery (issue #306) -----------------------
+
+    #[test]
+    fn pending_approval_recovers_held_call_from_queue() {
+        // Mirrors `pending_approval_recovers_held_request_from_queue` for the
+        // call surface: a held named call recovers the exact original signed
+        // request from the on-disk queue (0600) so an approving decision can
+        // re-authorize and spawn it, rather than the lossy `ApprovalRequest`
+        // summary (which deliberately omits `args` for the no-leak posture).
+        let dir = tmp_dir("held-call-recover");
+        let paths = paths_in(&dir);
+        let original = call_request();
+        let mut queue = ApprovalQueue::default();
+        queue.enqueue(PendingApproval {
+            room_id: "!abc:matrix.org".to_string(),
+            request: approval_request_for_call(&original, &allowance(true)),
+            held_request: Some(HeldRequest::Call(original.clone())),
+        });
+        queue.save(&paths).unwrap();
+
+        let reloaded = ApprovalQueue::load(&paths).unwrap();
+        let pending = reloaded.get("req_01HZ").expect("queued");
+        match &pending.held_request {
+            Some(HeldRequest::Call(req)) => assert_eq!(req, &original),
+            other => panic!("expected a held call, got {other:?}"),
+        }
+        // The queue file must remain 0600 after holding a call.
+        let mode = fs::metadata(approval_queue_file(&paths))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "queue file must be 0600");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- HeldRequest serde representation (issue #306) ---------------------
+
+    #[test]
+    fn held_request_json_tags_use_lowercase_discriminants() {
+        // The on-disk representation of `HeldRequest` is `{"exec": {...}}` /
+        // `{"call": {...}}` (externally-tagged, lowercase variant name via
+        // `rename_all = "lowercase"`). Pinning these tags ensures older daemons
+        // can read queues written by newer ones — and vice versa — without a
+        // silent deserialization break caused by case or naming drift.
+        let exec_json = serde_json::to_string(&HeldRequest::Exec(exec_request())).unwrap();
+        assert!(
+            exec_json.starts_with(r#"{"exec":"#),
+            "exec variant must use {{\"exec\":...}} discriminant tag; got: {exec_json}"
+        );
+        let call_json = serde_json::to_string(&HeldRequest::Call(call_request())).unwrap();
+        assert!(
+            call_json.starts_with(r#"{"call":"#),
+            "call variant must use {{\"call\":...}} discriminant tag; got: {call_json}"
+        );
+    }
+
+    // --- issue #306: decision_permits_spawn fail-closed cases ----------------
+
+    #[test]
+    fn decision_permits_spawn_is_case_sensitive() {
+        // Fail-closed (issue #306): only the exact lowercase "approved" string
+        // permits spawn. An uppercase "APPROVED" or an empty decision field must
+        // both be treated as a denial — any other byte sequence is a denial.
+        let uppercase = approval_decision_for("req", "APPROVED", "@a:srv", "t");
+        assert!(
+            !decision_permits_spawn(&uppercase),
+            "uppercase APPROVED must not permit spawn (case-sensitive)"
+        );
+        let empty = approval_decision_for("req", "", "@a:srv", "t");
+        assert!(
+            !decision_permits_spawn(&empty),
+            "empty decision string must not permit spawn"
+        );
+        let mixed = approval_decision_for("req", "Approved", "@a:srv", "t");
+        assert!(
+            !decision_permits_spawn(&mixed),
+            "mixed-case Approved must not permit spawn"
+        );
+    }
+
+    // --- issue #306: burn_decision_nonce expiry via wall clock ---------------
+
+    #[test]
+    fn burn_decision_nonce_rejects_expired_nonce_via_cache() {
+        // A decision whose `expires_at` is in the past is rejected by the cache's
+        // `admit` (expiry semantics), so `burn_decision_nonce` returns `false`.
+        // This is a defense-in-depth layer on top of `verification_failure` which
+        // checks expiry cache-independently.
+        let (router, dir) = make_router_for_burn("expired-via-cache");
+        let d = burn_decision(Some("nonce-expired-cache"), Some("1970-01-01T00:00:01Z"));
+        assert!(
+            !burn_decision_nonce(Some(&router), &d),
+            "a decision with a past expires_at must fail closed through the cache"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- issue #306: held request preserves full content at rest -------------
+
+    #[test]
+    fn held_exec_request_preserves_env_vars_at_rest() {
+        // The `HeldRequest::Exec` must store the full signed request including
+        // environment variables so the release path can re-authorize and spawn the
+        // exact same invocation. The env vars live only in the at-rest (0600)
+        // queue — they must never appear in the emitted, no-leak `ApprovalRequest`.
+        let mut request = exec_request();
+        request.env = std::collections::BTreeMap::from([
+            ("MY_TOKEN".to_string(), "secret-token-value".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ]);
+        let held = HeldRequest::Exec(request.clone());
+        let held_json = serde_json::to_string(&held).unwrap();
+
+        // At-rest: env vars must be present so re-authorization recovers them.
+        assert!(
+            held_json.contains("MY_TOKEN"),
+            "env key must be preserved in HeldRequest at rest"
+        );
+        assert!(
+            held_json.contains("secret-token-value"),
+            "env value must be preserved in HeldRequest at rest"
+        );
+
+        // Emitted (no-leak): the lossy ApprovalRequest must never contain them.
+        let approval = approval_request_for(&request, &allowance(true));
+        let approval_json = serde_json::to_string(&approval).unwrap();
+        assert!(
+            !approval_json.contains("MY_TOKEN"),
+            "env key must not leak into emitted ApprovalRequest: {approval_json}"
+        );
+        assert!(
+            !approval_json.contains("secret-token-value"),
+            "env value must not leak into emitted ApprovalRequest: {approval_json}"
+        );
+    }
+
+    #[test]
+    fn held_call_request_preserves_args_at_rest() {
+        // The `HeldRequest::Call` must store the full original call request
+        // including args so the release path can re-authorize and spawn the exact
+        // tool invocation. The args live only in the at-rest (0600) queue — they
+        // must never appear in the emitted, no-leak `ApprovalRequest`.
+        let request = call_request();
+        let held = HeldRequest::Call(request.clone());
+        let held_json = serde_json::to_string(&held).unwrap();
+
+        // At-rest: args must be present so re-authorization recovers them.
+        assert!(
+            held_json.contains("secret_key"),
+            "call arg keys must be preserved in HeldRequest at rest"
+        );
+        assert!(
+            held_json.contains("should_not_appear_in_approval"),
+            "call arg values must be preserved in HeldRequest at rest"
+        );
+
+        // Emitted (no-leak): the lossy ApprovalRequest must never contain them.
+        let approval = approval_request_for_call(&request, &allowance(true));
+        let approval_json = serde_json::to_string(&approval).unwrap();
+        assert!(
+            !approval_json.contains("secret_key"),
+            "call arg keys must not leak into emitted ApprovalRequest: {approval_json}"
+        );
+    }
+
+    // --- issue #306: mixed task/live holds co-exist in the same queue --------
+
+    #[test]
+    fn queue_holds_task_and_live_entries_without_interference() {
+        // A task-backed hold (`held_request == None`) and a live hold
+        // (`held_request == Some`) can co-exist in the same queue. The live
+        // decision handler uses `held_request.is_none()` as the sentinel to skip
+        // task/legacy holds (those are released by the scheduler), so the two
+        // release paths never double-fire on a single decision.
+        let dir = tmp_dir("mixed-holds");
+        let paths = paths_in(&dir);
+
+        let mut task_req = exec_request();
+        task_req.request_id = "req_task_hold".to_string();
+        let mut live_req = exec_request();
+        live_req.request_id = "req_live_hold".to_string();
+
+        let mut queue = ApprovalQueue::default();
+        queue.enqueue(PendingApproval {
+            room_id: "!room:matrix.org".to_string(),
+            request: approval_request_for(&task_req, &allowance(true)),
+            held_request: None, // task/legacy sentinel: skip in live handler
+        });
+        queue.enqueue(PendingApproval {
+            room_id: "!room:matrix.org".to_string(),
+            request: approval_request_for(&live_req, &allowance(true)),
+            held_request: Some(HeldRequest::Exec(live_req.clone())),
+        });
+        queue.save(&paths).unwrap();
+
+        let reloaded = ApprovalQueue::load(&paths).unwrap();
+        assert_eq!(
+            reloaded.pending().len(),
+            2,
+            "both hold types must be in the queue"
+        );
+
+        let task_hold = reloaded.get("req_task_hold").expect("task hold present");
+        assert!(
+            task_hold.held_request.is_none(),
+            "task-backed hold must carry no held_request (scheduler releases it)"
+        );
+
+        let live_hold = reloaded.get("req_live_hold").expect("live hold present");
+        assert!(
+            live_hold.held_request.is_some(),
+            "live hold must carry the original signed request"
+        );
+        // Removing one hold must not affect the other.
+        let mut reloaded2 = reloaded.clone();
+        reloaded2.remove("req_task_hold");
+        assert!(reloaded2.get("req_task_hold").is_none());
+        assert!(
+            reloaded2.get("req_live_hold").is_some(),
+            "live hold must survive removal of task hold"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
