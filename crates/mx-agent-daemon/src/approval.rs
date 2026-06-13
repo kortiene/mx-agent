@@ -23,7 +23,7 @@
 //! exec dispatch loop; this module provides the building blocks and enforces
 //! the "does not execute immediately" guarantee.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::matrix::restore_client;
 use crate::session::{SessionPaths, StoredSession};
 use crate::signing::load_or_create_signing_key;
+use crate::trust::TrustStore;
 use crate::workspace::{parse_room_or_alias, resolve_room_id, WorkspaceError};
 
 /// Whether an authorized request may run immediately or must wait for approval.
@@ -456,36 +457,52 @@ pub async fn read_approval_decisions(
     Ok(decisions)
 }
 
+/// The anchors an approval decision is verified against before it may release a
+/// held `requires_approval` task (issue #309).
+///
+/// Releasing a held task is a privileged action, so — like the exec/call/task
+/// receiver pipeline (`signature verify → trust store → deny-by-default`) — it is
+/// anchored in the operator's **local trust store**, never in room-published
+/// state alone. All four anchors are checked: an authorized approver identity, an
+/// Ed25519 signature from a key that is BOTH room-published and locally
+/// [`Trusted`](crate::trust::TrustStatus::Trusted), replay material, and a
+/// non-expired deadline.
+pub struct DecisionVerification<'a> {
+    /// The host daemon's own Matrix user id — always an authorized approver.
+    pub local_user: &'a str,
+    /// Additional Matrix user ids configured (via `RoomPolicy::approvers`) to
+    /// approve in this room. The authorized set is the **union**
+    /// `{local_user} ∪ approvers`, so an empty set means daemon-only (the secure
+    /// default). Membership is necessary but never sufficient: an approver still
+    /// needs an Ed25519 signature from a locally-trusted key.
+    pub approvers: &'a BTreeSet<String>,
+    /// Verifying keys resolved from room-published agent state, keyed by key_id.
+    /// This is the *key material*; the trust store below is the *authority*.
+    pub verifying_keys: &'a BTreeMap<String, VerifyingKey>,
+    /// The authoritative local trust store (mirrors the exec/call anchor).
+    pub trust: &'a TrustStore,
+    /// "Now" in Unix seconds for the cache-independent decision-expiry check.
+    pub now_unix: i64,
+}
+
 /// Read `com.mxagent.approval.decision.v1` events from `room`, keeping only those
-/// bound to a verifiable approver identity (issue #264).
+/// bound to a verifiable approver identity (issues #264, #309).
 ///
 /// Tightens [`read_approval_decisions`] so a decision can release a held task
-/// **only if** every check passes — any failure drops the decision before it is
-/// mapped, so a forged or unverifiable `approved` event presents to the gate as
-/// "no decision" (still pending) rather than a release:
-///
-/// 1. **Sender** — the Matrix `sender` (read from the top-level event, not the
-///    attacker-controlled `content`) must equal `local_user`, the host daemon's
-///    own user id. Room membership alone never satisfies the approval gate.
-/// 2. **Signature** — the decision must carry a [`Signature`](mx_agent_protocol::schema::Signature)
-///    whose `key_id` resolves in `verifying_keys` and verifies over the
-///    decision's canonical bytes. Because the sender check already establishes
-///    provenance for a self-issued decision, the daemon's own published key
-///    (present in `verifying_keys`) is sufficient; no separate trust-store
-///    membership is required for `sender == local_user`.
-/// 3. **Replay material** — the decision must carry both a `nonce` and an
-///    `expires_at`, which the scheduler consumes through the [`ReplayCache`] on
-///    the pass that actually releases the task.
+/// **only if** every check in [`verification_failure`] passes — any failure drops
+/// the decision before it is mapped, so a forged or unverifiable `approved` event
+/// presents to the gate as "no decision" (still pending) rather than a release.
+/// The decision's signing key must be both room-published *and* locally trusted,
+/// the sender must be an authorized approver, and the decision must be unexpired,
+/// so room membership / room-state write access (companion #301) can never on its
+/// own satisfy the approval gate.
 ///
 /// Rejections are logged with non-sensitive metadata only (sender, request_id,
 /// reason) — never the signature, nonce, or content.
-///
-/// [`ReplayCache`]: crate::replay::ReplayCache
 pub async fn read_verified_approval_decisions(
     room: &Room,
     limit: u32,
-    local_user: &str,
-    verifying_keys: &BTreeMap<String, VerifyingKey>,
+    verification: &DecisionVerification<'_>,
 ) -> Result<HashMap<String, ApprovalDecision>, WorkspaceError> {
     let mut request = MessagesOptions::backward();
     request.limit = matrix_sdk::ruma::UInt::from(limit);
@@ -509,7 +526,7 @@ pub async fn read_verified_approval_decisions(
             _ => continue,
         };
 
-        if let Some(reason) = verification_failure(&decision, &sender, local_user, verifying_keys) {
+        if let Some(reason) = verification_failure(&decision, &sender, verification) {
             tracing::warn!(
                 sender = %sender,
                 request_id = %decision.request_id,
@@ -528,29 +545,66 @@ pub async fn read_verified_approval_decisions(
 }
 
 /// Return the non-sensitive reason a decision is not eligible to release a held
-/// task, or `None` when it passes every sender/signature/replay-material check.
+/// task, or `None` when it passes every check.
 ///
-/// Pure and fail-closed, so it is unit-testable without a live room.
+/// Pure and fail-closed, so it is unit-testable without a live room. Checks are
+/// applied in this order, each reason a non-sensitive `&'static str` (issue
+/// #309):
+///
+/// 1. `untrusted_sender` — the Matrix `sender` (the top-level event sender, not
+///    the attacker-controlled `content`) is empty, or is neither
+///    `ctx.local_user` nor a member of the configured `ctx.approvers` allowlist.
+/// 2. `missing_signature` — no detached Ed25519 signature.
+/// 3. `unresolved_key` — `signature.key_id` is not among the room-published
+///    `ctx.verifying_keys`.
+/// 4. `untrusted_key` — `signature.key_id` is unknown or revoked in the local
+///    trust store. This is the trust-store anchor (mirrors
+///    [`authorize_exec_request_with_allowance`](crate::exec::authorize_exec_request_with_allowance)):
+///    room-published state is never the sole key anchor.
+/// 5. `invalid_signature` — the signature does not verify over the decision's
+///    canonical bytes.
+/// 6. `missing_replay_material` — `nonce` or `expires_at` is absent.
+/// 7. `malformed_expiry` / `decision_expired` — the `expires_at` stamp cannot be
+///    parsed (fail **closed**: a daemon-signed decision with an unparseable stamp
+///    is corrupt/tampered, unlike the request-side fail-open in
+///    [`approval_request_expired`]), or it has passed `ctx.now_unix` (the `<=`
+///    boundary matches [`ReplayCache::admit_at`](crate::replay::ReplayCache)).
+///    This makes decision expiry hold even when no replay cache is attached.
 pub fn verification_failure(
     decision: &ApprovalDecision,
     sender: &str,
-    local_user: &str,
-    verifying_keys: &BTreeMap<String, VerifyingKey>,
+    ctx: &DecisionVerification<'_>,
 ) -> Option<&'static str> {
-    if sender.is_empty() || sender != local_user {
+    // 1. Authorized approver: the daemon's own account is always allowed; a
+    //    configured allowlist *adds* approvers (union semantics).
+    let authorized =
+        !sender.is_empty() && (sender == ctx.local_user || ctx.approvers.contains(sender));
+    if !authorized {
         return Some("untrusted_sender");
     }
     let Some(signature) = &decision.signature else {
         return Some("missing_signature");
     };
-    let Some(key) = verifying_keys.get(&signature.key_id) else {
+    let Some(key) = ctx.verifying_keys.get(&signature.key_id) else {
         return Some("unresolved_key");
     };
+    // The signing key must be locally trusted — not merely self-consistent in
+    // room state. Unknown and revoked keys both return false here.
+    if !ctx.trust.is_key_trusted(&signature.key_id) {
+        return Some("untrusted_key");
+    }
     if verify_approval_decision(key, decision).is_err() {
         return Some("invalid_signature");
     }
-    if decision.nonce.is_none() || decision.expires_at.is_none() {
+    let (Some(_nonce), Some(expires_at)) = (&decision.nonce, &decision.expires_at) else {
         return Some("missing_replay_material");
+    };
+    // Cache-independent expiry: enforced here at read time so it holds even on a
+    // pass with no replay cache attached. Fail closed on a malformed stamp.
+    match crate::replay::parse_rfc3339_to_unix(expires_at) {
+        None => return Some("malformed_expiry"),
+        Some(expiry) if expiry <= ctx.now_unix => return Some("decision_expired"),
+        Some(_) => {}
     }
     None
 }
@@ -1139,7 +1193,7 @@ mod tests {
         assert!(now.ends_with('Z'));
     }
 
-    // --- verification_failure tests (issue #264) ----------------------------
+    // --- verification_failure tests (issues #264, #309) ---------------------
 
     fn vf_signing_key() -> SigningKey {
         SigningKey::from_bytes(&[
@@ -1151,11 +1205,20 @@ mod tests {
 
     const VF_KEY_ID: &str = "mxagent-ed25519:vf-test";
     const VF_LOCAL_USER: &str = "@daemon:server";
+    const VF_EXPIRES_AT: &str = "2026-06-10T13:00:00Z";
 
     fn vf_keys() -> BTreeMap<String, VerifyingKey> {
         let mut keys = BTreeMap::new();
         keys.insert(VF_KEY_ID.to_string(), vf_signing_key().verifying_key());
         keys
+    }
+
+    /// A trust store that trusts `VF_KEY_ID` (the daemon's own key), so the new
+    /// trust-store anchor (issue #309) passes by default.
+    fn vf_trust() -> TrustStore {
+        let mut trust = TrustStore::default();
+        trust.approve("vf-agent", VF_KEY_ID, None, None, None);
+        trust
     }
 
     fn signed_vf_decision() -> ApprovalDecision {
@@ -1165,7 +1228,7 @@ mod tests {
             approved_by: VF_LOCAL_USER.to_string(),
             created_at: "2026-06-10T12:00:00Z".to_string(),
             nonce: Some("nonce-vf-test".to_string()),
-            expires_at: Some("2026-06-10T13:00:00Z".to_string()),
+            expires_at: Some(VF_EXPIRES_AT.to_string()),
             signature: None,
             extra: Default::default(),
         };
@@ -1173,17 +1236,48 @@ mod tests {
         d
     }
 
+    /// Owned holders for a [`DecisionVerification`] context so a test can borrow
+    /// a context from them. Defaults trust `VF_KEY_ID`, configure no extra
+    /// approvers, and set `now_unix = 0` (long before `VF_EXPIRES_AT`).
+    struct VfFixture {
+        approvers: BTreeSet<String>,
+        keys: BTreeMap<String, VerifyingKey>,
+        trust: TrustStore,
+        now_unix: i64,
+    }
+
+    impl VfFixture {
+        fn new() -> Self {
+            Self {
+                approvers: BTreeSet::new(),
+                keys: vf_keys(),
+                trust: vf_trust(),
+                now_unix: 0,
+            }
+        }
+
+        fn ctx(&self) -> DecisionVerification<'_> {
+            DecisionVerification {
+                local_user: VF_LOCAL_USER,
+                approvers: &self.approvers,
+                verifying_keys: &self.keys,
+                trust: &self.trust,
+                now_unix: self.now_unix,
+            }
+        }
+    }
+
+    fn vf_expiry_unix() -> i64 {
+        crate::replay::parse_rfc3339_to_unix(VF_EXPIRES_AT).expect("VF_EXPIRES_AT parses")
+    }
+
     #[test]
     fn verification_failure_passes_valid_signed_decision() {
-        // Positive path: a properly signed decision from the daemon's own user
-        // must pass all checks (returns None = no failure).
+        // Positive path: a properly signed decision from the daemon's own user,
+        // a trusted key, and a fresh deadline must pass all checks (None).
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(
-                &signed_vf_decision(),
-                VF_LOCAL_USER,
-                VF_LOCAL_USER,
-                &vf_keys()
-            ),
+            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, &fx.ctx()),
             None,
             "a valid signed decision from the daemon itself must pass all checks"
         );
@@ -1191,8 +1285,9 @@ mod tests {
 
     #[test]
     fn verification_failure_rejects_empty_sender() {
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(&signed_vf_decision(), "", VF_LOCAL_USER, &vf_keys()),
+            verification_failure(&signed_vf_decision(), "", &fx.ctx()),
             Some("untrusted_sender")
         );
     }
@@ -1202,15 +1297,36 @@ mod tests {
         // Security regression #264: room membership alone must not satisfy the
         // approval gate. A room member who is not the host daemon cannot release
         // a held task regardless of what they put in the event content.
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(
-                &signed_vf_decision(),
-                "@attacker:server",
-                VF_LOCAL_USER,
-                &vf_keys()
-            ),
+            verification_failure(&signed_vf_decision(), "@attacker:server", &fx.ctx()),
             Some("untrusted_sender"),
             "room membership alone must not satisfy the approval gate"
+        );
+    }
+
+    #[test]
+    fn verification_failure_allows_configured_approver() {
+        // Issue #309: a non-daemon sender in the room's `approvers` allowlist,
+        // signing with a trusted key, may release a task.
+        let mut fx = VfFixture::new();
+        fx.approvers.insert("@approver:server".to_string());
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), "@approver:server", &fx.ctx()),
+            None,
+            "a configured approver with a trusted key must be authorized"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_stranger_not_in_approvers() {
+        // Issue #309: a sender that is neither the daemon nor in the allowlist is
+        // rejected even when the (populated) allowlist exists.
+        let mut fx = VfFixture::new();
+        fx.approvers.insert("@approver:server".to_string());
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), "@stranger:server", &fx.ctx()),
+            Some("untrusted_sender")
         );
     }
 
@@ -1224,12 +1340,13 @@ mod tests {
             approved_by: VF_LOCAL_USER.to_string(),
             created_at: "2026-06-10T12:00:00Z".to_string(),
             nonce: Some("nonce-vf-test".to_string()),
-            expires_at: Some("2026-06-10T13:00:00Z".to_string()),
+            expires_at: Some(VF_EXPIRES_AT.to_string()),
             signature: None,
             extra: Default::default(),
         };
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(&unsigned, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            verification_failure(&unsigned, VF_LOCAL_USER, &fx.ctx()),
             Some("missing_signature"),
             "an unsigned decision must not release a held task"
         );
@@ -1241,9 +1358,52 @@ mod tests {
         // rejected even if the signature bytes themselves could be valid.
         let mut d = signed_vf_decision();
         d.signature.as_mut().unwrap().key_id = "mxagent-ed25519:unknown".to_string();
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            verification_failure(&d, VF_LOCAL_USER, &fx.ctx()),
             Some("unresolved_key")
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_untrusted_key() {
+        // Issue #309 headline: a key that resolves in the room-published
+        // verifying-keys map but is absent from the local trust store can never
+        // release a held task, even with a valid signature and the correct
+        // sender. This is the room-state-is-not-trust anchor.
+        let mut fx = VfFixture::new();
+        fx.trust = TrustStore::default(); // key is published but not trusted
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, &fx.ctx()),
+            Some("untrusted_key"),
+            "a room-published key that is not locally trusted must be rejected"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_revoked_key() {
+        // A key the operator explicitly revoked must also be rejected.
+        let mut fx = VfFixture::new();
+        fx.trust.revoke("vf-agent", VF_KEY_ID);
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, &fx.ctx()),
+            Some("untrusted_key")
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_approver_with_untrusted_key() {
+        // "Necessary-not-sufficient" (issue #309): being in the `approvers`
+        // allowlist grants identity authorization but never overrides the
+        // trust-store anchor. An allowlisted sender whose signing key is absent
+        // from the local trust store must still be rejected with `untrusted_key`.
+        let mut fx = VfFixture::new();
+        fx.approvers.insert("@approver:server".to_string());
+        fx.trust = TrustStore::default(); // key published in room state, not locally trusted
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), "@approver:server", &fx.ctx()),
+            Some("untrusted_key"),
+            "allowlisted approver with a room-published but locally untrusted key must be rejected"
         );
     }
 
@@ -1253,8 +1413,9 @@ mod tests {
         // invalidate the signature so the event is dropped.
         let mut d = signed_vf_decision();
         d.decision = "denied".to_string();
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            verification_failure(&d, VF_LOCAL_USER, &fx.ctx()),
             Some("invalid_signature"),
             "a tampered decision field must fail signature verification"
         );
@@ -1266,8 +1427,9 @@ mod tests {
         // signature, preventing a forged release targeting a different task.
         let mut d = signed_vf_decision();
         d.request_id = "approval:other-task".to_string();
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            verification_failure(&d, VF_LOCAL_USER, &fx.ctx()),
             Some("invalid_signature")
         );
     }
@@ -1282,13 +1444,14 @@ mod tests {
             approved_by: VF_LOCAL_USER.to_string(),
             created_at: "2026-06-10T12:00:00Z".to_string(),
             nonce: None,
-            expires_at: Some("2026-06-10T13:00:00Z".to_string()),
+            expires_at: Some(VF_EXPIRES_AT.to_string()),
             signature: None,
             extra: Default::default(),
         };
         sign_approval_decision(&vf_signing_key(), VF_KEY_ID, &mut d).unwrap();
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            verification_failure(&d, VF_LOCAL_USER, &fx.ctx()),
             Some("missing_replay_material"),
             "a decision without a nonce must not release a held task"
         );
@@ -1309,10 +1472,56 @@ mod tests {
             extra: Default::default(),
         };
         sign_approval_decision(&vf_signing_key(), VF_KEY_ID, &mut d).unwrap();
+        let fx = VfFixture::new();
         assert_eq!(
-            verification_failure(&d, VF_LOCAL_USER, VF_LOCAL_USER, &vf_keys()),
+            verification_failure(&d, VF_LOCAL_USER, &fx.ctx()),
             Some("missing_replay_material"),
             "a decision without expires_at must not release a held task"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_expired_decision() {
+        // Issue #309: the cache-less expiry proof. A trusted, validly-signed
+        // decision whose `expires_at <= now_unix` is rejected at read time,
+        // independent of any replay cache.
+        let mut fx = VfFixture::new();
+        fx.now_unix = vf_expiry_unix() + 100; // past the deadline
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, &fx.ctx()),
+            Some("decision_expired")
+        );
+
+        // Boundary: `expires_at == now_unix` counts as expired (`<=`).
+        let mut boundary = VfFixture::new();
+        boundary.now_unix = vf_expiry_unix();
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, &boundary.ctx()),
+            Some("decision_expired"),
+            "a stamp equal to now_unix is expired"
+        );
+    }
+
+    #[test]
+    fn verification_failure_rejects_malformed_expiry() {
+        // Issue #309: a daemon-signed decision with an unparseable `expires_at`
+        // is corrupt/tampered, so fail CLOSED (distinct from the request-side
+        // fail-open).
+        let mut d = ApprovalDecision {
+            request_id: "approval:task-a".to_string(),
+            decision: "approved".to_string(),
+            approved_by: VF_LOCAL_USER.to_string(),
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            nonce: Some("nonce-vf-test".to_string()),
+            expires_at: Some("garbage".to_string()),
+            signature: None,
+            extra: Default::default(),
+        };
+        sign_approval_decision(&vf_signing_key(), VF_KEY_ID, &mut d).unwrap();
+        let fx = VfFixture::new();
+        assert_eq!(
+            verification_failure(&d, VF_LOCAL_USER, &fx.ctx()),
+            Some("malformed_expiry")
         );
     }
 
@@ -1320,11 +1529,92 @@ mod tests {
     fn verification_failure_rejects_empty_verifying_keys_map() {
         // The host daemon has no record of the signing key: must reject even
         // if the signature is otherwise valid.
-        let empty: BTreeMap<String, VerifyingKey> = BTreeMap::new();
+        let mut fx = VfFixture::new();
+        fx.keys = BTreeMap::new();
         assert_eq!(
-            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, VF_LOCAL_USER, &empty),
+            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, &fx.ctx()),
             Some("unresolved_key"),
             "a decision whose key_id is not locally known must be rejected"
+        );
+    }
+
+    #[test]
+    fn verification_failure_approved_by_field_does_not_gate_auth() {
+        // Issue #309 / --by flag: `approved_by` in the decision content is
+        // display-only metadata, not an authentication input. The auth inputs
+        // are the Matrix event sender (top-level event header) and the
+        // Ed25519 signature from a locally-trusted key. A decision whose
+        // `approved_by` field differs from the sender must still pass when the
+        // sender is authorized and the signature is valid.
+        //
+        // Note: because `approved_by` is bound by the signature, changing it
+        // *post-signing* would break verification (tested separately in
+        // signing.rs's `tampered_approval_decision_fails_verification`). This
+        // test proves the field's value does not influence the sender/trust
+        // authorization checks — the daemon signs it as a record, not as an
+        // auth gate.
+        let mut d = ApprovalDecision {
+            request_id: "approval:task-a".to_string(),
+            decision: "approved".to_string(),
+            approved_by: "@custom-display-label:server".to_string(), // != VF_LOCAL_USER
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            nonce: Some("nonce-vf-test".to_string()),
+            expires_at: Some(VF_EXPIRES_AT.to_string()),
+            signature: None,
+            extra: Default::default(),
+        };
+        sign_approval_decision(&vf_signing_key(), VF_KEY_ID, &mut d).unwrap();
+        let fx = VfFixture::new();
+        assert_eq!(
+            verification_failure(&d, VF_LOCAL_USER, &fx.ctx()),
+            None,
+            "approved_by in content is display-only and must not affect the auth check"
+        );
+    }
+
+    #[test]
+    fn verification_failure_daemon_remains_authorized_when_approvers_configured() {
+        // Issue #309 union semantics: the authorized sender set is
+        // `{local_user} ∪ approvers`. Adding external approvers must never
+        // revoke the daemon's own capability to release a held task — the host
+        // daemon is always a member of the authorized set.
+        let mut fx = VfFixture::new();
+        fx.approvers.insert("@external-approver:server".to_string());
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), VF_LOCAL_USER, &fx.ctx()),
+            None,
+            "daemon must remain authorized even when external approvers are configured"
+        );
+    }
+
+    #[test]
+    fn verification_failure_multiple_approvers_any_member_authorized() {
+        // Issue #309: with multiple configured approvers, each member of the
+        // set independently satisfies the sender check. A sender not in the
+        // set (nor the daemon itself) is still rejected.
+        //
+        // The signed decision uses `VF_KEY_ID` which is trusted; the different
+        // senders represent three agents whose Matrix accounts would be found
+        // as event senders in the timeline.
+        let mut fx = VfFixture::new();
+        fx.approvers.insert("@alice:server".to_string());
+        fx.approvers.insert("@bob:server".to_string());
+
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), "@alice:server", &fx.ctx()),
+            None,
+            "@alice is a configured approver and must be authorized"
+        );
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), "@bob:server", &fx.ctx()),
+            None,
+            "@bob is a configured approver and must be authorized"
+        );
+        // A third party not in the set is rejected even with a non-empty list.
+        assert_eq!(
+            verification_failure(&signed_vf_decision(), "@charlie:server", &fx.ctx()),
+            Some("untrusted_sender"),
+            "@charlie is not in the approvers set and must be rejected"
         );
     }
 }

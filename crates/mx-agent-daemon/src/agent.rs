@@ -26,6 +26,7 @@ use crate::matrix::restore_client;
 use crate::session::{SessionPaths, StoredSession};
 use crate::signing::load_or_create_signing_key;
 use crate::tools::ToolRegistry;
+use crate::trust::{TrustStatus, TrustStore};
 use crate::workspace::{
     git_output, parse_room_or_alias, resolve_room_id, send_workspace_state, WorkspaceError,
 };
@@ -165,7 +166,68 @@ pub async fn register_agent(
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
     send_workspace_state(&room, AGENT_STATE_TYPE, &agent_id, content).await?;
 
+    // Anchor this daemon's own signing key in the local trust store (issue #309).
+    // Approval-decision verification is now anchored to the trust store, and the
+    // daemon signs its self-issued decisions with this key, so the daemon-only
+    // approval default only works if its own key is locally `Trusted`. Seeding it
+    // on registration removes a manual `trust approve` bootstrap step. An explicit
+    // prior `Revoked` record is honoured (never overwritten), so a deliberate
+    // revocation still takes effect.
+    let paths = SessionPaths::resolve();
+    let mut trust = TrustStore::load(&paths).unwrap_or_default();
+    if seed_local_key_trust(
+        &mut trust,
+        &agent_id,
+        &signing.key_id(),
+        &signing.fingerprint(),
+        room_id.as_str(),
+        &state.matrix_user_id,
+    ) {
+        if let Err(e) = trust.save(&paths) {
+            tracing::warn!(error = %e, "could not persist local signing key trust seed (issue #309)");
+        }
+    }
+
     Ok(state)
+}
+
+/// Seed the daemon's own signing key as [`TrustStatus::Trusted`] in `trust`,
+/// unless it carries an explicit prior revocation (issue #309).
+///
+/// Returns `true` when `trust` was modified (the caller should persist it), and
+/// `false` when no change was needed — either the key is already trusted, or the
+/// operator explicitly [`Revoked`](TrustStatus::Revoked) it (which is honoured
+/// and never silently re-trusted).
+///
+/// Anchoring approval decisions to the local trust store means the daemon must
+/// trust the key it signs its own self-issued decisions with, or the daemon-only
+/// approval default would reject them. Seeding the key here keeps trust
+/// operator-revocable while making a fresh deployment work without a manual step.
+fn seed_local_key_trust(
+    trust: &mut TrustStore,
+    agent_id: &str,
+    key_id: &str,
+    fingerprint: &str,
+    room: &str,
+    trusted_by: &str,
+) -> bool {
+    if trust
+        .entry(agent_id, key_id)
+        .is_some_and(|e| e.status == TrustStatus::Revoked)
+    {
+        return false;
+    }
+    if trust.is_trusted(agent_id, key_id) {
+        return false;
+    }
+    trust.approve(
+        agent_id,
+        key_id,
+        Some(fingerprint.to_string()),
+        Some(room.to_string()),
+        Some(trusted_by.to_string()),
+    );
+    true
 }
 
 /// Register an agent, restoring the authenticated client from `session`.
@@ -479,6 +541,55 @@ mod tests {
     #[test]
     fn derive_agent_id_falls_back_to_full_user_id() {
         assert_eq!(derive_agent_id("weird-id", "DEV"), "weird-id-DEV");
+    }
+
+    // --- local signing-key trust seed (issue #309) --------------------------
+
+    const SEED_KEY: &str = "mxagent-ed25519:local-seed";
+    const SEED_AGENT: &str = "alice-DEV";
+
+    #[test]
+    fn seed_trusts_fresh_local_key() {
+        // A fresh deployment: the daemon's own key is seeded Trusted so its
+        // self-issued approval decisions survive the trust-store anchor.
+        let mut trust = TrustStore::default();
+        assert!(!trust.is_key_trusted(SEED_KEY));
+        let changed = seed_local_key_trust(
+            &mut trust,
+            SEED_AGENT,
+            SEED_KEY,
+            "SHA256:local-seed",
+            "!room:server",
+            "@alice:server",
+        );
+        assert!(changed, "first seed must report a change to persist");
+        assert!(trust.is_key_trusted(SEED_KEY));
+    }
+
+    #[test]
+    fn seed_is_idempotent_when_already_trusted() {
+        let mut trust = TrustStore::default();
+        trust.approve(SEED_AGENT, SEED_KEY, None, None, None);
+        let changed =
+            seed_local_key_trust(&mut trust, SEED_AGENT, SEED_KEY, "SHA256:x", "!r:s", "@a:s");
+        assert!(
+            !changed,
+            "re-seeding an already-trusted key must be a no-op"
+        );
+        assert!(trust.is_key_trusted(SEED_KEY));
+    }
+
+    #[test]
+    fn seed_honours_explicit_revocation() {
+        // An operator's deliberate revocation must never be overwritten by the
+        // registration seed.
+        let mut trust = TrustStore::default();
+        trust.approve(SEED_AGENT, SEED_KEY, None, None, None);
+        trust.revoke(SEED_AGENT, SEED_KEY);
+        let changed =
+            seed_local_key_trust(&mut trust, SEED_AGENT, SEED_KEY, "SHA256:x", "!r:s", "@a:s");
+        assert!(!changed, "a revoked key must not be re-trusted by the seed");
+        assert!(!trust.is_key_trusted(SEED_KEY));
     }
 
     fn sample_state(agent_id: &str, capabilities: &[&str], tools: &[&str]) -> AgentState {

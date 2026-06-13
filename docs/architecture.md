@@ -1653,7 +1653,7 @@ Commands:
 mx-agent approval list --room '!abc:matrix.org'
 mx-agent approval show req_01HZ...
 mx-agent approval approve req_01HZ...
-mx-agent approval deny req_01HZ... --reason 'unsafe command'
+mx-agent approval deny req_01HZ...
 ```
 
 Approval request event:
@@ -1692,27 +1692,60 @@ Approval decision event:
 
 A decision can release a deliberately-held `requires_approval` task only when it
 is bound to a verifiable approver identity — **room membership is not execution
-permission** (§1.2). Before the scheduler honours a decision it must pass, in
-order (any failure leaves the task `pending`, fail-closed):
+permission** (§1.2). Releasing a held task is a privileged action, so it is
+anchored where the rest of the daemon anchors execution authority: Ed25519
+signature → **local trust store** → deny-by-default policy (mirroring the
+exec/call/task receiver pipeline). Before the scheduler honours a decision it
+must pass, in order (any failure leaves the task `pending`, fail-closed; each
+rejection reason is a non-sensitive `&'static str` logged with only the sender
+and request id):
 
-1. **Sender check** — the Matrix `sender` of the decision event must equal the
-   host daemon's own user id. A decision published by any other room member is
-   dropped before it reaches the approval gate, so a newly-joined or compromised
-   member cannot release a held task.
-2. **Signature check** — the decision carries a detached Ed25519 `signature`
+1. **Authorized approver (`untrusted_sender`)** — the Matrix `sender` of the
+   decision event (read from the top-level event, never from the
+   attacker-controlled `content`) must be an authorized approver: the host
+   daemon's own user id, or a Matrix user id listed in the room's
+   `approvers` policy allowlist (issue #309). The authorized set is the union
+   `{local_user} ∪ approvers`, so an empty allowlist (the default) is
+   daemon-only. A decision published by any other room member is dropped before
+   it reaches the approval gate.
+2. **Signature present (`missing_signature`)** and **resolvable key
+   (`unresolved_key`)** — the decision carries a detached Ed25519 `signature`
    (over its canonical bytes with the `signature` field excluded, like an
    `exec.request`/`call.request`) whose `key_id` resolves to a published agent
-   key and verifies. Because the sender check already establishes provenance for
-   a self-issued decision, the daemon's own published key is sufficient.
-3. **Replay check** — the decision's single-use `nonce` (bounded by `expires_at`)
-   is admitted into the daemon's replay cache on the pass that actually releases
-   the task, so a stale `approved` event lingering in the timeline scan window
-   cannot re-release it on a later pass. The nonce is **not** consumed while the
-   task is merely held, so a legitimately-held task still runs when approved.
+   key.
+3. **Trusted key (`untrusted_key`)** — the signing `key_id` must be `Trusted` in
+   the **local trust store** (issue #309). A key that is only self-consistent in
+   room-published `com.mxagent.agent.v1` state — but unknown or revoked locally —
+   can never release a held task, even with writable room state (cf. the
+   workspace-room power-levels concern). This is the same `is_key_trusted` anchor
+   the exec/call/task receivers use. The daemon seeds its own signing key as
+   `Trusted` on agent registration (honouring any explicit prior revocation), so
+   the daemon-only default works without a manual `trust approve` step.
+4. **Valid signature (`invalid_signature`)** — the signature verifies over the
+   decision's canonical bytes.
+5. **Replay material (`missing_replay_material`)** and **unexpired
+   (`malformed_expiry`/`decision_expired`)** — the decision carries a single-use
+   `nonce` and an `expires_at`, and `expires_at` has not passed "now" (the `<=`
+   boundary counts as expired). This expiry check runs at decision-read time, so
+   it holds **even when no replay cache is attached** (independent of the
+   replay-cache fail-closed work). A daemon-signed decision with an unparseable
+   `expires_at` is corrupt/tampered and fails **closed** (distinct from the
+   request-side `approval_request_expired`, which fails open so the request stays
+   operator-decidable). When a replay cache is attached the `nonce` is also
+   admitted into it on the pass that actually releases the task, as
+   defense-in-depth so a stale `approved` event in the scan window cannot
+   re-release the task; the nonce is **not** consumed while the task is merely
+   held.
 
-The daemon signs the decision with its own key and emits it as itself, so a
-self-issued (operator-approved) decision passes all three checks and the existing
-approve → execute flow is preserved.
+The daemon signs the decision with its own (locally-trusted) key and emits it as
+itself, so a self-issued (operator-approved) decision passes every check and the
+existing approve → execute flow is preserved.
+
+The `approved_by` field of the decision event (set from the optional `--by` CLI
+flag) is **display-only audit metadata** — verification never reads it. The
+authoritative approver identity is the Matrix `sender` whose decision is
+Ed25519-signed by a locally-trusted key and matched against the room's approver
+set; the stateless CLI never owns Matrix credentials or the signing key.
 
 **Expiry (issue #265).** Every approval request carries a finite `expires_at`
 (stamped at `APPROVAL_REQUEST_TTL` = 1 h). A held `requires_approval` task whose
