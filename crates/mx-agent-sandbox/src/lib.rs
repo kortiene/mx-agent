@@ -27,7 +27,7 @@
 //! denies the network by default, and forwards only the sanitized environment.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Available sandbox backends.
@@ -219,10 +219,16 @@ const BWRAP: &str = "bwrap";
 /// - the working directory is set with `--chdir`; it must be reachable through
 ///   one of the bound paths.
 ///
-/// `--die-with-parent` ties the sandbox's lifetime to the runner, and `--unshare-pid`
-/// / `--unshare-uts` / `--unshare-ipc` give the command its own process, host,
-/// and IPC namespaces. The environment is still applied by the runner around the
-/// prepared argv, so secret scrubbing (architecture §13.4) is unaffected.
+/// `--die-with-parent` ties the sandbox's lifetime to the runner, and
+/// `--unshare-pid` / `--unshare-uts` / `--unshare-ipc` / `--unshare-user` give
+/// the command its own process, host, IPC, and user namespaces. `--cap-drop ALL`
+/// drops every capability inside the sandbox, and a private `--proc /proc`,
+/// minimal `--dev /dev`, and writable `--tmpfs /tmp` provide the pseudo-filesystems
+/// a command needs without exposing the host's. On the non-interactive batch path
+/// `--new-session` detaches the controlling terminal (blocking TIOCSTI injection);
+/// it is omitted for an interactive `--pty` session, which must keep its terminal.
+/// The environment is still applied by the runner around the prepared argv, so
+/// secret scrubbing (architecture §13.4) is unaffected.
 ///
 /// The implementation is pure — it only computes an argv — so the wrapping rules
 /// are unit-tested without spawning `bwrap`.
@@ -243,13 +249,40 @@ impl Sandbox for BubblewrapSandbox {
             "--unshare-pid".to_string(),
             "--unshare-uts".to_string(),
             "--unshare-ipc".to_string(),
+            // A new user namespace: the command runs with no privileged host
+            // identity, mapping the current uid into the sandbox (issue #310).
+            "--unshare-user".to_string(),
+            // Drop every capability inside the (already user-namespaced) sandbox
+            // as defence in depth (architecture §13.5).
+            "--cap-drop".to_string(),
+            "ALL".to_string(),
         ];
+
+        // A fresh terminal session detaches the command from the runner's
+        // controlling terminal, blocking TIOCSTI keystroke injection — but it
+        // also `setsid`s away from the PTY, breaking Ctrl-C/job control on an
+        // interactive `--pty` session. So it is added only on the non-interactive
+        // batch path; the PTY path keeps the controlling terminal (issue #310).
+        if !restrictions.interactive {
+            wrapped.push("--new-session".to_string());
+        }
 
         // Network deny: a fresh, empty network namespace (architecture §13.5,
         // "network disabled by default"). `allow` keeps the daemon's network.
         if restrictions.network == Network::Deny {
             wrapped.push("--unshare-net".to_string());
         }
+
+        // Pseudo-filesystems the command needs to run at all: a private /proc, a
+        // minimal /dev (null, zero, random, tty, …), and a writable tmpfs /tmp.
+        // Mounted before the configured binds so an explicit writable `/tmp`
+        // bind re-mounts the real directory over this tmpfs (issue #310).
+        wrapped.push("--proc".to_string());
+        wrapped.push("/proc".to_string());
+        wrapped.push("--dev".to_string());
+        wrapped.push("/dev".to_string());
+        wrapped.push("--tmpfs".to_string());
+        wrapped.push("/tmp".to_string());
 
         // Bind the configured filesystem at the same path inside the sandbox:
         // read-only mounts first, then writable, so a writable path nested under
@@ -311,10 +344,13 @@ const DEFAULT_IMAGE: &str = "debian:stable-slim";
 /// - the working directory is set with `--workdir`; it must be reachable through
 ///   one of the mounted paths.
 /// - only the sanitized environment ([`Restrictions::env`]) is forwarded, each
-///   variable passed explicitly with `--env KEY=VALUE`. A container does not
-///   inherit the runner's environment, so the variables are injected here rather
-///   than relied on from the spawned process. Secrets are already scrubbed by the
-///   caller (architecture §13.4), so no credential reaches the argv.
+///   variable passed **by name** with `--env KEY` (no `=VALUE`). The runtime reads
+///   the value from the `<runtime> run` process environment, which the runner sets
+///   to this same sanitized map, so values never appear in the argv (host `ps`) —
+///   only the names do. Secrets are already scrubbed by the caller (architecture
+///   §13.4).
+/// - `--cap-drop ALL` and `--security-opt no-new-privileges` drop all Linux
+///   capabilities and block privilege escalation inside the container.
 /// - when [`Restrictions::interactive`] is set (an `exec --pty` session) the
 ///   command also gets `-i -t`, allocating a controlling TTY inside the
 ///   container so `isatty` is true and full-screen/interactive programs work.
@@ -376,6 +412,13 @@ impl Sandbox for ContainerSandbox {
             // Read-only root filesystem: only explicitly mounted writable paths
             // can be written (architecture §13.5).
             "--read-only".to_string(),
+            // Drop every Linux capability and block privilege escalation
+            // (`setuid`/`setcap` binaries cannot gain new privileges) as defence
+            // in depth (issue #310).
+            "--cap-drop".to_string(),
+            "ALL".to_string(),
+            "--security-opt".to_string(),
+            "no-new-privileges".to_string(),
         ];
 
         // Interactive PTY session: allocate a TTY inside the container so the
@@ -398,12 +441,16 @@ impl Sandbox for ContainerSandbox {
             wrapped.push("none".to_string());
         }
 
-        // Forward only the sanitized environment (architecture §13.4). A
-        // container does not inherit the runner's environment, so each variable
-        // is passed explicitly. Values are already secret-scrubbed by the caller.
-        for (key, value) in &restrictions.env {
+        // Forward only the sanitized environment (architecture §13.4) by **name**
+        // (`--env KEY`, not `--env KEY=VALUE`): the runtime reads each value from
+        // the `<runtime> run` process environment, which the runner populates with
+        // exactly this sanitized map (`env_clear().envs(...)`). Passing names only
+        // keeps the values out of the host process argv (`ps`) and out of this
+        // prepared command, while remaining behaviorally identical (issue #310).
+        // Values are already secret-scrubbed by the caller.
+        for key in restrictions.env.keys() {
             wrapped.push("--env".to_string());
-            wrapped.push(format!("{key}={value}"));
+            wrapped.push(key.clone());
         }
 
         // Mount the configured filesystem at the same path inside the container:
@@ -438,13 +485,77 @@ impl Sandbox for ContainerSandbox {
 /// Construct the sandbox implementation for `backend`.
 ///
 /// All backends are implemented. The container backend uses its default runtime
-/// and image ([`ContainerSandbox::default`]); a configured image is supplied by
-/// constructing [`ContainerSandbox::new`] directly.
+/// (Docker) and image; call [`sandbox_for_container`] to select the policy's
+/// runtime and image instead.
 pub fn sandbox_for(backend: Backend) -> Box<dyn Sandbox> {
     match backend {
         Backend::None => Box::new(NoneSandbox),
         Backend::Bubblewrap => Box::new(BubblewrapSandbox),
         Backend::Container => Box::new(ContainerSandbox::default()),
+    }
+}
+
+/// Construct a container sandbox for `runtime`, running commands in `image` (or
+/// the built-in [`DEFAULT_IMAGE`] when `None`).
+///
+/// Threads the policy's runtime (`docker` vs `podman`) and configured image
+/// through to [`ContainerSandbox::new`], so `sandbox = "podman"` actually runs
+/// `podman run …` and `execution.container_image` reaches the argv instead of the
+/// hardcoded default (issue #310).
+pub fn sandbox_for_container(runtime: Runtime, image: Option<String>) -> Box<dyn Sandbox> {
+    match image {
+        Some(image) => Box::new(ContainerSandbox::new(runtime, image)),
+        None => Box::new(ContainerSandbox::new(runtime, DEFAULT_IMAGE)),
+    }
+}
+
+/// The launcher program `backend` needs on `PATH`, if any.
+///
+/// `None` (the baseline backend launches the command directly) has no launcher;
+/// bubblewrap needs `bwrap`; the container backend needs its `runtime`'s program.
+pub fn backend_program(backend: Backend, runtime: Runtime) -> Option<&'static str> {
+    match backend {
+        Backend::None => None,
+        Backend::Bubblewrap => Some(BWRAP),
+        Backend::Container => Some(runtime.program()),
+    }
+}
+
+/// Find `program` in a colon-separated `path` (like `$PATH`), returning the first
+/// existing match.
+///
+/// Pure over the process environment (the caller passes the `PATH` string), so a
+/// PATH-controlled test can drive it deterministically.
+fn find_in_path(program: &str, path: &str) -> Option<PathBuf> {
+    path.split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(program))
+        .find(|candidate| candidate.exists())
+}
+
+/// Confirm the launcher `backend`/`runtime` needs is available on the process
+/// `PATH`, returning an actionable diagnostic if not (issue #310).
+///
+/// Replaces the bare spawn `NotFound` an operator would otherwise see when a
+/// selected backend's binary is missing: the message names the backend and the
+/// program so the cause is obvious. The baseline `None` backend always succeeds.
+pub fn preflight_backend(backend: Backend, runtime: Runtime) -> Result<(), String> {
+    preflight_backend_in(backend, runtime, &std::env::var("PATH").unwrap_or_default())
+}
+
+/// Core of [`preflight_backend`] with the `PATH` injected, so the diagnostic can
+/// be unit-tested with a controlled path without mutating the process environment.
+fn preflight_backend_in(backend: Backend, runtime: Runtime, path: &str) -> Result<(), String> {
+    let Some(program) = backend_program(backend, runtime) else {
+        return Ok(());
+    };
+    if find_in_path(program, path).is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "sandbox backend {:?} selected but its launcher `{program}` was not found on PATH",
+            backend.name()
+        ))
     }
 }
 
@@ -574,6 +685,62 @@ mod tests {
         assert!(flags.contains("--chdir /work"));
     }
 
+    #[test]
+    fn bubblewrap_batch_includes_hardening_flags() {
+        // Acceptance (issue #310): the batch bwrap argv must mount /proc, /dev, a
+        // tmpfs /tmp, and enable the user namespace + a new terminal session, plus
+        // drop all capabilities.
+        let prepared = BubblewrapSandbox.prepare(argv(&["true"]), Restrictions::default());
+        let flags = bwrap_flags(&prepared).join(" ");
+        assert!(flags.contains("--proc /proc"), "flags: {flags}");
+        assert!(flags.contains("--dev /dev"), "flags: {flags}");
+        assert!(flags.contains("--tmpfs /tmp"), "flags: {flags}");
+        assert!(flags.contains("--unshare-user"), "flags: {flags}");
+        assert!(flags.contains("--new-session"), "flags: {flags}");
+        assert!(flags.contains("--cap-drop ALL"), "flags: {flags}");
+    }
+
+    #[test]
+    fn bubblewrap_interactive_omits_new_session() {
+        // An interactive `--pty` session must keep its controlling terminal, so
+        // `--new-session` (which `setsid`s away from it and breaks Ctrl-C) is
+        // omitted; the rest of the hardening still applies (issue #310).
+        let prepared = BubblewrapSandbox.prepare(
+            argv(&["sh"]),
+            Restrictions {
+                interactive: true,
+                ..Restrictions::default()
+            },
+        );
+        let flags = bwrap_flags(&prepared).join(" ");
+        assert!(!flags.contains("--new-session"), "flags: {flags}");
+        // The other hardening is still present.
+        assert!(flags.contains("--unshare-user"), "flags: {flags}");
+        assert!(flags.contains("--dev /dev"), "flags: {flags}");
+    }
+
+    #[test]
+    fn bubblewrap_writable_tmp_bind_remounts_over_tmpfs() {
+        // The tmpfs /tmp is mounted before the configured binds, so an explicit
+        // writable `/tmp` bind re-mounts the real directory over it (the bind
+        // appears after --tmpfs in the argv).
+        let prepared = BubblewrapSandbox.prepare(
+            argv(&["true"]),
+            Restrictions {
+                cwd: PathBuf::from("/tmp"),
+                writable_paths: vec![PathBuf::from("/tmp")],
+                ..Restrictions::default()
+            },
+        );
+        let flags = bwrap_flags(&prepared);
+        let tmpfs = flags.iter().position(|f| f == "--tmpfs").expect("tmpfs");
+        let bind = flags.iter().position(|f| f == "--bind").expect("bind");
+        assert!(
+            tmpfs < bind,
+            "--tmpfs /tmp must precede --bind /tmp /tmp so the bind wins: {flags:?}"
+        );
+    }
+
     // --- Integration tests that actually launch `bwrap`. ---------------------
     //
     // These validate the acceptance criteria (a command runs inside bubblewrap,
@@ -581,7 +748,13 @@ mod tests {
     // gracefully when `bwrap` is absent or unprivileged user namespaces are
     // unavailable (e.g. some CI sandboxes), so the suite stays green there.
 
-    /// Whether a minimal `bwrap` invocation works in this environment.
+    /// Whether a `bwrap` invocation using the same hardening flags `prepare`
+    /// emits works in this environment.
+    ///
+    /// Mirrors the production flags (user namespace, private /proc + /dev, tmpfs,
+    /// new session) so the skip decision matches what `prepare` would actually run
+    /// (issue #310): if this passes, the prepared argv runs; if it fails, the
+    /// real-sandbox tests skip (or fail under [`bwrap_available_or_required`]).
     fn bwrap_usable() -> bool {
         use std::process::Command;
         match Command::new("bwrap")
@@ -589,9 +762,14 @@ mod tests {
                 "--ro-bind",
                 "/",
                 "/",
-                "--dev-bind",
+                "--unshare-user",
+                "--proc",
+                "/proc",
+                "--dev",
                 "/dev",
-                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--new-session",
                 "--",
                 "true",
             ])
@@ -600,6 +778,28 @@ mod tests {
             Ok(out) => out.status.success(),
             Err(_) => false,
         }
+    }
+
+    /// Environment variable that turns the real-bwrap skip into a hard failure.
+    ///
+    /// The CI `sandbox-linux` job installs `bubblewrap` and sets this so the
+    /// real-sandbox tests cannot silently skip and mask a regression (issue #310).
+    const REQUIRE_BWRAP_ENV: &str = "MX_AGENT_REQUIRE_BWRAP";
+
+    /// Return whether bwrap is usable; when it is not, either skip (default) or —
+    /// if [`REQUIRE_BWRAP_ENV`] is set — panic, so CI fails instead of skipping.
+    fn bwrap_available_or_required() -> bool {
+        if bwrap_usable() {
+            return true;
+        }
+        if std::env::var_os(REQUIRE_BWRAP_ENV).is_some() {
+            panic!(
+                "{REQUIRE_BWRAP_ENV} is set but bwrap is not usable here; \
+                 the real-sandbox tests must run (install bubblewrap / enable user namespaces)"
+            );
+        }
+        eprintln!("skipping: bwrap not usable in this environment");
+        false
     }
 
     /// Spawn a prepared command and return its captured output.
@@ -623,8 +823,7 @@ mod tests {
 
     #[test]
     fn command_runs_inside_bubblewrap() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap not usable in this environment");
+        if !bwrap_available_or_required() {
             return;
         }
         let tmp = std::env::temp_dir();
@@ -652,8 +851,7 @@ mod tests {
 
     #[test]
     fn read_only_path_denies_writes() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap not usable in this environment");
+        if !bwrap_available_or_required() {
             return;
         }
         let tmp = std::env::temp_dir();
@@ -677,8 +875,7 @@ mod tests {
 
     #[test]
     fn writable_path_allows_writes() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap not usable in this environment");
+        if !bwrap_available_or_required() {
             return;
         }
         let tmp = std::env::temp_dir();
@@ -703,8 +900,7 @@ mod tests {
 
     #[test]
     fn denied_network_has_no_route() {
-        if !bwrap_usable() {
-            eprintln!("skipping: bwrap not usable in this environment");
+        if !bwrap_available_or_required() {
             return;
         }
         if !PathBuf::from("/sys/class/net").exists() {
@@ -866,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn container_forwards_only_sanitized_env() {
+    fn container_forwards_sanitized_env_by_name_not_value() {
         let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
             argv(&["true"]),
             Restrictions {
@@ -875,9 +1071,148 @@ mod tests {
             },
         );
         let flags = container_flags(&prepared, "img").join(" ");
-        // Each sanitized variable is forwarded explicitly as KEY=VALUE.
-        assert!(flags.contains("--env PATH=/usr/bin"), "flags: {flags}");
-        assert!(flags.contains("--env LANG=C"), "flags: {flags}");
+        // Each sanitized variable is forwarded by name only; the runtime reads the
+        // value from the `docker run` process environment (issue #310).
+        assert!(flags.contains("--env PATH"), "flags: {flags}");
+        assert!(flags.contains("--env LANG"), "flags: {flags}");
+    }
+
+    #[test]
+    fn container_argv_never_contains_env_key_value_pairs() {
+        // Acceptance (issue #310): no `KEY=VALUE` env pair appears in the prepared
+        // container argv — values must not be visible in host `ps`.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                env: env_map(&[("PATH", "/usr/bin"), ("LANG", "C"), ("HOME", "/home/me")]),
+                ..Restrictions::default()
+            },
+        );
+        // The only `=`-bearing token in the historical argv was an env pair; with
+        // the by-name form, no token in the whole argv contains `=`.
+        let with_eq: Vec<&String> = prepared.argv.iter().filter(|a| a.contains('=')).collect();
+        assert!(
+            with_eq.is_empty(),
+            "prepared container argv must contain no KEY=VALUE tokens, found: {with_eq:?}"
+        );
+        // The variable values must not leak into the argv at all.
+        let joined = prepared.argv.join(" ");
+        assert!(!joined.contains("/usr/bin"), "value leaked: {joined}");
+        assert!(!joined.contains("/home/me"), "value leaked: {joined}");
+    }
+
+    #[test]
+    fn container_includes_capability_and_privilege_hardening() {
+        // Acceptance (issue #310): the container argv drops all capabilities and
+        // blocks privilege escalation.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img")
+            .prepare(argv(&["true"]), Restrictions::default());
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(flags.contains("--cap-drop ALL"), "flags: {flags}");
+        assert!(
+            flags.contains("--security-opt no-new-privileges"),
+            "flags: {flags}"
+        );
+    }
+
+    #[test]
+    fn sandbox_for_container_threads_podman_runtime_and_image() {
+        // Acceptance (issue #310): `sandbox = "podman"` with a configured image
+        // produces `podman run … <image> …`, not the hardcoded docker default.
+        let prepared =
+            sandbox_for_container(Runtime::Podman, Some("ghcr.io/acme/ci:1".to_string()))
+                .prepare(argv(&["true"]), Restrictions::default());
+        assert_eq!(prepared.argv.first().map(String::as_str), Some("podman"));
+        assert_eq!(
+            container_command(&prepared, "ghcr.io/acme/ci:1"),
+            argv(&["true"]).as_slice()
+        );
+    }
+
+    #[test]
+    fn sandbox_for_container_defaults_image_when_unset() {
+        let prepared = sandbox_for_container(Runtime::Docker, None)
+            .prepare(argv(&["true"]), Restrictions::default());
+        assert_eq!(
+            container_command(&prepared, DEFAULT_IMAGE),
+            argv(&["true"]).as_slice()
+        );
+    }
+
+    // --- backend preflight (issue #310) --------------------------------------
+
+    #[test]
+    fn backend_program_names_the_launcher() {
+        assert_eq!(backend_program(Backend::None, Runtime::Docker), None);
+        assert_eq!(
+            backend_program(Backend::Bubblewrap, Runtime::Docker),
+            Some("bwrap")
+        );
+        assert_eq!(
+            backend_program(Backend::Container, Runtime::Docker),
+            Some("docker")
+        );
+        assert_eq!(
+            backend_program(Backend::Container, Runtime::Podman),
+            Some("podman")
+        );
+    }
+
+    #[test]
+    fn find_in_path_locates_a_present_program() {
+        // A PATH-controlled environment: a temp dir holding a fake launcher is
+        // found; an empty dir is not — no process-env mutation required.
+        let dir = std::env::temp_dir().join(format!("mx-agent-sbx-path-{}", std::process::id()));
+        let empty = std::env::temp_dir().join(format!("mx-agent-sbx-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        let prog = dir.join("bwrap");
+        std::fs::write(&prog, b"#!/bin/sh\n").unwrap();
+
+        let path = format!("{}:{}", empty.display(), dir.display());
+        assert_eq!(find_in_path("bwrap", &path), Some(prog));
+        assert_eq!(
+            find_in_path("bwrap", &empty.display().to_string()),
+            None,
+            "absent launcher must not be found"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn preflight_none_backend_always_succeeds() {
+        // The baseline backend has no launcher, so preflight is a no-op.
+        assert!(preflight_backend_in(Backend::None, Runtime::Docker, "").is_ok());
+    }
+
+    #[test]
+    fn preflight_finds_backend_on_controlled_path() {
+        // A PATH-controlled environment with a fake launcher passes preflight.
+        let dir = std::env::temp_dir().join(format!("mx-agent-sbx-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bwrap"), b"#!/bin/sh\n").unwrap();
+        let path = dir.display().to_string();
+        assert!(preflight_backend_in(Backend::Bubblewrap, Runtime::Docker, &path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preflight_missing_backend_yields_actionable_diagnostic() {
+        // With a PATH that cannot contain the launcher, preflight must name the
+        // backend and the missing program (issue #310). Uses an injected empty
+        // PATH so no process-global env is mutated.
+        let err = preflight_backend_in(Backend::Bubblewrap, Runtime::Docker, "")
+            .expect_err("missing bwrap must fail preflight");
+        assert!(err.contains("bubblewrap"), "diagnostic: {err}");
+        assert!(err.contains("bwrap"), "diagnostic: {err}");
+        assert!(err.contains("PATH"), "diagnostic: {err}");
+
+        let err = preflight_backend_in(Backend::Container, Runtime::Podman, "/nonexistent")
+            .expect_err("missing podman must fail preflight");
+        assert!(err.contains("container"), "diagnostic: {err}");
+        assert!(err.contains("podman"), "diagnostic: {err}");
     }
 
     /// Whether `flag` (accepting the short or long spelling) appears in `flags`.
@@ -917,9 +1252,9 @@ mod tests {
         let flags = container_flags(&prepared, "img");
         assert!(!has_interactive_flag(flags), "flags: {flags:?}");
         assert!(!has_tty_flag(flags), "flags: {flags:?}");
-        // Byte-for-byte unchanged from the historical non-interactive argv
-        // (`Restrictions::default()` denies the network, so `--network none` is
-        // present; no `-i`/`-t` appears anywhere).
+        // The full non-interactive argv (`Restrictions::default()` denies the
+        // network, so `--network none` is present; no `-i`/`-t` appears anywhere).
+        // Includes the cap-drop / no-new-privileges hardening (issue #310).
         assert_eq!(
             prepared.argv,
             argv(&[
@@ -927,6 +1262,10 @@ mod tests {
                 "run",
                 "--rm",
                 "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
                 "--network",
                 "none",
                 "--workdir",
@@ -940,10 +1279,28 @@ mod tests {
     }
 
     #[test]
-    fn bubblewrap_ignores_interactive_flag() {
-        // Only the container backend reacts to `interactive`. The bubblewrap
-        // backend inherits the parent's PTY slave directly, so its argv must be
-        // identical whether or not the flag is set.
+    fn bubblewrap_never_adds_container_tty_flags() {
+        // The bubblewrap backend inherits the parent's PTY slave directly, so it
+        // never adds the container `-i`/`-t` TTY flags regardless of the
+        // `interactive` flag (those are container-only).
+        for interactive in [true, false] {
+            let prepared = BubblewrapSandbox.prepare(
+                argv(&["sh"]),
+                Restrictions {
+                    interactive,
+                    ..Restrictions::default()
+                },
+            );
+            assert!(!has_interactive_flag(&prepared.argv));
+            assert!(!has_tty_flag(&prepared.argv));
+        }
+    }
+
+    #[test]
+    fn bubblewrap_interactive_differs_only_in_new_session() {
+        // The interactive PTY argv is the batch argv minus `--new-session`
+        // (which would detach the controlling terminal); nothing else changes
+        // (issue #310).
         let interactive = BubblewrapSandbox.prepare(
             argv(&["sh"]),
             Restrictions {
@@ -951,16 +1308,20 @@ mod tests {
                 ..Restrictions::default()
             },
         );
-        let non_interactive = BubblewrapSandbox.prepare(
+        let batch = BubblewrapSandbox.prepare(
             argv(&["sh"]),
             Restrictions {
                 interactive: false,
                 ..Restrictions::default()
             },
         );
-        assert_eq!(interactive.argv, non_interactive.argv);
-        assert!(!has_interactive_flag(&interactive.argv));
-        assert!(!has_tty_flag(&interactive.argv));
+        let batch_without_new_session: Vec<String> = batch
+            .argv
+            .iter()
+            .filter(|a| *a != "--new-session")
+            .cloned()
+            .collect();
+        assert_eq!(interactive.argv, batch_without_new_session);
     }
 
     #[test]

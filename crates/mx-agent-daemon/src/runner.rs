@@ -49,7 +49,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use mx_agent_sandbox::{sandbox_for, Backend, Network, Restrictions};
+use mx_agent_sandbox::{
+    preflight_backend, sandbox_for, sandbox_for_container, Backend, Network, Restrictions, Runtime,
+    Sandbox,
+};
 use tokio::process::Command;
 
 /// Default grace period between the SIGTERM and the SIGKILL escalation when a
@@ -202,6 +205,16 @@ pub struct RunSpec {
     /// (architecture §13.5). Ignored by [`Backend::None`]. Resolved from the
     /// policy's `execution.writable_paths`; defaults to empty.
     pub writable_paths: Vec<PathBuf>,
+    /// Container runtime to launch through when [`sandbox`](RunSpec::sandbox) is
+    /// [`Backend::Container`] (architecture §13.5). Derived from the policy
+    /// `sandbox` value (`docker` → [`Runtime::Docker`], `podman` →
+    /// [`Runtime::Podman`]); ignored by the other backends. Defaults to
+    /// [`Runtime::Docker`].
+    pub container_runtime: Runtime,
+    /// Container image to run the command in when [`sandbox`](RunSpec::sandbox) is
+    /// [`Backend::Container`]. Resolved from `execution.container_image`; `None`
+    /// uses the backend's built-in default image. Ignored by the other backends.
+    pub container_image: Option<String>,
 }
 
 impl Default for RunSpec {
@@ -218,6 +231,8 @@ impl Default for RunSpec {
             network: Network::default(),
             read_only_paths: Vec::new(),
             writable_paths: Vec::new(),
+            container_runtime: Runtime::Docker,
+            container_image: None,
         }
     }
 }
@@ -310,6 +325,24 @@ pub(crate) fn restrictions_for(spec: &RunSpec, env: BTreeMap<String, String>) ->
     }
 }
 
+/// Construct the sandbox backend for `spec`, threading the container runtime and
+/// image for [`Backend::Container`] (issue #310).
+///
+/// The other backends ignore the container fields, so they resolve through
+/// [`sandbox_for`]; the container backend resolves through
+/// [`sandbox_for_container`] so `sandbox = "podman"` runs `podman run …` and a
+/// policy-configured `execution.container_image` reaches the argv. Shared by the
+/// batch runner ([`build_command`]) and the interactive PTY spawn so both honour
+/// the configured runtime/image.
+pub(crate) fn resolve_sandbox(spec: &RunSpec) -> Box<dyn Sandbox> {
+    match spec.sandbox {
+        Backend::Container => {
+            sandbox_for_container(spec.container_runtime, spec.container_image.clone())
+        }
+        other => sandbox_for(other),
+    }
+}
+
 /// Build a configured [`Command`] from a [`RunSpec`].
 ///
 /// Validates the argv and cwd, applies the sanitized environment, sets the
@@ -329,6 +362,13 @@ pub(crate) fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
         return Err(RunError::MissingCwd(spec.cwd.clone()));
     }
 
+    // Fail with an actionable diagnostic if the selected backend's launcher is
+    // missing, instead of a bare spawn `NotFound` once the wrapped argv runs
+    // (issue #310). The baseline `None` backend has no launcher and always passes.
+    preflight_backend(spec.sandbox, spec.container_runtime).map_err(|message| {
+        RunError::Spawn(std::io::Error::new(std::io::ErrorKind::NotFound, message))
+    })?;
+
     let env = sanitize_env(std::env::vars(), &spec.env, &spec.env_allowlist);
 
     // Launch through the selected sandbox backend (architecture §13.5). The
@@ -337,7 +377,7 @@ pub(crate) fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
     // baseline `none` backend returns both unchanged; stronger backends rewrite
     // the argv to launch the command inside their wrapper.
     let restrictions = restrictions_for(spec, env);
-    let prepared = sandbox_for(spec.sandbox).prepare(spec.command.clone(), restrictions);
+    let prepared = resolve_sandbox(spec).prepare(spec.command.clone(), restrictions);
     let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
     let Restrictions { cwd, env, .. } = prepared.restrictions;
 
@@ -1039,6 +1079,47 @@ mod tests {
             !argv.contains("--unshare-net"),
             "expected no --unshare-net (network=Allow) in: {argv}"
         );
+    }
+
+    #[test]
+    fn resolve_sandbox_threads_container_runtime_and_image() {
+        // A container spec carrying the Podman runtime and a configured image
+        // must resolve to a `podman run … <image>` launcher (issue #310).
+        let spec = RunSpec {
+            command: vec!["true".to_string()],
+            cwd: std::env::temp_dir(),
+            sandbox: Backend::Container,
+            container_runtime: Runtime::Podman,
+            container_image: Some("ghcr.io/acme/ci:1".to_string()),
+            ..RunSpec::default()
+        };
+        let prepared =
+            resolve_sandbox(&spec).prepare(spec.command.clone(), Restrictions::default());
+        assert_eq!(prepared.argv.first().map(String::as_str), Some("podman"));
+        assert!(
+            prepared.argv.iter().any(|a| a == "ghcr.io/acme/ci:1"),
+            "configured image must reach the argv: {:?}",
+            prepared.argv
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_non_container_ignores_container_fields() {
+        // Bubblewrap and None ignore the container runtime/image.
+        for backend in [Backend::None, Backend::Bubblewrap] {
+            let spec = RunSpec {
+                command: vec!["true".to_string()],
+                cwd: std::env::temp_dir(),
+                sandbox: backend,
+                container_runtime: Runtime::Podman,
+                container_image: Some("unused:tag".to_string()),
+                ..RunSpec::default()
+            };
+            let prepared =
+                resolve_sandbox(&spec).prepare(spec.command.clone(), Restrictions::default());
+            assert_eq!(prepared.backend, backend);
+            assert!(!prepared.argv.iter().any(|a| a == "unused:tag"));
+        }
     }
 
     #[test]

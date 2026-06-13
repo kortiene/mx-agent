@@ -1200,6 +1200,8 @@ async fn run_controlled_exec(
         network: network_for(allowance.network),
         read_only_paths: allowance.read_only_paths.clone(),
         writable_paths: allowance.writable_paths.clone(),
+        container_runtime: container_runtime_for(allowance.sandbox),
+        container_image: allowance.container_image.clone(),
         ..Default::default()
     };
     let mut command = build_command(&spec)?;
@@ -1428,6 +1430,8 @@ async fn run_controlled_pty_exec(
         network: network_for(allowance.network),
         read_only_paths: allowance.read_only_paths.clone(),
         writable_paths: allowance.writable_paths.clone(),
+        container_runtime: container_runtime_for(allowance.sandbox),
+        container_image: allowance.container_image.clone(),
         ..Default::default()
     };
     // The requester sends an initial `pty.resize` with the real terminal size
@@ -1770,6 +1774,22 @@ pub(crate) fn sandbox_backend(sandbox: Option<Sandbox>) -> mx_agent_sandbox::Bac
         Some(Sandbox::Bubblewrap) => mx_agent_sandbox::Backend::Bubblewrap,
         Some(Sandbox::Docker | Sandbox::Podman) => mx_agent_sandbox::Backend::Container,
         _ => mx_agent_sandbox::Backend::None,
+    }
+}
+
+/// Map the policy sandbox value to the container [`Runtime`][mx_agent_sandbox::Runtime]
+/// the [`Backend::Container`][mx_agent_sandbox::Backend::Container] backend
+/// launches through (issue #310).
+///
+/// `podman` selects [`Runtime::Podman`][mx_agent_sandbox::Runtime::Podman]; every
+/// other value (including `docker` and the non-container backends, which ignore
+/// the runtime) maps to [`Runtime::Docker`][mx_agent_sandbox::Runtime::Docker].
+/// Shared with the task-dispatch and loopback paths so they all resolve the
+/// runtime the same way.
+pub(crate) fn container_runtime_for(sandbox: Option<Sandbox>) -> mx_agent_sandbox::Runtime {
+    match sandbox {
+        Some(Sandbox::Podman) => mx_agent_sandbox::Runtime::Podman,
+        _ => mx_agent_sandbox::Runtime::Docker,
     }
 }
 
@@ -3027,14 +3047,10 @@ allow_cwd = ["/home/me/code/project"]
             sandbox_backend(Some(Sandbox::Podman)),
             mx_agent_sandbox::Backend::Container
         );
-        // Unimplemented and None policy values fall back to Backend::None,
-        // preserving existing behavior (no silent widening to an isolating backend).
+        // The explicit `none` policy value and an unset sandbox both map to the
+        // baseline `Backend::None`.
         assert_eq!(
             sandbox_backend(Some(Sandbox::None)),
-            mx_agent_sandbox::Backend::None
-        );
-        assert_eq!(
-            sandbox_backend(Some(Sandbox::Firejail)),
             mx_agent_sandbox::Backend::None
         );
         assert_eq!(
@@ -3042,6 +3058,42 @@ allow_cwd = ["/home/me/code/project"]
             mx_agent_sandbox::Backend::None,
             "unset sandbox must default to Backend::None"
         );
+        // Firejail/Chroot can no longer reach this mapping: `Policy::validate`
+        // rejects them at load time (issue #310), so they never appear in a
+        // resolved allowance. The mapping's defensive fallback to `Backend::None`
+        // (rather than a silent isolating backend) remains as belt-and-suspenders.
+        assert_eq!(
+            sandbox_backend(Some(Sandbox::Firejail)),
+            mx_agent_sandbox::Backend::None,
+            "firejail must never silently widen to an isolating backend"
+        );
+        assert_eq!(
+            sandbox_backend(Some(Sandbox::Chroot)),
+            mx_agent_sandbox::Backend::None,
+            "chroot must never silently widen to an isolating backend"
+        );
+    }
+
+    #[test]
+    fn container_runtime_for_maps_podman_else_docker() {
+        // The container runtime is implied by the policy sandbox value: only
+        // `podman` selects the Podman runtime (issue #310).
+        assert_eq!(
+            container_runtime_for(Some(Sandbox::Podman)),
+            mx_agent_sandbox::Runtime::Podman
+        );
+        for sandbox in [
+            Some(Sandbox::Docker),
+            Some(Sandbox::Bubblewrap),
+            Some(Sandbox::None),
+            None,
+        ] {
+            assert_eq!(
+                container_runtime_for(sandbox),
+                mx_agent_sandbox::Runtime::Docker,
+                "{sandbox:?} must map to the Docker runtime"
+            );
+        }
     }
 
     // --- enforce_verified_device (issue #240) ---

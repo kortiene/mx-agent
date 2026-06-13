@@ -134,6 +134,34 @@ jobs:
       - name: cargo test (mx-agent-ipc)
         run: cargo test -p mx-agent-ipc
 
+  sandbox-linux:
+    # Installs bubblewrap and runs the real-sandbox tests un-skipped, so a
+    # regression in the bwrap argv cannot hide behind the graceful skip the other
+    # jobs take (none install bwrap). MX_AGENT_REQUIRE_BWRAP makes the tests panic
+    # instead of skipping if bwrap is somehow not usable on the runner (issue #310).
+    runs-on: ubuntu-latest
+    env:
+      MX_AGENT_REQUIRE_BWRAP: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Detect Cargo workspace
+        id: cargo
+        run: |
+          if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Install bubblewrap
+        if: steps.cargo.outputs.present == 'true'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.cargo.outputs.present == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.cargo.outputs.present == 'true'
+      - name: Real-sandbox tests (mx-agent-sandbox)
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo test -p mx-agent-sandbox
+      - name: Real-bwrap orchestration e2e (mx-agent-daemon)
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo test -p mx-agent-daemon --test task_orchestration_e2e sandbox_policy_settings_flow_through_task_orchestration
+
   cargo-deny:
     # Enforces the dependency policy in deny.toml: security advisories, the
     # allowed-license set, and trusted crate sources. Denied licenses or

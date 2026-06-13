@@ -148,6 +148,13 @@ pub struct ExecutionPolicy {
     /// still scrubbed, so the allowlist cannot reintroduce a credential.
     #[serde(default)]
     pub env_allowlist: Vec<String>,
+    /// Container image the `docker`/`podman` sandbox backends run commands in.
+    ///
+    /// `None` uses the backend's built-in default (`debian:stable-slim`). The
+    /// runtime itself (`docker` vs `podman`) is selected by the `sandbox` value,
+    /// not here. Ignored by the `none` and `bubblewrap` backends (issue #310).
+    #[serde(default)]
+    pub container_image: Option<String>,
 }
 
 /// Per-agent authorization rules within a room.
@@ -287,6 +294,7 @@ impl Policy {
     pub fn validate(&self) -> Result<(), PolicyError> {
         validate_paths("execution.read_only_paths", &self.execution.read_only_paths)?;
         validate_paths("execution.writable_paths", &self.execution.writable_paths)?;
+        validate_sandbox("execution.default_sandbox", self.execution.default_sandbox)?;
 
         if let Some((idx, _)) = self
             .execution
@@ -342,8 +350,29 @@ impl Policy {
     }
 }
 
+/// Reject sandbox backends that are named in the policy vocabulary but not
+/// implemented, so they can never silently run with zero isolation (issue #310).
+///
+/// `firejail` and `chroot` parse cleanly but have no backend; mapping them to the
+/// `none` backend at dispatch would be a silent downgrade. Failing closed here at
+/// load time — with a precise dotted-path error naming the implemented
+/// alternatives — surfaces the misconfiguration to the operator instead.
+fn validate_sandbox(path: &str, sandbox: Option<Sandbox>) -> Result<(), PolicyError> {
+    match sandbox {
+        Some(backend @ (Sandbox::Firejail | Sandbox::Chroot)) => Err(PolicyError::Validation {
+            path: path.to_string(),
+            message: format!(
+                "sandbox backend {:?} is not implemented; use \"bubblewrap\", \"docker\", or \"podman\"",
+                backend.name()
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn validate_agent(prefix: &str, agent: &AgentPolicy) -> Result<(), PolicyError> {
     validate_paths(&format!("{prefix}.allow_cwd"), &agent.allow_cwd)?;
+    validate_sandbox(&format!("{prefix}.sandbox"), agent.sandbox)?;
 
     for (idx, pattern) in agent.deny_args_regex.iter().enumerate() {
         if let Err(err) = regex::Regex::new(pattern) {
@@ -464,6 +493,72 @@ network = "deny"
         assert!(!agent.requires_approval);
         assert_eq!(agent.sandbox, Some(Sandbox::Bubblewrap));
         assert_eq!(agent.network, Some(NetworkPolicy::Deny));
+    }
+
+    #[test]
+    fn execution_container_image_parses() {
+        let policy = Policy::parse(
+            "[execution]\ndefault_sandbox = \"podman\"\ncontainer_image = \"ghcr.io/acme/ci:1\"\n",
+        )
+        .expect("policy with container_image parses");
+        assert_eq!(
+            policy.execution.container_image.as_deref(),
+            Some("ghcr.io/acme/ci:1")
+        );
+        // The image flows into the execution-level confinement floor.
+        assert_eq!(
+            policy.execution_allowance().container_image.as_deref(),
+            Some("ghcr.io/acme/ci:1")
+        );
+    }
+
+    #[test]
+    fn unimplemented_execution_sandbox_is_rejected() {
+        // firejail / chroot parse but must fail validation with a precise dotted
+        // path, never silently run unsandboxed (issue #310).
+        for backend in ["firejail", "chroot"] {
+            let err = Policy::parse(&format!("[execution]\ndefault_sandbox = \"{backend}\"\n"))
+                .expect_err("unimplemented backend must be rejected");
+            match err {
+                PolicyError::Validation { path, message } => {
+                    assert_eq!(path, "execution.default_sandbox");
+                    assert!(message.contains(backend), "message: {message}");
+                    assert!(message.contains("not implemented"), "message: {message}");
+                }
+                other => panic!("expected a Validation error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unimplemented_agent_sandbox_is_rejected() {
+        // An agent-level sandbox override must be validated too, with the agent's
+        // dotted path (issue #310).
+        let toml = "\
+[rooms.\"!r:server\"]
+trusted = true
+
+[rooms.\"!r:server\".agents.\"@a:server\"]
+allow_exec = true
+sandbox = \"firejail\"
+";
+        let err = Policy::parse(toml).expect_err("agent firejail override must be rejected");
+        match err {
+            PolicyError::Validation { path, message } => {
+                assert!(path.ends_with(".sandbox"), "path: {path}");
+                assert!(path.contains("@a:server"), "path: {path}");
+                assert!(message.contains("firejail"), "message: {message}");
+            }
+            other => panic!("expected a Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn implemented_sandbox_backends_still_validate() {
+        for backend in ["none", "bubblewrap", "docker", "podman"] {
+            Policy::parse(&format!("[execution]\ndefault_sandbox = \"{backend}\"\n"))
+                .unwrap_or_else(|e| panic!("{backend} must validate, got {e:?}"));
+        }
     }
 
     #[test]

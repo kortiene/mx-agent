@@ -28,11 +28,11 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
-use mx_agent_sandbox::{sandbox_for, Restrictions};
+use mx_agent_sandbox::{preflight_backend, Restrictions};
 use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 use rustix::termios::{tcgetwinsize, tcsetwinsize, Winsize};
 
-use crate::runner::{restrictions_for, sanitize_env, RunError, RunSpec};
+use crate::runner::{resolve_sandbox, restrictions_for, sanitize_env, RunError, RunSpec};
 
 /// A terminal window size: character grid plus optional pixel dimensions.
 ///
@@ -161,6 +161,12 @@ impl PtySession {
         // shared, so tcgetwinsize on the master afterwards reflects this size.
         tcsetwinsize(&slave, size.into()).map_err(|e| RunError::Spawn(e.into()))?;
 
+        // Fail with an actionable diagnostic if the selected backend's launcher
+        // is missing, mirroring the batch runner (issue #310).
+        preflight_backend(spec.sandbox, spec.container_runtime).map_err(|message| {
+            RunError::Spawn(std::io::Error::new(std::io::ErrorKind::NotFound, message))
+        })?;
+
         // Launch through the selected sandbox backend (architecture §13.5),
         // mirroring the non-interactive runner: the backend rewrites the argv to
         // launch inside its wrapper (e.g. `bwrap …`) and so enforces the network
@@ -175,7 +181,7 @@ impl PtySession {
         // inside the container. The `none`/`bubblewrap` backends inherit the
         // parent's PTY slave directly and ignore this flag.
         restrictions.interactive = true;
-        let prepared = sandbox_for(spec.sandbox).prepare(spec.command.clone(), restrictions);
+        let prepared = resolve_sandbox(spec).prepare(spec.command.clone(), restrictions);
         let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
         let Restrictions { cwd, env, .. } = prepared.restrictions;
         let mut command = Command::new(program);
