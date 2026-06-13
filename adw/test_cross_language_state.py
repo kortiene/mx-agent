@@ -240,6 +240,12 @@ class V1ProjectionEquivalence(unittest.TestCase):
     def test_py_doc_has_exactly_the_v1_keys(self) -> None:
         self.assertEqual(set(self.py_doc), set(V1_KEYS))
 
+    def test_ts_doc_has_exactly_the_v1_keys_plus_additive(self) -> None:
+        # Symmetric with the py-doc guard: pins the TS document's full key set so
+        # a future TS-writer field not declared in TS_ADDITIVE_KEYS fails loudly
+        # here (forcing a conscious contract update), not silently.
+        self.assertEqual(set(self.ts_doc), set(V1_KEYS) | set(TS_ADDITIVE_KEYS))
+
 
 class BothFixturesValidateAgainstSchema(unittest.TestCase):
     """Criterion #2(i): both engines' output validates against the contract."""

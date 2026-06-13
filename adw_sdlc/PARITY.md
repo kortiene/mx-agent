@@ -35,7 +35,7 @@ abbreviated.
 | **Artifacts** — `review`/`document` write `commit_message.txt`/`pr_body.md`, absorbed into state | ✅ mocked | `orchestrator.test.ts` *…absorbs artifacts…*; `phases.test.ts` *keeps artifact-file instructions on BOTH output paths* |
 | **State equivalence (cross-language)** — `state.json` validates against `state.schema.json` and is loadable+resumable by Python `adw/` **and vice-versa** | ✅ mocked **(this PR)** | `adw/test_cross_language_state.py` + `cross-language-state.test.ts` (round-trip both directions, v1-projection equivalence, schema validation); `engine-parity.test.ts` (TS-side equivalence ×4 runners); `adw/test_state.py` `SchemaContractTests` |
 | **Cost/usage** — `total_cost_usd`/`usage` per phase: native for claude/opencode/pi, parent-priced for token-only (codex, anthropic classify); claude native `maxBudgetUsd` honored | ✅ mocked | `models-pricing.test.ts` *costUsd* (prices classify + codex tiers, null for unpriced, table scoped to token-only); `orchestrator.test.ts` *poisons total_cost_usd to null once any phase cost is unknown*; `runner-claude.test.ts` *forwards maxBudgetUsd*, *maps native budget cap to signal 'budget'* |
-| **adw/ green** — the unchanged Python `adw` suite stays green | ✅ | `python3 -m pytest adw/` (191 passed + 25 subtests as of this PR; only delta vs. pre-migration is additive `schema_version` + test-only files) |
+| **adw/ green** — the unchanged Python `adw` suite stays green | ✅ | `python3 -m pytest adw/` (192 passed + 25 subtests as of this PR; only delta vs. pre-migration is additive `schema_version` + test-only files) |
 
 ---
 

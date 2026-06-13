@@ -212,6 +212,14 @@ describe('cross-language state.json contract (TS half)', () => {
     it('the py fixture has exactly the v1 keys', () => {
       expect(Object.keys(readFixtureDoc(PY_FIXTURE)).sort()).toEqual([...V1_KEYS].sort());
     });
+
+    it('the ts fixture has exactly the v1 keys plus the additive keys (no other leakage)', () => {
+      // Symmetric with the py-fixture guard above: pins the TS document's full
+      // key set so a future TS-writer field that is not declared in
+      // TS_ADDITIVE_KEYS fails loudly here (and forces a conscious contract
+      // update), independent of the drift guard.
+      expect(Object.keys(readFixtureDoc(TS_FIXTURE)).sort()).toEqual([...V1_KEYS, ...TS_ADDITIVE_KEYS].sort());
+    });
   });
 
   describe('criterion #2(i): both engines validate against state.schema.json', () => {
