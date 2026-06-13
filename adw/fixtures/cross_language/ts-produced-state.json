@@ -1,0 +1,36 @@
+{
+  "adw_id": "00000000",
+  "schema_version": 1,
+  "issue_number": "5",
+  "issue_class": "feat",
+  "branch_name": "feat/5-00000000-cross-language-contract",
+  "base": "main",
+  "plan_file": "specs/5-cross-language-contract.md",
+  "pr_number": 42,
+  "pr_url": "https://github.com/kortiene/mx-agent/pull/42",
+  "commit_message": "feat: cross-language state contract\n\ncloses #5",
+  "pr_body": "Closes #5\n\nProves agents/{adw_id}/state.json round-trips across the py and ts engines.",
+  "review_findings": [
+    {
+      "severity": "blocker",
+      "description": "example blocker the patch gate must fix",
+      "location": "adw/_state.py:120"
+    }
+  ],
+  "completed_phases": [
+    "setup",
+    "classify",
+    "plan",
+    "implement",
+    "tests",
+    "resolve",
+    "e2e",
+    "review",
+    "patch",
+    "document",
+    "merge"
+  ],
+  "engine": "ts",
+  "runner": "claude",
+  "total_cost_usd": 0.4242
+}
