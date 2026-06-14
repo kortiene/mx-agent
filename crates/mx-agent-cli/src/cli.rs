@@ -152,6 +152,9 @@ enum DaemonCommand {
     Status,
     /// Stop the daemon.
     Stop,
+    /// Reload the stored session, (re)starting sync/scheduler/heartbeat without
+    /// a restart (e.g. after a post-start `auth login`).
+    Reload,
 }
 
 #[derive(Debug, Args)]
@@ -1678,10 +1681,19 @@ fn auth_login(global: &GlobalArgs, args: &AuthLoginArgs) -> ExitCode {
     match result {
         Ok(session) => {
             let paths = mx_agent_daemon::SessionPaths::resolve();
-            if let Err(e) = mx_agent_daemon::save_session(&paths, &session) {
+            // Persist via `persist_login_session` (not bare `save_session`) so a
+            // stale sync token / superseded same-user device store is cleared when
+            // the identity changes, and the new device performs an initial full
+            // sync (issue #316).
+            if let Err(e) = mx_agent_daemon::persist_login_session(&paths, &session) {
                 eprintln!("mx-agent: login succeeded but saving the session failed: {e}");
                 return ExitCode::FAILURE;
             }
+            // Best-effort: ask a running daemon to bring up sync/scheduler/
+            // heartbeat for the new session without a restart (issue #316). A
+            // silent no-op if no daemon is up — the next `daemon start` picks it
+            // up.
+            best_effort_session_reload(global);
             let status = mx_agent_daemon::AuthStatus::from_session(&session);
             if global.json {
                 println!("{}", status.to_json());
@@ -1733,12 +1745,33 @@ fn auth_status(global: &GlobalArgs) -> ExitCode {
 
 fn auth_logout(global: &GlobalArgs) -> ExitCode {
     let paths = mx_agent_daemon::SessionPaths::resolve();
-    match mx_agent_daemon::clear_session(&paths) {
-        Ok(()) => {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("mx-agent: could not start async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Best-effort server-side `/logout` invalidates the access token on the
+    // homeserver before clearing local state, so an exfiltrated `session.json`
+    // is no longer usable; a network failure degrades to a local-only logout.
+    // The token is never printed or logged (issue #316).
+    match runtime.block_on(mx_agent_daemon::logout_session(&paths)) {
+        Ok(outcome) => {
             if global.json {
-                println!("{{\"logged_in\":false}}");
+                println!(
+                    "{{\"logged_in\":false,\"server_side\":{}}}",
+                    outcome.server_side
+                );
+            } else if outcome.server_side {
+                println!("mx-agent: logged out (access token invalidated server-side)");
             } else {
-                println!("mx-agent: logged out");
+                println!(
+                    "mx-agent: logged out (local only; server-side logout could not be reached)"
+                );
             }
             ExitCode::SUCCESS
         }
@@ -1746,6 +1779,16 @@ fn auth_logout(global: &GlobalArgs) -> ExitCode {
             eprintln!("mx-agent: could not clear session: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Best-effort: ask a running daemon to (re)start its background workers for the
+/// currently stored session via the `session.reload` IPC method, ignoring all
+/// errors (issue #316). A no-op when no daemon is reachable.
+fn best_effort_session_reload(global: &GlobalArgs) {
+    let socket = daemon_socket_path(global);
+    if let Ok(mut client) = mx_agent_ipc::Client::connect(&socket) {
+        let _ = client.call("session.reload", serde_json::Value::Null);
     }
 }
 
@@ -1813,24 +1856,24 @@ fn trust_list(global: &GlobalArgs, args: &TrustListArgs) -> ExitCode {
 /// Approve an agent signing key in the local trust store.
 fn trust_approve(global: &GlobalArgs, args: &TrustApproveArgs) -> ExitCode {
     let paths = mx_agent_daemon::SessionPaths::resolve();
-    let mut store = match mx_agent_daemon::TrustStore::load(&paths) {
-        Ok(store) => store,
+    // The whole load-modify-save round trip runs under the data-dir advisory
+    // write lock so a concurrent `trust approve`/`trust revoke` cannot lost-update
+    // and silently drop a revocation (issue #316).
+    let entry = match mx_agent_daemon::update_trust_store(&paths, |store| {
+        store.approve(
+            args.agent.clone(),
+            args.key.clone(),
+            args.fingerprint.clone(),
+            args.room.clone(),
+            None,
+        )
+    }) {
+        Ok(entry) => entry,
         Err(e) => {
-            eprintln!("mx-agent: could not read trust store: {e}");
+            eprintln!("mx-agent: could not update trust store: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let entry = store.approve(
-        args.agent.clone(),
-        args.key.clone(),
-        args.fingerprint.clone(),
-        args.room.clone(),
-        None,
-    );
-    if let Err(e) = store.save(&paths) {
-        eprintln!("mx-agent: could not save trust store: {e}");
-        return ExitCode::FAILURE;
-    }
     if global.json {
         println!(
             "{}",
@@ -1846,19 +1889,19 @@ fn trust_approve(global: &GlobalArgs, args: &TrustApproveArgs) -> ExitCode {
 /// Revoke an agent signing key in the local trust store.
 fn trust_revoke(global: &GlobalArgs, args: &TrustRevokeArgs) -> ExitCode {
     let paths = mx_agent_daemon::SessionPaths::resolve();
-    let mut store = match mx_agent_daemon::TrustStore::load(&paths) {
-        Ok(store) => store,
+    // Locked load-modify-save round trip so a concurrent approve/revoke cannot
+    // lost-update and drop this revocation (issue #316).
+    let revoked = match mx_agent_daemon::update_trust_store(&paths, |store| {
+        store.revoke(&args.agent, &args.key)
+    }) {
+        Ok(revoked) => revoked,
         Err(e) => {
-            eprintln!("mx-agent: could not read trust store: {e}");
+            eprintln!("mx-agent: could not update trust store: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match store.revoke(&args.agent, &args.key) {
+    match revoked {
         Some(entry) => {
-            if let Err(e) = store.save(&paths) {
-                eprintln!("mx-agent: could not save trust store: {e}");
-                return ExitCode::FAILURE;
-            }
             if global.json {
                 println!(
                     "{}",
@@ -3625,7 +3668,36 @@ fn handle_daemon(global: &GlobalArgs, cmd: &DaemonCommand) -> ExitCode {
         DaemonCommand::Start(args) => daemon_start(global, args.foreground),
         DaemonCommand::Status => daemon_status(global),
         DaemonCommand::Stop => daemon_stop(global),
+        DaemonCommand::Reload => daemon_reload(global),
     }
+}
+
+/// Reload the daemon's stored session over IPC, (re)starting its background
+/// workers without a process restart (issue #316).
+fn daemon_reload(global: &GlobalArgs) -> ExitCode {
+    #[derive(serde::Deserialize)]
+    struct ReloadResult {
+        started: bool,
+        logged_in: bool,
+    }
+    let result: ReloadResult =
+        match daemon_ipc_call(global, "session.reload", &serde_json::Value::Null) {
+            Ok(result) => result,
+            Err(code) => return code,
+        };
+    if global.json {
+        println!(
+            "{{\"started\":{},\"logged_in\":{}}}",
+            result.started, result.logged_in
+        );
+    } else if result.started {
+        println!("mx-agent daemon: session reloaded; sync/scheduler/heartbeat running");
+    } else if result.logged_in {
+        println!("mx-agent daemon: session reloaded but workers did not start");
+    } else {
+        println!("mx-agent daemon: no session stored; nothing to start (run `auth login`)");
+    }
+    ExitCode::SUCCESS
 }
 
 fn daemon_start(global: &GlobalArgs, foreground: bool) -> ExitCode {
@@ -3693,7 +3765,18 @@ fn daemon_status(global: &GlobalArgs) -> ExitCode {
                 println!("  socket:  {}", running.socket_path);
                 println!("  version: {}", running.version);
                 if let Some(sync) = &running.sync {
-                    println!("  sync:    {:?}", sync.state);
+                    // Surface a dead/degraded sync loop prominently rather than
+                    // burying it: a Stopped loop means the daemon is no longer
+                    // processing Matrix events until re-login + reload (issue #316).
+                    match sync.state {
+                        mx_agent_daemon::SyncState::Stopped => {
+                            println!("  sync:    STOPPED (unhealthy — re-login + `daemon reload` to resume)");
+                        }
+                        mx_agent_daemon::SyncState::Degraded => {
+                            println!("  sync:    DEGRADED (retrying)");
+                        }
+                        other => println!("  sync:    {other:?}"),
+                    }
                     println!("    syncs:    {}", sync.total_syncs);
                     if sync.consecutive_failures > 0 {
                         println!("    failures: {}", sync.consecutive_failures);
@@ -3762,6 +3845,7 @@ fn command_path(command: &Command) -> String {
                 DaemonCommand::Start(_) => "start",
                 DaemonCommand::Status => "status",
                 DaemonCommand::Stop => "stop",
+                DaemonCommand::Reload => "reload",
             }
         ),
         Command::Auth(c) => format!(

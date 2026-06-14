@@ -227,21 +227,26 @@ pub fn run_foreground() -> io::Result<()> {
     };
     write_status_file(&paths, &status)?;
 
-    // Start the Matrix sync loop if a session is present. The loop's health is
-    // shared with the IPC handler so `daemon.status` reports live progress. The
-    // loop runs on its own Tokio runtime and is signalled to stop on shutdown.
-    // When a session is present the same restored client also drives the live
-    // task scheduler loop (architecture §9.2, issue #199).
-    let sync_running = Arc::new(AtomicBool::new(true));
+    // Restart janitor: reap any exec child process groups left alive by a
+    // previous daemon run (a crash or a force-kill that never ran the graceful
+    // teardown) before starting fresh work (issue #316).
+    crate::exec::reap_orphaned_live_exec_children(&SessionPaths::resolve());
+
+    // Start the Matrix sync loop if a session is present. The supervisor owns the
+    // current worker generation (sync + scheduler + heartbeat) and its shared
+    // health, so `daemon.status` reports live progress and a post-start
+    // `auth login` can bring the workers up via `session.reload` without a daemon
+    // restart (issue #316). When a session is present the same restored client
+    // drives the live task scheduler loop (architecture §9.2, issue #199).
     let exec_subscribers = crate::ExecSubscriberRegistry::new();
-    let ((sync_thread, scheduler_thread, heartbeat_thread), health) =
-        spawn_matrix_workers(sync_running.clone(), exec_subscribers.clone());
+    let supervisor = WorkerSupervisor::new(exec_subscribers.clone());
+    supervisor.ensure_started();
 
     // Serve IPC requests on a background thread. The thread is torn down when
     // the process exits after shutdown.
     let listener = socket.listener().try_clone()?;
     let handler_socket = socket_path.clone();
-    let handler_health = health.clone();
+    let handler_supervisor = supervisor.clone();
     let _server = std::thread::spawn(move || {
         let handler = move |req: &Request, stream: &mut std::os::unix::net::UnixStream| {
             dispatch_streaming(
@@ -250,7 +255,7 @@ pub fn run_foreground() -> io::Result<()> {
                 pid,
                 started_at,
                 &handler_socket,
-                &handler_health,
+                &handler_supervisor,
                 &exec_subscribers,
             )
         };
@@ -266,20 +271,17 @@ pub fn run_foreground() -> io::Result<()> {
         tracing::info!(signal, "received shutdown signal");
     }
 
-    // Signal the sync, scheduler, and heartbeat loops to stop and wait for them
-    // to wind down.
-    sync_running.store(false, Ordering::SeqCst);
-    if let Some(handle) = sync_thread {
-        let _ = handle.join();
-    }
-    if let Some(handle) = scheduler_thread {
-        let _ = handle.join();
-    }
-    if let Some(handle) = heartbeat_thread {
-        let _ = handle.join();
-    }
-    // Drop the shared client so a later in-process run restores a fresh one.
-    crate::matrix::clear_active_client();
+    // Tear down in-flight exec child process groups before winding down the
+    // workers, so the common `daemon stop` path never orphans them when their
+    // owning runtime is dropped (issue #316). The SIGTERM→SIGKILL grace is kept
+    // well under `daemon stop`'s own 5s grace so this graceful teardown finishes
+    // before `stop` would escalate to SIGKILLing the daemon.
+    crate::exec::terminate_live_exec_children(&SessionPaths::resolve(), Duration::from_secs(2));
+
+    // Signal the sync, scheduler, and heartbeat loops to stop, wait for them to
+    // wind down, and drop the shared client so a later in-process run restores a
+    // fresh one.
+    supervisor.wind_down();
 
     remove_status_file(&paths);
     drop(socket);
@@ -335,6 +337,14 @@ fn spawn_matrix_workers(
     let shared_client: Arc<Mutex<Option<matrix_sdk::Client>>> = Arc::new(Mutex::new(None));
     let loop_health = health.clone();
     let sync_running = running.clone();
+    // On any non-shutdown sync exit (fatal auth error, persistence error, or a
+    // failed restore) the sync thread clears the shared generation flag so the
+    // scheduler and heartbeat loops — which watch the same flag — wind down with
+    // it, leaving the daemon idle but alive (still serving IPC, recoverable via
+    // re-login + `session.reload`) instead of running on a dead-token client
+    // (issue #316). On a graceful shutdown the flag is already clear, so this is
+    // a no-op.
+    let sync_wind_down = running.clone();
     let publish_client = shared_client.clone();
     // The scheduler shares the registry the sync loop forwards Matrix exec
     // results into, so Matrix-backed task dispatch can await those results.
@@ -380,6 +390,9 @@ fn spawn_matrix_workers(
                 tracing::warn!(error = %e, "sync loop exited with error");
             }
         });
+        // Wind down the rest of the generation if the loop stopped for any
+        // reason other than a requested shutdown (issue #316).
+        sync_wind_down.store(false, Ordering::SeqCst);
     });
 
     // The heartbeat thread shares the same restored client (waiting on the same
@@ -452,6 +465,117 @@ fn spawn_matrix_workers(
         Some(heartbeat_handle),
     );
     (threads, Some(health))
+}
+
+/// The current generation of background workers owned by a [`WorkerSupervisor`].
+struct WorkerGeneration {
+    /// The generation's shutdown flag, shared with all three loops. `None` when
+    /// no workers are running.
+    running: Option<Arc<AtomicBool>>,
+    /// The generation's live sync health, surfaced through `daemon.status`.
+    health: SharedHealth,
+    /// Join handles for the sync, scheduler, and heartbeat threads.
+    threads: WorkerThreads,
+}
+
+/// Owns the daemon's background worker generation (sync + scheduler + heartbeat)
+/// behind a shared handle, so the IPC handler and the shutdown path can start,
+/// reload, and inspect it (issue #316).
+///
+/// Lifting worker state into a supervisor lets a post-start `auth login` bring
+/// the loops up without a daemon restart (via the `session.reload` IPC method),
+/// makes `daemon.status` reflect a sync loop that started *after* daemon start,
+/// and gives the fatal-stop wind-down a single place to reload a fresh
+/// generation. Clones share one inner generation (`Arc<Mutex<…>>`).
+#[derive(Clone)]
+struct WorkerSupervisor {
+    inner: Arc<Mutex<WorkerGeneration>>,
+    exec_subscribers: crate::ExecSubscriberRegistry,
+}
+
+impl WorkerSupervisor {
+    /// Create a supervisor with no workers running yet.
+    fn new(exec_subscribers: crate::ExecSubscriberRegistry) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(WorkerGeneration {
+                running: None,
+                health: None,
+                threads: (None, None, None),
+            })),
+            exec_subscribers,
+        }
+    }
+
+    /// The current generation's sync health, for `daemon.status`. `None` when no
+    /// workers are running (e.g. before first login).
+    fn health(&self) -> SharedHealth {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .health
+            .clone()
+    }
+
+    /// Spawn the workers if none run and a session exists; no-op otherwise.
+    ///
+    /// Returns whether workers are running afterwards (`false` only when there is
+    /// still no stored session to start them for).
+    fn ensure_started(&self) -> bool {
+        let mut gen = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if gen.running.is_some() {
+            return true;
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        let (threads, health) =
+            spawn_matrix_workers(running.clone(), self.exec_subscribers.clone());
+        if health.is_none() {
+            // No session: nothing was spawned. Stay idle.
+            return false;
+        }
+        gen.running = Some(running);
+        gen.health = health;
+        gen.threads = threads;
+        true
+    }
+
+    /// Wind down the current generation: clear its flag, join its threads, and
+    /// drop the shared client so a later restore is fresh.
+    fn wind_down(&self) {
+        let (running, threads) = {
+            let mut gen = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let running = gen.running.take();
+            let threads = std::mem::take(&mut gen.threads);
+            gen.health = None;
+            (running, threads)
+        };
+        if let Some(running) = running {
+            running.store(false, Ordering::SeqCst);
+        }
+        // Join outside the lock so a worker that touches the supervisor cannot
+        // deadlock against the wind-down.
+        let (sync_thread, scheduler_thread, heartbeat_thread) = threads;
+        if let Some(handle) = sync_thread {
+            let _ = handle.join();
+        }
+        if let Some(handle) = scheduler_thread {
+            let _ = handle.join();
+        }
+        if let Some(handle) = heartbeat_thread {
+            let _ = handle.join();
+        }
+        crate::matrix::clear_active_client();
+    }
+
+    /// Wind down the current generation and start a fresh one (used by
+    /// `session.reload` and a post-login reload). Returns `(started, logged_in)`.
+    fn reload(&self) -> (bool, bool) {
+        self.wind_down();
+        let started = self.ensure_started();
+        let logged_in = load_session(&SessionPaths::resolve())
+            .map(|s| s.is_some())
+            .unwrap_or(false);
+        (started, logged_in)
+    }
 }
 
 fn write_ipc_response(
@@ -532,13 +656,24 @@ fn dispatch(
     pid: u32,
     started_at: u64,
     socket_path: &str,
-    health: &SharedHealth,
+    supervisor: &WorkerSupervisor,
     exec_subscribers: Option<&crate::ExecSubscriberRegistry>,
 ) -> Response {
     match req.method.as_str() {
         "daemon.ping" => Response::result(req.id.clone(), json!({"pong": true})),
+        // Bring the background workers up (or restart them) against the currently
+        // stored session, so a post-start `auth login` starts sync/scheduler/
+        // heartbeat without a daemon restart (issue #316).
+        "session.reload" => {
+            let (started, logged_in) = supervisor.reload();
+            Response::result(
+                req.id.clone(),
+                json!({ "started": started, "logged_in": logged_in }),
+            )
+        }
         "daemon.status" => {
-            let sync = health
+            let sync = supervisor
+                .health()
                 .as_ref()
                 .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone());
             let status = RunningStatus {
@@ -1246,7 +1381,7 @@ fn dispatch_streaming(
     pid: u32,
     started_at: u64,
     socket_path: &str,
-    health: &SharedHealth,
+    supervisor: &WorkerSupervisor,
     exec_subscribers: &crate::ExecSubscriberRegistry,
 ) -> io::Result<()> {
     if req.method == "task.watch" {
@@ -1263,7 +1398,7 @@ fn dispatch_streaming(
             pid,
             started_at,
             socket_path,
-            health,
+            supervisor,
             Some(exec_subscribers),
         );
         write_ipc_response(stream, &response)
@@ -1356,6 +1491,10 @@ pub fn stop(grace: Duration) -> io::Result<StopOutcome> {
 
     let _ = kill(target, Signal::SIGKILL);
     std::thread::sleep(Duration::from_millis(100));
+    // The force-killed daemon never ran its graceful exec-child teardown, so
+    // SIGKILL any process groups it recorded in the live-pgid sidecar; otherwise
+    // in-flight exec children (and their grandchildren) would orphan (issue #316).
+    crate::exec::kill_persisted_live_exec_children(&SessionPaths::resolve());
     remove_status_file(&paths);
     Ok(StopOutcome::Killed(pid))
 }
@@ -1371,6 +1510,14 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// An idle supervisor for dispatch tests: it spawns no workers (its
+    /// `ensure_started` is never called here), so `health()` is `None` and
+    /// `daemon.status` reports no sync loop — exactly the pre-login state these
+    /// tests exercise.
+    fn test_supervisor() -> WorkerSupervisor {
+        WorkerSupervisor::new(crate::ExecSubscriberRegistry::new())
     }
 
     struct TempRuntime {
@@ -1452,7 +1599,14 @@ mod tests {
             "task.cancel",
         ] {
             let req = Request::new(json!(1), method, Value::Null);
-            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+            let response = dispatch(
+                &req,
+                1,
+                now_unix(),
+                "/tmp/daemon.sock",
+                &test_supervisor(),
+                None,
+            );
             let error = response.error.expect("invalid params should be rejected");
             assert_eq!(error.code, INVALID_PARAMS);
             assert!(error.message.contains("invalid params"));
@@ -1468,7 +1622,14 @@ mod tests {
             "task.list",
             json!({"room":"!abc:matrix.org","state":null,"assigned_to":null}),
         );
-        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+        let response = dispatch(
+            &req,
+            1,
+            now_unix(),
+            "/tmp/daemon.sock",
+            &test_supervisor(),
+            None,
+        );
         let error = response.error.expect("missing session should be rejected");
         assert_eq!(error.code, INTERNAL_ERROR);
         assert!(error.message.contains("not logged in"));
@@ -1505,7 +1666,14 @@ mod tests {
         for method in methods {
             // `null` params never satisfy a struct-shaped parameter.
             let req = Request::new(json!(1), method, Value::Null);
-            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+            let response = dispatch(
+                &req,
+                1,
+                now_unix(),
+                "/tmp/daemon.sock",
+                &test_supervisor(),
+                None,
+            );
             let error = response
                 .error
                 .unwrap_or_else(|| panic!("{method}: invalid params should be rejected"));
@@ -1525,7 +1693,14 @@ mod tests {
             "workspace.status",
             json!({"room":"!abc:matrix.org"}),
         );
-        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+        let response = dispatch(
+            &req,
+            1,
+            now_unix(),
+            "/tmp/daemon.sock",
+            &test_supervisor(),
+            None,
+        );
         let error = response.error.expect("missing session should be rejected");
         assert_eq!(error.code, INTERNAL_ERROR);
         assert!(error.message.contains("not logged in"));
@@ -1541,7 +1716,14 @@ mod tests {
             crate::METHOD_DEVICE_VERIFY_START,
         ] {
             let req = Request::new(json!(1), method, json!({"room":"!abc:matrix.org"}));
-            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+            let response = dispatch(
+                &req,
+                1,
+                now_unix(),
+                "/tmp/daemon.sock",
+                &test_supervisor(),
+                None,
+            );
             let error = response
                 .error
                 .expect("streaming method on single-response path");
@@ -1562,7 +1744,14 @@ mod tests {
     fn removed_device_verify_confirm_cancel_methods_are_unknown() {
         for method in ["device.verify.confirm", "device.verify.cancel"] {
             let req = Request::new(json!(1), method, json!({"flow_id":"flow_abc"}));
-            let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+            let response = dispatch(
+                &req,
+                1,
+                now_unix(),
+                "/tmp/daemon.sock",
+                &test_supervisor(),
+                None,
+            );
             let error = response
                 .error
                 .unwrap_or_else(|| panic!("{method}: removed method should error"));
@@ -1576,7 +1765,14 @@ mod tests {
     fn exec_start_rejects_invalid_params() {
         // Missing the required `command` field.
         let req = Request::new(json!(1), "exec.start", json!({"cwd":"/tmp"}));
-        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+        let response = dispatch(
+            &req,
+            1,
+            now_unix(),
+            "/tmp/daemon.sock",
+            &test_supervisor(),
+            None,
+        );
         let error = response.error.expect("invalid params should be rejected");
         assert_eq!(error.code, INVALID_PARAMS);
         assert!(error.message.contains("exec.start"));
@@ -1591,7 +1787,14 @@ mod tests {
             "exec.start",
             json!({"command":["true"],"cwd":std::env::temp_dir()}),
         );
-        let response = dispatch(&req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+        let response = dispatch(
+            &req,
+            1,
+            now_unix(),
+            "/tmp/daemon.sock",
+            &test_supervisor(),
+            None,
+        );
         assert!(response.error.is_none(), "unexpected error: {response:?}");
         let result = response.result.expect("exec.start should return a result");
         let parsed: crate::ExecStartResult = serde_json::from_value(result).unwrap();
@@ -1617,7 +1820,14 @@ mod tests {
             "exec.stdin",
             json!({"invocation_id":"inv_1","data":[104,105],"eof":true}),
         );
-        let stdin_response = dispatch(&stdin_req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+        let stdin_response = dispatch(
+            &stdin_req,
+            1,
+            now_unix(),
+            "/tmp/daemon.sock",
+            &test_supervisor(),
+            None,
+        );
         assert!(stdin_response.result.is_none());
         let error = stdin_response
             .error
@@ -1630,7 +1840,14 @@ mod tests {
             "exec.cancel",
             json!({"invocation_id":"inv_1","reason":"test"}),
         );
-        let cancel_response = dispatch(&cancel_req, 1, now_unix(), "/tmp/daemon.sock", &None, None);
+        let cancel_response = dispatch(
+            &cancel_req,
+            1,
+            now_unix(),
+            "/tmp/daemon.sock",
+            &test_supervisor(),
+            None,
+        );
         assert!(cancel_response.result.is_none());
         let error = cancel_response
             .error

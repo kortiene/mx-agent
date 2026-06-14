@@ -173,7 +173,7 @@ mx-agent --json daemon start
 ```
 
 **Notes**
-On startup, the daemon binds the Unix-domain socket with mode 0600 (readable/writable by owner only) and validates that the runtime directory is private to the current user. If a Matrix session exists, the daemon spawns a sync loop and a live task scheduler; otherwise, it idles waiting for `auth login`. The status file is written to `$MX_AGENT_RUNTIME_DIR/daemon.json` (defaults to `$XDG_RUNTIME_DIR/mx-agent`). The socket is unlinked on shutdown.
+On startup, the daemon binds the Unix-domain socket with mode 0600 (readable/writable by owner only) and validates that the runtime directory is private to the current user. If a Matrix session exists, the daemon spawns the sync loop, the live task scheduler, and the heartbeat loop; otherwise, it idles waiting for `auth login`. A post-start `auth login` brings these loops up without a daemon restart: `auth login` triggers a best-effort `session.reload` automatically (or run `mx-agent daemon reload`). The status file is written to `$MX_AGENT_RUNTIME_DIR/daemon.json` (defaults to `$XDG_RUNTIME_DIR/mx-agent`). The socket is unlinked on shutdown.
 
 ---
 
@@ -303,7 +303,34 @@ mx-agent daemon status  # exit 3
 ```
 
 **Notes**
-The graceful shutdown gives the daemon 5 seconds to exit cleanly (e.g., flush logs, close Matrix sockets) before forcibly killing it. Any running invocations are cancelled with SIGTERM followed by SIGKILL per the standard cancel grace policy. The status file is removed on shutdown. Under the hood, stop reads the PID from the status file and signals it directly; it does not use IPC.
+The graceful shutdown gives the daemon 5 seconds to exit cleanly (e.g., flush logs, close Matrix sockets) before forcibly killing it. Before winding down, the daemon terminates any in-flight `exec` child process groups (SIGTERM then SIGKILL) so none are orphaned. If the daemon has to be force-killed, `stop` also SIGKILLs any process groups recorded in the daemon's live-pgid sidecar, so in-flight children (and their grandchildren) are reaped rather than left behind. The status file is removed on shutdown. Under the hood, stop reads the PID from the status file and signals it directly; it does not use IPC.
+
+### `mx-agent daemon reload`
+
+Reload the stored Matrix session and (re)start the daemon's sync, scheduler, and heartbeat loops without restarting the process.
+
+**Synopsis**
+
+```text
+mx-agent [GLOBAL] daemon reload
+```
+
+**Options**
+
+| Option | Value | Required | Default | Description |
+|---|---|---|---|---|
+| (none) | — | — | — | |
+
+**Behavior**
+Sends the `session.reload` IPC method to the running daemon. The daemon winds down the current worker generation (if any), then starts a fresh one against the currently stored session. Use it after a post-start `auth login` to bring the workers up without a restart, or to recover after a sync loop went fatal (e.g., a server-side logout invalidated the token). `auth login` already triggers this best-effort automatically; `daemon reload` is the explicit form.
+
+In human mode, prints whether the workers started; with `--json`, emits `{"started":<bool>,"logged_in":<bool>}`.
+
+**Exit codes**
+
+- 0: reload request acknowledged
+- 1: encoding/response error
+- 3: daemon not reachable
 
 ## `auth` — Manage Matrix authentication
 
@@ -422,14 +449,16 @@ mx-agent [GLOBAL] auth logout
 None.
 
 **Behavior**
-Removes the persisted session file. The daemon is unaffected (does not unregister the device or revoke the token server-side); restarting the daemon later will fail to sync until you `auth login` again. In human mode, prints `mx-agent: logged out`; in `--json`, outputs `{"logged_in":false}`.
+Makes a best-effort server-side `/logout` call to invalidate the access token on the homeserver, then clears all local session state: the session file, the per-device crypto store, the crypto-store key, and the persisted `/sync` batch token. A network/HTTP failure degrades cleanly to a local-only logout (local state is still cleared). The access/refresh token is never printed or logged. In human mode, prints `mx-agent: logged out (access token invalidated server-side)` (or a local-only note on degrade); in `--json`, outputs `{"logged_in":false,"server_side":<bool>}`.
+
+Clearing the sync token means a later `auth login` (always a brand-new device) performs an initial full sync rather than resuming from the previous session's stale batch.
 
 **Exit codes**
 
 | Code | Meaning |
 |---|---|
-| 0 | Successfully cleared session |
-| 1 | Error deleting session file (e.g., permission denied) |
+| 0 | Successfully logged out (server-side or local-only) |
+| 1 | Error clearing local session state (e.g., permission denied) |
 
 **Examples**
 
@@ -439,8 +468,8 @@ mx-agent auth logout
 
 **Notes**
 
-- Does not contact the homeserver or require the daemon to run.
-- The daemon's in-memory session reference will be stale until it is restarted.
+- Attempts to contact the homeserver to invalidate the token, but does not require the daemon to be running and never fails the command on a network error (it degrades to local-only).
+- If a daemon is running, the server-side logout immediately invalidates its access token, so its sync loop goes fatal (`daemon status` reports `STOPPED`). Resume with `auth login` (which best-effort triggers `session.reload`) or `mx-agent daemon reload`.
 
 ### `mx-agent auth cross-signing bootstrap`
 
