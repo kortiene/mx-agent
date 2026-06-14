@@ -253,8 +253,12 @@ enum RecoveryCommand {
 
 #[derive(Debug, Args)]
 struct RecoveryRecoverArgs {
-    /// Recovery key recorded when recovery was enabled. If omitted, it is read
-    /// from `MX_AGENT_RECOVERY_KEY` or prompted on stdin.
+    /// Recovery key recorded when recovery was enabled.
+    ///
+    /// WARNING: passing the key here exposes it in shell history and `ps`
+    /// output; prefer `MX_AGENT_RECOVERY_KEY` or the interactive prompt. If
+    /// omitted, it is read from `MX_AGENT_RECOVERY_KEY` or prompted on stdin
+    /// (no echo).
     #[arg(long = "recovery-key", value_name = "KEY")]
     recovery_key: Option<String>,
 }
@@ -1458,10 +1462,28 @@ fn recovery_status(global: &GlobalArgs) -> ExitCode {
     }
 }
 
+/// Warning printed to stderr when the recovery key is supplied via the
+/// `--recovery-key` argv flag, where it lands in shell history and `ps` output.
+///
+/// Returned as a constant (rather than inlined) so it can be asserted directly
+/// in a unit test without driving the full command.
+const RECOVERY_KEY_ARGV_WARNING: &str = "mx-agent: warning: --recovery-key is visible in shell \
+     history and `ps`; prefer MX_AGENT_RECOVERY_KEY or the interactive prompt";
+
 /// Resolve the recovery key from `--recovery-key`, the environment, or a prompt.
+///
+/// Precedence is argv, then `MX_AGENT_RECOVERY_KEY`, then an interactive prompt.
+/// Supplying the key on argv prints [`RECOVERY_KEY_ARGV_WARNING`] to stderr
+/// because it is exposed in shell history and `ps`. The interactive prompt reads
+/// with terminal echo suppressed via [`prompt_secret_line`] (the same no-echo
+/// path as the login password, issue #273), so the typed key never lands on
+/// screen, in scrollback, or in a `script(1)` transcript. Only leading/trailing
+/// whitespace is trimmed: Matrix recovery keys are space-grouped and may contain
+/// internal spaces.
 fn resolve_recovery_key(args: &RecoveryRecoverArgs) -> Result<String, ExitCode> {
     if let Some(key) = &args.recovery_key {
         if !key.is_empty() {
+            eprintln!("{RECOVERY_KEY_ARGV_WARNING}");
             return Ok(key.clone());
         }
     }
@@ -1470,14 +1492,13 @@ fn resolve_recovery_key(args: &RecoveryRecoverArgs) -> Result<String, ExitCode> 
             return Ok(key);
         }
     }
-    use std::io::Write as _;
-    eprint!("Recovery key: ");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        eprintln!("mx-agent: could not read recovery key");
-        return Err(ExitCode::FAILURE);
-    }
+    let line = match prompt_secret_line("Recovery key: ") {
+        Ok(line) => line,
+        Err(_) => {
+            eprintln!("mx-agent: could not read recovery key");
+            return Err(ExitCode::FAILURE);
+        }
+    };
     let key = line.trim().to_string();
     if key.is_empty() {
         eprintln!(
@@ -1493,7 +1514,9 @@ fn recovery_recover(global: &GlobalArgs, args: &RecoveryRecoverArgs) -> ExitCode
         Ok(key) => key,
         Err(code) => return code,
     };
-    let params = mx_agent_daemon::RecoverParams { recovery_key };
+    let params = mx_agent_daemon::RecoverParams {
+        recovery_key: mx_agent_daemon::Secret::new(recovery_key),
+    };
     match daemon_ipc_call::<_, mx_agent_daemon::RecoveryStatusInfo>(
         global,
         "recovery.recover",
@@ -1531,15 +1554,32 @@ fn read_password() -> std::io::Result<String> {
             return Ok(pw);
         }
     }
-    eprint!("Matrix password: ");
+    // Read with terminal echo suppressed on a TTY (shared with the recovery-key
+    // prompt). No further trimming: the verbatim semantics are covered by
+    // `read_password_env_var_returned_verbatim`.
+    prompt_secret_line("Matrix password: ")
+}
+
+/// Prompt on stderr and read one line from stdin with terminal echo suppressed
+/// on a TTY.
+///
+/// Echo suppression uses [`EchoOffGuard`], which returns `None` for non-TTY
+/// stdin (pipes, here-docs, the test harness); in that case the read proceeds
+/// normally so scripted input still works. The returned line has only its
+/// trailing newline (`\n`/`\r`) stripped — callers apply any further trimming.
+/// The value is never echoed, logged, or stored. Shared by [`read_password`]
+/// and [`resolve_recovery_key`] so there is a single no-echo secret-reading
+/// path to audit.
+fn prompt_secret_line(prompt: &str) -> std::io::Result<String> {
     use std::io::Write;
+    eprint!("{prompt}");
     std::io::stderr().flush()?;
     // Suppress echo while reading from a TTY. `activate()` returns `None` for a
     // non-TTY stdin (pipe, here-doc, test harness), in which case the read
     // proceeds normally and scriptability is preserved.
     let guard = EchoOffGuard::activate();
-    let mut pw = String::new();
-    let read = std::io::stdin().read_line(&mut pw);
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
     // With echo suppressed the user's Enter keystroke is not echoed either, so
     // emit the newline ourselves to terminate the prompt line before any
     // subsequent output. Do this regardless of read success so an error message
@@ -1548,7 +1588,7 @@ fn read_password() -> std::io::Result<String> {
         let _ = writeln!(std::io::stderr());
     }
     read?;
-    Ok(pw.trim_end_matches(['\n', '\r']).to_string())
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
 /// RAII guard that clears the terminal `ECHO` (and `ECHONL`) local-mode flags on
@@ -6119,6 +6159,170 @@ mod tests {
             after.local_modes.contains(LocalModes::ICANON),
             had_icanon,
             "ICANON must be intact after guard is dropped"
+        );
+    }
+
+    /// Serializes the tests that mutate `MX_AGENT_RECOVERY_KEY`, since the
+    /// process environment is global shared state.
+    static ENV_RECOVERY_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn recovery_key_argv_warning_mentions_exposure_and_alternatives() {
+        // The warning must name the exposure (shell history / `ps`) and steer to
+        // the safer inputs, so an operator who uses `--recovery-key` is told why
+        // and what to use instead.
+        assert!(RECOVERY_KEY_ARGV_WARNING.contains("shell history"));
+        assert!(RECOVERY_KEY_ARGV_WARNING.contains("ps"));
+        assert!(RECOVERY_KEY_ARGV_WARNING.contains(ENV_RECOVERY_KEY));
+    }
+
+    #[test]
+    fn resolve_recovery_key_prefers_argv() {
+        // An explicit `--recovery-key` is returned verbatim (preserving internal
+        // spaces) without consulting the environment or prompting.
+        let _lock = ENV_RECOVERY_KEY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_RECOVERY_KEY).ok();
+        std::env::set_var(ENV_RECOVERY_KEY, "from env should be ignored");
+        let args = RecoveryRecoverArgs {
+            recovery_key: Some("EsTL abcd efgh".to_string()),
+        };
+        let resolved = resolve_recovery_key(&args);
+        match prev {
+            Some(v) => std::env::set_var(ENV_RECOVERY_KEY, v),
+            None => std::env::remove_var(ENV_RECOVERY_KEY),
+        }
+        assert_eq!(resolved.expect("argv key resolves"), "EsTL abcd efgh");
+    }
+
+    #[test]
+    fn resolve_recovery_key_prefers_env_when_no_argv() {
+        // With no `--recovery-key`, the env var is used and the interactive
+        // prompt (which would block on stdin) is never reached.
+        let _lock = ENV_RECOVERY_KEY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_RECOVERY_KEY).ok();
+        std::env::set_var(ENV_RECOVERY_KEY, "EsTL from env");
+        let args = RecoveryRecoverArgs { recovery_key: None };
+        let resolved = resolve_recovery_key(&args);
+        match prev {
+            Some(v) => std::env::set_var(ENV_RECOVERY_KEY, v),
+            None => std::env::remove_var(ENV_RECOVERY_KEY),
+        }
+        assert_eq!(resolved.expect("env key resolves"), "EsTL from env");
+    }
+
+    #[test]
+    fn resolve_recovery_key_empty_argv_falls_through_to_env() {
+        // An empty `--recovery-key ""` is treated as absent (not returned
+        // verbatim) so the env-var path is tried next, and the argv-exposure
+        // warning is NOT printed for an empty value.
+        let _lock = ENV_RECOVERY_KEY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_RECOVERY_KEY).ok();
+        std::env::set_var(ENV_RECOVERY_KEY, "EsTL from env fallback");
+        let args = RecoveryRecoverArgs {
+            recovery_key: Some("".to_string()),
+        };
+        let resolved = resolve_recovery_key(&args);
+        match prev {
+            Some(v) => std::env::set_var(ENV_RECOVERY_KEY, v),
+            None => std::env::remove_var(ENV_RECOVERY_KEY),
+        }
+        assert_eq!(
+            resolved.expect("env key resolves after empty argv"),
+            "EsTL from env fallback",
+            "empty --recovery-key must fall through to the env var"
+        );
+    }
+
+    #[test]
+    fn empty_env_recovery_key_does_not_short_circuit() {
+        // An empty `MX_AGENT_RECOVERY_KEY` is treated as absent so the
+        // interactive prompt path is taken (mirrors `empty_env_password_does_not_short_circuit`).
+        // We assert the predicate logic rather than driving the prompt to avoid
+        // blocking stdin in CI.
+        let _lock = ENV_RECOVERY_KEY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_RECOVERY_KEY).ok();
+        std::env::set_var(ENV_RECOVERY_KEY, "");
+        let short_circuits = std::env::var(ENV_RECOVERY_KEY)
+            .map(|k| !k.is_empty())
+            .unwrap_or(false);
+        match prev {
+            Some(v) => std::env::set_var(ENV_RECOVERY_KEY, v),
+            None => std::env::remove_var(ENV_RECOVERY_KEY),
+        }
+        assert!(
+            !short_circuits,
+            "an empty MX_AGENT_RECOVERY_KEY must not short-circuit the prompt"
+        );
+    }
+
+    #[test]
+    fn recovery_recover_parses_key_flag() {
+        // Verify the CLI parser accepts `--recovery-key` and stores it in
+        // `RecoveryRecoverArgs.recovery_key`.
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "recovery",
+            "recover",
+            "--recovery-key",
+            "EsTL abcd efgh",
+        ])
+        .unwrap();
+        match &cli.command {
+            Command::Recovery(RecoveryCommand::Recover(args)) => {
+                assert_eq!(
+                    args.recovery_key.as_deref(),
+                    Some("EsTL abcd efgh"),
+                    "recovery_key must be captured verbatim (spaces preserved)"
+                );
+            }
+            other => panic!("expected recovery recover, got {other:?}"),
+        }
+        assert_eq!(command_path(&cli.command), "recovery recover");
+    }
+
+    #[test]
+    fn recovery_recover_key_flag_is_optional() {
+        // Without `--recovery-key` the arg is absent; the runtime will try the
+        // env var or the interactive prompt.
+        let cli = Cli::try_parse_from(["mx-agent", "recovery", "recover"]).unwrap();
+        match &cli.command {
+            Command::Recovery(RecoveryCommand::Recover(args)) => {
+                assert!(
+                    args.recovery_key.is_none(),
+                    "recovery_key must be None when the flag is omitted"
+                );
+            }
+            other => panic!("expected recovery recover, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_recover_help_documents_argv_exposure() {
+        // `--help` for `recovery recover` must mention the argv-exposure risk
+        // and steer users to the safer env-var alternative.  clap surfaces the
+        // doc-comment on `RecoveryRecoverArgs.recovery_key` in its help text,
+        // so a broken doc-comment would be caught here.
+        let err = Cli::try_parse_from(["mx-agent", "recovery", "recover", "--help"]).unwrap_err();
+        let help = err.to_string();
+        assert!(
+            help.contains("shell history"),
+            "help must warn about shell-history exposure: {help}"
+        );
+        assert!(
+            help.contains("ps"),
+            "help must warn about `ps` exposure: {help}"
+        );
+        assert!(
+            help.contains(ENV_RECOVERY_KEY),
+            "help must mention the env-var alternative {ENV_RECOVERY_KEY}: {help}"
         );
     }
 }

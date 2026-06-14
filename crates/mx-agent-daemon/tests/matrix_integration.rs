@@ -126,6 +126,10 @@
 //! - `MX_AGENT_TEST_SAS_USER` / `_PASSWORD` and
 //!   `MX_AGENT_TEST_SAS_USER2` / `_PASSWORD2` — fresh-per-run single-device peers
 //!   for [`live_two_daemon_sas_confirms_and_verifies`]
+//! - `MX_AGENT_TEST_LOGREDACT_USER` / `_PASSWORD` — a fresh-per-run user (pristine
+//!   cross-signing) for the process-level
+//!   [`live_no_secrets_in_daemon_log_after_login_and_recover`]; falls back to the
+//!   recovery user, then the shared user, when unset
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,10 +166,10 @@ use mx_agent_daemon::{
     ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey,
     FetchContextOptions, ForwardedExecEvent, GrantWorkspaceOptions, HeartbeatConfig, HeldRequest,
     ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PendingApproval,
-    PtyWinsize, RegisterAgentOptions, RetrieveArtifactOptions, SasAdvance, SessionPaths,
-    ShareContextOptions, SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceError,
-    WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, DEFAULT_ARTIFACT_SCAN_LIMIT,
-    HEARTBEAT_SCAN_LIMIT, WORKSPACE_AGENT_PL,
+    PtyWinsize, RecoveryEnableResult, RegisterAgentOptions, RetrieveArtifactOptions, SasAdvance,
+    SessionPaths, ShareContextOptions, SyncHealth, SyncState, TaskDispatchMode, TrustStore,
+    WorkspaceError, WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED,
+    DEFAULT_ARTIFACT_SCAN_LIMIT, HEARTBEAT_SCAN_LIMIT, WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -9638,4 +9642,264 @@ allow_cwd = ["{cwd}"]
         .expect("bob sync exits cleanly");
     std::env::remove_var(ENV_DATA_DIR);
     std::env::remove_var("MX_AGENT_CONFIG_DIR");
+}
+
+/// Path to the compiled `mx-agent` CLI binary, located next to this
+/// integration-test binary (`target/<profile>/deps/<test>` →
+/// `target/<profile>/mx-agent`).
+///
+/// The `mx-agent` binary is defined in the `mx-agent-cli` crate, so the daemon
+/// crate's tests cannot use `env!("CARGO_BIN_EXE_mx-agent")`. The integration
+/// harness (`scripts/matrix_integration_test.sh`) builds it before running this
+/// suite; a direct `cargo test` invocation must build it first.
+fn mx_agent_bin() -> std::path::PathBuf {
+    let mut dir = std::env::current_exe().expect("current test exe path");
+    dir.pop(); // drop the test binary file name
+    if dir.ends_with("deps") {
+        dir.pop(); // drop the `deps` directory
+    }
+    dir.join("mx-agent")
+}
+
+/// Live no-secrets-in-logs end-to-end check through the **real daemon process**
+/// (issue #311).
+///
+/// This is the process-level acceptance test for the operational-log redaction
+/// goal. It drives the compiled `mx-agent` binary through a real
+/// `auth login` → `daemon start` → `recovery enable` → `recovery recover` flow
+/// against the live homeserver, then greps the captured `daemon.log` and every
+/// CLI process's stderr for the actual access token and recovery key. Neither
+/// secret may appear in either place.
+///
+/// **Why a process test rather than in-process calls.** `daemon.log` only
+/// exists when the daemon runs as a background process: `start_background` opens
+/// it `0600` and redirects the foreground daemon's stdout+stderr into it (see
+/// [`crate::lifecycle`]). The credential-redaction behaviours themselves —
+/// `session::Secret` `Debug`/`Display`, `RecoverParams` redaction, and the
+/// telemetry subscriber's `Redacting` field formatter — are unit-tested in
+/// `session.rs`, `recovery_ipc.rs`, `verification.rs`, and `mx_agent_telemetry`.
+/// This test proves they actually hold for the *running daemon* and the *real
+/// CLI*, with real homeserver-issued secrets, end to end — which the previous
+/// in-process variant of this test did not (it only formatted `Debug` strings
+/// and a scoped subscriber buffer, never reading `daemon.log` or capturing a
+/// child process's stderr).
+///
+/// **Flow**
+/// 1. `auth login` (password supplied via `MX_AGENT_PASSWORD`, never argv)
+///    writes `session.json`; the real access token is read back from it.
+/// 2. `daemon start` spawns the daemon, which loads the session and runs the
+///    real sync loop; `daemon.log` is created `0600`.
+/// 3. `recovery enable --json` provisions SSSS + key backup over IPC and returns
+///    the one-time recovery key. That is the key's only legitimate appearance
+///    (the enable command's *stdout*), so enable's stdout is deliberately
+///    excluded from the grep set.
+/// 4. `recovery recover` re-imports keys over IPC with the key fed via
+///    `MX_AGENT_RECOVERY_KEY` (never argv), exercising `recover_for_session`'s
+///    `RecoverParams` path inside the daemon.
+///
+/// `MX_AGENT_LOG=debug` maximises the leak surface: a stray
+/// `tracing::debug!(token = …)` or `?params` anywhere on these paths would land
+/// in `daemon.log` and fail the test.
+///
+/// **Isolation.** A dedicated fresh-per-run user with pristine cross-signing
+/// state (`MX_AGENT_TEST_LOGREDACT_USER`, falling back to the recovery user and
+/// then the shared user) so `recovery enable` bootstraps cleanly regardless of
+/// test order, plus throwaway runtime/data dirs.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[test]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+fn live_no_secrets_in_daemon_log_after_login_and_recover() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    // Prefer a dedicated fresh-per-run user (pristine cross-signing) so
+    // `recovery enable` bootstraps cleanly no matter which recovery test runs
+    // first; fall back to the recovery user, then the shared user, so a direct
+    // `cargo test` invocation against a freshly-reset homeserver still runs.
+    let user = std::env::var("MX_AGENT_TEST_LOGREDACT_USER")
+        .or_else(|_| std::env::var("MX_AGENT_TEST_RECOVERY_USER"))
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_USER"));
+    let pass = std::env::var("MX_AGENT_TEST_LOGREDACT_PASSWORD")
+        .or_else(|_| std::env::var("MX_AGENT_TEST_RECOVERY_PASSWORD"))
+        .unwrap_or_else(|_| required_env("MX_AGENT_TEST_PASSWORD"));
+
+    let bin = mx_agent_bin();
+    assert!(
+        bin.exists(),
+        "mx-agent binary not found at {} — build it first \
+         (`cargo build -p mx-agent-cli`); the matrix integration harness does this",
+        bin.display()
+    );
+
+    // Throwaway, per-run dirs. The runtime dir (which holds daemon.log and the
+    // IPC socket) lives under the data dir so a single `remove_dir_all` cleans
+    // both up. Both must be `0700`: the daemon refuses to bind its socket in a
+    // group/other-accessible runtime dir (`ensure_safe_parent_dir`,
+    // `UNSAFE_DIR_BITS == 0o077`), so create them privately up front regardless
+    // of the ambient umask.
+    let data_dir = throwaway_data_dir();
+    let runtime_dir = data_dir.join("runtime");
+    for dir in [&data_dir, &runtime_dir] {
+        std::fs::create_dir_all(dir).expect("create test dir");
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .expect("tighten test dir to 0700");
+    }
+
+    // Run `mx-agent <args>` with isolated dirs and verbose (debug) logging.
+    // Secrets are never inherited from the ambient environment; the only secret
+    // env vars are the ones explicitly passed via `extra_env` per call.
+    let mx = |args: &[&str], extra_env: &[(&str, &str)]| -> std::process::Output {
+        let mut cmd = Command::new(&bin);
+        cmd.args(args)
+            .env("MX_AGENT_DATA_DIR", &data_dir)
+            .env("MX_AGENT_RUNTIME_DIR", &runtime_dir)
+            .env("MX_AGENT_LOG", "debug")
+            .env_remove("MX_AGENT_PASSWORD")
+            .env_remove("MX_AGENT_RECOVERY_KEY");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("failed to run mx-agent")
+    };
+
+    // Everything a secret must NOT appear in: daemon.log plus every CLI
+    // process's stderr (and the non-secret stdouts). The recovery key's one
+    // legitimate sink — `recovery enable`'s stdout — is excluded by design.
+    let mut captured = String::new();
+
+    // ── 1. Login (password via env, never argv) — CLI-local, writes session.json
+    let login = mx(
+        &[
+            "auth",
+            "login",
+            "--homeserver",
+            &homeserver,
+            "--user",
+            &user,
+        ],
+        &[("MX_AGENT_PASSWORD", &pass)],
+    );
+    captured.push_str(&String::from_utf8_lossy(&login.stderr));
+    assert!(
+        login.status.success(),
+        "auth login must succeed: stderr={}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+
+    // Read the real access token back from the persisted session.
+    let session_path = data_dir.join("session.json");
+    let session_json = std::fs::read_to_string(&session_path).expect("read session.json");
+    let session_val: Value = serde_json::from_str(&session_json).expect("parse session.json");
+    let access_token = session_val
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .expect("session.json must contain an access_token field")
+        .to_string();
+    assert!(
+        !access_token.is_empty(),
+        "homeserver must issue a non-empty access token"
+    );
+
+    // ── 2. Start the daemon in the background; daemon.log is created here.
+    let start = mx(&["daemon", "start"], &[]);
+    captured.push_str(&String::from_utf8_lossy(&start.stderr));
+    assert!(
+        start.status.success(),
+        "daemon start must succeed: stderr={}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    // Poll until the daemon reports running.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = mx(&["daemon", "status", "--json"], &[]);
+        captured.push_str(&String::from_utf8_lossy(&status.stderr));
+        if status.status.success() {
+            captured.push_str(&String::from_utf8_lossy(&status.stdout));
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon never became ready");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // ── 3. Enable recovery over IPC. The one-time key is returned on stdout —
+    //    its only legitimate appearance — so enable's stdout is NOT captured.
+    let enable = mx(&["recovery", "enable", "--json"], &[]);
+    captured.push_str(&String::from_utf8_lossy(&enable.stderr));
+    assert!(
+        enable.status.success(),
+        "recovery enable must succeed: stderr={}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    let enable_stdout = String::from_utf8_lossy(&enable.stdout);
+    // Parse without echoing the raw stdout on failure (it carries the key).
+    let enabled: RecoveryEnableResult = serde_json::from_str(enable_stdout.trim())
+        .unwrap_or_else(|e| panic!("recovery enable --json must emit RecoveryEnableResult ({e})"));
+    let recovery_key = enabled.recovery_key.expose().to_string();
+    assert!(
+        !recovery_key.is_empty(),
+        "recovery enable must return a non-empty recovery key"
+    );
+
+    // ── 4. Recover over IPC with the key supplied via env (never argv). This
+    //    drives the daemon's `recover_for_session` / `RecoverParams` path.
+    let recover = mx(
+        &["recovery", "recover"],
+        &[("MX_AGENT_RECOVERY_KEY", &recovery_key)],
+    );
+    captured.push_str(&String::from_utf8_lossy(&recover.stderr));
+    captured.push_str(&String::from_utf8_lossy(&recover.stdout));
+    assert!(
+        recover.status.success(),
+        "recovery recover must succeed: stderr={}",
+        String::from_utf8_lossy(&recover.stderr)
+    );
+
+    // Stop the daemon before inspecting its log.
+    let stop = mx(&["daemon", "stop"], &[]);
+    captured.push_str(&String::from_utf8_lossy(&stop.stderr));
+
+    // ── Read the captured daemon.log (the daemon's own stdout+stderr).
+    let log_path = runtime_dir.join("daemon.log");
+    let daemon_log = std::fs::read_to_string(&log_path).expect("read daemon.log");
+
+    // daemon.log must be owner-only (0600) regardless of umask (issue #311).
+    let mode = std::fs::metadata(&log_path)
+        .expect("stat daemon.log")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "daemon.log must be private (0600)");
+
+    // The daemon must actually have logged at debug, so the absences below are
+    // meaningful rather than an empty-file artifact.
+    assert!(
+        !daemon_log.trim().is_empty(),
+        "daemon.log is empty; MX_AGENT_LOG=debug should have produced operational logs"
+    );
+
+    // ── The acceptance assertions: neither secret appears in daemon.log or in
+    //    any CLI process's stderr/stdout. Failure messages deliberately omit the
+    //    secret values so a failure never re-leaks them into CI output.
+    assert!(
+        !daemon_log.contains(&access_token),
+        "access token leaked into daemon.log (issue #311)"
+    );
+    assert!(
+        !daemon_log.contains(&recovery_key),
+        "recovery key leaked into daemon.log (issue #311)"
+    );
+    assert!(
+        !captured.contains(&access_token),
+        "access token leaked into a CLI process's stderr/stdout (issue #311)"
+    );
+    assert!(
+        !captured.contains(&recovery_key),
+        "recovery key leaked into a CLI process's stderr/stdout (issue #311)"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

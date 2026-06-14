@@ -163,10 +163,13 @@ session** in their handlers using an in-memory seen-nonce set scoped to the
 invocation lifetime (architecture §7.5–§7.7).
 
 **Tokens never leak into output.** Access and refresh tokens are wrapped in a
-`Secret` type whose `Debug` and `Display` render `***redacted***`. The telemetry
-layer independently redacts any structured field whose key looks sensitive
-(`token`, `secret`, `password`, `api_key`, `private_key`, `credential`,
-`authorization`, …), substituting `***redacted***`.
+`Secret` type whose `Debug` and `Display` render `***redacted***`. As a backstop
+for accidental `tracing` field leaks, the telemetry subscriber independently
+redacts the value of any structured field whose key looks sensitive (`token`,
+`secret`, `password`, `api_key`, `private_key`, `credential`, `authorization`,
+…), substituting `***redacted***` in both the human and JSON output formats. The
+redaction is a safety net, not a licence to log secrets: the `Secret` wrappers
+and the "never log raw tokens/keys" discipline still apply.
 
 **CLI ⇄ daemon isolation.** The CLI talks to the daemon over a Unix domain
 socket created with mode `0600` in a directory that must not have group/world
@@ -187,8 +190,12 @@ command runs, its environment is built from scratch:
 - You may add names via `execution.env_allowlist` in `policy.toml`.
 - **Defence in depth:** even an allowlisted name is dropped if it matches a
   secret pattern — exact names `MATRIX_ACCESS_TOKEN`, `MX_AGENT_TOKEN`,
-  `SSH_AUTH_SOCK`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `NPM_TOKEN`, or prefixes `AWS_*`, `GOOGLE_*`, `AZURE_*`.
+  `MX_AGENT_PASSWORD`, `MX_AGENT_RECOVERY_KEY`, `SSH_AUTH_SOCK`,
+  `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `NPM_TOKEN`, or
+  prefixes `AWS_*`, `GOOGLE_*`, `AZURE_*`. As a final catch-all,
+  `mx_agent_telemetry::is_sensitive_key` scrubs any name containing `token`,
+  `secret`, `password`, `api_key`, etc., so future mx-agent credential
+  variables are covered automatically.
 
 > **Safe vs unsafe:** keep `env_allowlist` minimal. Every name you add is a
 > variable the remote agent's command can read. Adding a credential-bearing var
@@ -324,6 +331,12 @@ mx-agent recovery recover    # after a re-provision: re-import keys (prompts for
 > once. Store it somewhere safe immediately. It is never logged and never
 > persisted in clear; **if you lose it, history backed up under it is
 > unrecoverable** — there is no escrow.
+>
+> When feeding the key back to `recovery recover`, prefer the
+> `MX_AGENT_RECOVERY_KEY` environment variable or the interactive `Recovery key:`
+> prompt (which suppresses terminal echo, exactly like the password prompt) over
+> the `--recovery-key` flag. Passing it as a flag exposes it in shell history and
+> `ps`; the CLI prints a warning to stderr if you do.
 
 **Restart vs. re-provision.**
 
@@ -588,7 +601,10 @@ so the audit trail records *that* a command ran without recording its secrets.
 **Operational logs** are separate from the audit log and go to stderr. Control
 them with `MX_AGENT_LOG` (filter directives, falls back to `RUST_LOG`) and
 `MX_AGENT_LOG_FORMAT` (`human` or `json`). The same secret-key redaction applies
-to structured fields here.
+to structured fields here, in both formats. When the daemon runs in the
+background its stdout/stderr are captured to `daemon.log` in the runtime
+directory; that file is created `0600` (owner-only) regardless of the umask, like
+the rest of the daemon's private state.
 
 > **Safe vs unsafe:** the audit log is append-only and lives `0600` under your
 > config dir — ship it to a tamper-evident store if you need non-repudiation,
@@ -615,7 +631,7 @@ to structured fields here.
       prompt, never as flags; the interactive prompt suppresses terminal echo.
 - [ ] `crypto-store/` (`0700`) and `crypto-store-key` (`0600`) left daemon-owned; never copied off-box.
 - [ ] `recovery enable` run once per daemon identity; recovery key stored safely offline (shown once, never logged or persisted in clear).
-- [ ] After a re-provision onto a new host, `recovery recover` run before accepting privileged events so history remains decryptable.
+- [ ] After a re-provision onto a new host, `recovery recover` run before accepting privileged events so history remains decryptable; feed the key via `MX_AGENT_RECOVERY_KEY` or the interactive `Recovery key:` prompt (both suppress terminal echo, exactly like the password prompt) — avoid `--recovery-key` (argv is visible in shell history and `ps`; the CLI prints a warning if you do).
 - [ ] If peer device verification is required, `require_verified_device = true` set *after* verifying peer devices via `mx-agent device verify`; the flag is additive-deny only and does not relax execution policy.
 - [ ] Interactive SAS (`mx-agent device verify`) treated as operator-attended; headless daemons use `--manual --fingerprint` or pre-seeded cross-signing instead. An unanswered prompt cancels automatically after ~300 s (fails safe to cancel); other daemon IPC commands remain unaffected while the flow is in progress.
 - [ ] Audit log monitored and shipped off-box if you need non-repudiation.

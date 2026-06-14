@@ -74,6 +74,13 @@ PASS_SAS1="${USER_SAS1}-pass"
 USER_SAS2="mxagent_it_sas2_$$_${RANDOM}"
 PASS_SAS2="${USER_SAS2}-pass"
 
+# The process-level no-secrets-in-logs test (issue #311) enables recovery via the
+# real daemon, which needs a pristine cross-signing identity to bootstrap cleanly
+# regardless of which recovery test runs first. Give it its own fresh-per-run
+# user so it never collides with the recovery/key-backup users above.
+USER_LOGREDACT="mxagent_it_logredact_$$_${RANDOM}"
+PASS_LOGREDACT="${USER_LOGREDACT}-pass"
+
 # Register a user if needed; fall back to login so re-runs (where the user
 # already exists) still succeed. Both paths confirm the credentials work.
 ensure_user() {
@@ -99,6 +106,14 @@ ensure_user "$USER_REC" "$PASS_REC"
 ensure_user "$USER_BACKUP" "$PASS_BACKUP"
 ensure_user "$USER_SAS1" "$PASS_SAS1"
 ensure_user "$USER_SAS2" "$PASS_SAS2"
+ensure_user "$USER_LOGREDACT" "$PASS_LOGREDACT"
+
+# The no-secrets-in-logs test (issue #311) drives the compiled `mx-agent` binary
+# as a child process (it must read the real `daemon.log`). That binary lives in
+# the `mx-agent-cli` crate, which the daemon test target does not pull in, so
+# build it explicitly before running the suite.
+note "building mx-agent CLI binary"
+( cd "$REPO_DIR" && cargo build -p mx-agent-cli --bin mx-agent )
 
 note "running integration test against $HOMESERVER"
 set +e
@@ -117,6 +132,8 @@ set +e
   MX_AGENT_TEST_SAS_PASSWORD="$PASS_SAS1" \
   MX_AGENT_TEST_SAS_USER2="$USER_SAS2" \
   MX_AGENT_TEST_SAS_PASSWORD2="$PASS_SAS2" \
+  MX_AGENT_TEST_LOGREDACT_USER="$USER_LOGREDACT" \
+  MX_AGENT_TEST_LOGREDACT_PASSWORD="$PASS_LOGREDACT" \
     cargo test -p mx-agent-daemon --test matrix_integration -- --ignored --nocapture --test-threads=1
 )
 status=$?

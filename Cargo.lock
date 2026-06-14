@@ -2322,6 +2322,7 @@ version = "0.2.0"
 name = "mx-agent-telemetry"
 version = "0.2.0"
 dependencies = [
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

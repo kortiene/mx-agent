@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1260,6 +1260,30 @@ fn dispatch_streaming(
     }
 }
 
+/// Open (creating if needed) the background daemon log with owner-only `0600`
+/// permissions, regardless of the process umask.
+///
+/// `daemon.log` captures the foreground daemon's stdout and stderr — including
+/// everything it logs — so it is held to the same private-file posture as the
+/// rest of the daemon's local state (`session.json`, the status file, the audit
+/// log). The file is created with mode `0o600` atomically via
+/// [`OpenOptionsExt::mode`] — no world-readable window between create and
+/// `chmod` — and its permissions are re-asserted so a pre-existing log left
+/// loose by an earlier build or an operator mistake is tightened back to
+/// `0600`. Mirrors [`crate::AuditLog`]'s append path.
+///
+/// [`OpenOptionsExt::mode`]: std::os::unix::fs::OpenOptionsExt::mode
+fn open_log_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
 /// Spawn the daemon as a detached background process and wait for it to report
 /// readiness via the status file.
 pub fn start_background() -> io::Result<RunningStatus> {
@@ -1270,10 +1294,7 @@ pub fn start_background() -> io::Result<RunningStatus> {
     mx_agent_ipc::ensure_safe_parent_dir(&paths.runtime_dir)?;
 
     let exe = std::env::current_exe()?;
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.log_file)?;
+    let log = open_log_file(&paths.log_file)?;
     let log_err = log.try_clone()?;
 
     Command::new(exe)
@@ -1615,5 +1636,55 @@ mod tests {
             stop(Duration::from_millis(200)).unwrap(),
             StopOutcome::NotRunning
         );
+    }
+
+    #[test]
+    fn open_log_file_creates_private_mode() {
+        // Issue #311: `daemon.log` captures the daemon's stdout/stderr and must
+        // be owner-only regardless of the umask, like the status and audit logs.
+        let base =
+            std::env::temp_dir().join(format!("mx-log-mode-{}-{}", std::process::id(), now_unix()));
+        fs::create_dir_all(&base).expect("mk base");
+        let path = base.join("daemon.log");
+
+        let file = open_log_file(&path).expect("open log");
+        drop(file);
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "daemon.log must be created 0600");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn open_log_file_tightens_preexisting_loose_log() {
+        // A log left world-readable by an earlier build is re-tightened to 0600
+        // on the next open, not left exposed.
+        let base = std::env::temp_dir().join(format!(
+            "mx-log-tighten-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::create_dir_all(&base).expect("mk base");
+        let path = base.join("daemon.log");
+        fs::write(&path, b"old line\n").expect("seed log");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        let file = open_log_file(&path).expect("open log");
+        drop(file);
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "pre-existing loose log must be tightened to 0600"
+        );
+        // Append mode must preserve the existing contents.
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.starts_with("old line"),
+            "log must be append, not truncate"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
