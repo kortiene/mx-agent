@@ -1528,11 +1528,15 @@ list`/`approve`/`revoke`/`fingerprint` run CLI-local against `trust.json` —
 `trust fingerprint` can create the daemon's Ed25519 signing key in-process. These
 are in-process library calls at the same UID, not a separate privilege boundary,
 which is why no `auth.*` method exists in the table below. A cross-process
-advisory `flock` on `<data_dir>/.write.lock` now serializes those in-process
-session/crypto-store-key/signing-key writes against a running daemon so two
-`mx-agent` processes cannot lost-update the same file (issue #269); the lock is
-advisory and does **not** refresh a running daemon's in-memory client after a
-CLI-local re-login (that staleness clears only on daemon restart). `trust
+advisory `flock` on `<data_dir>/.write.lock` serializes those in-process
+writes against a running daemon — covering `session.json`, the crypto-store key,
+the signing key, the `trust.json` load→modify→save round trip (`trust
+approve`/`trust revoke`), and `clear_session` (issues #269, #316). Two
+concurrent `mx-agent` processes cannot lost-update `trust.json` and silently drop
+a revocation; `clear_session` cannot race a concurrent `save_session` and leave
+an orphaned per-device crypto store. The lock is advisory and does **not** refresh
+a running daemon's in-memory client after a CLI-local re-login (that staleness
+clears on `daemon reload` or daemon restart). `trust
 publish`/`state` remain fully daemon-IPC-mediated.
 
 | Method | Params | Result |
@@ -1561,6 +1565,7 @@ publish`/`state` remain fully daemon-IPC-mediated.
 | `recovery.enable` | (none) | `RecoveryEnableResult` (recovery key surfaced once, never logged) |
 | `recovery.status` | (none) | `RecoveryStatusInfo` |
 | `recovery.recover` | `RecoverParams` | `RecoveryStatusInfo` |
+| `session.reload` | (none) | `{started: bool, logged_in: bool}` — winds down the current worker generation (sync + scheduler + heartbeat) and starts a fresh one against the on-disk session; used by `daemon reload` and auto-triggered by a successful `auth login` |
 
 `task.watch` keeps the Unix-socket connection open and sends one JSON-RPC
 response frame per event using the original request id. Event envelopes carry
@@ -1660,15 +1665,30 @@ Daemon behavior:
 
 - Ignore expired requests.
 - Reject replayed nonces.
-- De-duplicate by idempotency key.
+- De-duplicate by idempotency key. The `idempotency_key` is fully derived from
+  the invocation id (`exec:<invocation_id>`) and is part of the signed content,
+  so it carries no out-of-band value: the daemon rejects any request whose key
+  does not equal `exec:<invocation_id>` as `malformed_request`. Before spawning a
+  live `exec`, the daemon de-duplicates against the in-memory live-control
+  registry — a replayed request for an already-running invocation re-emits the
+  existing `exec.accepted` instead of spawning a second child.
 - Persist invocation state before starting local child process.
-- On restart, reconcile running child processes and Matrix invocation state.
+- On restart, reconcile running child processes and Matrix invocation state. The
+  daemon records each in-flight `exec` child's process group in a `0600`
+  `live-pgids` sidecar and reaps any groups left alive by a previous run on the
+  next startup (and on `daemon stop`'s force-kill escalation), so a crash or
+  SIGKILL does not orphan children.
 
 ### 11.3 Reconnect and Recovery
 
 On daemon startup or reconnect:
 
-1. Resume Matrix sync from stored sync token.
+1. Resume Matrix sync from stored sync token. The token is keyed to the
+   current `user_id`/`device_id`; `auth logout` clears it, and `auth login`
+   (always a new device) clears any stale token for a changed identity so the
+   daemon performs an initial full sync rather than resuming a previous session's
+   batch. This ensures room state — memberships, invitations, historical task
+   events — is not skipped after re-login.
 2. Load the executing-task snapshot from `com.mxagent.task.v1` room state.
 3. Fetch room state for agent/task/invocation snapshots.
 4. Reconcile executing tasks against the `com.mxagent.invocation.v1` snapshot
@@ -1683,10 +1703,11 @@ On daemon startup or reconnect:
 | Target agent offline | request remains pending until timeout or is rejected by caller policy |
 | Homeserver rate limit | daemon backs off, chunks less frequently, may switch to artifact mode |
 | Missing stream chunk | receiver buffers then marks degraded or fails in strict mode |
-| Daemon crashes while child runs | supervisor kills or recovers child according to policy |
+| Daemon crashes while child runs | supervisor kills or recovers child according to policy; live-pgid sidecar lets the restart janitor reap any orphaned process groups |
 | Request arrives after expiry | target rejects without execution |
 | E2EE decryption fails | event ignored or marked undecryptable; no execution |
 | Policy changes during run | new requests use new policy; running invocations follow configured behavior |
+| Sync loop dies (token I/O error or fatal auth error) | `record_fatal` surfaces the dead loop in `daemon.status` (`STOPPED`); scheduler and heartbeat wind down with it; the process stays alive and is recoverable via `auth login` → `daemon reload` |
 
 ---
 

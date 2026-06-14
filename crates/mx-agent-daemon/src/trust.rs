@@ -243,6 +243,34 @@ impl TrustStore {
     }
 }
 
+/// Load the trust store, apply `f`, and persist the result atomically — the
+/// whole `load → modify → save` round trip under the data-dir advisory write
+/// lock so concurrent `trust approve` / `trust revoke` invocations cannot
+/// lost-update `trust.json` and silently drop a revocation (issue #316).
+///
+/// This is the only correct way to mutate the persisted store from a CLI-local
+/// command or a daemon trust path: two unlocked `load → mutate → save` round
+/// trips can interleave so the second writer's save clobbers the first writer's
+/// change, dropping it. Holding the lock across the whole round trip serializes
+/// them, so both updates are reflected (the revocation is never lost). The
+/// closure's return value (e.g. the resulting [`TrustEntry`], or `None` for a
+/// revoke of an unknown key) is returned on success.
+///
+/// [`TrustStore::load`] stays lock-free — reads tolerate a concurrent atomic
+/// rename — and [`TrustStore::save`] must stay lock-free too so there is no
+/// nested acquisition inside this helper.
+pub fn update_trust_store<R>(
+    paths: &SessionPaths,
+    f: impl FnOnce(&mut TrustStore) -> R,
+) -> io::Result<R> {
+    crate::session::with_data_dir_write_lock(paths, || {
+        let mut store = TrustStore::load(paths)?;
+        let result = f(&mut store);
+        store.save(paths)?;
+        Ok(result)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +416,87 @@ mod tests {
         let paths = SessionPaths::resolve();
         let store = TrustStore::load(&paths).unwrap();
         assert!(store.entries().is_empty());
+    }
+
+    /// A unique, per-call data dir that does not touch `MX_AGENT_DATA_DIR` (and
+    /// so the env lock), for tests that spawn threads sharing one explicit dir.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "mx-agent-trustlock-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ))
+    }
+
+    #[test]
+    fn update_trust_store_persists_round_trip() {
+        let dir = unique_temp_dir("roundtrip");
+        let paths = SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+        let entry = update_trust_store(&paths, |store| store.approve(AGENT, KEY, None, None, None))
+            .unwrap();
+        assert_eq!(entry.status, TrustStatus::Trusted);
+        assert!(TrustStore::load(&paths).unwrap().is_trusted(AGENT, KEY));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_update_trust_store_preserves_both_updates() {
+        // Issue #316: a concurrent approve (of one key) and revoke (of another)
+        // running through `update_trust_store` must both land — the lock-held
+        // load-modify-save round trip means neither lost-updates the other, so a
+        // revocation is never silently dropped.
+        use std::sync::{Arc, Barrier};
+
+        let dir = unique_temp_dir("race");
+        let paths = Arc::new(SessionPaths::for_data_dir(dir.clone()));
+        paths.ensure_data_dir().unwrap();
+        // Seed the key that will be revoked.
+        update_trust_store(&paths, |store| {
+            store.approve(AGENT, KEY, None, None, None);
+        })
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let p_approve = Arc::clone(&paths);
+        let b_approve = Arc::clone(&barrier);
+        let approver = std::thread::spawn(move || {
+            b_approve.wait();
+            for _ in 0..50 {
+                update_trust_store(&p_approve, |store| {
+                    store.approve("late", "mxagent-ed25519:late", None, None, None);
+                })
+                .unwrap();
+            }
+        });
+        let p_revoke = Arc::clone(&paths);
+        let b_revoke = Arc::clone(&barrier);
+        let revoker = std::thread::spawn(move || {
+            b_revoke.wait();
+            for _ in 0..50 {
+                update_trust_store(&p_revoke, |store| {
+                    store.revoke(AGENT, KEY);
+                })
+                .unwrap();
+            }
+        });
+        approver.join().unwrap();
+        revoker.join().unwrap();
+
+        let store = TrustStore::load(&paths).unwrap();
+        assert_eq!(
+            store.entry(AGENT, KEY).map(|e| e.status),
+            Some(TrustStatus::Revoked),
+            "the revocation must never be lost"
+        );
+        assert!(
+            store.is_key_trusted("mxagent-ed25519:late"),
+            "the concurrent approve must also be preserved"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

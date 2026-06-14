@@ -15,7 +15,7 @@ use matrix_sdk::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::session::{Secret, SessionPaths, StoredSession};
+use crate::session::{clear_session, load_session, Secret, SessionPaths, StoredSession};
 
 /// Daemon Matrix configuration, typically loaded from `config.toml`.
 ///
@@ -447,6 +447,91 @@ pub async fn restore_client(session: &StoredSession) -> Result<Client, LoginErro
         .await
         .map_err(LoginError::Matrix)?;
     Ok(client)
+}
+
+/// Non-sensitive outcome of a [`logout_session`] call.
+///
+/// Carries only whether the best-effort server-side `/logout` succeeded; it
+/// never contains the access/refresh token (issue #316).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogoutOutcome {
+    /// Whether the homeserver-side `/logout` (token invalidation) succeeded.
+    /// `false` means a network/HTTP failure degraded the logout to local-only;
+    /// the local session state is cleared regardless.
+    pub server_side: bool,
+}
+
+/// Best-effort server-side `/logout`, then clear all local session state.
+///
+/// Logging out locally (deleting `session.json`) leaves the access token valid
+/// on the homeserver indefinitely, so an exfiltrated copy stays usable. This
+/// invalidates the token server-side first, then clears the local state. The
+/// server-side call is best-effort: a network/HTTP failure degrades to a
+/// local-only logout (the returned [`LogoutOutcome::server_side`] is `false`).
+/// The token is never logged or returned (issue #316).
+///
+/// The logout client is **store-less** ([`build_client`]) with the stored tokens
+/// restored onto it: we only need an authenticated HTTP client to call
+/// `/logout`, and a store-backed client would race a running daemon's SQLite
+/// OlmMachine. Regardless of the server-side result, [`clear_session`] is called
+/// (which also clears the persisted sync token). With no stored session this is
+/// a no-op success (already logged out).
+///
+/// Note: if a daemon is running, the server-side logout immediately invalidates
+/// its access token, so its sync loop hits `UnknownToken` → fatal (now surfaced
+/// in `daemon.status`); resume with `auth login` + `session.reload`.
+pub async fn logout_session(paths: &SessionPaths) -> std::io::Result<LogoutOutcome> {
+    let server_side = match load_session(paths)? {
+        Some(session) => match server_side_logout(&session).await {
+            Ok(()) => true,
+            Err(e) => {
+                // Never log the token — only the non-sensitive error.
+                tracing::warn!(error = %e, "server-side logout failed; clearing local session only");
+                false
+            }
+        },
+        None => false,
+    };
+    clear_session(paths)?;
+    Ok(LogoutOutcome { server_side })
+}
+
+/// Restore `session`'s tokens onto a fresh store-less client and call
+/// `matrix_auth().logout()` to invalidate them server-side. Never logs the
+/// token (issue #316).
+async fn server_side_logout(session: &StoredSession) -> Result<(), LoginError> {
+    use matrix_sdk::authentication::matrix::MatrixSession;
+    use matrix_sdk::authentication::SessionTokens;
+    use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
+    use matrix_sdk::SessionMeta;
+
+    let config = MatrixConfig {
+        homeserver_url: session.homeserver.clone(),
+    };
+    let client = build_client(&config).await?;
+    let user_id = OwnedUserId::try_from(session.user_id.as_str())
+        .map_err(|e| LoginError::Matrix(matrix_sdk::Error::from(e)))?;
+    let device_id = OwnedDeviceId::from(session.device_id.as_str());
+    let matrix_session = MatrixSession {
+        meta: SessionMeta { user_id, device_id },
+        tokens: SessionTokens {
+            access_token: session.access_token.expose().to_string(),
+            refresh_token: session
+                .refresh_token
+                .as_ref()
+                .map(|t| t.expose().to_string()),
+        },
+    };
+    client
+        .restore_session(matrix_session)
+        .await
+        .map_err(LoginError::Matrix)?;
+    client
+        .matrix_auth()
+        .logout()
+        .await
+        .map_err(|e| LoginError::Matrix(matrix_sdk::Error::from(e)))?;
+    Ok(())
 }
 
 #[cfg(test)]

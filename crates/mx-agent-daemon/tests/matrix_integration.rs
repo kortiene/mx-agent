@@ -158,19 +158,19 @@ use mx_agent_daemon::{
     decide_approval_for_session, diagnose_tasks, emit_approval_decision, emit_heartbeat,
     encode_verifying_key, fetch_context, get_invocation, grant_workspace, key_id_for_verifying_key,
     list_agents, list_agents_with_liveness_for_session, list_pending_approvals, list_tasks,
-    load_or_create_signing_key, load_sync_token, login_password, read_latest_heartbeats,
-    register_agent, restore_client, retrieve_artifact, run_matrix_sync,
-    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, share_context, show_agent,
-    sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, ApprovalQueue,
-    BackoffConfig, CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions,
-    CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
-    ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, FetchContextOptions,
-    ForwardedExecEvent, GrantWorkspaceOptions, HeartbeatConfig, HeldRequest, ListAgentsOptions,
-    ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PendingApproval, PtyWinsize,
-    RecoveryEnableResult, RegisterAgentOptions, RetrieveArtifactOptions, SasAdvance, SessionPaths,
-    ShareContextOptions, SyncHealth, SyncState, TaskDiagnostic, TaskDispatchMode, TrustStore,
-    WorkspaceError, WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED,
-    DEFAULT_ARTIFACT_SCAN_LIMIT, HEARTBEAT_SCAN_LIMIT, MAX_HEARTBEAT_SCAN_EVENTS,
+    load_or_create_signing_key, load_sync_token, login_password, persist_login_session,
+    read_latest_heartbeats, register_agent, restore_client, retrieve_artifact, run_matrix_sync,
+    run_matrix_sync_with_subscribers, run_scheduler_loop, run_sync_loop, save_session,
+    save_sync_token, share_context, show_agent, sign_task_action, start_call_matrix,
+    start_exec_matrix, AgentListing, ApprovalQueue, BackoffConfig, CallOutcome, CallStartParams,
+    CallTargeting, CreateTaskOptions, CreateWorkspaceOptions, DaemonSigningKey, ExecFrame,
+    ExecOutcome, ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey,
+    FetchContextOptions, ForwardedExecEvent, GrantWorkspaceOptions, HeartbeatConfig, HeldRequest,
+    ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PendingApproval,
+    PtyWinsize, RecoveryEnableResult, RegisterAgentOptions, RetrieveArtifactOptions, SasAdvance,
+    SessionPaths, ShareContextOptions, StepError, SyncHealth, SyncState, TaskDiagnostic,
+    TaskDispatchMode, TrustStore, WorkspaceError, WorkspaceVisibility, DECISION_APPROVED,
+    DECISION_DENIED, DEFAULT_ARTIFACT_SCAN_LIMIT, HEARTBEAT_SCAN_LIMIT, MAX_HEARTBEAT_SCAN_EVENTS,
     WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
@@ -10450,4 +10450,229 @@ async fn live_running_invocations_and_task_diagnostics_use_heartbeat_liveness() 
         "heartbeat-enriched Active verdict must suppress assigned_to_inactive_agent; \
          got: {diags_enriched:?}"
     );
+}
+
+/// Re-login after logout must clear the stale sync token so the new session
+/// performs an initial full sync rather than resuming from the previous
+/// session's batch position (issue #316).
+///
+/// This test proves the live `login_password` + `persist_login_session` flow
+/// against a real homeserver:
+///
+/// 1. Save a fake "stale" sync token to the data dir (simulating a prior run).
+/// 2. Log in as Alice — `login_password` always creates a new Matrix device, so
+///    the `(user_id, device_id)` pair changes.
+/// 3. Call `persist_login_session` with Alice's new session (the real login path).
+/// 4. Assert the stale token was cleared: `load_sync_token` returns `None`.
+/// 5. Start `run_sync_loop` with Alice's restored client and verify the first sync
+///    does NOT resume from a token (`SyncHealth::resumed_from_token == false`).
+///
+/// The cross-account variant: if a different user was previously logged in on
+/// the same data dir their stale token must also be evicted (identity changed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_re_login_clears_stale_sync_token_and_starts_initial_sync() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    // Seed a stale sync token that belongs to a hypothetical prior session
+    // (could be Alice on a previous device, or a completely different account).
+    save_sync_token(&paths, "s_batch_stale_prior_session").expect("save stale token");
+    assert_eq!(
+        load_sync_token(&paths)
+            .expect("load stale token")
+            .as_deref(),
+        Some("s_batch_stale_prior_session"),
+        "stale token must be present before login"
+    );
+
+    // Log in as Alice — every call to login_password creates a brand-new device_id.
+    let config = MatrixConfig {
+        homeserver_url: homeserver.clone(),
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login must succeed");
+
+    // `persist_login_session` is what the real login flow calls (cli.rs).
+    // It detects the identity change (new device_id) and clears the stale token.
+    persist_login_session(&paths, &alice_session).expect("persist_login_session must succeed");
+
+    assert!(
+        load_sync_token(&paths)
+            .expect("load token after login")
+            .is_none(),
+        "stale sync token must be cleared by persist_login_session on re-login \
+         (issue #316: a new device must not resume from a stale batch token)"
+    );
+
+    // Start the real sync loop with Alice's restored client and check that
+    // `resumed_from_token` is false — the new session starts from scratch.
+    let alice = restore_client(&alice_session)
+        .await
+        .expect("alice session restore must succeed");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let health_check = Arc::clone(&health);
+    let running_stop = Arc::clone(&running);
+
+    // Drive one sync iteration then stop the loop.
+    let sync_handle = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = Arc::clone(&health);
+        let running = Arc::clone(&running);
+        tokio::spawn(async move {
+            run_matrix_sync(&alice, &paths, health, BackoffConfig::default(), running).await
+        })
+    };
+
+    // Wait for the loop to report at least one successful sync, then stop it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        {
+            let h = health_check.lock().unwrap();
+            if h.total_syncs >= 1 {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("sync loop did not complete a sync within 30s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    running_stop.store(false, Ordering::SeqCst);
+    let _ = sync_handle.await;
+
+    // The first sync must have started without a token (initial full sync).
+    let h = health_check.lock().unwrap();
+    assert!(
+        !h.resumed_from_token,
+        "SyncHealth must report resumed_from_token=false for a post-login initial sync \
+         (issue #316: stale token must not be reused after re-login)"
+    );
+    assert!(
+        h.total_syncs >= 1,
+        "sync loop must have completed at least one sync; got: {h:?}"
+    );
+
+    std::env::remove_var(ENV_DATA_DIR);
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// A fatal sync-loop error (e.g. revoked/unknown token) must surface in
+/// `SyncHealth` as `Stopped` so `daemon.status` reports the dead loop as
+/// unhealthy rather than showing the last healthy state forever (issue #316).
+///
+/// This test proves the live path: `run_sync_loop` is driven with a step
+/// function that returns `StepError::Fatal` after the first (successful) sync,
+/// mimicking what happens when the homeserver revokes the access token mid-run.
+/// The health snapshot must transition to `Stopped` with a recorded error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_fatal_sync_error_reported_as_stopped_in_health() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    persist_login_session(&paths, &alice_session).expect("persist login session");
+
+    // Run one real sync to get a valid batch token, then inject a fatal error on
+    // the second step — mimicking a server-side token revocation mid-run.
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let step_count = Arc::new(AtomicU32::new(0));
+
+    {
+        use matrix_sdk::config::SyncSettings;
+        let paths_inner = paths.clone();
+        let health_inner = Arc::clone(&health);
+        let running_inner = Arc::clone(&running);
+        let step_count_inner = Arc::clone(&step_count);
+
+        run_sync_loop(
+            &paths_inner,
+            health_inner,
+            BackoffConfig {
+                base: std::time::Duration::from_millis(10),
+                max: std::time::Duration::from_millis(10),
+                factor: 1,
+            },
+            running_inner,
+            move |token| {
+                let alice = alice.clone();
+                let count = step_count_inner.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if count == 0 {
+                        // First step: real sync to get a valid batch token.
+                        let mut settings =
+                            SyncSettings::default().timeout(std::time::Duration::from_secs(30));
+                        if let Some(t) = token {
+                            settings = settings.token(t);
+                        }
+                        alice
+                            .sync_once(settings)
+                            .await
+                            .map(|r| r.next_batch)
+                            .map_err(|e| StepError::Transient(e.to_string()))
+                    } else {
+                        // Second step: inject a fatal error, mimicking a revoked token.
+                        Err(StepError::Fatal(
+                            "M_UNKNOWN_TOKEN: Access token has expired".to_string(),
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("run_sync_loop returns Ok even on fatal step");
+    }
+
+    let h = health.lock().unwrap();
+    assert_eq!(
+        h.state,
+        SyncState::Stopped,
+        "SyncHealth must be Stopped after a fatal sync error so daemon.status reports \
+         the dead loop as unhealthy (issue #316); got: {h:?}"
+    );
+    assert!(
+        h.last_error.is_some(),
+        "a fatal error description must be recorded in SyncHealth.last_error; got: {h:?}"
+    );
+    assert!(
+        h.last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Access token has expired"),
+        "recorded error must include the fatal message; got: {:?}",
+        h.last_error
+    );
+
+    std::env::remove_var(ENV_DATA_DIR);
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

@@ -104,9 +104,10 @@ pub use exec::{
     build_signed_exec_cancel, build_signed_exec_request, build_signed_exec_stdin,
     build_signed_pty_resize, emit_exec_accepted, emit_exec_cancelled, emit_exec_rejected,
     handle_live_exec_cancel, handle_live_exec_request, handle_live_exec_stdin,
-    handle_live_pty_resize, invocation_state_for, publish_invocation_state, send_exec_cancel,
-    send_exec_request, send_exec_stdin, send_pty_resize, CancelRejection, ExecRejection,
-    ExecRequestOptions,
+    handle_live_pty_resize, invocation_state_for, kill_persisted_live_exec_children,
+    publish_invocation_state, reap_orphaned_live_exec_children, send_exec_cancel,
+    send_exec_request, send_exec_stdin, send_pty_resize, terminate_live_exec_children,
+    CancelRejection, ExecRejection, ExecRequestOptions,
 };
 pub use exec_ipc::{
     send_exec_cancel_matrix, send_exec_stdin_matrix, start_exec_loopback, start_exec_matrix,
@@ -135,8 +136,8 @@ pub use lifecycle::{
     run_foreground, start_background, status, stop, Paths, RunningStatus, StopOutcome,
 };
 pub use matrix::{
-    build_client, login_password, restore_client, ClientError, ConfigError, LoginError,
-    MatrixConfig,
+    build_client, login_password, logout_session, restore_client, ClientError, ConfigError,
+    LoginError, LogoutOutcome, MatrixConfig,
 };
 pub use mx_agent_protocol::schema::{TaskAction, TaskActionAuthorization, TaskResult};
 #[cfg(unix)]
@@ -159,8 +160,9 @@ pub use scheduler_loop::{
     DEFAULT_SCHEDULER_INTERVAL,
 };
 pub use session::{
-    auth_status, clear_session, clear_sync_token, load_session, load_sync_token, save_session,
-    save_sync_token, AuthStatus, Secret, SessionPaths, StoredSession,
+    auth_status, clear_session, clear_sync_token, load_session, load_sync_token,
+    persist_login_session, save_session, save_sync_token, AuthStatus, Secret, SessionPaths,
+    StoredSession,
 };
 pub use signing::{
     decode_verifying_key, encode_verifying_key, key_id_for_verifying_key,
@@ -195,7 +197,7 @@ pub use task_orchestrator::{
 };
 pub use tool_exec::{execute_tool, execute_tool_async, ToolError, ToolResult, RUN_TESTS};
 pub use tools::{builtin_tools, ToolRegistry};
-pub use trust::{fingerprint_from_key_id, TrustEntry, TrustStatus, TrustStore};
+pub use trust::{fingerprint_from_key_id, update_trust_store, TrustEntry, TrustStatus, TrustStore};
 pub use trust_state::{
     effective_trust, effective_trust_table, list_trust_states, list_trust_states_for_session,
     publish_trust_state, publish_trust_state_for_session, trust_state_from_entry, trust_state_key,

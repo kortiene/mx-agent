@@ -318,19 +318,117 @@ where
 /// lock so a CLI-local `auth login` cannot interleave its session write with a
 /// running daemon's (issue #269).
 pub fn save_session(paths: &SessionPaths, session: &StoredSession) -> io::Result<()> {
+    with_data_dir_write_lock(paths, || write_session_file(paths, session))
+}
+
+/// Atomically write `session.json` (`0600`) **without** taking the advisory
+/// lock.
+///
+/// Factored out of [`save_session`] so callers that already hold the data-dir
+/// write lock — [`persist_login_session`] — can persist the session without a
+/// nested `flock` acquisition (which would self-deadlock against the same
+/// process's outer lock). Assumes the data dir already exists (the lock helper
+/// ensures it).
+fn write_session_file(paths: &SessionPaths, session: &StoredSession) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(session)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let tmp = paths.session_file.with_extension("json.tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        f.write_all(&bytes)?;
+        f.flush()?;
+    }
+    fs::rename(&tmp, &paths.session_file)?;
+    Ok(())
+}
+
+/// Persist a freshly-minted login session, clearing the stale sync token and
+/// reclaiming a superseded same-user device store when the session identity
+/// changes (issue #316).
+///
+/// Runs the whole load-compare-write round trip under the data-dir advisory
+/// write lock so it serializes against [`save_session`], [`clear_session`], and
+/// crypto-store-key generation. Behaviour:
+///
+/// - If there is no prior session, or its `(user_id, device_id)` differs from
+///   `session`, the persisted `/sync` batch token is cleared so the new device
+///   performs an initial full sync rather than resuming from the previous
+///   session's batch (which would skip room state and miss invites — and would
+///   even carry across a different account on one data dir). Because every real
+///   login mints a brand-new `device_id`, this clears the token on essentially
+///   every login while staying correct if the identical identity is re-saved.
+/// - If a prior session existed for the **same `user_id`** but a **different
+///   `device_id`**, that specific superseded device crypto store is removed
+///   (guarded by [`is_plain_path_component`]). This reclaims only the previous
+///   device of the *same account*; a concurrent *different* user's store (the
+///   multi-user integration-test layout) is never touched.
+/// - Any other device-store directories that match neither the new device are
+///   only **warned** about (count + device-id stems, no secrets) so an operator
+///   can reclaim them deliberately rather than risk clobbering another user.
+pub fn persist_login_session(paths: &SessionPaths, session: &StoredSession) -> io::Result<()> {
     with_data_dir_write_lock(paths, || {
-        let bytes = serde_json::to_vec_pretty(session)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let tmp = paths.session_file.with_extension("json.tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.set_permissions(fs::Permissions::from_mode(0o600))?;
-            f.write_all(&bytes)?;
-            f.flush()?;
+        let prior = load_session(paths)?;
+        let identity_changed = match &prior {
+            Some(p) => p.user_id != session.user_id || p.device_id != session.device_id,
+            None => true,
+        };
+        if identity_changed {
+            clear_sync_token(paths)?;
         }
-        fs::rename(&tmp, &paths.session_file)?;
-        Ok(())
+        // Reclaim the superseded device store of the *same* user only.
+        if let Some(prior) = &prior {
+            if prior.user_id == session.user_id
+                && prior.device_id != session.device_id
+                && is_plain_path_component(&prior.device_id)
+            {
+                remove_dir_if_present(&paths.data_dir.join(&prior.device_id))?;
+            }
+        }
+        warn_stranded_device_stores(paths, &session.device_id);
+        write_session_file(paths, session)
     })
+}
+
+/// Log (non-sensitively) about per-device crypto stores that belong to neither
+/// the new session's device nor the legacy flat layout, so an operator can
+/// reclaim them deliberately (issue #316).
+///
+/// Deliberately warn-only rather than auto-deleting: device-id subdirectories
+/// may belong to *different users* sharing one data dir (the Alice+Bob
+/// integration-test layout), and a blanket "remove every dir that is not the new
+/// device" would clobber a concurrent user's store. Only the superseded device
+/// of the *same* account is auto-reclaimed (see [`persist_login_session`]). The
+/// `.login-*` temp dirs, the legacy flat `crypto-store/`, the lock file, and
+/// `trust.json` are never reported.
+fn warn_stranded_device_stores(paths: &SessionPaths, new_device_id: &str) {
+    let Ok(entries) = fs::read_dir(&paths.data_dir) else {
+        return;
+    };
+    let mut stems: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == new_device_id
+            || name == "crypto-store"
+            || name.starts_with(".login-")
+            || !is_plain_path_component(name)
+        {
+            continue;
+        }
+        // Only count directories that actually hold a per-device crypto store.
+        if entry.path().join("crypto-store").is_dir() {
+            stems.push(name.to_string());
+        }
+    }
+    if !stems.is_empty() {
+        tracing::warn!(
+            count = stems.len(),
+            devices = ?stems,
+            "stranded per-device crypto stores remain under the data dir; \
+             reclaim them deliberately if they belong to no active session"
+        );
+    }
 }
 
 /// Load a persisted session, if one exists.
@@ -355,21 +453,33 @@ pub fn load_session(paths: &SessionPaths) -> io::Result<Option<StoredSession>> {
 /// session's device id (see [`crate::matrix::login_password`] /
 /// [`crate::matrix::restore_client`]); the session is read first to locate it,
 /// and the legacy flat-layout store (`crypto-store/` directly under the data
-/// dir) is cleared too. Missing files are not an error, so logout is idempotent.
+/// dir) is cleared too, as is the persisted `/sync` batch token so a later login
+/// (a brand-new device) performs an initial full sync rather than resuming from
+/// the old session's batch (issue #316). Missing files are not an error, so
+/// logout is idempotent.
+///
+/// The whole removal runs under the data-dir advisory write lock so a logout
+/// racing a concurrent `auth login` ([`save_session`] / [`persist_login_session`])
+/// cannot interleave and strand a half-written crypto store after a "successful"
+/// logout (issue #316).
 pub fn clear_session(paths: &SessionPaths) -> io::Result<()> {
-    // Remove the device-specific crypto store before deleting the session that
-    // names it. A device id that is not a single path component is ignored so
-    // the recursive removal can never escape the data directory (the id is
-    // server-assigned and otherwise untrusted).
-    if let Ok(Some(session)) = load_session(paths) {
-        if is_plain_path_component(&session.device_id) {
-            remove_dir_if_present(&paths.data_dir.join(&session.device_id))?;
+    with_data_dir_write_lock(paths, || {
+        // Remove the device-specific crypto store before deleting the session
+        // that names it. A device id that is not a single path component is
+        // ignored so the recursive removal can never escape the data directory
+        // (the id is server-assigned and otherwise untrusted).
+        if let Ok(Some(session)) = load_session(paths) {
+            if is_plain_path_component(&session.device_id) {
+                remove_dir_if_present(&paths.data_dir.join(&session.device_id))?;
+            }
         }
-    }
-    // Legacy single-user flat layout (crypto store directly under the data dir).
-    remove_dir_if_present(&paths.crypto_store_dir)?;
-    remove_file_if_present(&paths.crypto_store_key_file)?;
-    remove_file_if_present(&paths.session_file)
+        // Legacy single-user flat layout (crypto store directly under the data dir).
+        remove_dir_if_present(&paths.crypto_store_dir)?;
+        remove_file_if_present(&paths.crypto_store_key_file)?;
+        remove_file_if_present(&paths.session_file)?;
+        // Drop the persisted batch token too (issue #316).
+        clear_sync_token(paths)
+    })
 }
 
 /// Recursively remove a directory, treating "already gone" as success.
@@ -709,6 +819,76 @@ mod tests {
     }
 
     #[test]
+    fn clear_session_removes_sync_token() {
+        // Issue #316: logout must also drop the persisted /sync batch token so a
+        // later login (a brand-new device) performs an initial full sync.
+        let paths = SessionPaths::for_data_dir(unique_temp_dir("clear-synctoken"));
+        paths.ensure_data_dir().unwrap();
+        save_session(&paths, &sample()).unwrap();
+        save_sync_token(&paths, "s_batch_token").unwrap();
+        clear_session(&paths).unwrap();
+        assert!(
+            load_sync_token(&paths).unwrap().is_none(),
+            "sync token must be cleared on logout"
+        );
+        assert!(load_session(&paths).unwrap().is_none());
+        let _ = fs::remove_dir_all(&paths.data_dir);
+    }
+
+    #[test]
+    fn persist_login_session_clears_token_on_identity_change() {
+        // Issue #316: a re-login with a different device id clears the stale token
+        // (forcing an initial full sync); re-saving the identical identity keeps it.
+        let paths = SessionPaths::for_data_dir(unique_temp_dir("persist-token"));
+        paths.ensure_data_dir().unwrap();
+        let mut s1 = sample();
+        s1.device_id = "DEV1".to_string();
+        persist_login_session(&paths, &s1).unwrap();
+        save_sync_token(&paths, "tok").unwrap();
+        // Re-saving the same identity preserves the token.
+        persist_login_session(&paths, &s1).unwrap();
+        assert_eq!(load_sync_token(&paths).unwrap().as_deref(), Some("tok"));
+        // A new device (the real-login case) clears it.
+        let mut s2 = sample();
+        s2.device_id = "DEV2".to_string();
+        persist_login_session(&paths, &s2).unwrap();
+        assert!(
+            load_sync_token(&paths).unwrap().is_none(),
+            "identity change must clear the stale sync token"
+        );
+        let _ = fs::remove_dir_all(&paths.data_dir);
+    }
+
+    #[test]
+    fn persist_login_session_reclaims_same_user_prior_device_store_only() {
+        // Issue #316: re-login as the same user reclaims that user's superseded
+        // device store, but a *different* user's store (multi-user test layout)
+        // is never touched.
+        let paths = SessionPaths::for_data_dir(unique_temp_dir("persist-stores"));
+        paths.ensure_data_dir().unwrap();
+        let mut alice1 = sample(); // @alice:matrix.org
+        alice1.device_id = "ALICEDEV1".to_string();
+        persist_login_session(&paths, &alice1).unwrap();
+        // Seed alice's current device store and a different user's store.
+        fs::create_dir_all(paths.data_dir.join("ALICEDEV1").join("crypto-store")).unwrap();
+        let bob_store = paths.data_dir.join("BOBDEV").join("crypto-store");
+        fs::create_dir_all(&bob_store).unwrap();
+        // Alice logs in on a new device.
+        let mut alice2 = sample();
+        alice2.device_id = "ALICEDEV2".to_string();
+        persist_login_session(&paths, &alice2).unwrap();
+        assert!(
+            !paths.data_dir.join("ALICEDEV1").exists(),
+            "superseded same-user device store must be removed"
+        );
+        assert!(
+            bob_store.exists(),
+            "a different user's store must be preserved"
+        );
+        let _ = fs::remove_dir_all(&paths.data_dir);
+    }
+
+    #[test]
     fn is_plain_path_component_rejects_traversal() {
         // A hostile or garbage device id must never escape the data dir when its
         // crypto store is removed on logout (issue #240).
@@ -738,6 +918,66 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// `clear_session` racing `save_session` must always leave the store in a
+    /// consistent (parseable) state — never a torn partial file — because both
+    /// hold the data-dir advisory write lock (issue #316).
+    #[test]
+    fn concurrent_clear_session_and_save_session_is_consistent() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = unique_temp_dir("clear-save-race");
+        let paths = SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        let session = sample();
+
+        // Seed initial session and token so clear_session has something to remove.
+        save_session(&paths, &session).unwrap();
+        save_sync_token(&paths, "token_before_race").unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let p_clear = paths.clone();
+        let b_clear = Arc::clone(&barrier);
+        let clearer = std::thread::spawn(move || {
+            b_clear.wait();
+            for _ in 0..30 {
+                // clear_session is idempotent; safe to call even when no session.
+                clear_session(&p_clear).unwrap();
+            }
+        });
+
+        let p_save = paths.clone();
+        let b_save = Arc::clone(&barrier);
+        let session_copy = session.clone();
+        let saver = std::thread::spawn(move || {
+            b_save.wait();
+            for _ in 0..30 {
+                save_session(&p_save, &session_copy).unwrap();
+            }
+        });
+
+        clearer.join().unwrap();
+        saver.join().unwrap();
+
+        // The final state must be consistent: parseable as either "logged in"
+        // or "logged out", never torn JSON, and the two are mutually consistent.
+        let status = auth_status(&paths).unwrap();
+        if status.logged_in {
+            assert!(
+                status.user_id.is_some() && status.device_id.is_some(),
+                "logged-in status must have user_id and device_id"
+            );
+        } else {
+            assert!(
+                status.user_id.is_none() && status.device_id.is_none(),
+                "logged-out status must have neither user_id nor device_id"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

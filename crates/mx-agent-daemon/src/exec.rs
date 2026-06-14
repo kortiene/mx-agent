@@ -35,6 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use matrix_sdk::Room;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use mx_agent_policy::{
@@ -127,6 +128,211 @@ fn admit_control_nonce(control: &LiveExecControl, nonce: &str) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(nonce.to_string())
+}
+
+/// A live exec child's process-group id plus a cheap liveness discriminator.
+///
+/// The pgid equals the child's pid (children are spawned in their own process
+/// group; see [`crate::runner::build_command`]). `started_unix` records when the
+/// child was spawned so a reaper has a discriminator against the pgid-reuse
+/// race (a pgid could be recycled by an unrelated process after the child dies).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct LivePgid {
+    /// Process-group id (== child pid) to signal with `killpg`.
+    pgid: u32,
+    /// Spawn time in Unix seconds (liveness discriminator / forensics).
+    started_unix: u64,
+}
+
+/// Process-wide registry of live exec child process groups, keyed by
+/// `invocation_id` (issue #316).
+///
+/// `kill_on_drop` only reaps the *immediate* child and never fires on a SIGKILL
+/// of the daemon, so an in-flight exec child (and its grandchildren) would
+/// otherwise orphan on `daemon stop`'s force-kill escalation or a daemon crash.
+/// This registry lets the graceful-shutdown path signal every live child's whole
+/// process group, and it is mirrored to a `0600` sidecar so the SIGKILL-path
+/// reaper (`daemon stop`, a different process) and the restart janitor can reap
+/// groups this process can no longer reach via `Drop`.
+static LIVE_PGIDS: OnceLock<Mutex<BTreeMap<String, LivePgid>>> = OnceLock::new();
+
+fn live_pgids() -> &'static Mutex<BTreeMap<String, LivePgid>> {
+    LIVE_PGIDS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Path to the `0600` JSON sidecar mirroring [`LIVE_PGIDS`].
+fn live_pgids_file(paths: &crate::SessionPaths) -> PathBuf {
+    paths.data_dir.join("live-pgids.json")
+}
+
+/// Atomically persist the in-memory live-pgid map to the sidecar (`0600`).
+///
+/// Contains only integers (pgids + spawn timestamps) — no secrets. Best-effort:
+/// a write failure is non-fatal to running the command, so callers ignore the
+/// `Err`.
+fn persist_live_pgids(paths: &crate::SessionPaths, map: &BTreeMap<String, LivePgid>) {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    if paths.ensure_data_dir().is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(map) else {
+        return;
+    };
+    let file = live_pgids_file(paths);
+    let tmp = file.with_extension("json.tmp");
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(&bytes)?;
+        f.flush()?;
+        std::fs::rename(&tmp, &file)
+    };
+    if let Err(e) = write() {
+        tracing::debug!(error = %e, "could not persist live-pgids sidecar");
+    }
+}
+
+/// Load the persisted live-pgid records, returning an empty vec when the sidecar
+/// is missing or unreadable.
+fn load_live_pgids(paths: &crate::SessionPaths) -> Vec<LivePgid> {
+    match std::fs::read(live_pgids_file(paths)) {
+        Ok(bytes) => serde_json::from_slice::<BTreeMap<String, LivePgid>>(&bytes)
+            .map(|m| m.into_values().collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Remove the live-pgid sidecar (best-effort; missing is success).
+fn clear_live_pgids_file(paths: &crate::SessionPaths) {
+    let _ = std::fs::remove_file(live_pgids_file(paths));
+}
+
+/// RAII guard registering one live exec child's process group for its lifetime.
+///
+/// Constructing it (on spawn) records the pgid in the in-memory registry and the
+/// sidecar; dropping it (on every terminal path — finished, cancelled, errored,
+/// or panicked) deregisters it, mirroring [`crate::inflight::InflightGuard`].
+struct LivePgidGuard {
+    invocation_id: String,
+    paths: crate::SessionPaths,
+}
+
+impl LivePgidGuard {
+    /// Register `pgid` (== child pid) for `invocation_id`.
+    fn register(invocation_id: &str, pgid: u32) -> Self {
+        let paths = crate::SessionPaths::resolve();
+        {
+            let mut map = live_pgids().lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(
+                invocation_id.to_string(),
+                LivePgid {
+                    pgid,
+                    started_unix: now_unix(),
+                },
+            );
+            persist_live_pgids(&paths, &map);
+        }
+        Self {
+            invocation_id: invocation_id.to_string(),
+            paths,
+        }
+    }
+}
+
+impl Drop for LivePgidGuard {
+    fn drop(&mut self) {
+        let mut map = live_pgids().lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&self.invocation_id);
+        if map.is_empty() {
+            clear_live_pgids_file(&self.paths);
+        } else {
+            persist_live_pgids(&self.paths, &map);
+        }
+    }
+}
+
+/// Whether the process-group leader (pid == pgid) is currently alive.
+#[cfg(unix)]
+fn process_group_alive(pgid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    matches!(
+        kill(Pid::from_raw(pgid as i32), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
+}
+
+/// Terminate every live exec child process group registered in *this* process,
+/// SIGTERM then SIGKILL after `grace`, for the graceful daemon-shutdown path
+/// (issue #316).
+///
+/// Called from [`crate::lifecycle::run_foreground`] after the shutdown signal so
+/// the common `daemon stop` path leaves no orphaned children. Clears the sidecar
+/// afterwards (the groups are being torn down here, so the SIGKILL-path reaper
+/// has nothing left to do).
+pub fn terminate_live_exec_children(paths: &crate::SessionPaths, grace: Duration) {
+    let pgids: Vec<u32> = live_pgids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .map(|r| r.pgid)
+        .collect();
+    if pgids.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = pgids.len(),
+        "terminating in-flight exec child process groups on shutdown"
+    );
+    for pgid in &pgids {
+        terminate_process_group(*pgid);
+    }
+    std::thread::sleep(grace);
+    for pgid in &pgids {
+        kill_process_group(*pgid);
+    }
+    clear_live_pgids_file(paths);
+}
+
+/// SIGKILL every *persisted* live exec child process group (issue #316).
+///
+/// Used by `daemon stop`'s SIGKILL escalation: it runs in the CLI process (a
+/// different process from the daemon, so the in-memory registry is empty) and
+/// reads the sidecar the force-killed daemon left behind. The daemon is being
+/// force-killed in the same breath, so the pgid-reuse window is negligible.
+pub fn kill_persisted_live_exec_children(paths: &crate::SessionPaths) {
+    for rec in load_live_pgids(paths) {
+        kill_process_group(rec.pgid);
+    }
+    clear_live_pgids_file(paths);
+}
+
+/// Restart janitor: reap any exec child process groups left alive by a previous
+/// daemon run, then clear the sidecar (issue #316).
+///
+/// Best-effort and reconcile-first: it only signals a recorded pgid whose group
+/// leader is still alive, accepting the documented pgid-reuse caveat (a recycled
+/// pgid could belong to an unrelated process). The authoritative teardown is the
+/// graceful in-process path ([`terminate_live_exec_children`]); this only mops up
+/// after a crash or force-kill.
+pub fn reap_orphaned_live_exec_children(paths: &crate::SessionPaths) {
+    let records = load_live_pgids(paths);
+    if records.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = records.len(),
+        "reaping exec child process groups left by a previous daemon run"
+    );
+    for rec in &records {
+        #[cfg(unix)]
+        if process_group_alive(rec.pgid) {
+            kill_process_group(rec.pgid);
+        }
+    }
+    clear_live_pgids_file(paths);
 }
 
 /// Why an incoming `com.mxagent.exec.request.v1` was rejected.
@@ -564,6 +770,23 @@ pub async fn handle_live_exec_request(
         return;
     }
 
+    // The idempotency key is fully derived from the invocation id (`exec:<id>`)
+    // and is part of the signed content, so it can carry no out-of-band value.
+    // Reject a mismatch as a malformed request before doing any work, so the
+    // field cannot smuggle a foreign key (issue #316).
+    if request.idempotency_key != format!("exec:{}", request.invocation_id) {
+        if let Err(e) = emit_exec_rejected(
+            &room,
+            request.invocation_id.clone(),
+            &ExecRejection::Malformed,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec rejection for malformed idempotency key");
+        }
+        return;
+    }
+
     let content = match serde_json::to_value(request) {
         Ok(value) => value,
         Err(e) => {
@@ -605,6 +828,23 @@ pub async fn handle_live_exec_request(
         }
     };
     let (request, allowance) = authorized;
+
+    // De-duplicate a replayed exec request by its idempotency key (issue #316):
+    // if this invocation already has a live control registered, a second child
+    // must not be spawned. Re-emit the existing `exec.accepted` instead of
+    // running the command twice. (The router's replay cache already drops a
+    // byte-identical re-delivery; this guards a re-send carrying a fresh nonce
+    // but the same — fully derived — invocation id / idempotency key.)
+    if live_exec_control(&request.invocation_id).is_some() {
+        tracing::info!(
+            invocation_id = %request.invocation_id,
+            "duplicate exec request for a live invocation; re-emitting accepted instead of spawning again"
+        );
+        if let Err(e) = emit_exec_accepted(&room, request.invocation_id.clone()).await {
+            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to re-emit exec accepted for duplicate request");
+        }
+        return;
+    }
 
     match crate::approval::disposition_for_exec(request.clone(), &allowance) {
         crate::approval::ExecDisposition::RequiresApproval { approval, .. } => {
@@ -1219,6 +1459,10 @@ async fn run_controlled_exec(
     let mut command = build_command(&spec)?;
     let mut child = command.spawn().map_err(crate::runner::RunError::Spawn)?;
     let pid = child.id();
+    // Register the child's process group so a daemon shutdown/force-kill can reap
+    // it instead of orphaning it (issue #316). Dropped when this function returns
+    // (the child has exited by then), deregistering it on every terminal path.
+    let _pgid_guard = pid.map(|p| LivePgidGuard::register(&request.invocation_id, p));
 
     let stdin_task = if request.stdin {
         child.stdin.take().map(|mut pipe| {
@@ -1450,6 +1694,9 @@ async fn run_controlled_pty_exec(
     // immediately, so the conventional 24x80 is only the pre-resize default.
     let session = PtySession::spawn(&spec, PtyWinsize::default())?;
     let pid = Some(session.id());
+    // Register the PTY child's process group for shutdown/force-kill reaping
+    // (issue #316); dropped when this function returns (the child has exited).
+    let _pgid_guard = pid.map(|p| LivePgidGuard::register(&request.invocation_id, p));
     let reader = session
         .try_clone_reader()
         .map_err(crate::runner::RunError::Spawn)?;
@@ -1932,6 +2179,14 @@ fn audit_exec_expired(paths: &crate::SessionPaths, room_id: &str, request: &Exec
     append_audit(paths, &request.invocation_id, record);
 }
 
+/// Current time in Unix seconds (used as the live-pgid liveness discriminator).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn rfc3339_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2275,6 +2530,22 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use serde_json::json;
+
+    /// A unique, per-call data dir resolved via [`crate::SessionPaths::for_data_dir`].
+    ///
+    /// Avoids touching `MX_AGENT_DATA_DIR` so tests that spawn threads can share
+    /// one explicit data dir without conflicting over the process environment.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "mx-agent-exec-{}-{}-{}",
+            tag,
+            std::process::id(),
+            n,
+        ))
+    }
 
     /// Deterministic signing key from a fixed seed.
     fn test_key() -> SigningKey {
@@ -3181,5 +3452,188 @@ allow_cwd = ["/home/me/code/project"]
         assert!(ExecRejection::ApprovalExpired
             .to_string()
             .contains("expired"));
+    }
+
+    // ── Issue #316: live-pgid sidecar ──────────────────────────────────────────
+
+    /// The live-pgid sidecar persists and reloads correctly, and clearing it
+    /// results in an empty load. This verifies the round-trip that lets
+    /// `kill_persisted_live_exec_children` and `reap_orphaned_live_exec_children`
+    /// find orphaned process groups after a daemon force-kill or crash.
+    #[test]
+    fn live_pgids_sidecar_round_trips() {
+        let dir = unique_temp_dir("pgid-sidecar");
+        let paths = crate::session::SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        // No sidecar yet → empty vec.
+        assert!(
+            load_live_pgids(&paths).is_empty(),
+            "missing sidecar must load as empty"
+        );
+
+        // Persist two pgid entries and reload them.
+        let mut map = BTreeMap::new();
+        map.insert(
+            "inv_aaa".to_string(),
+            LivePgid {
+                pgid: 12345,
+                started_unix: 1_000_000,
+            },
+        );
+        map.insert(
+            "inv_bbb".to_string(),
+            LivePgid {
+                pgid: 67890,
+                started_unix: 1_000_001,
+            },
+        );
+        persist_live_pgids(&paths, &map);
+
+        let loaded = load_live_pgids(&paths);
+        assert_eq!(loaded.len(), 2, "both pgids must round-trip");
+        let pgids: std::collections::HashSet<u32> = loaded.iter().map(|r| r.pgid).collect();
+        assert!(pgids.contains(&12345));
+        assert!(pgids.contains(&67890));
+
+        // Clearing removes the sidecar; next load is empty.
+        clear_live_pgids_file(&paths);
+        assert!(
+            load_live_pgids(&paths).is_empty(),
+            "cleared sidecar must load as empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `kill_persisted_live_exec_children` and `reap_orphaned_live_exec_children`
+    /// must be no-ops when no sidecar file exists (issue #316: these are called on
+    /// every daemon start and on `daemon stop` SIGKILL escalation).
+    #[test]
+    fn kill_persisted_and_reap_orphaned_children_with_no_sidecar_are_noops() {
+        let dir = unique_temp_dir("pgid-nofile");
+        let paths = crate::session::SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        // Neither must panic when the sidecar is absent.
+        kill_persisted_live_exec_children(&paths);
+        reap_orphaned_live_exec_children(&paths);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `kill_persisted_live_exec_children` actually delivers SIGKILL to a real
+    /// process group, not just to a fake pgid stored in a JSON file (issue #316).
+    ///
+    /// This is the process-level e2e proof that `daemon stop`'s SIGKILL escalation
+    /// path does not orphan in-flight exec children: a real `sleep 300` is spawned
+    /// in its own process group, its pgid is recorded in the sidecar, and
+    /// `kill_persisted_live_exec_children` kills it within the grace period.
+    #[test]
+    fn kill_persisted_live_exec_children_kills_real_process_group() {
+        use nix::sys::signal;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Command;
+
+        let dir = unique_temp_dir("pgid-real-kill");
+        let paths = crate::session::SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        // Spawn `sleep 300` in its own process group (setsid == pgid = child pid).
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .process_group(0) // new process group; pgid == child pid
+            .spawn()
+            .expect("spawn sleep 300 for orphan-kill test");
+        let child_pid = child.id();
+        let pgid = child_pid; // setsid → pgid == child pid
+
+        // Register the child's pgid in the sidecar, mirroring what the exec
+        // runner does before delegating to the child process.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "inv_orphan_test".to_string(),
+            LivePgid {
+                pgid,
+                started_unix: 0,
+            },
+        );
+        persist_live_pgids(&paths, &map);
+        assert!(
+            load_live_pgids(&paths).iter().any(|r| r.pgid == pgid),
+            "pgid must appear in the sidecar before the kill call"
+        );
+
+        // Verify the child is alive before we kill it.
+        let target = Pid::from_raw(child_pid as i32);
+        assert!(
+            signal::kill(target, None).is_ok(),
+            "child must be alive before kill_persisted_live_exec_children"
+        );
+
+        // This is the `daemon stop` SIGKILL-escalation path: the CLI process
+        // (a different process from the daemon) reads the sidecar and kills
+        // every recorded process group.
+        kill_persisted_live_exec_children(&paths);
+
+        // Wait for the child to actually exit (bounded by the SIGKILL).
+        let _ = child.wait(); // reap the zombie
+        let wait_result = waitpid(target, None);
+        // Either the child was already waited above (Ok(WaitStatus::Exited)) or
+        // waitpid returns ECHILD because it was already reaped — either way the
+        // child is gone.
+        match wait_result {
+            Ok(_) | Err(nix::errno::Errno::ECHILD) => {}
+            Err(e) => panic!("unexpected waitpid error: {e}"),
+        }
+
+        // The process must no longer be alive.
+        assert!(
+            !process_group_alive(pgid),
+            "exec child process group (pgid={pgid}) must be dead after \
+             kill_persisted_live_exec_children"
+        );
+
+        // The sidecar must have been cleared by the kill function.
+        assert!(
+            load_live_pgids(&paths).is_empty(),
+            "live-pgids sidecar must be cleared after kill_persisted_live_exec_children"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An idempotency key derived from `build_signed_exec_request` always equals
+    /// `exec:<invocation_id>`, matching the validation in `handle_live_exec_request`.
+    /// A different format would cause the live handler to reject the request as
+    /// `Malformed` (issue #316 receive-side de-dup).
+    #[test]
+    fn idempotency_key_derivation_matches_live_handler_check() {
+        let key = test_key();
+        for invocation_id in ["inv_01HZ", "01JABCDEFGH", "custom-id-42"] {
+            let content = build_signed_exec_request(
+                &key,
+                key_id_for(&key),
+                invocation_id,
+                "req_x",
+                "nonce_x",
+                "2026-06-14T00:00:00Z",
+                "2026-06-14T00:05:00Z",
+                &options(&["cargo", "test"], "/home/me/code/project"),
+            )
+            .expect("signs");
+            let req: ExecRequest = serde_json::from_value(content).unwrap();
+            // This is the exact check the live handler performs before allowing
+            // the request to proceed (live handler line: if request.idempotency_key
+            // != format!("exec:{}", request.invocation_id)).
+            assert_eq!(
+                req.idempotency_key,
+                format!("exec:{}", req.invocation_id),
+                "builder must always produce idempotency_key = exec:<invocation_id> \
+                 so the live handler's validation passes"
+            );
+        }
     }
 }

@@ -199,7 +199,20 @@ where
     F: FnMut(Option<String>) -> Fut,
     Fut: Future<Output = Result<String, StepError>>,
 {
-    let mut token = load_sync_token(paths)?;
+    // A sync-token persistence error is fatal to the loop: record it on the
+    // shared health *before* returning so `daemon.status` reports the dead loop
+    // as `Stopped` rather than reporting the last healthy state forever (the
+    // bare `?` here previously bypassed health entirely — issue #316).
+    let mut token = match load_sync_token(paths) {
+        Ok(token) => token,
+        Err(e) => {
+            health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_fatal(format!("sync token load failed: {e}"));
+            return Err(e);
+        }
+    };
     {
         let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
         *h = SyncHealth::initializing(token.is_some());
@@ -209,7 +222,13 @@ where
     while running.load(Ordering::SeqCst) {
         match step(token.clone()).await {
             Ok(next_token) => {
-                save_sync_token(paths, &next_token)?;
+                if let Err(e) = save_sync_token(paths, &next_token) {
+                    health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_fatal(format!("sync token save failed: {e}"));
+                    return Err(e);
+                }
                 token = Some(next_token);
                 backoff.reset();
                 let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
@@ -712,5 +731,94 @@ mod tests {
         let h = health.lock().unwrap();
         assert_eq!(h.state, SyncState::Stopped);
         assert_eq!(h.last_error.as_deref(), Some("token revoked"));
+    }
+
+    /// A unique per-call data dir that does not set `MX_AGENT_DATA_DIR` (avoids
+    /// the env-var mutex), for tests that can share a `SessionPaths` explicitly.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "mx-agent-sync-uniq-{}-{}-{}",
+            tag,
+            std::process::id(),
+            n,
+        ))
+    }
+
+    // A sync-token persistence error is surfaced as a stopped (unhealthy) loop
+    // rather than silently bypassing health (issue #316).
+    #[tokio::test]
+    async fn loop_records_stopped_on_token_load_error() {
+        let _data = TempData::new("tokenloaderr");
+        let paths = SessionPaths::resolve();
+        paths.ensure_data_dir().unwrap();
+        // Force a non-NotFound I/O error from `load_sync_token` by making the
+        // token path a directory (so `read_to_string` fails).
+        std::fs::create_dir_all(&paths.sync_token_file).unwrap();
+
+        let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+        let running = Arc::new(AtomicBool::new(true));
+        let result = run_sync_loop(
+            &paths,
+            health.clone(),
+            fast_backoff(),
+            running,
+            |_token| async move { Ok::<String, StepError>("unused".to_string()) },
+        )
+        .await;
+
+        assert!(result.is_err(), "a token load error must propagate");
+        let h = health.lock().unwrap();
+        assert_eq!(h.state, SyncState::Stopped, "dead loop reports Stopped");
+        assert!(
+            h.last_error.is_some(),
+            "the persistence error is recorded for status"
+        );
+    }
+
+    // A sync-token SAVE error must also transition health to Stopped so
+    // daemon.status reports the dead loop as unhealthy (issue #316 — the
+    // load path was already guarded; this closes the save path gap).
+    #[tokio::test]
+    async fn loop_records_stopped_on_token_save_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir("tokensaveerr");
+        let paths = crate::session::SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        // Make the data dir read-only so save_sync_token cannot create the tmp
+        // file; load_sync_token still succeeds (missing file returns Ok(None)).
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let result = run_sync_loop(
+            &paths,
+            health.clone(),
+            fast_backoff(),
+            running,
+            |_token| async move { Ok::<String, StepError>("next_token".to_string()) },
+        )
+        .await;
+
+        // Restore write permissions before cleanup so the dir can be removed.
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(result.is_err(), "a token save error must propagate");
+        let h = health.lock().unwrap();
+        assert_eq!(
+            h.state,
+            SyncState::Stopped,
+            "dead loop must report Stopped on save error"
+        );
+        assert!(
+            h.last_error.is_some(),
+            "the save error must be recorded for status"
+        );
     }
 }
