@@ -490,7 +490,9 @@ scripts/matrix_dev.sh reset   # stop and wipe all homeserver data
 - **Remote execution is dangerous by design.** `call` and `exec` run commands
   and the `run_tests` tool literally shells out to `cargo test`. Only target
   workspaces and agents you trust, and never run a command or tool you have not
-  read. In this alpha both runners execute on your local machine.
+  read. Both runners execute locally by default and become signed, Matrix-backed
+  remote operations only when both `--room` and `--agent` target a registered
+  remote agent.
 - **The bundled homeserver is for local testing only.** It binds to
   `127.0.0.1`, disables federation, and its registration token lives in a
   gitignored `dev/matrix/.env`. Do not expose it, point it at production data,

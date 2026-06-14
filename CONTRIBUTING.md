@@ -81,7 +81,8 @@ Notes:
 The default `cargo test --all` needs no homeserver. The live Matrix
 integration/E2E tests are `#[ignore]`d and run against a throwaway Tuwunel
 homeserver via Docker. The one-command harness boots the homeserver, registers
-the two test users, and runs the whole `#[ignore]`d suite:
+the per-run test users (two stable accounts plus a fresh account per recovery,
+key-backup, SAS, and log-redaction test), and runs the whole `#[ignore]`d suite:
 
 ```bash
 scripts/matrix_integration_test.sh              # run the live E2E suite

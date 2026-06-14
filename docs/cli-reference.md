@@ -3,7 +3,7 @@
 <!-- markdownlint-disable MD013 MD036 MD060 -->
 
 > Complete command reference for the `mx-agent` binary (workspace **v0.2.0**, public alpha).
-> Verified against source at commit `e616908`. Platform: **Unix only** (Linux and macOS).
+> Verified against the v0.2.0 source tree. Platform: **Unix only** (Linux and macOS).
 
 `mx-agent` is a Matrix-backed CLI for decentralized orchestration between coding agents. The
 CLI is **stateless**: it holds no Matrix session, keys, or policy of its own. Every command is
@@ -1324,7 +1324,7 @@ When `--room` and `--agent` are specified, the command becomes a signed, Matrix-
 | 128 | Stream protocol failure: stream ended without an `exec.finished` frame. |
 | 128+*n* | Remote process was killed by signal *n* (e.g., 130 = SIGINT = 2, 143 = SIGTERM = 15). |
 | 129 | Timeout: the requester abandoned the remote run after its deadline (requested `--timeout` + grace) and sent a signed `exec.cancel`. |
-| 132 | Stream integrity violation in strict mode (`--strict-stream`): a chunk was missing or failed validation (bad encoding or sha256 mismatch). |
+| 132 | Stream integrity violation in strict mode (`--strict-stream`): a chunk was missing or could not be decoded (bad base64 encoding). mx-agent producers do not populate the per-chunk `sha256` digest today (`sha256: null`), so the digest-mismatch path is unreachable until they do. |
 | 64 | Input validation error: empty command, bad `--cwd` path, or daemon IPC failure. |
 | 3 | Daemon not running (when `--pty` fails to connect to the daemon socket). |
 
@@ -3089,7 +3089,7 @@ Per crates/mx-agent-cli/src/cli.rs, stream.rs, terminal.rs:
 - **64** — input validation: empty `exec`/`call` command, an unusable `--cwd`, malformed arguments, or an IPC setup failure (`EmptyCommand` / `InvalidArgs`)
 - **127** — command, tool, or working directory not found on the target (`ExecErrorKind::NotFound` / `CallErrorKind::NotFound`)
 - **128** — `EXIT_PROTOCOL_FAILURE` — an `exec` stream ended without an `exec.finished` frame
-- **132** — `EXIT_STREAM_INTEGRITY` — `--strict-stream` and a chunk was missing/corrupt (bad encoding or sha256 mismatch)
+- **132** — `EXIT_STREAM_INTEGRITY` — `--strict-stream` and a chunk was missing or could not be decoded (bad base64 encoding); mx-agent producers do not populate the per-chunk `sha256` today, so the digest-mismatch path is unreachable until they do
 - **128 + signum** — `exec` passes the target process's own exit status through (0–255); a process killed by a signal maps to 128+signum per shell convention (e.g. SIGTERM=15 → 143, SIGINT=2 → 130)
 
 > The exact code per command is given in each command's **Exit codes** note above. `exec` is the
@@ -3170,9 +3170,15 @@ require_verified_device = false       # When true, Matrix device must be verifie
 > **Implemented backends vs. accepted values.** `policy.toml` *parses* all six `sandbox` /
 > `default_sandbox` values, but only `bubblewrap` (Linux) and `docker`/`podman` (the container
 > backend) are implemented runners in v0.2.0; `none` is the default fallback and applies no
-> isolation. `firejail` and `chroot` are accepted by the parser but are **not** implemented
-> backends today. Path/network confinement is enforced end-to-end for **batch** `exec`; interactive
-> `--pty` has baseline controls only. (See the sandbox row in the README status matrix.)
+> isolation. `firejail` and `chroot` are **rejected at policy load** — naming either in
+> `execution.default_sandbox` or an agent `sandbox` fails validation with a dotted-path error (no
+> silent unsandboxed fallthrough). Path and network confinement is enforced end-to-end for both
+> **batch** `exec` and interactive `exec --pty`: the PTY path routes the command through the same
+> selected sandbox backend as the batch path. A remote `--room`/`--agent` PTY enforces the target
+> agent's sandbox/network/path policy exactly like batch exec; a **loopback** `exec --pty` (no
+> `--room`/`--agent`) applies the operator's loopback *confinement floor* (the configured default
+> sandbox backend, network decision, filesystem binds, and env-allowlist scrub), with the 64 MiB
+> output cap and no wall-clock timeout. (See the sandbox row in the README status matrix.)
 
 ### Validation Rules
 
@@ -3187,7 +3193,7 @@ require_verified_device = false       # When true, Matrix device must be verifie
 
 ## Trust Store Format
 
-The trust store (`~/.config/mx-agent/trust.json` in the data directory) is a JSON array of `TrustEntry` objects, persisted with `0600` permissions. Each entry records a single `(agent_id, key_id)` pair, its trust status, and audit metadata.
+The trust store (`<data_dir>/trust.json` — `$XDG_DATA_HOME/mx-agent/trust.json`, default `~/.local/share/mx-agent/trust.json`) is a JSON array of `TrustEntry` objects, persisted with `0600` permissions. Each entry records a single `(agent_id, key_id)` pair, its trust status, and audit metadata.
 
 ```json
 {

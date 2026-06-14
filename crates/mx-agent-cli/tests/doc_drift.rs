@@ -15,6 +15,12 @@ const ARCHITECTURE: &str = include_str!("../../../docs/architecture.md");
 const SECURITY_HARDENING: &str = include_str!("../../../docs/security-hardening.md");
 const IPC_MOD: &str = include_str!("../../mx-agent-daemon/src/ipc.rs");
 
+// Issue #313 additions (see the "Issue #313" section at the end of this file).
+const CLI_REFERENCE: &str = include_str!("../../../docs/cli-reference.md");
+const WIKI_PROTOCOL: &str = include_str!("../../../wiki/Stream-and-Protocol-Spec.md");
+const WIKI_SECURITY: &str = include_str!("../../../wiki/Security-and-Sandboxing.md");
+const WIKI_GETTING_STARTED: &str = include_str!("../../../wiki/Getting-Started.md");
+
 /// Phase 10 of the roadmap must describe the live scheduler loop and the
 /// signed Matrix `exec` transport as *delivered*, not as remaining work.
 ///
@@ -388,5 +394,199 @@ fn ipc_module_doc_names_auth_trust_exception() {
     assert!(
         !IPC_MOD.contains("AuthLoginParams"),
         "ipc.rs must not define AuthLoginParams (auth login is CLI-local, not daemon-IPC-mediated)"
+    );
+}
+
+// ── Issue #313: docs drift wave 3 — stale PTY-sandbox/E2EE passages, wrong ─────
+// paths/flags, and the interop-breaking public wiki protocol spec.
+//
+// These guards pin the corrected passages: the stale phrase must be absent and
+// the corrected phrase present. A final serde round-trip proves the corrected
+// wiki `exec.finished`/`stream.chunk` examples still deserialize against the
+// `mx-agent-protocol` schema types (the wire contract third parties code to).
+
+/// `docs/cli-reference.md` must describe interactive `exec --pty` as routing
+/// through the selected sandbox backend under the loopback confinement floor,
+/// not as having "baseline controls only".
+#[test]
+fn cli_reference_pty_routes_through_backend_not_baseline_controls() {
+    // Negative: the stale "baseline controls only" framing must be gone.
+    assert!(
+        !CLI_REFERENCE.contains("baseline controls only"),
+        "cli-reference must not claim interactive --pty has baseline controls only (issue #313)"
+    );
+    // Positive: the corrected paragraph names the loopback confinement floor and
+    // the PTY path explicitly.
+    assert!(
+        CLI_REFERENCE.contains("confinement floor"),
+        "cli-reference must describe the loopback confinement floor for exec --pty (issue #313)"
+    );
+    assert!(
+        CLI_REFERENCE.contains("exec --pty"),
+        "cli-reference must state that exec --pty routes through the sandbox backend (issue #313)"
+    );
+}
+
+/// `docs/alpha-release-checklist.md` must document that `workspace create --e2ee
+/// on` exists (default is still unencrypted), not that workspace encryption is
+/// unimplemented "until #249 lands".
+#[test]
+fn alpha_checklist_workspace_e2ee_optin_exists() {
+    // Negative: the stale "lands (#249)" framing and the false "never adds an
+    // m.room.encryption" claim must be gone.
+    assert!(
+        !ALPHA_CHECKLIST.contains("until workspace E2EE lands (#249)"),
+        "alpha checklist must not frame workspace E2EE as unshipped pending #249 (issue #313)"
+    );
+    assert!(
+        !ALPHA_CHECKLIST.contains("never adds an `m.room.encryption`"),
+        "alpha checklist must not claim create_workspace never adds m.room.encryption (issue #313)"
+    );
+    // Positive: the opt-in flag is documented.
+    assert!(
+        ALPHA_CHECKLIST.contains("--e2ee on"),
+        "alpha checklist must document the workspace create --e2ee on opt-in (issue #313)"
+    );
+}
+
+/// `docs/cli-reference.md` must locate the trust store under the **data** dir,
+/// not the self-contradictory "`~/.config/mx-agent/trust.json` in the data
+/// directory".
+#[test]
+fn cli_reference_trust_store_path_is_data_dir() {
+    // Negative: the self-contradictory config-path-in-the-data-dir phrasing.
+    assert!(
+        !CLI_REFERENCE.contains("`~/.config/mx-agent/trust.json` in the data directory"),
+        "cli-reference must not place trust.json under ~/.config while calling it the data dir (issue #313)"
+    );
+    // Positive: the corrected default data-dir path.
+    assert!(
+        CLI_REFERENCE.contains(".local/share/mx-agent/trust.json"),
+        "cli-reference must give the data-dir trust.json path (issue #313)"
+    );
+}
+
+/// `docs/user-guide.md` must not claim "both runners execute on your local
+/// machine"; it must name signed remote dispatch via `--room`/`--agent`.
+#[test]
+fn user_guide_not_both_runners_local() {
+    // Negative: the stale local-only claim.
+    assert!(
+        !USER_GUIDE.contains("both runners execute on your local machine"),
+        "user-guide must not claim both runners only execute locally (issue #313)"
+    );
+    // Positive: the corrected sentence names local default + signed remote dispatch.
+    assert!(
+        USER_GUIDE.contains("execute locally by default"),
+        "user-guide must say runners execute locally by default (issue #313)"
+    );
+    assert!(
+        USER_GUIDE.contains("Matrix-backed"),
+        "user-guide must name signed Matrix-backed remote operations via --room/--agent (issue #313)"
+    );
+}
+
+/// The public wiki protocol spec must give `exec.finished.signal` as a signal
+/// *name* string, list the real `exec.stdin.v1` event, and never show a
+/// populated `artifact_mxc` (it is always null on the wire).
+#[test]
+fn wiki_protocol_signal_is_name_not_int() {
+    // Negative: the integer signal example and a populated artifact_mxc.
+    assert!(
+        !WIKI_PROTOCOL.contains("\"signal\": 9"),
+        "wiki protocol spec must not show signal as the integer 9 (issue #313)"
+    );
+    assert!(
+        !WIKI_PROTOCOL.contains("\"artifact_mxc\": \"mxc://"),
+        "wiki protocol spec must not show a populated artifact_mxc (always null on the wire; issue #313)"
+    );
+    // Positive: the corrected signal-name example and the real stdin event type.
+    assert!(
+        WIKI_PROTOCOL.contains("\"signal\": \"SIGKILL\""),
+        "wiki protocol spec must show signal as a name string, e.g. SIGKILL (issue #313)"
+    );
+    assert!(
+        WIKI_PROTOCOL.contains("com.mxagent.exec.stdin.v1"),
+        "wiki protocol spec must list the real com.mxagent.exec.stdin.v1 event type (issue #313)"
+    );
+}
+
+/// The public wiki must present the *current* policy-denial exit code (`128`),
+/// not the not-yet-emitted `126`, in its troubleshooting/config rows.
+#[test]
+fn wiki_policy_denial_exit_is_128_not_126() {
+    // Negative: the stale "126 is the current denial code" phrasings.
+    assert!(
+        !WIKI_SECURITY.contains("local exit code `126`"),
+        "wiki Security-and-Sandboxing must not present 126 as the current denial exit (issue #313)"
+    );
+    assert!(
+        !WIKI_GETTING_STARTED.contains("`exit 126` from an exec"),
+        "wiki Getting-Started must not present exit 126 as the current denial exit (issue #313)"
+    );
+    // Positive: the 128-today wording in each page.
+    assert!(
+        WIKI_SECURITY.contains("code `128` today"),
+        "wiki Security-and-Sandboxing must state the denial exit is 128 today (issue #313)"
+    );
+    assert!(
+        WIKI_GETTING_STARTED.contains("surfaces as `128`"),
+        "wiki Getting-Started must state the denial exit surfaces as 128 today (issue #313)"
+    );
+}
+
+/// Acceptance-criterion serde round-trip: the corrected wiki `exec.finished` and
+/// `stream.chunk` content examples must deserialize against the
+/// `mx-agent-protocol` schema types. The chunk example uses `"sha256": null`
+/// (producers do not populate the per-chunk digest today); the finished example
+/// uses `"signal": "SIGKILL"` (a signal *name*) and `"artifact_mxc": null`
+/// (never populated on the wire).
+#[test]
+fn wiki_exec_finished_and_chunk_examples_deserialize() {
+    use mx_agent_protocol::schema::{ExecFinished, StreamChunk};
+
+    // The corrected wiki stream.chunk content object (UTF-8 chunk).
+    let chunk_content = r#"{
+    "invocation_id": "inv_01HZ8QK3M9V0X2YJ4N6P7R5T8W",
+    "stream": "stdout",
+    "seq": 42,
+    "encoding": "utf-8",
+    "data": "PASS src/foo.test.ts\n",
+    "eof": false,
+    "compressed": false,
+    "sha256": null,
+    "timestamp": "2026-06-02T12:00:01.123Z"
+  }"#;
+    serde_json::from_str::<StreamChunk>(chunk_content)
+        .expect("corrected wiki stream.chunk example must deserialize into StreamChunk");
+
+    // The corrected wiki exec.finished content object (signal-death case).
+    let finished_content = r#"{
+    "invocation_id": "inv_01HZ8QK3M9V0X2YJ4N6P7R5T8W",
+    "exit_code": null,
+    "signal": "SIGKILL",
+    "duration_ms": 5004,
+    "stdout_bytes": 1048576,
+    "stderr_bytes": 0,
+    "truncated": true,
+    "artifact_mxc": null
+  }"#;
+    serde_json::from_str::<ExecFinished>(finished_content)
+        .expect("corrected wiki exec.finished example must deserialize into ExecFinished");
+
+    // Tie the round-trip to the published wiki: the distinctive corrected tokens
+    // must be present so a future wiki edit that diverges from the schema-valid
+    // shape fails this test (the lower-risk alternative to brittle fence-parsing).
+    assert!(
+        WIKI_PROTOCOL.contains("\"sha256\": null"),
+        "wiki stream.chunk examples must show sha256: null (issue #313)"
+    );
+    assert!(
+        WIKI_PROTOCOL.contains("\"signal\": \"SIGKILL\""),
+        "wiki exec.finished example must show signal as a name string (issue #313)"
+    );
+    assert!(
+        WIKI_PROTOCOL.contains("\"artifact_mxc\": null"),
+        "wiki exec.finished example must show artifact_mxc: null (issue #313)"
     );
 }

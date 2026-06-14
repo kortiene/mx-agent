@@ -119,7 +119,7 @@ Matrix room state is **last-write-wins per `(type, state_key)`**. mx-agent layer
 3. **Idempotency** — privileged requests carry `request_id`, `idempotency_key`, `nonce`, and `expires_at`; replays and duplicates are de-duplicated, expired requests are ignored (architecture §11.2).
 4. **Coordinator pattern** — for high-contention work, agents *propose* via timeline events and one coordinator agent *commits* the resolved state, serializing the decision without a central server.
 
-The throughline: **mx-agent never hides a conflict behind a mutable flag. It signs every claim, versions every snapshot, and makes disagreement an explicit, auditable event.**
+The throughline: **mx-agent never hides a conflict behind a mutable flag. It Ed25519-signs every privileged request and decision — the execution gate — versions every state snapshot with `state_rev`/`previous_event_id` (task-state writes are versioned, not signed), and makes disagreement an explicit, auditable event.**
 
 ---
 

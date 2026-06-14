@@ -29,7 +29,7 @@ A single agent is pinned by three separate cryptographic facts, so compromising 
 
 ### End-to-end encryption over Matrix
 
-When E2EE is enabled, message *contents* are encrypted between daemons (Olm for 1:1 to-device signaling, Megolm for room streams); the homeserver relays ciphertext only. E2EE protects confidentiality and binds the device identity — but note it is **orthogonal to authorization**: a correctly decrypted request from a trusted device is *still* rejected if its Ed25519 signature, local policy, or any schema-provided nonce/expiry check fails. Encryption answers "did this really come from that device, privately?"; policy answers "is that device allowed to do this here?".
+When E2EE is enabled, message *contents* are encrypted between daemons with Megolm room encryption (matrix-sdk uses Olm under the hood to share Megolm room keys between devices; mx-agent itself sends no app-level to-device messages); the homeserver relays ciphertext only. E2EE protects confidentiality and binds the device identity — but note it is **orthogonal to authorization**: a correctly decrypted request from a trusted device is *still* rejected if its Ed25519 signature, local policy, or any schema-provided nonce/expiry check fails. Encryption answers "did this really come from that device, privately?"; policy answers "is that device allowed to do this here?".
 
 ### Two distinct trust roots — transport vs. execution
 
@@ -100,7 +100,7 @@ This means a remote agent cannot exfiltrate your cloud or model-provider credent
 
 ## Hardened Production Configuration
 
-A complete, fully-commented `policy.toml`. Place it at `~/.config/mx-agent/policy.toml` (override the config dir with `MX_CONFIG_DIR`) and set it to mode `0600`. The engine is **deny-by-default**: anything not explicitly allowed is denied (local exit code `126`).
+A complete, fully-commented `policy.toml`. Place it at `~/.config/mx-agent/policy.toml` (override the config dir with `MX_AGENT_CONFIG_DIR`) and set it to mode `0600`. The engine is **deny-by-default**: anything not explicitly allowed is denied — the local CLI exits with code `128` today (a dedicated `126` for policy denial is planned; see `docs/architecture.md §5.3`).
 
 ```toml
 # ~/.config/mx-agent/policy.toml
@@ -248,7 +248,7 @@ Device verification is advisory by default. To additionally require a verified s
 
 ## Audit Logging (architecture §13.6)
 
-Every privileged decision is logged locally, without secrets, to `~/.local/share/mx-agent/audit.log`:
+Every privileged decision is logged locally, without secrets, to the audit log in the **config** directory — `$MX_AGENT_CONFIG_DIR/audit.log` (default `$XDG_CONFIG_HOME/mx-agent/audit.log`, i.e. `~/.config/mx-agent/audit.log`):
 
 ```json
 {

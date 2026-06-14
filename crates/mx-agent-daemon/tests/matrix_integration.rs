@@ -112,8 +112,10 @@
 //! scripts/matrix_integration_test.sh
 //! ```
 //!
-//! which boots the local homeserver (issue #59), registers the two test users,
-//! and sets the environment variables this test reads:
+//! which boots the local homeserver (issue #59), registers the per-run test
+//! users (two stable accounts plus a fresh account per recovery, key-backup,
+//! SAS, and log-redaction test), and sets the environment variables this test
+//! reads:
 //!
 //! - `MX_AGENT_TEST_HOMESERVER` — homeserver base URL (e.g. `http://127.0.0.1:8008`)
 //! - `MX_AGENT_TEST_USER` / `MX_AGENT_TEST_PASSWORD` — the daemon-side user
