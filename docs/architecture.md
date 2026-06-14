@@ -393,23 +393,14 @@ The local CLI should exit with the remote process exit code when possible.
 |---:|---|
 | 0 | Remote command succeeded |
 | 1-125 | Remote command exit code |
+| 3 | Not-found / not-logged-in sentinel (`daemon status`, `auth status`, lookups) |
 | 64 | Invalid CLI usage (e.g. an empty command) |
-| 126 | Local policy denied *(planned; currently surfaces as `128`)* |
 | 127 | Agent/tool/command not found |
-| 128 | Protocol/network failure — and, today, also a policy denial or a remote rejection (see note) |
-| 128 + signum | Process killed by a signal — e.g. `130` for SIGINT/Ctrl-C on the non-interactive path |
+| 128 | Protocol/network failure; today also covers local policy denial (planned dedicated `126`) and remote rejection (planned dedicated `131`) |
+| 128 + signum | Process killed by a signal — e.g. `130` for SIGINT/Ctrl-C |
 | 129 | Timeout — the requester abandoned a remote exec after its deadline (requested timeout + grace) and sent a signed `exec.cancel` (issue #314) |
-| 130 | Interrupted/cancelled locally (non-interactive path: `128 + SIGINT`) |
-| 131 | Remote rejected request *(planned; currently surfaces as `128`)* |
 | 132 | Stream integrity failure (strict mode) |
 
-> **Note (current behavior).** The daemon-mediated `exec` path emits the distinct
-> `129` (requester-side timeout) code, but does not yet distinguish `126` (policy
-> denied) or `131` (remote rejected); those each currently surface as `128`. A
-> process killed by a signal exits `128 + signum` (so a Ctrl-C'd command on the
-> non-interactive path exits `130`). Emitting the distinct `126`/`131` codes is
-> planned follow-up work.
->
 > **`exec.cancelled` and truncation.** A cancelled run's output is incomplete by
 > definition, so `com.mxagent.exec.cancelled.v1` carries no `truncated` field and
 > the cancel path intentionally drops the capture summary. The `truncated` flag is
@@ -1443,16 +1434,10 @@ clients can wait without accessing Matrix state.
 
 ### 10.2 IPC Transport
 
-POSIX:
+mx-agent is Unix-only; the IPC transport is a Unix-domain socket:
 
 ```text
 $XDG_RUNTIME_DIR/mx-agent/daemon.sock
-```
-
-Windows:
-
-```text
-\\.\pipe\mx-agent-daemon
 ```
 
 Security:
@@ -1460,7 +1445,6 @@ Security:
 - socket mode `0600`
 - owned by current user
 - verify peer credentials where supported, e.g. `SO_PEERCRED`
-- optional local IPC auth token stored outside agent-visible env
 
 Peer credential verification works as follows (implemented in
 `mx-agent-ipc`, module `peercred`):
@@ -1703,7 +1687,7 @@ On daemon startup or reconnect:
 | Target agent offline | request remains pending until timeout or is rejected by caller policy |
 | Homeserver rate limit | daemon backs off, chunks less frequently, may switch to artifact mode |
 | Missing stream chunk | receiver buffers then marks degraded or fails in strict mode |
-| Daemon crashes while child runs | supervisor kills or recovers child according to policy; live-pgid sidecar lets the restart janitor reap any orphaned process groups |
+| Daemon crashes while child runs | no child supervisor runs between crashes; the live-pgid sidecar lets the restart janitor reap orphaned process groups on next startup or `daemon stop` |
 | Request arrives after expiry | target rejects without execution |
 | E2EE decryption fails | event ignored or marked undecryptable; no execution |
 | Policy changes during run | new requests use new policy; running invocations follow configured behavior |
@@ -2320,5 +2304,4 @@ Defer until after MVP:
 - Multi-writer conflict resolution UI.
 - Rich approval UX.
 - Advanced sandboxing presets.
-- Cross-platform named pipes.
 - Full key rotation/revocation automation.

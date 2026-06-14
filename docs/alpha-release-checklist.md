@@ -146,7 +146,7 @@ it here before release.
   privileged-event decryption and fail-safe handling for undecryptable events
   ship today, and **production E2EE hardening shipped** (#240/#256): device
   verification UX, cross-signing, and server-side key backup/recovery — see
-  `README.md` and roadmap Phase 12.
+  `README.md` and roadmap Phase 16 ("Hardening and Release").
 - **Sandbox is not a security boundary on its own.** The `none`, `bubblewrap`,
   and Docker/Podman container backends are implemented and policy-selectable
   (`firejail`/`chroot` are rejected at policy load, never silently unsandboxed).
@@ -161,15 +161,19 @@ it here before release.
   `bubblewrap`/`docker`/`podman`. Bound the blast radius with policy (cwd, env
   scrub, network, path-bind confinement, runtime/output caps) and a real sandbox
   backend.
-- **Workspace rooms are unencrypted; exec/call/share traffic is homeserver-readable.**
-  `workspace create` does not enable room-level E2EE (`create_workspace()` never
-  adds an `m.room.encryption` initial-state event). Every `EXEC_REQUEST`,
-  `EXEC_FINISHED`, `STREAM_CHUNK`, `CALL_REQUEST`, `CALL_RESPONSE`, and `share`
-  payload travels as a cleartext Matrix timeline event readable by the homeserver
-  operator. Requests are **Ed25519-signed** (integrity/authenticity guaranteed),
-  but **not end-to-end encrypted**. Do not send commands, stdin, or payloads you
-  need to keep confidential from the homeserver operator until workspace E2EE
-  lands (#249).
+- **Workspace rooms are unencrypted by default; turn on E2EE for confidentiality from the
+  homeserver operator.** A plain `workspace create` leaves the room unencrypted, so every
+  `EXEC_REQUEST`, `EXEC_FINISHED`, `STREAM_CHUNK`, `CALL_REQUEST`, `CALL_RESPONSE`, and
+  `share` payload travels as a cleartext Matrix timeline event readable by the homeserver
+  operator. `workspace create --e2ee on` injects an `m.room.encryption` initial-state event
+  at creation (born encrypted, Megolm v1; `workspace.rs`, #249/#296), so timeline events and
+  the media offload are encrypted and unreadable by the operator. Requests are
+  **Ed25519-signed** (integrity/authenticity guaranteed) regardless of encryption. Even under
+  `--e2ee on`, Matrix **state** events (the task action `command`/`env`/`result`,
+  invocation/agent/workspace state) are never Megolm-encrypted and stay plaintext readable by
+  the operator — do not place secrets in a task action's `env` (issue #308). Do not send
+  commands, stdin, or payloads you need to keep confidential from the homeserver operator
+  without `--e2ee on`.
 - **Bundled homeserver is dev-only.** The Tuwunel homeserver in `dev/matrix`
   binds to loopback, disables federation, and is for local testing only — never
   for production identities or data.

@@ -247,7 +247,7 @@ local exit: 7
 | `error: peer credential mismatch (peer uid 1001 != daemon uid 1000)` | You're running the CLI as a different user than the daemon | Run both as the **same** OS user; mx-agent deliberately refuses cross-user sockets |
 | `error: not logged in to Matrix` | Skipped Step 2, or session expired | `mx-agent auth login --homeserver <URL> --user <USER>` |
 | `error: unknown room '!…'` | Wrong room ID, or you haven't joined | `mx-agent workspace join '#alias:server'`; double-check the `$ROOM` value |
-| `exit 126` from an exec | **Local policy denied** the command | Allow it in `~/.config/mx-agent/policy.toml` (see [[Security & Sandboxing|Security-and-Sandboxing]]); deny-by-default is intentional |
+| `exit 128` from an exec you expected to succeed | **Local policy denied** the command — today a policy denial surfaces as `128` (a dedicated `126` is planned; see `docs/architecture.md §5.3`) | Allow it in `~/.config/mx-agent/policy.toml` (see [[Security & Sandboxing|Security-and-Sandboxing]]); deny-by-default is intentional |
 | `exit 127` | Agent / tool / command not found | Check `mx-agent agent list --room "$ROOM"` and that the binary exists on the target |
 | `--socket` ignored / wrong path | Custom `$XDG_RUNTIME_DIR` | Pass `--socket <path>` explicitly or set `MX_AGENT_RUNTIME_DIR` |
 
