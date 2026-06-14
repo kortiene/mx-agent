@@ -349,6 +349,34 @@ trusted = true
 require_verified_device = true     # every agent in this room must send from a verified device
 ```
 
+**What `--e2ee on` does and does not protect (issue #308).** Room encryption is
+a *confidentiality* property (who can read), never an *authority* property (who
+may execute). Under `workspace create --e2ee on`:
+
+- **Encrypted, unreadable by the homeserver operator:** workspace **timeline**
+  events — exec/call requests, results, stream chunks, the artifact/share
+  *referencing* events, heartbeats — are Megolm-encrypted. The **media offload**
+  (exec output over 256 KiB and large `share` payloads) is uploaded as
+  ciphertext via the Matrix `EncryptedFile` scheme and decrypted on retrieval, so
+  the full log / shared blob is not readable by the operator.
+- **Plaintext, readable by the homeserver operator even under `--e2ee on`:**
+  Matrix **state** events are never Megolm-encrypted. That includes the
+  `com.mxagent.task.v1` action (`command`/`cwd`/`env`) and result, and the
+  `com.mxagent.invocation.v1` / `com.mxagent.agent.v1` / `com.mxagent.workspace.v1`
+  state (requester/target identities, capabilities, `cwd`, `project_id`, git
+  commit, local path). The scheduler reads the real action from state to execute
+  it, so it cannot be redacted or moved into encrypted timeline events without a
+  deferred task-engine redesign.
+
+> **Do not place secrets in a task action's `env`.** It is published in plaintext
+> room state and is readable by the homeserver operator regardless of encryption.
+> The daemon emits one advisory warning (logging only the *count* of env keys,
+> never their names or values) when a task action with a non-empty `env` is
+> published into an encrypted room. Exec request `env` rides the encrypted
+> timeline event, but operational env secrets are scrubbed by the daemon's
+> redactor regardless — prefer the daemon's `env_allowlist` and the host
+> environment over carrying secrets through Matrix at all.
+
 ## Policy examples
 
 Policy lives in `policy.toml`, resolved in this order:

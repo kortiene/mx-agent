@@ -231,10 +231,22 @@ pub struct StreamArtifact {
     pub size_bytes: u64,
     /// Base64 digest of the artifact.
     pub sha256: String,
-    /// MXC URI of the uploaded artifact.
+    /// MXC URI of the uploaded artifact. On the encrypted path this is the
+    /// ciphertext URL (`EncryptedFile.url`); the presence of
+    /// [`encrypted_file`](Self::encrypted_file) — not this URI — selects the
+    /// decrypt path on download.
     pub mxc_uri: String,
     /// Tail preview of the output.
     pub tail_preview: String,
+    /// `EncryptedFile` key material (ruma `m.encrypted` file scheme) for a media
+    /// payload uploaded to an end-to-end-encrypted room. Present only when the
+    /// media blob is ciphertext; absent for a plaintext `mxc_uri` upload (the
+    /// default and the only form produced before this field existed). Carried as
+    /// an opaque JSON object so the protocol crate stays free of a ruma
+    /// dependency. The bytes are the AES-CTR key, IV, and ciphertext SHA-256
+    /// hashes; never log them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_file: Option<Value>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -310,9 +322,21 @@ pub struct ContextShare {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
     /// MXC URI of the uploaded object for a large context. `None` for an inline
-    /// (small-payload) share.
+    /// (small-payload) share. On the encrypted path this is the ciphertext URL
+    /// (`EncryptedFile.url`); the presence of
+    /// [`encrypted_file`](Self::encrypted_file) — not this URI — selects the
+    /// decrypt path on download.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mxc_uri: Option<String>,
+    /// `EncryptedFile` key material (ruma `m.encrypted` file scheme) for a
+    /// media-backed share uploaded to an end-to-end-encrypted room. Present only
+    /// when the media blob is ciphertext; absent for an inline payload or a
+    /// plaintext `mxc_uri` upload (the default and the only form produced before
+    /// this field existed). Carried as an opaque JSON object so the protocol
+    /// crate stays free of a ruma dependency. The bytes are the AES-CTR key, IV,
+    /// and ciphertext SHA-256 hashes; never log them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_file: Option<Value>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -474,6 +498,14 @@ pub struct RepoInfo {
 /// `com.mxagent.workspace.v1` state content (architecture §9.3).
 ///
 /// Published with an empty state key: one workspace metadata record per room.
+///
+/// # Confidentiality
+///
+/// This is a Matrix **state** event: its `project_id`, local `path`, and repo
+/// metadata are plaintext readable by the homeserver operator and all room
+/// members even in an `--e2ee on` workspace (state events are not
+/// Megolm-encrypted). Do not attach a path or project identifier you consider
+/// secret (issue #308).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     /// Project identifier, e.g. `repo:github.com/org/project`.
@@ -514,6 +546,14 @@ pub struct AgentLoad {
 }
 
 /// `com.mxagent.agent.v1` state content (architecture §9.1).
+///
+/// # Confidentiality
+///
+/// This is a Matrix **state** event, refreshed by the heartbeat loop. Its
+/// declared `capabilities`, `tools`, and embedded [`AgentWorkspace`] (`cwd`,
+/// `project_id`, git commit) are plaintext readable by the homeserver operator
+/// even in an `--e2ee on` workspace (state events are not Megolm-encrypted)
+/// (issue #308).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentState {
     /// Agent identifier.
@@ -617,12 +657,26 @@ pub enum TaskAction {
         authorization: Option<TaskActionAuthorization>,
     },
     /// Invoke an exec-style command through the daemon's execution path.
+    ///
+    /// # Confidentiality
+    ///
+    /// This action is carried in the `com.mxagent.task.v1` **state** event, which
+    /// Matrix never Megolm-encrypts — even in an `--e2ee on` workspace, state
+    /// events are plaintext readable by the homeserver operator. The scheduler
+    /// reads `command`/`cwd`/`env` from state to execute the task, so they cannot
+    /// be redacted or moved into encrypted timeline events without the deferred
+    /// task-engine redesign (issue #308). **Do not place secrets in `env`**; the
+    /// daemon emits an advisory warning when a non-empty `env` is published into
+    /// an encrypted room.
     Exec {
-        /// Command argv: program followed by arguments.
+        /// Command argv: program followed by arguments. Published in plaintext
+        /// room state; readable by the homeserver operator even under `--e2ee on`.
         command: Vec<String>,
-        /// Working directory for the command.
+        /// Working directory for the command. Published in plaintext room state.
         cwd: String,
-        /// Explicit environment overrides.
+        /// Explicit environment overrides. Published in plaintext room state and
+        /// readable by the homeserver operator even under `--e2ee on`; never
+        /// place secrets here.
         #[serde(default)]
         env: BTreeMap<String, String>,
         /// Optional timeout in milliseconds.
@@ -724,6 +778,15 @@ impl TaskAction {
 /// but daemon-written results use this documented shape so automation can rely
 /// on stable fields. The summary should be non-sensitive: large or secret-prone
 /// output belongs in stream/artifact events, not in the task result.
+///
+/// # Confidentiality
+///
+/// This result is stored in the `com.mxagent.task.v1` **state** event, which is
+/// plaintext readable by the homeserver operator even in an `--e2ee on`
+/// workspace (Matrix does not Megolm-encrypt state events). Keep the
+/// [`summary`](Self::summary) non-sensitive and point full output at an
+/// encrypted media artifact via [`artifact_mxc`](Self::artifact_mxc) rather than
+/// embedding it here (issue #308).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskResult {
     /// Terminal status, normally `succeeded` or `failed`.
@@ -762,6 +825,17 @@ impl TaskResult {
 }
 
 /// `com.mxagent.task.v1` state content (architecture §9.2).
+///
+/// # Confidentiality
+///
+/// This is a Matrix **state** event. Matrix never Megolm-encrypts state events,
+/// so even in an `--e2ee on` workspace the homeserver operator can read every
+/// field — including the [`action`](Self::action) (an [`TaskAction::Exec`]'s
+/// `command`/`cwd`/`env`) and the [`result`](Self::result) payload. The
+/// scheduler needs the real action in state to execute it, so these are
+/// documented-and-warned, not hidden, until the deferred encrypted-timeline
+/// offload redesign lands (issue #308). Do not place secrets in a task action's
+/// `env`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskState {
     /// Task identifier.
@@ -803,6 +877,13 @@ pub struct TaskState {
 }
 
 /// `com.mxagent.invocation.v1` state content (architecture §9, table row).
+///
+/// # Confidentiality
+///
+/// This is a Matrix **state** event: the `requester`/`target` identities and
+/// lifecycle (`state`, `exit_code`) are plaintext readable by the homeserver
+/// operator even in an `--e2ee on` workspace (state events are not
+/// Megolm-encrypted) (issue #308).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvocationState {
     /// Invocation identifier.
@@ -1007,6 +1088,52 @@ mod tests {
     }
 
     #[test]
+    fn stream_artifact_with_encrypted_file_round_trips() {
+        // An artifact uploaded to an encrypted room carries the opaque
+        // `EncryptedFile` key material alongside a ciphertext `mxc_uri`.
+        assert_round_trip::<StreamArtifact>(json!({
+            "invocation_id": "inv_01HZ",
+            "stream": "stdout",
+            "name": "stdout.log.zst",
+            "mime_type": "text/plain+zstd",
+            "size_bytes": 10485760u64,
+            "sha256": "base64",
+            "mxc_uri": "mxc://matrix.org/ciphertext",
+            "tail_preview": "last 4KB of output...",
+            "encrypted_file": {
+                "url": "mxc://matrix.org/ciphertext",
+                "key": { "kty": "oct", "alg": "A256CTR", "k": "base64url", "ext": true, "key_ops": ["encrypt", "decrypt"] },
+                "iv": "base64",
+                "hashes": { "sha256": "base64" },
+                "v": "v2"
+            }
+        }));
+    }
+
+    #[test]
+    fn stream_artifact_legacy_json_has_no_encrypted_file() {
+        // A pre-change (plaintext) artifact has no `encrypted_file`; it must
+        // deserialize to `None` and re-serialize without the field.
+        let parsed: StreamArtifact = serde_json::from_value(json!({
+            "invocation_id": "inv_01HZ",
+            "stream": "stdout",
+            "name": "stdout.log",
+            "mime_type": "text/plain",
+            "size_bytes": 1024u64,
+            "sha256": "base64",
+            "mxc_uri": "mxc://matrix.org/plain",
+            "tail_preview": "tail"
+        }))
+        .expect("legacy artifact without encrypted_file must deserialize");
+        assert!(parsed.encrypted_file.is_none());
+        let value = serde_json::to_value(&parsed).expect("serialize artifact");
+        assert!(
+            value.get("encrypted_file").is_none(),
+            "a plaintext artifact must not serialize encrypted_file"
+        );
+    }
+
+    #[test]
     fn context_share_large_object_round_trips() {
         // A large object referenced by Matrix media: no inline payload.
         assert_round_trip::<ContextShare>(json!({
@@ -1017,6 +1144,48 @@ mod tests {
             "sha256": "base64",
             "mxc_uri": "mxc://matrix.org/abcdef"
         }));
+    }
+
+    #[test]
+    fn context_share_encrypted_media_round_trips() {
+        // A large share uploaded to an encrypted room carries `encrypted_file`
+        // alongside a ciphertext `mxc_uri` and no inline payload.
+        assert_round_trip::<ContextShare>(json!({
+            "context_id": "ctx_01HZ",
+            "name": "full-test-log.txt",
+            "mime_type": "text/plain",
+            "size_bytes": 2500000u64,
+            "sha256": "base64",
+            "mxc_uri": "mxc://matrix.org/ciphertext",
+            "encrypted_file": {
+                "url": "mxc://matrix.org/ciphertext",
+                "key": { "kty": "oct", "alg": "A256CTR", "k": "base64url", "ext": true, "key_ops": ["encrypt", "decrypt"] },
+                "iv": "base64",
+                "hashes": { "sha256": "base64" },
+                "v": "v2"
+            }
+        }));
+    }
+
+    #[test]
+    fn context_share_legacy_media_has_no_encrypted_file() {
+        // A pre-change (plaintext) media share has no `encrypted_file`; it must
+        // deserialize to `None` and re-serialize without the field.
+        let parsed: ContextShare = serde_json::from_value(json!({
+            "context_id": "ctx_01HZ",
+            "name": "full-test-log.txt",
+            "mime_type": "text/plain",
+            "size_bytes": 2500000u64,
+            "sha256": "base64",
+            "mxc_uri": "mxc://matrix.org/plain"
+        }))
+        .expect("legacy media share without encrypted_file must deserialize");
+        assert!(parsed.encrypted_file.is_none());
+        let value = serde_json::to_value(&parsed).expect("serialize share");
+        assert!(
+            value.get("encrypted_file").is_none(),
+            "a plaintext share must not serialize encrypted_file"
+        );
     }
 
     #[test]
@@ -1455,5 +1624,155 @@ mod tests {
         );
         let reserialized = serde_json::to_value(&parsed).unwrap();
         assert_eq!(reserialized, value, "unknown field must round-trip");
+    }
+
+    // ── Issue #308: E2EE confidentiality schema tests ─────────────────────────
+
+    #[test]
+    fn task_action_exec_env_survives_json_round_trip() {
+        // `TaskAction::Exec` env is published in `com.mxagent.task.v1` state
+        // events, which are plaintext readable by the homeserver operator even
+        // under `--e2ee on` (issue #308). The env must survive a JSON
+        // round-trip without loss so the scheduler reads the same values the
+        // requester published.
+        let mut env = BTreeMap::new();
+        env.insert("CI".to_string(), "1".to_string());
+        env.insert("NODE_ENV".to_string(), "test".to_string());
+        let action = TaskAction::Exec {
+            command: vec!["cargo".to_string(), "test".to_string()],
+            cwd: "/repo".to_string(),
+            env: env.clone(),
+            timeout_ms: Some(60_000),
+            stream: true,
+            authorization: None,
+        };
+        let serialized = serde_json::to_value(&action).expect("serialize TaskAction");
+        let restored: TaskAction =
+            serde_json::from_value(serialized).expect("deserialize TaskAction");
+        if let TaskAction::Exec {
+            env: restored_env, ..
+        } = restored
+        {
+            assert_eq!(
+                restored_env, env,
+                "exec action env must survive the JSON round-trip"
+            );
+        } else {
+            panic!("expected Exec after round-trip");
+        }
+    }
+
+    #[test]
+    fn task_action_kind_returns_correct_strings() {
+        // `kind()` drives the `action` field recorded in `TaskResult`, so the
+        // wrong string would make task results uninterpretable by automation.
+        let tool = TaskAction::Tool {
+            tool: "run_tests".to_string(),
+            args: Value::Null,
+            authorization: None,
+        };
+        assert_eq!(tool.kind(), "tool");
+
+        let exec = TaskAction::Exec {
+            command: vec!["sh".to_string()],
+            cwd: "/".to_string(),
+            env: Default::default(),
+            timeout_ms: None,
+            stream: false,
+            authorization: None,
+        };
+        assert_eq!(exec.kind(), "exec");
+    }
+
+    #[test]
+    fn without_authorization_preserves_exec_env_when_non_empty() {
+        // The signing helper calls `without_authorization` to derive the byte
+        // string it signs, then re-attaches the signature. The env must be
+        // preserved — if it were dropped, the signature would bind a different
+        // action than what the scheduler actually executes (issue #308).
+        let mut env = BTreeMap::new();
+        env.insert("DEPLOY_ENV".to_string(), "staging".to_string());
+        env.insert("PORT".to_string(), "8080".to_string());
+        let exec = TaskAction::Exec {
+            command: vec!["deploy.sh".to_string()],
+            cwd: "/opt/app".to_string(),
+            env: env.clone(),
+            timeout_ms: Some(120_000),
+            stream: false,
+            authorization: None,
+        };
+        let stripped = exec.without_authorization();
+        if let TaskAction::Exec {
+            command,
+            cwd,
+            env: stripped_env,
+            timeout_ms,
+            stream,
+            authorization,
+        } = stripped
+        {
+            assert_eq!(command, vec!["deploy.sh"]);
+            assert_eq!(cwd, "/opt/app");
+            assert_eq!(stripped_env, env, "env must survive without_authorization");
+            assert_eq!(timeout_ms, Some(120_000));
+            assert!(!stream);
+            assert!(authorization.is_none(), "authorization must be stripped");
+        } else {
+            panic!("expected Exec after without_authorization");
+        }
+    }
+
+    #[test]
+    fn task_result_without_artifact_mxc_backward_compat() {
+        // A result published before `artifact_mxc` existed must deserialize to
+        // `None` — the field has `#[serde(default)]` so an absent field is
+        // silently treated as `None` (backward compat, issue #308).
+        let parsed: TaskResult = serde_json::from_value(json!({
+            "status": "succeeded",
+            "completed_by": "developer-pi",
+            "completed_at": "2026-06-12T10:00:00Z",
+            "invocation_id": "inv_legacy",
+            "exit_code": 0
+        }))
+        .expect("legacy result without artifact_mxc must deserialize");
+        assert!(
+            parsed.artifact_mxc.is_none(),
+            "missing artifact_mxc in legacy JSON must be None"
+        );
+    }
+
+    #[test]
+    fn task_state_exec_action_with_non_empty_env_round_trips() {
+        // The full `com.mxagent.task.v1` state event — including an exec
+        // action with a non-empty `env` — must round-trip losslessly. An env
+        // key dropped during round-trip would cause the scheduler to run with
+        // fewer environment variables than the requester intended (issue #308).
+        assert_round_trip::<TaskState>(json!({
+            "task_id": "task-deploy",
+            "title": "Deploy staging",
+            "description": "",
+            "state": "assigned",
+            "assigned_to": "developer-pi",
+            "created_by": "@planner:server",
+            "depends_on": [],
+            "blocks": [],
+            "invocation_id": null,
+            "created_at": "2026-06-12T10:00:00Z",
+            "updated_at": "2026-06-12T10:00:00Z",
+            "state_rev": 1,
+            "previous_event_id": null,
+            "result": null,
+            "action": {
+                "type": "exec",
+                "command": ["./deploy.sh"],
+                "cwd": "/opt/app",
+                "env": {
+                    "DEPLOY_ENV": "staging",
+                    "PORT": "8080"
+                },
+                "timeout_ms": 120000,
+                "stream": false
+            }
+        }));
     }
 }

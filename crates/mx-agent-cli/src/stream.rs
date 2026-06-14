@@ -626,6 +626,7 @@ mod tests {
             sha256: "abc123".to_string(),
             mxc_uri: mxc.to_string(),
             tail_preview: tail.to_string(),
+            encrypted_file: None,
             extra: Default::default(),
         }
     }

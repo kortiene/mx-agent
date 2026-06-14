@@ -1111,13 +1111,17 @@ async fn emit_output_events(
     let total = stdout.len() + stderr.len();
     let artifact_config = crate::ArtifactConfig::default();
     if artifact_config.should_switch(total) {
+        // In an `--e2ee on` room the artifact media is encrypted end to end
+        // (ciphertext on the homeserver); in a plaintext room it is uploaded as
+        // cleartext as before (issue #308).
+        let encrypted = room.encryption_state().is_encrypted();
         for (stream, data) in [(StreamKind::Stdout, stdout), (StreamKind::Stderr, stderr)] {
             if data.is_empty() {
                 continue;
             }
             let prepared =
                 crate::prepare_artifact(invocation_id, stream, data, &artifact_config).await;
-            match crate::upload_artifact(client, prepared).await {
+            match crate::upload_artifact(client, prepared, encrypted).await {
                 Ok(event) => {
                     if let Ok(content) = serde_json::to_value(&event) {
                         let _ = room.send_raw(STREAM_ARTIFACT, content).await;

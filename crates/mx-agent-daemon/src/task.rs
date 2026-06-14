@@ -519,10 +519,38 @@ async fn publish_task_state(
     task_id: &str,
     state: &TaskState,
 ) -> Result<(), WorkspaceError> {
+    warn_env_in_encrypted_room_state(room, task_id, state);
     let content = serde_json::to_value(state)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
     send_workspace_state(room, TASK_STATE_TYPE, task_id, content).await?;
     Ok(())
+}
+
+/// Warn when a task action carrying a non-empty `env` is published into an
+/// **encrypted** room.
+///
+/// Matrix never Megolm-encrypts state events, so the `com.mxagent.task.v1`
+/// action (`command`/`cwd`/`env`) is plaintext readable by the homeserver
+/// operator even under `--e2ee on` (issue #308). An operator who created an
+/// encrypted workspace might wrongly assume the env is confidential, so the
+/// daemon surfaces one advisory warning per publish. To avoid leaking the very
+/// secrets it is warning about, the log records only the **count** of env keys —
+/// never their names or values. Unencrypted rooms are already documented as
+/// cleartext and are not warned about, so they are not spammed.
+fn warn_env_in_encrypted_room_state(room: &Room, task_id: &str, state: &TaskState) {
+    let Some(TaskAction::Exec { env, .. }) = state.action.as_ref() else {
+        return;
+    };
+    if env.is_empty() || !room.encryption_state().is_encrypted() {
+        return;
+    }
+    tracing::warn!(
+        task_id,
+        room_id = %room.room_id(),
+        env_key_count = env.len(),
+        "task action env is published in room state and is readable by the homeserver \
+         operator even in an encrypted room; do not place secrets in task env"
+    );
 }
 
 /// Create a task in a workspace room.
@@ -1697,5 +1725,94 @@ mod tests {
         );
         // Original authorization is unchanged.
         assert_eq!(presigned.authorization().unwrap().nonce, original_nonce);
+    }
+
+    // ── Issue #308: plaintext-in-state exec env tests ─────────────────────────
+
+    #[test]
+    fn build_new_task_preserves_exec_action_with_non_empty_env() {
+        // The exec action (including env) is published as `com.mxagent.task.v1`
+        // state, which is plaintext readable even in an `--e2ee on` workspace
+        // (issue #308). The daemon must publish exactly the env the requester
+        // supplied — neither dropping keys nor injecting extras.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("CI".to_string(), "1".to_string());
+        env.insert("NODE_ENV".to_string(), "test".to_string());
+        let mut opts = create_opts();
+        opts.action = Some(TaskAction::Exec {
+            command: vec!["npm".to_string(), "test".to_string()],
+            cwd: "/repo".to_string(),
+            env: env.clone(),
+            timeout_ms: Some(60_000),
+            stream: false,
+            authorization: None,
+        });
+        let task = build_new_task(
+            &opts,
+            "task_env".to_string(),
+            "claude-local".to_string(),
+            "2026-06-12T10:00:00Z".to_string(),
+        );
+        let action = task.action.expect("task must carry the exec action");
+        if let TaskAction::Exec {
+            env: task_env,
+            command,
+            cwd,
+            ..
+        } = action
+        {
+            assert_eq!(
+                task_env, env,
+                "task action env must be preserved as published"
+            );
+            assert_eq!(command, vec!["npm", "test"]);
+            assert_eq!(cwd, "/repo");
+        } else {
+            panic!("expected Exec action in built task");
+        }
+    }
+
+    #[test]
+    fn apply_update_replaces_exec_action_preserving_env() {
+        // When a task update supplies a new exec action (e.g. to change the
+        // cwd or timeout), the replacement action — including its env — must be
+        // stored exactly as supplied. The env is later serialized into the
+        // plaintext state event (issue #308); dropping or modifying it would
+        // cause the scheduler to run with wrong environment variables.
+        let mut task = build_new_task(
+            &create_opts(),
+            "task_update_env".to_string(),
+            "me".to_string(),
+            "t1".to_string(),
+        );
+        let mut new_env = std::collections::BTreeMap::new();
+        new_env.insert("DEPLOY_ENV".to_string(), "staging".to_string());
+        let new_action = TaskAction::Exec {
+            command: vec!["./deploy.sh".to_string()],
+            cwd: "/opt/app".to_string(),
+            env: new_env.clone(),
+            timeout_ms: Some(120_000),
+            stream: false,
+            authorization: None,
+        };
+        let update = UpdateTaskOptions {
+            task_id: "task_update_env".to_string(),
+            action: Some(new_action),
+            ..Default::default()
+        };
+        apply_update(&mut task, &update, "t2".to_string(), None);
+
+        let stored = task.action.expect("action must be set after update");
+        if let TaskAction::Exec {
+            env: stored_env, ..
+        } = stored
+        {
+            assert_eq!(
+                stored_env, new_env,
+                "exec env must be preserved after action replacement"
+            );
+        } else {
+            panic!("expected Exec action after update");
+        }
     }
 }

@@ -32,7 +32,7 @@ use base64::Engine as _;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
 use matrix_sdk::room::MessagesOptions;
-use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::events::room::{EncryptedFile, MediaSource};
 use matrix_sdk::ruma::OwnedMxcUri;
 use matrix_sdk::{Client, Room};
 use sha2::{Digest, Sha256};
@@ -126,12 +126,39 @@ impl PreparedArtifact {
         &self.bytes
     }
 
-    /// Finalize into a [`StreamArtifact`] event referencing `mxc_uri`.
+    /// Finalize into a plaintext [`StreamArtifact`] event referencing `mxc_uri`.
     ///
     /// Pass an empty `mxc_uri` when no upload was performed (e.g. the local
     /// `exec` loopback, which has no homeserver); consumers render the tail
-    /// preview regardless.
+    /// preview regardless. The produced event carries no `encrypted_file`, so it
+    /// downloads via the plain [`MediaSource::Plain`] path. For an
+    /// end-to-end-encrypted upload use [`into_event_encrypted`](Self::into_event_encrypted).
     pub fn into_event(self, mxc_uri: impl Into<String>) -> StreamArtifact {
+        self.into_event_with(mxc_uri, None)
+    }
+
+    /// Finalize into an encrypted [`StreamArtifact`] event referencing the
+    /// ciphertext `mxc_uri` and carrying the opaque ruma `EncryptedFile` key
+    /// material in [`StreamArtifact::encrypted_file`].
+    ///
+    /// `mxc_uri` is the `EncryptedFile.url` (the ciphertext blob's MXC URI); the
+    /// presence of `encrypted_file` selects the decrypt path on download. Never
+    /// log `encrypted_file` — it holds the AES-CTR key and IV.
+    pub fn into_event_encrypted(
+        self,
+        mxc_uri: impl Into<String>,
+        encrypted_file: serde_json::Value,
+    ) -> StreamArtifact {
+        self.into_event_with(mxc_uri, Some(encrypted_file))
+    }
+
+    /// Shared finalizer for [`into_event`](Self::into_event) /
+    /// [`into_event_encrypted`](Self::into_event_encrypted).
+    fn into_event_with(
+        self,
+        mxc_uri: impl Into<String>,
+        encrypted_file: Option<serde_json::Value>,
+    ) -> StreamArtifact {
         StreamArtifact {
             invocation_id: self.invocation_id,
             stream: self.stream,
@@ -141,6 +168,7 @@ impl PreparedArtifact {
             sha256: self.sha256,
             mxc_uri: mxc_uri.into(),
             tail_preview: self.tail_preview,
+            encrypted_file,
             extra: Default::default(),
         }
     }
@@ -201,10 +229,30 @@ pub async fn prepare_artifact(
 
 /// Upload a [`PreparedArtifact`] as Matrix media and return the referencing
 /// [`StreamArtifact`] event.
+///
+/// When `encrypted` is `true` (the destination room has E2EE enabled) the bytes
+/// are encrypted client-side and uploaded as ciphertext via
+/// [`Client::upload_encrypted_file`]; the returned event carries the ruma
+/// `EncryptedFile` key material in [`StreamArtifact::encrypted_file`] and a
+/// ciphertext `mxc_uri`. When `false` the existing plaintext `media().upload`
+/// path is used and no `encrypted_file` is recorded. The `EncryptedFile` key
+/// material is never logged.
 pub async fn upload_artifact(
     client: &Client,
     prepared: PreparedArtifact,
+    encrypted: bool,
 ) -> Result<StreamArtifact, ArtifactError> {
+    if encrypted {
+        let mut reader = std::io::Cursor::new(prepared.bytes.clone());
+        let file = client
+            .upload_encrypted_file(&mut reader)
+            .await
+            .map_err(|e| ArtifactError::Upload(Box::new(e)))?;
+        let mxc = file.url.to_string();
+        let encrypted_file = serde_json::to_value(&file)
+            .map_err(|e| ArtifactError::Upload(Box::new(matrix_sdk::Error::SerdeJson(e))))?;
+        return Ok(prepared.into_event_encrypted(mxc, encrypted_file));
+    }
     let mime = prepared
         .mime_type
         .parse()
@@ -473,10 +521,37 @@ fn parse_mxc(uri: &str) -> Result<OwnedMxcUri, WorkspaceError> {
     }
 }
 
-/// Download the raw bytes of an artifact's uploaded media.
-async fn download_media(client: &Client, mxc_uri: &str) -> Result<Vec<u8>, WorkspaceError> {
+/// Resolve the [`MediaSource`] for an artifact's uploaded media.
+///
+/// When the artifact carries [`StreamArtifact::encrypted_file`] (an upload into
+/// an encrypted room) the source is [`MediaSource::Encrypted`], so
+/// `get_media_content` decrypts the ciphertext blob and verifies its
+/// `EncryptedFile.hashes`. Otherwise it is the plaintext
+/// [`MediaSource::Plain`] reference. A malformed `encrypted_file` fails closed
+/// with [`WorkspaceError::ArtifactRetrievalFailed`].
+fn media_source(artifact: &StreamArtifact) -> Result<MediaSource, WorkspaceError> {
+    match &artifact.encrypted_file {
+        Some(value) => {
+            let file: EncryptedFile = serde_json::from_value(value.clone()).map_err(|e| {
+                WorkspaceError::ArtifactRetrievalFailed(format!(
+                    "artifact for {:?} has malformed encrypted_file key material: {e}",
+                    artifact.invocation_id
+                ))
+            })?;
+            Ok(MediaSource::Encrypted(Box::new(file)))
+        }
+        None => Ok(MediaSource::Plain(parse_mxc(&artifact.mxc_uri)?)),
+    }
+}
+
+/// Download the raw bytes of an artifact's uploaded media, decrypting when the
+/// artifact references encrypted media (see [`media_source`]).
+async fn download_media(
+    client: &Client,
+    artifact: &StreamArtifact,
+) -> Result<Vec<u8>, WorkspaceError> {
     let request = MediaRequestParameters {
-        source: MediaSource::Plain(parse_mxc(mxc_uri)?),
+        source: media_source(artifact)?,
         format: MediaFormat::File,
     };
     client
@@ -622,7 +697,7 @@ pub async fn retrieve_artifact(
             options.invocation_id
         )));
     }
-    let media = download_media(client, &artifact.mxc_uri).await?;
+    let media = download_media(client, &artifact).await?;
     let data = verify_and_decompress(&artifact, media).await?;
     Ok(RetrievedArtifact { artifact, data })
 }
@@ -718,6 +793,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn into_event_encrypted_carries_key_material_and_ciphertext_uri() {
+        // The encrypted finalizer records the ciphertext mxc_uri and the opaque
+        // EncryptedFile key material; the plain finalizer records neither.
+        let data = b"log body".to_vec();
+        let config = ArtifactConfig {
+            compress: false,
+            ..ArtifactConfig::new()
+        };
+        let prepared = prepare_artifact("inv_enc", StreamKind::Stdout, &data, &config).await;
+        let key_material = serde_json::json!({ "url": "mxc://s/cipher", "iv": "base64" });
+        let event = prepared.into_event_encrypted("mxc://s/cipher", key_material.clone());
+        assert_eq!(event.mxc_uri, "mxc://s/cipher");
+        assert_eq!(event.encrypted_file.as_ref(), Some(&key_material));
+
+        let plain = prepare_artifact("inv_plain", StreamKind::Stdout, &data, &config).await;
+        let plain_event = plain.into_event("mxc://s/plain");
+        assert!(plain_event.encrypted_file.is_none());
+    }
+
+    /// A valid ruma `EncryptedFile` serialized to JSON, as `upload_encrypted_file`
+    /// would produce it (the protocol crate stores this opaquely).
+    fn sample_encrypted_file_value(url: &str) -> serde_json::Value {
+        use matrix_sdk::ruma::events::room::{
+            EncryptedFile, EncryptedFileHashes, EncryptedFileInfo, V2EncryptedFileInfo,
+        };
+        use matrix_sdk::ruma::OwnedMxcUri;
+        let file = EncryptedFile::new(
+            OwnedMxcUri::from(url),
+            EncryptedFileInfo::V2(V2EncryptedFileInfo::encode([7u8; 32], [3u8; 16])),
+            EncryptedFileHashes::with_sha256([9u8; 32]),
+        );
+        serde_json::to_value(&file).expect("EncryptedFile serializes to a JSON object")
+    }
+
+    #[test]
+    fn media_source_selects_encrypted_vs_plain() {
+        // A plaintext artifact downloads via MediaSource::Plain.
+        let plain = StreamArtifact {
+            invocation_id: "inv".into(),
+            stream: StreamKind::Stdout,
+            name: "stdout.log".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 0,
+            sha256: String::new(),
+            mxc_uri: "mxc://s/plain".into(),
+            tail_preview: String::new(),
+            encrypted_file: None,
+            extra: Default::default(),
+        };
+        assert!(matches!(
+            media_source(&plain).expect("plain source"),
+            MediaSource::Plain(_)
+        ));
+
+        // A well-formed EncryptedFile selects MediaSource::Encrypted.
+        let encrypted = StreamArtifact {
+            mxc_uri: "mxc://example.org/ciphertext".into(),
+            encrypted_file: Some(sample_encrypted_file_value("mxc://example.org/ciphertext")),
+            ..plain.clone()
+        };
+        assert!(matches!(
+            media_source(&encrypted).expect("encrypted source"),
+            MediaSource::Encrypted(_)
+        ));
+
+        // Malformed key material fails closed rather than silently downloading
+        // the (ciphertext) blob as plaintext.
+        let malformed = StreamArtifact {
+            encrypted_file: Some(serde_json::json!({ "not": "an EncryptedFile" })),
+            ..plain
+        };
+        assert!(matches!(
+            media_source(&malformed),
+            Err(WorkspaceError::ArtifactRetrievalFailed(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn compression_reflects_zstd_availability() {
         // "Compress logs with zstd where available." When zstd is present the
         // artifact is compressed and named accordingly; otherwise it falls back
@@ -767,6 +920,7 @@ mod tests {
             sha256: String::new(),
             mxc_uri: "mxc://s/a".into(),
             tail_preview: String::new(),
+            encrypted_file: None,
             extra: Default::default(),
         };
         assert!(is_compressed(&prepared));
@@ -792,6 +946,7 @@ mod tests {
                 sha256: String::new(),
                 mxc_uri: "mxc://s/a".into(),
                 tail_preview: String::new(),
+                encrypted_file: None,
                 extra: Default::default(),
             },
             producer: producer.into(),
@@ -900,5 +1055,120 @@ mod tests {
             }
             other => panic!("expected ArtifactIntegrity, got {other:?}"),
         }
+    }
+
+    // ── Issue #308: E2EE media confidentiality tests ───────────────────────────
+
+    #[test]
+    fn artifact_config_default_matches_new() {
+        // `Default::default()` and `ArtifactConfig::new()` must produce
+        // identical tuning so callers using either API get the same switching
+        // threshold, tail size, and compression setting.
+        let d = ArtifactConfig::default();
+        let n = ArtifactConfig::new();
+        assert_eq!(d.max_timeline_output_bytes, n.max_timeline_output_bytes);
+        assert_eq!(d.tail_preview_bytes, n.tail_preview_bytes);
+        assert_eq!(d.compress, n.compress);
+    }
+
+    #[test]
+    fn stream_stems_are_correct_for_all_kinds() {
+        // The stem determines the file name uploaded to Matrix media. A wrong
+        // stem makes an artifact indistinguishable from the wrong stream (e.g.
+        // `stdin.log` for stdout output).
+        assert_eq!(stream_stem(StreamKind::Stdin), "stdin");
+        assert_eq!(stream_stem(StreamKind::Stdout), "stdout");
+        assert_eq!(stream_stem(StreamKind::Stderr), "stderr");
+        assert_eq!(stream_stem(StreamKind::Pty), "pty");
+        assert_eq!(stream_stem(StreamKind::Control), "control");
+    }
+
+    #[test]
+    fn into_event_plaintext_path_leaves_encrypted_file_absent() {
+        // `into_event` (plaintext path) must never set `encrypted_file`.
+        // Presence of that field is the signal that triggers the decrypt path
+        // on download (issue #308); a spurious field would break retrieval.
+        let data = b"log output".to_vec();
+        let prepared = PreparedArtifact {
+            invocation_id: "inv_plain".into(),
+            stream: StreamKind::Stdout,
+            name: "stdout.log".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: data.len() as u64,
+            sha256: sha256_b64(&data),
+            tail_preview: "log output".into(),
+            compressed: false,
+            bytes: data,
+        };
+        let event = prepared.into_event("mxc://s/plain");
+        assert!(
+            event.encrypted_file.is_none(),
+            "into_event (plaintext path) must not set encrypted_file"
+        );
+    }
+
+    #[test]
+    fn parse_mxc_fails_for_non_mxc_uri_on_plain_artifact() {
+        // `media_source` calls `parse_mxc` on the `mxc_uri` of a plain artifact.
+        // A non-mxc URI must fail closed rather than silently constructing an
+        // unusable `MediaSource::Plain` that downloads ciphertext as if plain
+        // (issue #308).
+        let bad_uri = StreamArtifact {
+            invocation_id: "inv_1".into(),
+            stream: StreamKind::Stdout,
+            name: "stdout.log".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 0,
+            sha256: String::new(),
+            mxc_uri: "https://example.org/not-mxc".into(),
+            tail_preview: String::new(),
+            encrypted_file: None,
+            extra: Default::default(),
+        };
+        assert!(
+            matches!(
+                media_source(&bad_uri),
+                Err(WorkspaceError::ArtifactRetrievalFailed(_))
+            ),
+            "a non-mxc URI on a plain artifact must fail closed"
+        );
+    }
+
+    #[test]
+    fn encrypted_artifact_event_carries_distinct_fields() {
+        // An artifact from an encrypted room carries both the ciphertext
+        // `mxc_uri` AND the opaque `EncryptedFile` key material. The download
+        // path selects decryption based on the presence of `encrypted_file`,
+        // not on the URI itself, so both fields must be correctly set.
+        let data = b"big log".to_vec();
+        let prepared = PreparedArtifact {
+            invocation_id: "inv_enc".into(),
+            stream: StreamKind::Stdout,
+            name: "stdout.log".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: data.len() as u64,
+            sha256: sha256_b64(&data),
+            tail_preview: "big log".into(),
+            compressed: false,
+            bytes: data,
+        };
+        // Use a well-formed EncryptedFile value (real key/IV lengths so ruma
+        // validation passes on the retrieval path).
+        let key_material = sample_encrypted_file_value("mxc://s/ciphertext");
+        let event = prepared.into_event_encrypted("mxc://s/ciphertext", key_material.clone());
+        // The ciphertext MXC URI is carried for retrieval.
+        assert_eq!(event.mxc_uri, "mxc://s/ciphertext");
+        // The key material must be present so the downloader decrypts it.
+        assert_eq!(
+            event.encrypted_file.as_ref(),
+            Some(&key_material),
+            "encrypted artifact must carry EncryptedFile key material"
+        );
+        // The media_source resolves to the Encrypted variant, confirming the
+        // key material is parseable and of the correct length.
+        assert!(matches!(
+            media_source(&event).expect("valid encrypted_file source"),
+            MediaSource::Encrypted(_)
+        ));
     }
 }

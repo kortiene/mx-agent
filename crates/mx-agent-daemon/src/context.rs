@@ -25,7 +25,7 @@ use base64::Engine as _;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
 use matrix_sdk::room::MessagesOptions;
-use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::events::room::{EncryptedFile, MediaSource};
 use matrix_sdk::ruma::OwnedMxcUri;
 use matrix_sdk::{Client, Room};
 use mime::Mime;
@@ -192,6 +192,7 @@ fn build_inline_share(
         data: Some(payload),
         encoding: Some(encoding.to_string()),
         mxc_uri: None,
+        encrypted_file: None,
         extra: Default::default(),
     }
 }
@@ -199,7 +200,10 @@ fn build_inline_share(
 /// Build the `com.mxagent.context.share.v1` content for a media-backed payload.
 ///
 /// The raw bytes live in Matrix media at `mxc_uri`; the event carries only the
-/// reference plus the size and digest, with no inline `data`/`encoding`.
+/// reference plus the size and digest, with no inline `data`/`encoding`. Pass
+/// `encrypted_file` (the opaque ruma `EncryptedFile` JSON) when the blob is
+/// ciphertext uploaded into an encrypted room; pass `None` for a plaintext
+/// upload. On the encrypted path `mxc_uri` is the ciphertext `EncryptedFile.url`.
 fn build_media_share(
     context_id: String,
     name: String,
@@ -207,6 +211,7 @@ fn build_media_share(
     size_bytes: u64,
     sha256: String,
     mxc_uri: String,
+    encrypted_file: Option<serde_json::Value>,
 ) -> ContextShare {
     ContextShare {
         context_id,
@@ -217,6 +222,7 @@ fn build_media_share(
         data: None,
         encoding: None,
         mxc_uri: Some(mxc_uri),
+        encrypted_file,
         extra: Default::default(),
     }
 }
@@ -228,15 +234,41 @@ fn parse_mime(mime_type: &str) -> Mime {
 }
 
 /// Upload `data` as Matrix media and build a media-backed [`ContextShare`].
+///
+/// When `encrypted` is `true` (the destination room has E2EE enabled) the bytes
+/// are encrypted client-side and uploaded as ciphertext via
+/// [`Client::upload_encrypted_file`]; the share carries the ruma `EncryptedFile`
+/// key material in [`ContextShare::encrypted_file`] and a ciphertext `mxc_uri`.
+/// When `false` the existing plaintext `media().upload` path is used. The
+/// `EncryptedFile` key material is never logged.
 async fn upload_media_share(
     client: &Client,
     context_id: String,
     name: String,
     mime_type: String,
     data: &[u8],
+    encrypted: bool,
 ) -> Result<ContextShare, WorkspaceError> {
     let sha256 = sha256_b64(data);
     let size_bytes = data.len() as u64;
+    if encrypted {
+        let mut reader = std::io::Cursor::new(data.to_vec());
+        let file = client
+            .upload_encrypted_file(&mut reader)
+            .await
+            .map_err(WorkspaceError::from)?;
+        let mxc = file.url.to_string();
+        let encrypted_file = serde_json::to_value(&file).map_err(matrix_sdk::Error::SerdeJson)?;
+        return Ok(build_media_share(
+            context_id,
+            name,
+            mime_type,
+            size_bytes,
+            sha256,
+            mxc,
+            Some(encrypted_file),
+        ));
+    }
     let mime = parse_mime(&mime_type);
     let response = client
         .media()
@@ -250,6 +282,7 @@ async fn upload_media_share(
         size_bytes,
         sha256,
         response.content_uri.to_string(),
+        None,
     ))
 }
 
@@ -265,10 +298,38 @@ fn parse_mxc(uri: &str) -> Result<OwnedMxcUri, WorkspaceError> {
     }
 }
 
-/// Download the raw bytes of a media-backed share from `mxc_uri`.
-async fn download_media(client: &Client, mxc_uri: &str) -> Result<Vec<u8>, WorkspaceError> {
+/// Resolve the [`MediaSource`] for a media-backed share.
+///
+/// When the share carries [`ContextShare::encrypted_file`] (an upload into an
+/// encrypted room) the source is [`MediaSource::Encrypted`], so
+/// `get_media_content` decrypts the ciphertext blob and verifies its
+/// `EncryptedFile.hashes`. Otherwise it is the plaintext
+/// [`MediaSource::Plain`] reference. A malformed `encrypted_file` fails closed
+/// with [`WorkspaceError::ContextRetrievalFailed`].
+fn media_source(share: &ContextShare, mxc_uri: &str) -> Result<MediaSource, WorkspaceError> {
+    match &share.encrypted_file {
+        Some(value) => {
+            let file: EncryptedFile = serde_json::from_value(value.clone()).map_err(|e| {
+                WorkspaceError::ContextRetrievalFailed(format!(
+                    "share {:?} has malformed encrypted_file key material: {e}",
+                    share.context_id
+                ))
+            })?;
+            Ok(MediaSource::Encrypted(Box::new(file)))
+        }
+        None => Ok(MediaSource::Plain(parse_mxc(mxc_uri)?)),
+    }
+}
+
+/// Download the raw bytes of a media-backed share, decrypting when the share
+/// references encrypted media (see [`media_source`]).
+async fn download_media(
+    client: &Client,
+    share: &ContextShare,
+    mxc_uri: &str,
+) -> Result<Vec<u8>, WorkspaceError> {
     let request = MediaRequestParameters {
-        source: MediaSource::Plain(parse_mxc(mxc_uri)?),
+        source: media_source(share, mxc_uri)?,
         format: MediaFormat::File,
     };
     client
@@ -440,12 +501,18 @@ pub async fn share_context(
     let room = sync_and_get_room(client, &options.room).await?;
     let context_id = generate_context_id();
     let content = if options.data.len() > MAX_INLINE_BYTES {
+        // In an `--e2ee on` room a media-backed share is encrypted end to end
+        // (ciphertext on the homeserver); in a plaintext room it is uploaded as
+        // cleartext as before (issue #308). Inline (small) shares ride the
+        // already-encrypted timeline event and need no media encryption.
+        let encrypted = room.encryption_state().is_encrypted();
         upload_media_share(
             client,
             context_id,
             options.name.clone(),
             options.mime_type.clone(),
             &options.data,
+            encrypted,
         )
         .await?
     } else {
@@ -617,7 +684,7 @@ pub async fn fetch_context(
     )?;
 
     let data = match &share.mxc_uri {
-        Some(mxc_uri) => download_media(client, mxc_uri).await?,
+        Some(mxc_uri) => download_media(client, &share, mxc_uri).await?,
         None => decode_inline(&share)?,
     };
     verify_digest(&share, &data)?;
@@ -727,6 +794,7 @@ mod tests {
             data.len() as u64,
             sha256_b64(&data),
             "mxc://matrix.org/abcdef".to_string(),
+            None,
         );
         assert_eq!(share.context_id, "ctx_big");
         assert_eq!(share.name, "full-log.txt");
@@ -750,6 +818,70 @@ mod tests {
         let err =
             parse_mxc("https://example.org/not-mxc").expect_err("a non-mxc URI must be rejected");
         assert!(matches!(err, WorkspaceError::ContextRetrievalFailed(_)));
+    }
+
+    /// A valid ruma `EncryptedFile` serialized to JSON, as `upload_encrypted_file`
+    /// would produce it (the protocol crate stores this opaquely).
+    fn sample_encrypted_file_value(url: &str) -> serde_json::Value {
+        use matrix_sdk::ruma::events::room::{
+            EncryptedFile, EncryptedFileHashes, EncryptedFileInfo, V2EncryptedFileInfo,
+        };
+        use matrix_sdk::ruma::OwnedMxcUri;
+        let file = EncryptedFile::new(
+            OwnedMxcUri::from(url),
+            EncryptedFileInfo::V2(V2EncryptedFileInfo::encode([7u8; 32], [3u8; 16])),
+            EncryptedFileHashes::with_sha256([9u8; 32]),
+        );
+        serde_json::to_value(&file).expect("EncryptedFile serializes to a JSON object")
+    }
+
+    #[test]
+    fn media_source_selects_encrypted_vs_plain() {
+        // A plaintext media share downloads via MediaSource::Plain.
+        let plain = build_media_share(
+            "ctx".to_string(),
+            "n".to_string(),
+            "text/plain".to_string(),
+            10,
+            sha256_b64(b"data"),
+            "mxc://matrix.org/plain".to_string(),
+            None,
+        );
+        assert!(matches!(
+            media_source(&plain, "mxc://matrix.org/plain").expect("plain source"),
+            MediaSource::Plain(_)
+        ));
+
+        // A well-formed EncryptedFile selects MediaSource::Encrypted.
+        let encrypted = build_media_share(
+            "ctx".to_string(),
+            "n".to_string(),
+            "text/plain".to_string(),
+            10,
+            sha256_b64(b"data"),
+            "mxc://matrix.org/ciphertext".to_string(),
+            Some(sample_encrypted_file_value("mxc://matrix.org/ciphertext")),
+        );
+        assert!(matches!(
+            media_source(&encrypted, "mxc://matrix.org/ciphertext").expect("encrypted source"),
+            MediaSource::Encrypted(_)
+        ));
+
+        // Malformed key material fails closed rather than downloading ciphertext
+        // as if it were plaintext.
+        let malformed = build_media_share(
+            "ctx".to_string(),
+            "n".to_string(),
+            "text/plain".to_string(),
+            10,
+            sha256_b64(b"data"),
+            "mxc://matrix.org/ciphertext".to_string(),
+            Some(serde_json::json!({ "not": "an EncryptedFile" })),
+        );
+        assert!(matches!(
+            media_source(&malformed, "mxc://matrix.org/ciphertext"),
+            Err(WorkspaceError::ContextRetrievalFailed(_))
+        ));
     }
 
     #[test]
@@ -862,6 +994,7 @@ mod tests {
             data.len() as u64,
             sha256_b64(data),
             "mxc://matrix.org/id".to_string(),
+            None,
         );
         verify_digest(&share, data).expect("matching digest must pass");
     }
@@ -877,6 +1010,7 @@ mod tests {
             9,
             sha256_b64(b"the original"),
             "mxc://matrix.org/id".to_string(),
+            None,
         );
         let err =
             verify_digest(&share, b"tampered!").expect_err("a digest mismatch must be detected");
@@ -992,5 +1126,94 @@ mod tests {
         let share = select_share(shares, "ctx_1", Some("@exec:hs"))
             .expect("pinned producer with duplicates should return the first match");
         assert_eq!(share.context_id, "ctx_1");
+    }
+
+    // ── Issue #308: E2EE media-share confidentiality tests ────────────────────
+
+    #[test]
+    fn inline_share_never_carries_encrypted_file() {
+        // Small payloads ride the already-Megolm-encrypted timeline event and
+        // are never uploaded as Matrix media, so they must not carry an
+        // `encrypted_file` field regardless of room encryption state
+        // (issue #308).
+        let share = build_inline_share(
+            "ctx_small".to_string(),
+            "note.txt".to_string(),
+            "text/plain".to_string(),
+            b"hello small context",
+        );
+        assert!(
+            share.encrypted_file.is_none(),
+            "inline shares must not carry encrypted_file (they ride the timeline event)"
+        );
+        assert!(
+            share.mxc_uri.is_none(),
+            "inline shares have no mxc reference"
+        );
+        assert!(
+            share.data.is_some(),
+            "inline shares carry their payload in the data field"
+        );
+    }
+
+    #[test]
+    fn media_share_with_encrypted_file_carries_key_material() {
+        // A large share uploaded to an `--e2ee on` room carries the
+        // `EncryptedFile` key material so the downloader knows to decrypt the
+        // ciphertext blob (issue #308). The key material must be present and
+        // must not bleed into the inline `data`/`encoding` fields.
+        let ef = sample_encrypted_file_value("mxc://matrix.org/ciphertext");
+        let share = build_media_share(
+            "ctx_big_enc".to_string(),
+            "large.bin".to_string(),
+            "application/octet-stream".to_string(),
+            1024 * 1024,
+            sha256_b64(b"placeholder"),
+            "mxc://matrix.org/ciphertext".to_string(),
+            Some(ef.clone()),
+        );
+        assert_eq!(
+            share.encrypted_file.as_ref(),
+            Some(&ef),
+            "encrypted media share must carry the EncryptedFile key material"
+        );
+        assert_eq!(
+            share.mxc_uri.as_deref(),
+            Some("mxc://matrix.org/ciphertext"),
+            "ciphertext mxc_uri must be preserved"
+        );
+        // Key material must not appear as inline payload.
+        assert!(
+            share.data.is_none(),
+            "no inline data on a media-backed share"
+        );
+        assert!(
+            share.encoding.is_none(),
+            "no encoding on a media-backed share"
+        );
+    }
+
+    #[test]
+    fn parse_mxc_rejects_http_uri_for_share() {
+        // `media_source` calls `parse_mxc` to build `MediaSource::Plain` for
+        // a plaintext share. A non-mxc URI must fail closed rather than
+        // downloading an arbitrary HTTPS URL as if it were a Matrix media
+        // artifact (issue #308).
+        let share = build_media_share(
+            "ctx_bad".to_string(),
+            "n".to_string(),
+            "text/plain".to_string(),
+            10,
+            sha256_b64(b"data"),
+            "https://example.org/not-mxc".to_string(),
+            None,
+        );
+        assert!(
+            matches!(
+                media_source(&share, "https://example.org/not-mxc"),
+                Err(WorkspaceError::ContextRetrievalFailed(_))
+            ),
+            "a non-mxc URI for a plain share must fail closed"
+        );
     }
 }

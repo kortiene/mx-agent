@@ -152,19 +152,20 @@ use mx_agent_daemon::{
     build_signed_call_request, build_signed_call_request_for_target, build_signed_exec_request,
     cancel_task_for_session, create_task, create_task_for_session, create_workspace,
     decide_approval_for_session, emit_approval_decision, emit_heartbeat, encode_verifying_key,
-    get_invocation, grant_workspace, key_id_for_verifying_key, list_agents, list_pending_approvals,
-    list_tasks, load_or_create_signing_key, load_sync_token, login_password,
-    read_latest_heartbeats, register_agent, restore_client, run_matrix_sync,
-    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, show_agent,
-    sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, ApprovalQueue,
-    BackoffConfig, CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions,
-    CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
-    ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, ForwardedExecEvent,
-    GrantWorkspaceOptions, HeartbeatConfig, HeldRequest, ListAgentsOptions, ListTasksOptions,
-    Liveness, LivenessConfig, MatrixConfig, PendingApproval, PtyWinsize, RegisterAgentOptions,
-    SasAdvance, SessionPaths, SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceError,
-    WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, HEARTBEAT_SCAN_LIMIT,
-    WORKSPACE_AGENT_PL,
+    fetch_context, get_invocation, grant_workspace, key_id_for_verifying_key, list_agents,
+    list_pending_approvals, list_tasks, load_or_create_signing_key, load_sync_token,
+    login_password, read_latest_heartbeats, register_agent, restore_client, retrieve_artifact,
+    run_matrix_sync, run_matrix_sync_with_subscribers, run_scheduler_loop, save_session,
+    share_context, show_agent, sign_task_action, start_call_matrix, start_exec_matrix,
+    AgentListing, ApprovalQueue, BackoffConfig, CallOutcome, CallStartParams, CallTargeting,
+    CreateTaskOptions, CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome,
+    ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey,
+    FetchContextOptions, ForwardedExecEvent, GrantWorkspaceOptions, HeartbeatConfig, HeldRequest,
+    ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PendingApproval,
+    PtyWinsize, RegisterAgentOptions, RetrieveArtifactOptions, SasAdvance, SessionPaths,
+    ShareContextOptions, SyncHealth, SyncState, TaskDispatchMode, TrustStore, WorkspaceError,
+    WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED, DEFAULT_ARTIFACT_SCAN_LIMIT,
+    HEARTBEAT_SCAN_LIMIT, WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -9268,4 +9269,373 @@ requires_approval = true
         sentinel.exists(),
         "task released by a configured non-daemon approver must spawn its command"
     );
+}
+
+/// E2EE media confidentiality round-trip (issue #308).
+///
+/// Proves two acceptance criteria for the `--e2ee on` workspace media path:
+///
+/// 1. **Artifact encryption.** An exec whose stdout exceeds the 256 KiB
+///    `DEFAULT_MAX_TIMELINE_OUTPUT_BYTES` threshold uploads the artifact with
+///    [`Client::upload_encrypted_file`]; the `com.mxagent.stream.artifact.v1`
+///    event carries `EncryptedFile` key material, and the requester's
+///    [`retrieve_artifact`] download + decrypt round-trips the original bytes.
+///
+/// 2. **Context-share encryption.** A context share whose payload exceeds the
+///    256 KiB `MAX_INLINE_BYTES` inline threshold is uploaded with
+///    [`Client::upload_encrypted_file`]; the `com.mxagent.context.share.v1`
+///    event carries `EncryptedFile` key material, and [`fetch_context`] download
+///    + decrypt round-trips the original bytes.
+///
+/// In both cases the homeserver holds only ciphertext blobs; the plaintext is
+/// never readable by the homeserver operator even in an E2EE room.
+///
+/// **Security invariants preserved:** room encryption is a
+/// transport/confidentiality property only — the Ed25519 signature +
+/// trust-store + deny-by-default policy checks are still required for execution
+/// permission. This test does not weaken the authorization model.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_e2ee_media_round_trip_encrypts_artifacts_and_shares() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let bob_id = bob.user_id().expect("bob user id").to_owned();
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+
+    // Create an **encrypted** room — all timeline events and media uploads inside
+    // must use E2EE (issue #308). Alice is the daemon; Bob is the requester.
+    let room = create_encrypted_room(&bob, "mx-agent E2EE media round-trip").await;
+    let room_id = room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins encrypted room");
+    wait_for_joined_member(&room, &alice_id).await;
+
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(requester_agent.clone()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register requester agent");
+    register_agent(
+        &alice,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(TARGET_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec!["exec".to_string()],
+            tools: vec![],
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: "mx-agent-it".to_string(),
+            max_invocations: 2,
+        },
+    )
+    .await
+    .expect("register target agent");
+
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let subscribers = ExecSubscriberRegistry::new();
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let health = health.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &alice,
+                &paths,
+                health,
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    let bob_sync_paths = paths_in(data_dir.join("bob-sync"));
+    bob_sync_paths
+        .ensure_data_dir()
+        .expect("create bob sync dir");
+    let bob_sync = {
+        let bob = bob.clone();
+        let paths = bob_sync_paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &bob,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    save_session(&paths, &bob_session).expect("save requester session");
+
+    // ── Test 1: Artifact encryption ───────────────────────────────────────────
+    //
+    // Run a command that produces exactly 270 000 bytes of stdout (well above the
+    // 256 KiB = 262 144 byte threshold). In an E2EE room `emit_output_events`
+    // must call `upload_encrypted_file`; the resulting `StreamArtifact` event
+    // carries `EncryptedFile` key material and a ciphertext `mxc_uri`.
+    let big_result = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            // `dd` is available on every POSIX host; `tr` converts NULs to 'x'.
+            // Both together produce exactly 270 000 'x' bytes on stdout.
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "dd if=/dev/zero bs=270000 count=1 2>/dev/null | tr '\\0' x".to_string(),
+            ],
+            cwd: Some(cwd.clone()),
+            stdin: None,
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+            env: Default::default(),
+            timeout_ms: Some(60_000),
+            invocation_id: None,
+        },
+        &subscribers,
+    )
+    .await;
+
+    let invocation_id = big_result.invocation_id.clone();
+    let artifact_event = match &big_result.outcome {
+        ExecOutcome::Ok { frames } => frames
+            .iter()
+            .find_map(|f| {
+                if let ExecFrame::Artifact(a) = f {
+                    Some(a.clone())
+                } else {
+                    None
+                }
+            })
+            .expect(
+                "exec producing 270 000 bytes (> 256 KiB threshold) must deliver \
+                 an Artifact frame; check that the daemon is running and is in the room",
+            ),
+        ExecOutcome::Error { message, .. } => {
+            panic!("exec failed unexpectedly (expected >256 KiB artifact upload): {message}")
+        }
+    };
+
+    // The event must carry EncryptedFile key material — not a plain mxc_uri
+    // reference — because the destination room has E2EE enabled (issue #308).
+    assert!(
+        artifact_event.encrypted_file.is_some(),
+        "StreamArtifact in an E2EE room must carry EncryptedFile key material \
+         so the homeserver cannot read the artifact bytes; got: {artifact_event:?}"
+    );
+    assert!(
+        !artifact_event.mxc_uri.is_empty(),
+        "StreamArtifact must carry a ciphertext mxc_uri referencing the encrypted blob"
+    );
+
+    // Round-trip: retrieve the artifact via Bob's client. `download_media` uses
+    // `MediaSource::Encrypted` when `encrypted_file` is present, so the matrix
+    // SDK downloads the ciphertext blob and decrypts it with the EncryptedFile
+    // key material. `verify_and_decompress` then checks the plaintext SHA-256
+    // before decompressing (if the artifact was compressed with zstd).
+    let retrieved = retrieve_artifact(
+        &bob,
+        &RetrieveArtifactOptions {
+            room: room_id.to_string(),
+            invocation_id: invocation_id.clone(),
+            stream: StreamKind::Stdout,
+            limit: DEFAULT_ARTIFACT_SCAN_LIMIT,
+            expected_sender: Some(alice_id.to_string()),
+        },
+    )
+    .await
+    .expect(
+        "retrieve_artifact must decrypt and verify the encrypted media artifact \
+         (issue #308: homeserver holds ciphertext; client decrypts with EncryptedFile key)",
+    );
+
+    assert_eq!(
+        retrieved.data.len(),
+        270_000,
+        "artifact must round-trip to 270 000 bytes (the full command output)"
+    );
+    assert!(
+        retrieved.data.iter().all(|&b| b == b'x'),
+        "artifact content must consist entirely of 'x' bytes after decryption"
+    );
+    assert!(
+        retrieved.artifact.encrypted_file.is_some(),
+        "retrieved artifact must preserve the EncryptedFile key material in its event"
+    );
+
+    // ── Test 2: Context-share encryption ─────────────────────────────────────
+    //
+    // Bob shares 270 KiB of data into the encrypted room. Because the payload
+    // exceeds MAX_INLINE_BYTES (256 KiB) it is uploaded as Matrix media; because
+    // the room has E2EE enabled, `share_context` calls `upload_encrypted_file`
+    // and records the EncryptedFile key material on the share event (issue #308).
+    let share_data: Vec<u8> = (0u8..=255).cycle().take(270 * 1024).collect();
+    let share = share_context(
+        &bob,
+        &ShareContextOptions {
+            room: room_id.to_string(),
+            name: "large-share.bin".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            data: share_data.clone(),
+        },
+    )
+    .await
+    .expect("share_context (>256 KiB) in an E2EE room should succeed");
+
+    assert!(
+        share.mxc_uri.is_some(),
+        "large share must use media-backed transport (mxc_uri must be set)"
+    );
+    assert!(
+        share.encrypted_file.is_some(),
+        "large share in an E2EE room must carry EncryptedFile key material \
+         so the homeserver cannot read the payload; got: {share:?}"
+    );
+    assert!(
+        share.data.is_none(),
+        "media-backed share must not inline the payload in the event"
+    );
+
+    // Round-trip: retrieve and decrypt the share via Alice's client. Alice's
+    // sync loop has received Bob's encrypted share event (Megolm-decryptable
+    // since both are room members); `fetch_context` locates it, downloads the
+    // ciphertext blob, decrypts with the EncryptedFile key material, and
+    // verifies the SHA-256 of the plaintext against the share's `sha256` field.
+    let fetched = fetch_context(
+        &alice,
+        &FetchContextOptions {
+            room: room_id.to_string(),
+            context_id: share.context_id.clone(),
+            limit: 100,
+            expected_sender: Some(bob_id.to_string()),
+        },
+    )
+    .await
+    .expect(
+        "fetch_context must decrypt and verify the encrypted share bytes \
+         (issue #308: homeserver holds ciphertext; client decrypts with EncryptedFile key)",
+    );
+
+    assert_eq!(
+        fetched.data, share_data,
+        "fetch_context must return the exact original share bytes after decryption"
+    );
+
+    running.store(false, Ordering::SeqCst);
+    alice_sync
+        .await
+        .expect("alice sync joins")
+        .expect("alice sync exits cleanly");
+    bob_sync
+        .await
+        .expect("bob sync joins")
+        .expect("bob sync exits cleanly");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
 }
