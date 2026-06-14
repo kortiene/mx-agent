@@ -45,10 +45,25 @@ pub const DEFAULT_OFFLINE_AFTER: Duration = Duration::from_secs(300);
 /// refreshed even when the status has not changed.
 pub const DEFAULT_STATE_REFRESH: Duration = Duration::from_secs(300);
 
-/// Upper bound on recent timeline events scanned per room when resolving the
-/// latest heartbeat per agent. Bounds the cost of a liveness query, consistent
-/// with the approval-decision scan limit.
+/// Per-page limit on recent timeline events scanned when resolving the latest
+/// heartbeat per agent. One `/messages` request fetches at most this many
+/// events; [`read_latest_heartbeats`] paginates backward up to
+/// [`MAX_HEARTBEAT_SCAN_EVENTS`] in total. Consistent with the approval-decision
+/// scan limit.
 pub const HEARTBEAT_SCAN_LIMIT: u32 = 100;
+
+/// Total upper bound on timeline events scanned (across all pages) by a single
+/// [`read_latest_heartbeats`] call.
+///
+/// Heartbeats share the timeline with exec stream chunks, so on a busy room a
+/// heartbeat can sit behind many newer events; a single
+/// [`HEARTBEAT_SCAN_LIMIT`]-event page would silently miss it and degrade
+/// liveness to durable-only. Paginating backward up to this bound (≈10 pages)
+/// recovers the heartbeat while keeping a liveness query's cost bounded — a
+/// hostile or pathological timeline cannot make the scan walk unbounded history.
+/// The loop also stops early once every queried agent has a heartbeat, so the
+/// common (quiet) case still ends after the first page.
+pub const MAX_HEARTBEAT_SCAN_EVENTS: u32 = 1_000;
 
 /// Upper bound on the per-agent durable-refresh timestamps tracked by
 /// [`run_heartbeat_loop`] before the map is cleared, bounding memory on a
@@ -214,13 +229,16 @@ pub async fn emit_heartbeat(
     let ts = now_ms();
 
     let existing = read_agent_state(room, agent_id).await?;
-    let load = existing
-        .as_ref()
-        .map(|s| s.load.clone())
-        .unwrap_or(AgentLoad {
-            running_invocations: 0,
-            max_invocations: 0,
-        });
+    // Publish the *live* in-flight count (issue #312) rather than carrying the
+    // registration-time `0` forward. `max_invocations` is the agent's advertised
+    // capacity, so it is preserved from the durable state.
+    let load = AgentLoad {
+        running_invocations: crate::inflight::running_invocations(agent_id),
+        max_invocations: existing
+            .as_ref()
+            .map(|s| s.load.max_invocations)
+            .unwrap_or(0),
+    };
 
     let heartbeat = Heartbeat {
         agent_id: agent_id.to_string(),
@@ -246,6 +264,9 @@ pub async fn emit_heartbeat(
     if let Some(mut state) = existing {
         state.status = status.to_string();
         state.last_seen_ts = ts;
+        // Reflect the live in-flight count in the durable state too, so
+        // `agent show` reports real load between heartbeat ticks (issue #312).
+        state.load = load.clone();
         state.state_rev += 1;
         let content = serde_json::to_value(&state)
             .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
@@ -257,35 +278,105 @@ pub async fn emit_heartbeat(
     }
 }
 
-/// Read the most recent `com.mxagent.heartbeat.v1` timeline event per agent in
-/// `room`.
+/// Decide whether a heartbeat carrying `agent_id`, emitted by Matrix `sender`,
+/// should be accepted given the `expected` `agent_id → matrix_user_id` map.
 ///
-/// Scans up to `limit` recent timeline events newest-first and keeps the **first
-/// (newest)** heartbeat seen per `agent_id`, mirroring
-/// [`crate::approval::read_approval_decisions`]. The returned timestamps feed
-/// [`LivenessConfig::liveness_combined`] so a liveness verdict reflects the 30s
-/// timeline heartbeat cadence rather than the slower durable-state refresh.
+/// A heartbeat is accepted only when its `agent_id` is a known registered agent
+/// **and** the homeserver-asserted event `sender` equals that agent's registered
+/// `matrix_user_id` (issue #312). This pins the display-only heartbeat plane to
+/// the registered sender so a room member cannot spoof a `com.mxagent.heartbeat.v1`
+/// for another agent's `agent_id` and inflate its verdict. It is a display guard,
+/// not an authorization input: dispatch authority remains signature → trust →
+/// policy → approval regardless.
+fn accept_heartbeat(expected: &HashMap<&str, &str>, agent_id: &str, sender: Option<&str>) -> bool {
+    match (expected.get(agent_id), sender) {
+        (Some(&registered), Some(sender)) => registered == sender,
+        // Unknown agent, or an event with no `sender` field: reject.
+        _ => false,
+    }
+}
+
+/// Read the most recent `com.mxagent.heartbeat.v1` timeline event per agent in
+/// `room`, accepting only heartbeats whose sender matches the registered agent.
+///
+/// Scans the timeline newest-first, keeping the **first (newest)** heartbeat seen
+/// per `agent_id`, mirroring [`crate::approval::read_approval_decisions`]. Each
+/// heartbeat is sender-pinned via [`accept_heartbeat`]: its `agent_id` must name
+/// an agent in `agents` and the event `sender` must equal that agent's
+/// `matrix_user_id`, so a spoofed heartbeat from any other member is ignored.
+///
+/// The scan paginates `/messages` backward, one [`HEARTBEAT_SCAN_LIMIT`]-event
+/// page at a time, up to `max_events` total (callers pass
+/// [`MAX_HEARTBEAT_SCAN_EVENTS`]). It stops early once every agent in `agents`
+/// has a heartbeat — the common quiet case ends after the first page — so exec
+/// stream chunks sharing the timeline cannot evict heartbeats from the scan
+/// window on a busy room. The bound caps a liveness query's cost.
+///
+/// The returned timestamps feed [`LivenessConfig::liveness_combined`] so a
+/// liveness verdict reflects the 30s timeline heartbeat cadence rather than the
+/// slower durable-state refresh.
+///
+/// No server-side event-type filter is applied: in an encrypted room a heartbeat
+/// is an `m.room.encrypted` event on the wire, so a `types` filter on the inner
+/// `com.mxagent.heartbeat.v1` type would match nothing and *hide* heartbeats
+/// there. Bounded pagination is the load-bearing mechanism and works in both
+/// encrypted and unencrypted rooms (`/messages` decrypts what it returns).
 pub async fn read_latest_heartbeats(
     room: &Room,
-    limit: u32,
+    agents: &[AgentState],
+    max_events: u32,
 ) -> Result<HashMap<String, Heartbeat>, WorkspaceError> {
-    let mut request = MessagesOptions::backward();
-    request.limit = matrix_sdk::ruma::UInt::from(limit);
-    let messages = room.messages(request).await.map_err(WorkspaceError::from)?;
+    // Expected sender per agent for the per-event sender pin.
+    let expected: HashMap<&str, &str> = agents
+        .iter()
+        .map(|a| (a.agent_id.as_str(), a.matrix_user_id.as_str()))
+        .collect();
+    // With no agents to pin to, every heartbeat would be rejected; skip the scan.
+    if expected.is_empty() {
+        return Ok(HashMap::new());
+    }
 
     let mut latest: HashMap<String, Heartbeat> = HashMap::new();
-    for event in messages.chunk {
-        let raw = event.raw();
-        let is_heartbeat =
-            raw.get_field::<String>("type").ok().flatten().as_deref() == Some(HEARTBEAT_EVENT_TYPE);
-        if !is_heartbeat {
-            continue;
+    let mut from: Option<String> = None;
+    let mut scanned: u32 = 0;
+
+    while scanned < max_events {
+        let mut request = MessagesOptions::backward();
+        request.limit = matrix_sdk::ruma::UInt::from(HEARTBEAT_SCAN_LIMIT);
+        request.from = from.clone();
+        let messages = room.messages(request).await.map_err(WorkspaceError::from)?;
+        if messages.chunk.is_empty() {
+            break;
         }
-        if let Ok(Some(heartbeat)) = raw.get_field::<Heartbeat>("content") {
-            // Newest-first scan: the first occurrence per agent_id wins.
-            latest
-                .entry(heartbeat.agent_id.clone())
-                .or_insert(heartbeat);
+        for event in &messages.chunk {
+            scanned += 1;
+            let raw = event.raw();
+            let is_heartbeat = raw.get_field::<String>("type").ok().flatten().as_deref()
+                == Some(HEARTBEAT_EVENT_TYPE);
+            if !is_heartbeat {
+                continue;
+            }
+            let sender = raw.get_field::<String>("sender").ok().flatten();
+            if let Ok(Some(heartbeat)) = raw.get_field::<Heartbeat>("content") {
+                if !accept_heartbeat(&expected, &heartbeat.agent_id, sender.as_deref()) {
+                    // Spoofed (sender mismatch) or unknown agent: ignore.
+                    continue;
+                }
+                // Newest-first scan: the first occurrence per agent_id wins.
+                latest
+                    .entry(heartbeat.agent_id.clone())
+                    .or_insert(heartbeat);
+            }
+        }
+        // Every queried agent now has a heartbeat: nothing older can improve the
+        // result, so stop (the common case after the first page).
+        if expected.keys().all(|id| latest.contains_key(*id)) {
+            break;
+        }
+        match messages.end {
+            Some(end) => from = Some(end),
+            // No earlier pagination token: the timeline is exhausted.
+            None => break,
         }
     }
     Ok(latest)
@@ -595,6 +686,34 @@ mod tests {
     }
 
     #[test]
+    fn accept_heartbeat_pins_to_registered_sender() {
+        // `developer-pi` is registered as `@pi:matrix.org`.
+        let expected: HashMap<&str, &str> =
+            [("developer-pi", "@pi:matrix.org")].into_iter().collect();
+
+        // Genuine sender for a known agent is accepted.
+        assert!(accept_heartbeat(
+            &expected,
+            "developer-pi",
+            Some("@pi:matrix.org")
+        ));
+        // A different room member spoofing the agent's heartbeat is rejected.
+        assert!(!accept_heartbeat(
+            &expected,
+            "developer-pi",
+            Some("@mallory:matrix.org")
+        ));
+        // An unknown agent_id is rejected even with a plausible sender.
+        assert!(!accept_heartbeat(
+            &expected,
+            "ghost-agent",
+            Some("@pi:matrix.org")
+        ));
+        // A heartbeat with no `sender` field is rejected.
+        assert!(!accept_heartbeat(&expected, "developer-pi", None));
+    }
+
+    #[test]
     fn owned_agents_returns_only_local_user_agents() {
         let mine = {
             let mut a = agent_state(0, "active");
@@ -669,4 +788,59 @@ mod tests {
             Liveness::Active
         );
     }
+
+    #[test]
+    fn accept_heartbeat_rejects_all_when_expected_map_is_empty() {
+        // When no agents are registered in the expected map (e.g. read_latest_heartbeats
+        // was called with an empty agents slice and the early-exit was bypassed, or
+        // a test exercises the predicate directly), every heartbeat must be rejected.
+        let expected: HashMap<&str, &str> = HashMap::new();
+        assert!(!accept_heartbeat(
+            &expected,
+            "any-agent",
+            Some("@any:server")
+        ));
+        assert!(!accept_heartbeat(&expected, "any-agent", None));
+        assert!(!accept_heartbeat(&expected, "", Some("@any:server")));
+    }
+
+    #[test]
+    fn accept_heartbeat_handles_multiple_agents_independently() {
+        // Two agents are registered; each is pinned to its own sender. Cross-sender
+        // spoofing (alice heartbeating for agent-b) must be rejected for each agent.
+        let expected: HashMap<&str, &str> =
+            [("agent-a", "@alice:server"), ("agent-b", "@bob:server")]
+                .into_iter()
+                .collect();
+
+        // Each agent's genuine sender is accepted.
+        assert!(accept_heartbeat(
+            &expected,
+            "agent-a",
+            Some("@alice:server")
+        ));
+        assert!(accept_heartbeat(&expected, "agent-b", Some("@bob:server")));
+        // Cross-sender: alice cannot send a heartbeat for agent-b.
+        assert!(!accept_heartbeat(
+            &expected,
+            "agent-b",
+            Some("@alice:server")
+        ));
+        // Cross-sender: bob cannot send a heartbeat for agent-a.
+        assert!(!accept_heartbeat(&expected, "agent-a", Some("@bob:server")));
+        // Unknown agent is rejected even when the sender is a registered user.
+        assert!(!accept_heartbeat(
+            &expected,
+            "agent-c",
+            Some("@alice:server")
+        ));
+        // Missing sender for a known agent is rejected.
+        assert!(!accept_heartbeat(&expected, "agent-a", None));
+    }
+
+    // Compile-time sanity: MAX_HEARTBEAT_SCAN_EVENTS must exceed the per-page
+    // HEARTBEAT_SCAN_LIMIT and cover at least two full pages so the pagination
+    // loop can actually cross page boundaries on busy timelines (issue #312).
+    const _: () = assert!(MAX_HEARTBEAT_SCAN_EVENTS > HEARTBEAT_SCAN_LIMIT);
+    const _: () = assert!(MAX_HEARTBEAT_SCAN_EVENTS >= HEARTBEAT_SCAN_LIMIT * 2);
 }

@@ -19,6 +19,7 @@ pub mod exec;
 pub mod exec_ipc;
 pub mod exec_subscribers;
 pub mod heartbeat;
+pub mod inflight;
 pub mod invocation;
 pub mod ipc;
 pub mod lifecycle;
@@ -118,7 +119,7 @@ pub use exec_subscribers::{
 pub use heartbeat::{
     emit_heartbeat, read_latest_heartbeats, run_heartbeat_loop, HeartbeatConfig, Liveness,
     LivenessConfig, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_OFFLINE_AFTER, DEFAULT_STALE_AFTER,
-    DEFAULT_STATE_REFRESH, HEARTBEAT_SCAN_LIMIT,
+    DEFAULT_STATE_REFRESH, HEARTBEAT_SCAN_LIMIT, MAX_HEARTBEAT_SCAN_EVENTS,
 };
 pub use invocation::{
     advance_invocation, advance_invocation_for_session, cancel_invocation,

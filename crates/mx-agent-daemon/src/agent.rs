@@ -20,7 +20,7 @@ use mx_agent_protocol::events::state::AGENT as AGENT_STATE_TYPE;
 use mx_agent_protocol::schema::{AgentLoad, AgentState, AgentWorkspace, ToolSchema};
 
 use crate::heartbeat::{
-    now_ms, read_latest_heartbeats, Liveness, LivenessConfig, HEARTBEAT_SCAN_LIMIT,
+    now_ms, read_latest_heartbeats, Liveness, LivenessConfig, MAX_HEARTBEAT_SCAN_EVENTS,
 };
 use crate::matrix::restore_client;
 use crate::session::{SessionPaths, StoredSession};
@@ -438,13 +438,15 @@ pub async fn show_agent_for_session(
 /// Attach a daemon-computed [`Liveness`] verdict to each `agent`, using the
 /// latest heartbeat per agent in `room`.
 ///
-/// The room's timeline is scanned once (up to [`HEARTBEAT_SCAN_LIMIT`] events)
-/// and the verdict is computed with [`LivenessConfig::liveness_combined`], so a
-/// healthy agent reads `active` between durable-state refreshes. A timeline read
-/// failure degrades to durable-only liveness (advisory signal, never fail the
-/// query): the verdict falls back to the durable `last_seen_ts`.
+/// The room's timeline is scanned (paginating backward up to
+/// [`MAX_HEARTBEAT_SCAN_EVENTS`] events) with each heartbeat sender-pinned to the
+/// registered agent, and the verdict is computed with
+/// [`LivenessConfig::liveness_combined`], so a healthy agent reads `active`
+/// between durable-state refreshes. A timeline read failure degrades to
+/// durable-only liveness (advisory signal, never fail the query): the verdict
+/// falls back to the durable `last_seen_ts`.
 async fn enrich_with_liveness(room: &Room, agents: Vec<AgentState>) -> Vec<AgentListing> {
-    let latest = read_latest_heartbeats(room, HEARTBEAT_SCAN_LIMIT)
+    let latest = read_latest_heartbeats(room, &agents, MAX_HEARTBEAT_SCAN_EVENTS)
         .await
         .unwrap_or_else(|e| {
             tracing::debug!(error = %e, "could not read heartbeats; using durable-only liveness");

@@ -695,6 +695,12 @@ pub(crate) async fn spawn_authorized_live_exec(
     if request.pty {
         let room = room.clone();
         tokio::spawn(async move {
+            // Count this invocation as in-flight for the executing (local) agent
+            // for its whole lifetime (issue #312). The guard is created *inside*
+            // the spawned task and dropped when it ends — finished, cancelled,
+            // rejected, errored, or panicked — so the live load count is released
+            // on every terminal path without per-path bookkeeping.
+            let _inflight = crate::inflight::InflightGuard::enter(&request.target_agent);
             run_pty_exec_task(
                 room, request, allowance, stdin_rx, resize_rx, cancel_rx, state,
             )
@@ -706,6 +712,8 @@ pub(crate) async fn spawn_authorized_live_exec(
     let client = client.clone();
     let room = room.clone();
     tokio::spawn(async move {
+        // In-flight accounting for the non-PTY run (issue #312); see the PTY arm.
+        let _inflight = crate::inflight::InflightGuard::enter(&request.target_agent);
         let started = std::time::Instant::now();
         let result = run_controlled_exec(&request, &allowance, stdin_rx, cancel_rx).await;
         remove_live_exec_control(&request.invocation_id);
