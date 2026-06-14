@@ -206,6 +206,7 @@ fn throwaway_data_dir() -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn daemon_syncs_and_receives_events_from_live_homeserver() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -331,6 +332,65 @@ const TARGET_AGENT: &str = "developer-pi";
 /// run concurrently in the same binary.
 fn paths_in(dir: std::path::PathBuf) -> SessionPaths {
     SessionPaths::for_data_dir(dir)
+}
+
+/// Set while a live integration test is executing, so a second overlapping live
+/// test can be detected and refused (see [`enter_single_threaded_section`]).
+static LIVE_TEST_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Acquire the process-global single-thread section for a live test.
+///
+/// The live suite mutates process-global env (`MX_AGENT_DATA_DIR`,
+/// `MX_AGENT_CONFIG_DIR`, …) via dozens of `set_var` calls and is correct only
+/// when test functions run one at a time, so it MUST be driven through
+/// `scripts/matrix_integration_test.sh`, which passes `--test-threads=1`. A bare
+/// `cargo test -p mx-agent-daemon --test matrix_integration -- --ignored` runs
+/// the tests in parallel and would silently race those mutations.
+///
+/// Every `#[ignore]` live test acquires this guard as its first statement. If
+/// two ever overlap (i.e. the suite was run multi-threaded), the second
+/// acquisition panics with a pointer to the wrapper script instead of racing.
+/// The guard releases on drop — including during panic unwind — so a failing
+/// test never poisons later runs. Uses only `AtomicBool` + RAII `Drop`; no
+/// `unsafe` (the workspace forbids it).
+#[must_use]
+fn enter_single_threaded_section() -> SingleThreadGuard {
+    if LIVE_TEST_RUNNING.swap(true, Ordering::SeqCst) {
+        panic!(
+            "two live integration tests are running concurrently; this suite \
+             mutates process-global env and MUST run single-threaded. Run it \
+             via scripts/matrix_integration_test.sh (which passes \
+             --test-threads=1), not a bare `cargo test -- --ignored`."
+        );
+    }
+    SingleThreadGuard
+}
+
+/// RAII release token for [`enter_single_threaded_section`]; clears
+/// `LIVE_TEST_RUNNING` on drop.
+struct SingleThreadGuard;
+
+impl Drop for SingleThreadGuard {
+    fn drop(&mut self) {
+        LIVE_TEST_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Unit-level coverage for [`enter_single_threaded_section`]: a second
+/// acquisition while the first is still held must panic, and the section must be
+/// re-acquirable once the first guard drops. Runs in the default `cargo test`
+/// (it is **not** `#[ignore]`d) and never overlaps the live tests, which only
+/// run under `--ignored`.
+#[test]
+fn single_thread_guard_trips_on_overlap() {
+    let held = enter_single_threaded_section(); // first acquisition holds the flag
+    let res = std::panic::catch_unwind(|| {
+        let _g = enter_single_threaded_section();
+    });
+    assert!(res.is_err(), "second concurrent acquisition must panic");
+    drop(held);
+    // The flag is released; a fresh acquisition now succeeds.
+    let _g = enter_single_threaded_section();
 }
 
 /// A receive-side policy that trusts `room_id` and permits the requester to run
@@ -491,6 +551,7 @@ async fn decrypted_content(room: &Room, event_id: &EventId) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_matrix_backed_remote_call_round_trips() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -730,6 +791,7 @@ allow_tools = ["run_tests"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_matrix_backed_remote_exec_round_trips_and_denies() {
+    let _serial = enter_single_threaded_section();
     // Enable logging so CI captures daemon decisions on failure (--nocapture).
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -1021,6 +1083,7 @@ allow_cwd = ["{cwd}"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_non_pty_exec_truncation_is_reported() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -1284,6 +1347,7 @@ max_output_bytes = 10
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_matrix_backed_remote_pty_streams_and_resizes() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -1536,6 +1600,7 @@ allow_cwd = ["{cwd}"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_pty_exec_truncation_is_reported() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -1774,6 +1839,7 @@ max_output_bytes = 10
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn daemon_e2ee_privileged_event_coverage() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -2060,6 +2126,7 @@ fn signed_exec_task(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_scheduler_executes_signed_task_dag_and_denies() {
+    let _serial = enter_single_threaded_section();
     // Capture the scheduler thread's non-sensitive decision logs so a failure is
     // diagnosable from CI output (`--nocapture`).
     let _ = tracing_subscriber::fmt()
@@ -2491,6 +2558,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_production_task_create_signs_and_executes() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -2855,6 +2923,7 @@ allow_cwd = ["{cwd}"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_task_cancel_drives_remote_invocation() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -3358,6 +3427,7 @@ fn assert_stable_agent_listing_json(state: &AgentState, liveness: Liveness, expe
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn two_daemons_discover_each_other_and_compute_liveness() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -3708,6 +3778,7 @@ async fn two_daemons_discover_each_other_and_compute_liveness() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_device_manual_verify_and_sender_verified() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -3888,6 +3959,7 @@ async fn live_device_manual_verify_and_sender_verified() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_recovery_enable_and_status() {
+    let _serial = enter_single_threaded_section();
     // Enable logging so CI captures daemon decisions on failure (--nocapture).
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -4036,6 +4108,7 @@ async fn live_recovery_enable_and_status() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_require_verified_device_gate() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -4354,6 +4427,7 @@ require_verified_device = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn workspace_room_is_created_without_encryption() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -4507,6 +4581,7 @@ async fn workspace_room_is_created_without_encryption() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn workspace_create_with_e2ee_enables_encryption_and_routes_privileged_events() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -4720,6 +4795,7 @@ async fn workspace_create_with_e2ee_enables_encryption_and_routes_privileged_eve
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_scheduler_rejects_forged_approval_decisions() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -5050,6 +5126,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_named_call_requires_approval_holds_and_enqueues() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -5334,6 +5411,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_exec_held_approval_approve_releases_and_runs() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -5593,6 +5671,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_exec_held_approval_deny_never_runs() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -5841,6 +5920,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_call_held_approval_approve_releases_and_runs() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -6129,6 +6209,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_exec_held_forged_decision_ignored() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -6381,6 +6462,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_exec_held_expiry_never_runs() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -6624,6 +6706,7 @@ async fn live_exec_held_expiry_never_runs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_decrypt_after_restart_from_persistent_store() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -6774,6 +6857,7 @@ async fn live_decrypt_after_restart_from_persistent_store() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_key_backup_restore_across_reprovision() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -7107,6 +7191,7 @@ async fn drive_sas_responder(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_two_daemon_sas_confirms_and_verifies() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -7330,6 +7415,7 @@ async fn live_two_daemon_sas_confirms_and_verifies() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn workspace_power_levels_non_creator_daemon_registers_and_heartbeats() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -7512,6 +7598,7 @@ async fn workspace_power_levels_non_creator_daemon_registers_and_heartbeats() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn workspace_plain_member_cannot_overwrite_agent_state() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -7705,6 +7792,7 @@ async fn workspace_plain_member_cannot_overwrite_agent_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_result_plane_forge_is_rejected() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -8044,6 +8132,7 @@ allow_cwd = ["{cwd}"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_scheduler_rejects_decision_with_untrusted_key() {
+    let _serial = enter_single_threaded_section();
     use ed25519_dalek::SigningKey as Ed25519SigningKey;
     use mx_agent_protocol::signing::sign_approval_decision;
 
@@ -8390,6 +8479,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_scheduler_rejects_expired_decision() {
+    let _serial = enter_single_threaded_section();
     use mx_agent_protocol::signing::sign_approval_decision;
 
     let _ = tracing_subscriber::fmt()
@@ -8694,6 +8784,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_approval_window_expiry_blocks_task() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -8961,6 +9052,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_approver_allowlist_releases_task() {
+    let _serial = enter_single_threaded_section();
     use ed25519_dalek::SigningKey as Ed25519SigningKey;
     use mx_agent_protocol::signing::sign_approval_decision;
 
@@ -9312,6 +9404,7 @@ requires_approval = true
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_e2ee_media_round_trip_encrypts_artifacts_and_shares() {
+    let _serial = enter_single_threaded_section();
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
@@ -9719,6 +9812,7 @@ fn mx_agent_bin() -> std::path::PathBuf {
 #[test]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 fn live_no_secrets_in_daemon_log_after_login_and_recover() {
+    let _serial = enter_single_threaded_section();
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -9926,6 +10020,7 @@ fn live_no_secrets_in_daemon_log_after_login_and_recover() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_spoofed_heartbeat_is_ignored_by_sender_pin() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
     let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
@@ -10088,6 +10183,7 @@ async fn live_spoofed_heartbeat_is_ignored_by_sender_pin() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_heartbeat_pagination_finds_event_buried_under_noise() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let bob_user = required_env("MX_AGENT_TEST_USER2");
     let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
@@ -10226,6 +10322,7 @@ async fn live_heartbeat_pagination_finds_event_buried_under_noise() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_running_invocations_and_task_diagnostics_use_heartbeat_liveness() {
+    let _serial = enter_single_threaded_section();
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let bob_user = required_env("MX_AGENT_TEST_USER2");
     let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");

@@ -23,13 +23,14 @@ on:
 jobs:
   add-to-project:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Dependabot-triggered runs cannot read repo secrets, so `PROJECT_TOKEN`
     # is empty and `add-to-project` fails with "Input required and not
     # supplied: github-token". Skip the job for Dependabot (its PRs don't need
     # board tracking) so those runs report neutral instead of a red check.
     if: ${{ vars.PROJECT_URL != '' && github.actor != 'dependabot[bot]' }}
     steps:
-      - uses: actions/add-to-project@v2.0.0
+      - uses: actions/add-to-project@5afcf98fcd03f1c2f92c3c83f58ae24323cc57fd # v2.0.0
         with:
           project-url: ${{ vars.PROJECT_URL }}
           github-token: ${{ secrets.PROJECT_TOKEN }}

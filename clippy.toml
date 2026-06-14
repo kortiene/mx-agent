@@ -1,3 +1,5 @@
 # Clippy expectations for the mx-agent workspace.
 # Pin the MSRV so clippy does not suggest APIs newer than we support.
-msrv = "1.74"
+# Keep in lockstep with Cargo.toml `rust-version` and the `msrv` CI job's
+# `toolchain:` (issue #315). matrix-sdk 0.18 sets the real floor at 1.93.
+msrv = "1.93"

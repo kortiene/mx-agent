@@ -442,11 +442,11 @@ fn check_transition(task_id: &str, from: &str, to: &str) -> Result<(), Workspace
 
 /// Return `true` when `task` passes the (optional) state and assignee filters.
 fn matches_filters(task: &TaskState, options: &ListTasksOptions) -> bool {
-    options.state.as_deref().map_or(true, |s| task.state == s)
+    options.state.as_deref().is_none_or(|s| task.state == s)
         && options
             .assigned_to
             .as_deref()
-            .map_or(true, |a| task.assigned_to == a)
+            .is_none_or(|a| task.assigned_to == a)
 }
 
 /// Sync once, resolve the room, and return its [`Room`] handle.

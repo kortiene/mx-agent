@@ -82,7 +82,11 @@ executed. The daemon's `e2e-encryption` support is enabled only for test builds
 ## Configuration
 
 - `dev/matrix/docker-compose.yml` — the Tuwunel service (loopback-only port,
-  named data volume).
+  named data volume). The image is **pinned by digest** (`tuwunel@sha256:…`) for
+  reproducible e2e runs (issue #315); bump it deliberately — refresh the digest
+  from `docker buildx imagetools inspect ghcr.io/matrix-construct/tuwunel:latest`
+  (or let Dependabot's `docker` ecosystem raise the PR), don't switch back to a
+  moving `:latest` tag.
 - `dev/matrix/tuwunel.toml` — homeserver config (no secrets).
 - `dev/matrix/.env` — local config incl. `MATRIX_REGISTRATION_TOKEN` and
   `MATRIX_PORT`. Auto-created from `.env.example`; **gitignored**.

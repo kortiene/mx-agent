@@ -9,3 +9,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+  # Refresh the digest-pinned Tuwunel homeserver image in
+  # dev/matrix/docker-compose.yml (issue #315). Dependabot's `docker` ecosystem
+  # scans Compose files for `image:` references and opens a PR bumping the
+  # digest. If this account does not pick the file up, bump the digest manually
+  # (see the comment on the `image:` line).
+  - package-ecosystem: docker
+    directory: /dev/matrix
+    schedule:
+      interval: weekly

@@ -21,8 +21,9 @@ are abusive or off-topic.
 
 - A **Unix host** (Linux or macOS). Windows is not supported — mx-agent relies on
   Unix-domain-socket IPC and Unix process semantics.
-- **Rust stable toolchain, 1.74+** (the project MSRV), installed via
-  [rustup](https://rustup.rs).
+- **Rust stable toolchain, 1.93+** (the project MSRV), installed via
+  [rustup](https://rustup.rs). The MSRV was raised from 1.74 to 1.93 for
+  `matrix-sdk 0.18`; the `msrv` CI job builds the workspace on it (issue #315).
 - Optional, for integration/e2e tests: **Docker** (for the throwaway
   [Tuwunel](https://github.com/matrix-construct/tuwunel) homeserver).
 
@@ -72,7 +73,8 @@ Notes:
   public items.
 - Formatting is pinned to stable rustfmt options; just run `cargo fmt`.
 - Clippy honors the MSRV declared in `clippy.toml`; don't use APIs newer than
-  Rust 1.74 without bumping it deliberately.
+  Rust 1.93 without bumping it deliberately (and update `Cargo.toml`
+  `rust-version` + the `msrv` CI job's `toolchain:` in lockstep).
 
 ## Running the integration tests
 

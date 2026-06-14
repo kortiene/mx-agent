@@ -1,0 +1,25 @@
+name: audit
+
+# Re-run the RustSec advisory check on a schedule so a newly published
+# advisory against an already-locked dependency surfaces without waiting for
+# the next push (issue #315). The push/PR cargo-deny job in ci.yml still runs
+# the full `check advisories bans licenses sources` gate on every change; this
+# scheduled job is scoped to `advisories` because licenses/bans/sources only
+# change with a code change, which the push/PR gate already covers.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC (off the high-load top-of-hour)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check advisories

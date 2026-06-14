@@ -212,11 +212,11 @@ fn matches_filters(invocation: &InvocationState, options: &ListInvocationsOption
     options
         .state
         .as_deref()
-        .map_or(true, |s| invocation.state == s)
+        .is_none_or(|s| invocation.state == s)
         && options
             .task_id
             .as_deref()
-            .map_or(true, |t| invocation.task_id.as_deref() == Some(t))
+            .is_none_or(|t| invocation.task_id.as_deref() == Some(t))
 }
 
 /// Sync once, resolve the room, and return its [`Room`] handle.
