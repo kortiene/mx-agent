@@ -85,6 +85,11 @@ pub struct Allowance {
     /// gate; it can only deny, never grant. See
     /// [`AgentPolicy::require_verified_device`](crate::AgentPolicy::require_verified_device).
     pub require_verified_device: bool,
+    /// Container image the `docker`/`podman` backend runs the command in, if the
+    /// operator configured one (`execution.container_image`). `None` uses the
+    /// backend's built-in default image. Ignored by the `none`/`bubblewrap`
+    /// backends (issue #310).
+    pub container_image: Option<String>,
 }
 
 /// Machine-readable reason a request was denied.
@@ -259,6 +264,7 @@ impl Policy {
             env_allowlist: self.execution.env_allowlist.clone(),
             read_only_paths: self.execution.read_only_paths.clone(),
             writable_paths: self.execution.writable_paths.clone(),
+            container_image: self.execution.container_image.clone(),
             ..Allowance::default()
         }
     }
@@ -287,6 +293,7 @@ impl Policy {
             env_allowlist: self.execution.env_allowlist.clone(),
             read_only_paths: self.execution.read_only_paths.clone(),
             writable_paths: self.execution.writable_paths.clone(),
+            container_image: self.execution.container_image.clone(),
             // The verified-device requirement applies if either the room default
             // or the agent rule sets it (issue #240).
             require_verified_device: room.require_verified_device || agent.require_verified_device,

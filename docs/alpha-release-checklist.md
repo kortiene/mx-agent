@@ -148,17 +148,19 @@ it here before release.
   verification UX, cross-signing, and server-side key backup/recovery — see
   `README.md` and roadmap Phase 12.
 - **Sandbox is not a security boundary on its own.** The `none`, `bubblewrap`,
-  and Docker/Podman container backends are implemented and policy-selectable.
+  and Docker/Podman container backends are implemented and policy-selectable
+  (`firejail`/`chroot` are rejected at policy load, never silently unsandboxed).
   `read_only_paths` / `writable_paths` filesystem-bind confinement and `network`
   policy are wired end-to-end from the policy engine to the runner — including
-  for auto-executed task DAGs. However there is no seccomp filtering, rlimit
-  capping, or UID/GID remapping; commands run as the daemon's user. The built-in
+  for auto-executed task DAGs **and** the interactive `exec --pty` path, which
+  routes through the selected backend too. Bubblewrap adds a user namespace,
+  `--cap-drop ALL`, private `/proc`/`/dev`/tmpfs, and `--new-session` (batch);
+  containers add `no-new-privileges`. However there is still no seccomp filtering
+  and no rlimit/cgroup resource capping. The built-in
   fallback backend is `none` (zero isolation) — operators must choose
   `bubblewrap`/`docker`/`podman`. Bound the blast radius with policy (cwd, env
   scrub, network, path-bind confinement, runtime/output caps) and a real sandbox
-  backend. Interactive `exec --pty` does not route through the sandbox backend;
-  only the baseline controls (env scrub, cwd, timeout, output cap) apply to the
-  PTY path.
+  backend.
 - **Workspace rooms are unencrypted; exec/call/share traffic is homeserver-readable.**
   `workspace create` does not enable room-level E2EE (`create_workspace()` never
   adds an `m.room.encryption` initial-state event). Every `EXEC_REQUEST`,

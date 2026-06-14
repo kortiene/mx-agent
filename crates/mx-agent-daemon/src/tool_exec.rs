@@ -134,6 +134,8 @@ fn tool_run_spec(
         network: crate::exec::network_for(allowance.network),
         read_only_paths: allowance.read_only_paths.clone(),
         writable_paths: allowance.writable_paths.clone(),
+        container_runtime: crate::exec::container_runtime_for(allowance.sandbox),
+        container_image: allowance.container_image.clone(),
     })
 }
 

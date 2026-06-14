@@ -407,11 +407,12 @@ network = "deny"
 
 | Field | Default | Notes |
 |---|---|---|
-| `default_sandbox` | none set | Backend used when an agent rule doesn't override. |
+| `default_sandbox` | none set | Backend used when an agent rule doesn't override. `firejail`/`chroot` are rejected. |
 | `network` | none set | `allow` or `deny`. |
 | `read_only_paths` | `[]` | Bound read-only into the sandbox. |
 | `writable_paths` | `[]` | Bound writable — **keep minimal**. |
 | `env_allowlist` | `[]` | Extra env names (still subject to the secret scrub). |
+| `container_image` | `debian:stable-slim` | Image the `docker`/`podman` backend runs in. The runtime follows the `sandbox` value. |
 
 `[rooms."<room>"]`:
 
@@ -462,9 +463,9 @@ The sandbox decides *how* an allowed command is isolated. Backends:
 | Backend (`sandbox = …`) | Isolation |
 |---|---|
 | `none` | **No isolation.** Only the centralized controls (cwd, env scrub, timeout, output cap) apply. |
-| `bubblewrap` | PID/UTS/IPC namespaces, `--die-with-parent`, bind-mounted filesystem, network namespace dropped when `network = "deny"`. |
-| `docker` / `podman` | Read-only root (`--read-only`), `--network none` when denied, explicit `--volume` mounts, env injected per-variable, `--rm` cleanup. |
-| `firejail` / `chroot` | Selectable in policy where available. |
+| `bubblewrap` | PID/UTS/IPC/**user** namespaces, `--die-with-parent`, `--cap-drop ALL`, private `/proc` + minimal `/dev` + tmpfs `/tmp`, bind-mounted filesystem, network namespace dropped when `network = "deny"`, and `--new-session` on the batch path (omitted for an interactive `--pty` so Ctrl-C still works). |
+| `docker` / `podman` | Read-only root (`--read-only`), `--security-opt no-new-privileges`, `--network none` when denied, explicit `--volume` mounts, env passed **by name** (`--env KEY`, values never in argv), `--rm` cleanup. The runtime follows the `sandbox` value (`podman` runs `podman run …`); the image is `execution.container_image` (default `debian:stable-slim`). (No `--cap-drop ALL`: the container runs as root and dropping `CAP_DAC_OVERRIDE` would block writes to operator-owned `writable_paths`; that needs a `--user` mapping, deferred.) |
+| `firejail` / `chroot` | **Not implemented — rejected at policy load.** Naming either in `execution.default_sandbox` or an agent `sandbox` fails validation with a dotted-path error (no silent unsandboxed fallthrough). |
 
 **Default backend.** The library's built-in fallback is `Backend::None` (zero
 isolation). This is *not* the configuration you should run: always set
@@ -482,16 +483,24 @@ the sandbox; everything else is hidden. Read-only mounts are applied before
 writable ones, so a nested `writable_paths` entry can carve a writable hole in a
 read-only tree. Keep `writable_paths` as small as the task allows — typically
 the project directory and a scratch dir under `/tmp`. Filesystem-bind confinement
-applies to batch exec and named tool calls (`call`); the interactive `exec --pty`
-path does not route through the sandbox backend, though the output byte cap
-(`max_output_bytes`) is still enforced on the PTY stream regardless of sandbox.
+applies to batch exec, named tool calls (`call`), **and** the interactive
+`exec --pty` path — all three route the command through the selected sandbox
+backend; the output byte cap (`max_output_bytes`) is also enforced on the PTY
+stream.
 
-**What the sandbox does *not* do.** There is no seccomp filtering, no
-rlimit-based resource capping, and no UID/GID remapping — commands run as the
-daemon's own user. Runtime and output are bounded by `max_runtime_ms` /
-`max_output_bytes` from policy, not by the sandbox. For stronger isolation
-(syscall filtering, user remapping, cgroup limits), prefer a container backend
-and configure those limits in your container runtime.
+**A backend selected but missing fails closed.** If `bwrap`/`docker`/`podman` is
+not on the daemon's `PATH`, the run fails with an actionable diagnostic naming the
+backend and the missing launcher — it never silently falls back to no isolation.
+
+**What the sandbox does *not* do.** Bubblewrap runs the command in a user
+namespace (`--unshare-user`, so it is not the daemon's privileged identity) and
+drops all capabilities; containers block privilege escalation
+(`no-new-privileges`). There is still **no seccomp syscall filtering and no
+rlimit/cgroup resource capping** — runtime and output are bounded by
+`max_runtime_ms` / `max_output_bytes` from policy, and per-process/memory limits
+(`--pids-limit` / `--memory`) and a container `--cap-drop ALL` (with a `--user`
+mapping) are not yet wired from policy. For stronger isolation, prefer a
+container backend and configure those limits in your runtime.
 
 > **Safe vs unsafe:** `sandbox = "bubblewrap"` (or a container) + `network =
 > "deny"` + tight `writable_paths` is the safe baseline. `sandbox = "none"`,

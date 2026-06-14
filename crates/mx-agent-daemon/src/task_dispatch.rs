@@ -142,6 +142,13 @@ pub struct ExecRunRequest {
     /// Extra environment variable names the child may inherit beyond the
     /// built-in safe defaults, resolved from the policy's `env_allowlist`.
     pub env_allowlist: Vec<String>,
+    /// Container runtime for the [`Backend::Container`][mx_agent_sandbox::Backend::Container]
+    /// backend, resolved from the policy `sandbox` value (issue #310). Ignored by
+    /// the other backends.
+    pub container_runtime: mx_agent_sandbox::Runtime,
+    /// Container image for the container backend, resolved from
+    /// `execution.container_image`; `None` uses the backend default (issue #310).
+    pub container_image: Option<String>,
 }
 
 /// A function that runs an exec request and returns the captured outcome.
@@ -167,6 +174,8 @@ fn default_command_runner(request: &ExecRunRequest) -> Result<RunOutput, RunErro
         network: request.network,
         read_only_paths: request.read_only_paths.clone(),
         writable_paths: request.writable_paths.clone(),
+        container_runtime: request.container_runtime,
+        container_image: request.container_image.clone(),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -283,6 +292,8 @@ where
                     read_only_paths: allowance.read_only_paths.clone(),
                     writable_paths: allowance.writable_paths.clone(),
                     env_allowlist: allowance.env_allowlist.clone(),
+                    container_runtime: crate::exec::container_runtime_for(allowance.sandbox),
+                    container_image: allowance.container_image.clone(),
                 };
                 match (self.run_command)(&request) {
                     Ok(output) => Ok(exec_result_from_output(&output, None)),

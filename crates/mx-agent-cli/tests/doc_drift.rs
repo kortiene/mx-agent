@@ -299,6 +299,45 @@ fn security_hardening_loopback_floor_and_pty_sandbox_corrected() {
     );
 }
 
+// ── Issue #310: sandbox backends fail-closed + hardening — doc drift guards ───
+//
+// Before #310, firejail/chroot were "Selectable in policy where available" (but
+// silently ran unsandboxed) and the docs said the PTY path skipped the sandbox
+// backend. The fix rejects firejail/chroot at load and routes the PTY through the
+// backend. These guard the corrected wording.
+
+/// security-hardening must mark firejail/chroot as not implemented / rejected,
+/// not as "selectable where available".
+#[test]
+fn security_hardening_firejail_chroot_rejected_not_selectable() {
+    // Negative: the stale "selectable where available" wording must be gone.
+    assert!(
+        !SECURITY_HARDENING.contains("Selectable in policy where available"),
+        "security-hardening must not claim firejail/chroot are selectable (issue #310)"
+    );
+    // Positive: they are documented as not implemented / rejected at load.
+    assert!(
+        SECURITY_HARDENING.contains("rejected at policy load")
+            || SECURITY_HARDENING.contains("Not implemented"),
+        "security-hardening must state firejail/chroot are rejected at policy load (issue #310)"
+    );
+    // Positive: the container image policy key is documented.
+    assert!(
+        SECURITY_HARDENING.contains("container_image"),
+        "security-hardening must document the execution.container_image policy key (issue #310)"
+    );
+}
+
+/// security-hardening must no longer claim the PTY path skips the sandbox backend
+/// in the filesystem-confinement section.
+#[test]
+fn security_hardening_pty_routes_through_sandbox_backend() {
+    assert!(
+        !SECURITY_HARDENING.contains("does not route through the sandbox backend"),
+        "security-hardening must not claim the PTY path skips the sandbox backend (issue #310)"
+    );
+}
+
 /// The `ipc.rs` module doc must name the `auth`/`trust` carve-out so a reader
 /// of that file cannot conclude that ALL commands are daemon-IPC-mediated.
 ///

@@ -423,14 +423,21 @@ fn daemon_drives_tasks_through_policy_dependencies_and_denial() {
 /// the check in `mx-agent-sandbox/src/lib.rs`.
 fn bwrap_usable() -> bool {
     use std::process::Command;
+    // Mirror the hardened flags `BubblewrapSandbox::prepare` emits (issue #310),
+    // so the skip decision matches what the real run actually does.
     match Command::new("bwrap")
         .args([
             "--ro-bind",
             "/",
             "/",
-            "--dev-bind",
+            "--unshare-user",
+            "--proc",
+            "/proc",
+            "--dev",
             "/dev",
-            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--new-session",
             "--",
             "true",
         ])
@@ -439,6 +446,22 @@ fn bwrap_usable() -> bool {
         Ok(out) => out.status.success(),
         Err(_) => false,
     }
+}
+
+/// Return whether bwrap is usable; when it is not, either skip (default) or — if
+/// `MX_AGENT_REQUIRE_BWRAP` is set — panic, so the CI `sandbox-linux` job fails
+/// instead of silently skipping the real-bwrap coverage (issue #310).
+fn bwrap_available_or_required() -> bool {
+    if bwrap_usable() {
+        return true;
+    }
+    if std::env::var_os("MX_AGENT_REQUIRE_BWRAP").is_some() {
+        panic!(
+            "MX_AGENT_REQUIRE_BWRAP is set but bwrap is not usable here; \
+             the real-bwrap orchestration test must run (install bubblewrap / enable user namespaces)"
+        );
+    }
+    false
 }
 
 /// System paths that a bubblewrap sandbox needs bound read-only for `sh` and
@@ -538,8 +561,9 @@ allow_cwd = ["{cwd}"]
     // --- Part 2: Backend::Bubblewrap with real confinement. ------------------
     //
     // Skip gracefully when bwrap is absent or unprivileged user namespaces are
-    // blocked (macOS, some CI sandboxes).
-    if !bwrap_usable() {
+    // blocked (macOS, some CI sandboxes) — unless MX_AGENT_REQUIRE_BWRAP forces it
+    // to run (the CI sandbox-linux job).
+    if !bwrap_available_or_required() {
         eprintln!(
             "skipping sandbox_policy_settings_flow_through_task_orchestration (bubblewrap part): \
             bwrap not usable in this environment (macOS, absent binary, or no user-namespaces)"
