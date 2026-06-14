@@ -13,7 +13,7 @@
 //! state is available, so a missing agent snapshot never produces misleading
 //! warnings.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mx_agent_protocol::schema::{AgentState, TaskAction, TaskState};
@@ -84,8 +84,21 @@ pub const KIND_TOOL_UNAVAILABLE: &str = "tool_unavailable";
 /// tool availability) are skipped, so an unavailable agent snapshot never yields
 /// misleading warnings. Liveness is evaluated against the current wall clock; use
 /// [`diagnose_tasks_at`] for a deterministic time in tests.
-pub fn diagnose_tasks(tasks: &[TaskState], agents: &[AgentState]) -> Vec<TaskDiagnostic> {
-    diagnose_tasks_at(tasks, agents, now_ms())
+///
+/// `liveness` supplies a precomputed, heartbeat-enriched verdict per `agent_id`
+/// (typically from [`crate::agent::list_agents_with_liveness_for_session`]). The
+/// inactive-agent check uses it so a healthy agent that is heartbeating but whose
+/// durable `last_seen_ts` has aged past the stale threshold (it is only refreshed
+/// every ~300 s) does not produce a false `assigned_to_inactive_agent` warning
+/// (issue #312). An agent absent from the map falls back to durable-only
+/// [`LivenessConfig::liveness_of`], so callers with no heartbeat data (e.g. an
+/// empty map) get the previous durable-only behavior.
+pub fn diagnose_tasks(
+    tasks: &[TaskState],
+    agents: &[AgentState],
+    liveness: &HashMap<String, Liveness>,
+) -> Vec<TaskDiagnostic> {
+    diagnose_tasks_at(tasks, agents, liveness, now_ms())
 }
 
 /// Like [`diagnose_tasks`] but evaluates agent liveness as of `now_ms`
@@ -93,6 +106,7 @@ pub fn diagnose_tasks(tasks: &[TaskState], agents: &[AgentState]) -> Vec<TaskDia
 pub fn diagnose_tasks_at(
     tasks: &[TaskState],
     agents: &[AgentState],
+    liveness: &HashMap<String, Liveness>,
     now_ms: u64,
 ) -> Vec<TaskDiagnostic> {
     let mut out = Vec::new();
@@ -148,7 +162,7 @@ pub fn diagnose_tasks_at(
     if !agents.is_empty() {
         let by_id: BTreeMap<&str, &AgentState> =
             agents.iter().map(|a| (a.agent_id.as_str(), a)).collect();
-        let liveness = LivenessConfig::default();
+        let cfg = LivenessConfig::default();
         for task in tasks {
             if task.assigned_to.is_empty() {
                 continue;
@@ -163,7 +177,13 @@ pub fn diagnose_tasks_at(
                     ),
                 )),
                 Some(agent) => {
-                    if liveness.liveness_of(agent, now_ms) != Liveness::Active {
+                    // Prefer the precomputed (heartbeat-enriched) verdict; fall
+                    // back to durable-only liveness when the agent has no entry.
+                    let verdict = liveness
+                        .get(agent.agent_id.as_str())
+                        .copied()
+                        .unwrap_or_else(|| cfg.liveness_of(agent, now_ms));
+                    if verdict != Liveness::Active {
                         out.push(TaskDiagnostic::warning(
                             KIND_INACTIVE_AGENT,
                             Some(task.task_id.clone()),
@@ -288,13 +308,19 @@ mod tests {
         diags.iter().map(|d| d.kind.as_str()).collect()
     }
 
+    /// Diagnose with no precomputed liveness verdicts, so the inactive-agent
+    /// check falls back to durable-only liveness (the pre-issue-#312 behavior).
+    fn diag_at(tasks: &[TaskState], agents: &[AgentState], now_ms: u64) -> Vec<TaskDiagnostic> {
+        diagnose_tasks_at(tasks, agents, &HashMap::new(), now_ms)
+    }
+
     #[test]
     fn detects_duplicate_titles() {
         let tasks = vec![
             with_tool(task("task-a", "Run tests", "pending", ""), "run_tests"),
             with_tool(task("task-b", "Run tests", "pending", ""), "run_tests"),
         ];
-        let diags = diagnose_tasks_at(&tasks, &[], 0);
+        let diags = diag_at(&tasks, &[], 0);
         let dup: Vec<&TaskDiagnostic> = diags
             .iter()
             .filter(|d| d.kind == KIND_DUPLICATE_TITLE)
@@ -310,7 +336,7 @@ mod tests {
         let mut b = with_tool(task("task-b", "B", "pending", ""), "run_tests");
         a.depends_on = vec!["task-b".to_string()];
         b.depends_on = vec!["task-a".to_string()];
-        let diags = diagnose_tasks_at(&[a, b], &[], 0);
+        let diags = diag_at(&[a, b], &[], 0);
         assert!(kinds(&diags).contains(&KIND_DEPENDENCY_CYCLE));
     }
 
@@ -318,7 +344,7 @@ mod tests {
     fn detects_missing_dependency() {
         let mut t = with_tool(task("task-a", "A", "pending", ""), "run_tests");
         t.depends_on = vec!["task-ghost".to_string()];
-        let diags = diagnose_tasks_at(std::slice::from_ref(&t), &[], 0);
+        let diags = diag_at(std::slice::from_ref(&t), &[], 0);
         let missing: Vec<&TaskDiagnostic> = diags
             .iter()
             .filter(|d| d.kind == KIND_MISSING_DEPENDENCY)
@@ -336,7 +362,7 @@ mod tests {
         let assigned_inactive = with_tool(task("task-b", "B", "pending", "sleepy"), "run_tests");
         // `sleepy` was last seen long ago -> offline/inactive.
         let agents = vec![agent("sleepy", 0, &["run_tests@1.0.0"])];
-        let diags = diagnose_tasks_at(&[assigned_unknown, assigned_inactive], &agents, now);
+        let diags = diag_at(&[assigned_unknown, assigned_inactive], &agents, now);
         let ks = kinds(&diags);
         assert!(ks.contains(&KIND_UNKNOWN_AGENT));
         assert!(ks.contains(&KIND_INACTIVE_AGENT));
@@ -348,7 +374,7 @@ mod tests {
         // Active agent that offers `lint`, not `run_tests`.
         let agents = vec![agent("dev", now, &["lint@1.0.0"])];
         let t = with_tool(task("task-a", "A", "pending", "dev"), "run_tests");
-        let diags = diagnose_tasks_at(std::slice::from_ref(&t), &agents, now);
+        let diags = diag_at(std::slice::from_ref(&t), &agents, now);
         let tool: Vec<&TaskDiagnostic> = diags
             .iter()
             .filter(|d| d.kind == KIND_TOOL_UNAVAILABLE)
@@ -361,12 +387,12 @@ mod tests {
     fn detects_runnable_task_without_action() {
         // Assigned + pending but no action.
         let t = task("task-a", "A", "pending", "dev");
-        let diags = diagnose_tasks_at(std::slice::from_ref(&t), &[], 0);
+        let diags = diag_at(std::slice::from_ref(&t), &[], 0);
         assert!(kinds(&diags).contains(&KIND_RUNNABLE_WITHOUT_ACTION));
 
         // An unassigned planning task with no action is fine (no warning).
         let planning = task("task-plan", "Plan", "pending", "");
-        let diags = diagnose_tasks_at(std::slice::from_ref(&planning), &[], 0);
+        let diags = diag_at(std::slice::from_ref(&planning), &[], 0);
         assert!(!kinds(&diags).contains(&KIND_RUNNABLE_WITHOUT_ACTION));
     }
 
@@ -375,7 +401,7 @@ mod tests {
         // A task assigned to an unknown agent must NOT warn when no agent
         // snapshot is available (avoids misleading diagnostics).
         let t = with_tool(task("task-a", "A", "pending", "ghost"), "run_tests");
-        let diags = diagnose_tasks_at(std::slice::from_ref(&t), &[], 0);
+        let diags = diag_at(std::slice::from_ref(&t), &[], 0);
         let ks = kinds(&diags);
         assert!(!ks.contains(&KIND_UNKNOWN_AGENT));
         assert!(!ks.contains(&KIND_INACTIVE_AGENT));
@@ -387,8 +413,85 @@ mod tests {
         let now = 1_000u64;
         let agents = vec![agent("dev", now, &["run_tests@1.0.0"])];
         let t = with_tool(task("task-a", "A", "pending", "dev"), "run_tests");
-        let diags = diagnose_tasks_at(std::slice::from_ref(&t), &agents, now);
+        let diags = diag_at(std::slice::from_ref(&t), &agents, now);
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn heartbeat_verdict_suppresses_false_inactive_warning() {
+        // The durable state alone is offline (last seen long ago), which without
+        // a heartbeat would raise `assigned_to_inactive_agent` (issue #312)...
+        let now = 10_000_000u64;
+        let agents = vec![agent("dev", 0, &["run_tests@1.0.0"])];
+        let t = with_tool(task("task-a", "A", "pending", "dev"), "run_tests");
+        assert!(
+            kinds(&diag_at(std::slice::from_ref(&t), &agents, now)).contains(&KIND_INACTIVE_AGENT),
+            "durable-only liveness should warn for a long-idle agent"
+        );
+        // ...but a supplied `Active` verdict (a recent heartbeat lifted it) must
+        // suppress the warning.
+        let liveness: HashMap<String, Liveness> = [("dev".to_string(), Liveness::Active)]
+            .into_iter()
+            .collect();
+        let diags = diagnose_tasks_at(std::slice::from_ref(&t), &agents, &liveness, now);
+        assert!(
+            !kinds(&diags).contains(&KIND_INACTIVE_AGENT),
+            "a heartbeat-lifted Active verdict must not warn: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn stale_heartbeat_still_warns_inactive() {
+        // When both signals are stale (durable offline and the supplied verdict
+        // is also non-Active), the inactive-agent warning still fires.
+        let now = 10_000_000u64;
+        let agents = vec![agent("dev", 0, &["run_tests@1.0.0"])];
+        let t = with_tool(task("task-a", "A", "pending", "dev"), "run_tests");
+        for verdict in [Liveness::Stale, Liveness::Offline] {
+            let liveness: HashMap<String, Liveness> =
+                [("dev".to_string(), verdict)].into_iter().collect();
+            let diags = diagnose_tasks_at(std::slice::from_ref(&t), &agents, &liveness, now);
+            assert!(
+                kinds(&diags).contains(&KIND_INACTIVE_AGENT),
+                "a {verdict} verdict must still warn inactive: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn liveness_map_fallback_is_per_agent_independent() {
+        // Agent X is in the liveness map as Active → no inactive warning.
+        // Agent Y is NOT in the liveness map → fallback to durable (offline) → warns.
+        // The two evaluations must not interfere with each other.
+        let now = 10_000_000u64;
+        // Both agents have a durable state that is far offline.
+        let agent_x = agent("agent-x", 0, &["run_tests@1.0.0"]);
+        let agent_y = agent("agent-y", 0, &["run_tests@1.0.0"]);
+        let task_x = with_tool(task("task-x", "X", "pending", "agent-x"), "run_tests");
+        let task_y = with_tool(task("task-y", "Y", "pending", "agent-y"), "run_tests");
+
+        // X has a precomputed Active verdict (heartbeat lifted it); Y is absent.
+        let liveness: HashMap<String, Liveness> = [("agent-x".to_string(), Liveness::Active)]
+            .into_iter()
+            .collect();
+        let agents = vec![agent_x, agent_y];
+        let tasks = vec![task_x, task_y];
+        let diags = diagnose_tasks_at(&tasks, &agents, &liveness, now);
+
+        // task-x: agent-x is Active in the map → no inactive warning.
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.kind == KIND_INACTIVE_AGENT && d.task_id.as_deref() == Some("task-x")),
+            "agent-x has Active verdict in liveness map; task-x must not warn inactive: {diags:?}"
+        );
+        // task-y: agent-y absent from map → fallback to durable (offline) → warns.
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.kind == KIND_INACTIVE_AGENT && d.task_id.as_deref() == Some("task-y")),
+            "agent-y absent from liveness map; task-y must warn inactive via durable fallback: {diags:?}"
+        );
     }
 
     #[test]

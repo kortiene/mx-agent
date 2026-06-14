@@ -131,7 +131,7 @@
 //!   [`live_no_secrets_in_daemon_log_after_login_and_recover`]; falls back to the
 //!   recovery user, then the shared user, when unset
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -155,21 +155,23 @@ use mx_agent_daemon::{
     approval_decision_for, authorize_call_request, authorize_exec_request,
     build_signed_call_request, build_signed_call_request_for_target, build_signed_exec_request,
     cancel_task_for_session, create_task, create_task_for_session, create_workspace,
-    decide_approval_for_session, emit_approval_decision, emit_heartbeat, encode_verifying_key,
-    fetch_context, get_invocation, grant_workspace, key_id_for_verifying_key, list_agents,
-    list_pending_approvals, list_tasks, load_or_create_signing_key, load_sync_token,
-    login_password, read_latest_heartbeats, register_agent, restore_client, retrieve_artifact,
-    run_matrix_sync, run_matrix_sync_with_subscribers, run_scheduler_loop, save_session,
-    share_context, show_agent, sign_task_action, start_call_matrix, start_exec_matrix,
-    AgentListing, ApprovalQueue, BackoffConfig, CallOutcome, CallStartParams, CallTargeting,
-    CreateTaskOptions, CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome,
-    ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey,
-    FetchContextOptions, ForwardedExecEvent, GrantWorkspaceOptions, HeartbeatConfig, HeldRequest,
-    ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PendingApproval,
-    PtyWinsize, RecoveryEnableResult, RegisterAgentOptions, RetrieveArtifactOptions, SasAdvance,
-    SessionPaths, ShareContextOptions, SyncHealth, SyncState, TaskDispatchMode, TrustStore,
+    decide_approval_for_session, diagnose_tasks, emit_approval_decision, emit_heartbeat,
+    encode_verifying_key, fetch_context, get_invocation, grant_workspace, key_id_for_verifying_key,
+    list_agents, list_agents_with_liveness_for_session, list_pending_approvals, list_tasks,
+    load_or_create_signing_key, load_sync_token, login_password, read_latest_heartbeats,
+    register_agent, restore_client, retrieve_artifact, run_matrix_sync,
+    run_matrix_sync_with_subscribers, run_scheduler_loop, save_session, share_context, show_agent,
+    sign_task_action, start_call_matrix, start_exec_matrix, AgentListing, ApprovalQueue,
+    BackoffConfig, CallOutcome, CallStartParams, CallTargeting, CreateTaskOptions,
+    CreateWorkspaceOptions, DaemonSigningKey, ExecFrame, ExecOutcome, ExecRequestOptions,
+    ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey, FetchContextOptions,
+    ForwardedExecEvent, GrantWorkspaceOptions, HeartbeatConfig, HeldRequest, ListAgentsOptions,
+    ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PendingApproval, PtyWinsize,
+    RecoveryEnableResult, RegisterAgentOptions, RetrieveArtifactOptions, SasAdvance, SessionPaths,
+    ShareContextOptions, SyncHealth, SyncState, TaskDiagnostic, TaskDispatchMode, TrustStore,
     WorkspaceError, WorkspaceVisibility, DECISION_APPROVED, DECISION_DENIED,
-    DEFAULT_ARTIFACT_SCAN_LIMIT, HEARTBEAT_SCAN_LIMIT, WORKSPACE_AGENT_PL,
+    DEFAULT_ARTIFACT_SCAN_LIMIT, HEARTBEAT_SCAN_LIMIT, MAX_HEARTBEAT_SCAN_EVENTS,
+    WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -3613,10 +3615,17 @@ async fn two_daemons_discover_each_other_and_compute_liveness() {
     // This is the first end-to-end coverage of `read_latest_heartbeats` against a
     // real Matrix homeserver timeline (issue #250). The heartbeat was emitted via
     // `emit_heartbeat`, which sends a `com.mxagent.heartbeat.v1` timeline event.
-    // `read_latest_heartbeats` paginates `/messages` backward and must find it.
-    let latest = read_latest_heartbeats(&room, HEARTBEAT_SCAN_LIMIT)
-        .await
-        .expect("read_latest_heartbeats must succeed against the live homeserver");
+    // `read_latest_heartbeats` paginates `/messages` backward (up to
+    // `MAX_HEARTBEAT_SCAN_EVENTS`) and sender-pins each heartbeat to the registered
+    // agent (issue #312), so it is passed Bob's agent state and must find Bob's own
+    // heartbeat (sender == Bob's `matrix_user_id`).
+    let latest = read_latest_heartbeats(
+        &room,
+        std::slice::from_ref(&bob_after_hb),
+        HEARTBEAT_SCAN_LIMIT,
+    )
+    .await
+    .expect("read_latest_heartbeats must succeed against the live homeserver");
     assert!(
         latest.contains_key(BOB_AGENT),
         "emitted heartbeat must appear in the timeline scan for agent {BOB_AGENT}: found {:?}",
@@ -9902,4 +9911,543 @@ fn live_no_secrets_in_daemon_log_after_login_and_recover() {
     );
 
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Sender-pin enforcement for `read_latest_heartbeats` (issue #312 §1).
+///
+/// Proves that a spoofed `com.mxagent.heartbeat.v1` timeline event — sent by
+/// Alice claiming BOB_AGENT's `agent_id` — is silently rejected by the
+/// sender-pin check in [`read_latest_heartbeats`]. The check requires the event
+/// `sender` to equal the registered agent's `matrix_user_id`; Alice's sender
+/// differs from Bob's registered `matrix_user_id`, so the spoof is skipped and
+/// the genuine earlier heartbeat Bob emitted is returned instead.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_spoofed_heartbeat_is_ignored_by_sender_pin() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+
+    // Bob creates the room; Alice joins. Default PublicChat power levels give
+    // Bob PL 100 (state events allowed) and Alice PL 0 (timeline only).
+    let bob_room = create_public_room(&bob, "mx-agent heartbeat sender-pin e2e").await;
+    let room_id = bob_room.room_id().to_owned();
+    alice
+        .join_room_by_id(&room_id)
+        .await
+        .expect("alice joins room");
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+    wait_for_joined_member(&bob_room, &alice_id).await;
+
+    // Alice syncs to establish a pagination token (required for room.messages).
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice initial sync");
+
+    // Bob registers BOB_AGENT. PL 100 > state_default 50 → allowed.
+    let base = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &base);
+    paths_in(base.clone())
+        .ensure_data_dir()
+        .expect("create data dir");
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(BOB_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            cwd: "/tmp".to_string(),
+            project_id: "sender-pin-test".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register BOB_AGENT");
+    std::env::remove_var(ENV_DATA_DIR);
+
+    // Alice syncs to see Bob's registered agent state; `emit_heartbeat` via
+    // alice_room reads the state to check status_changed — it must see Bob's
+    // status ("active") before Alice's spoof call.
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice syncs agent registration");
+    let alice_room = alice.get_room(&room_id).expect("alice is in room");
+
+    // Get the registered agent state (needed for the sender-pin map).
+    let bob_state = list_agents(
+        &alice,
+        &ListAgentsOptions {
+            room: room_id.to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await
+    .expect("list agents via alice")
+    .into_iter()
+    .find(|a| a.agent_id == BOB_AGENT)
+    .expect("BOB_AGENT must be visible to alice after her sync");
+    assert_eq!(
+        bob_state.matrix_user_id,
+        bob.user_id().expect("bob user id").as_str(),
+        "BOB_AGENT's matrix_user_id must be Bob's"
+    );
+
+    // Bob emits a genuine heartbeat. Use a very long state_refresh to skip the
+    // durable-state rewrite (the timeline event is what we are testing).
+    let hb_cfg = HeartbeatConfig {
+        state_refresh: Duration::from_secs(999_999),
+        ..HeartbeatConfig::default()
+    };
+    emit_heartbeat(&bob_room, BOB_AGENT, "active", &hb_cfg, 0)
+        .await
+        .expect("bob emits genuine heartbeat");
+
+    // Record a timestamp AFTER Bob's genuine heartbeat but BEFORE Alice's spoof,
+    // so we can distinguish which heartbeat the scan returns: Bob's ts <
+    // before_spoof_ms < Alice's ts.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let before_spoof_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Alice emits a spoofed heartbeat for BOB_AGENT.
+    // Conditions to prevent Alice from triggering a durable-state rewrite she
+    // lacks power to write (Alice is PL 0; state_default is 50):
+    // - status = "active" matches the registered status → status_changed=false.
+    // - last_state_ms = u64::MAX → now_ms.saturating_sub(u64::MAX)=0 <
+    //   state_refresh ms → time-based refresh disabled.
+    emit_heartbeat(&alice_room, BOB_AGENT, "active", &hb_cfg, u64::MAX)
+        .await
+        .expect("alice emits spoofed heartbeat timeline event");
+
+    // Scan backward. Alice's spoof is more recent (sender = alice, registered
+    // sender = bob) → sender-pin rejects it. Bob's genuine heartbeat is older
+    // (sender = bob == registered sender) → accepted.
+    let latest = read_latest_heartbeats(&alice_room, &[bob_state], MAX_HEARTBEAT_SCAN_EVENTS)
+        .await
+        .expect("read_latest_heartbeats must succeed on live homeserver");
+
+    assert!(
+        latest.contains_key(BOB_AGENT),
+        "scan must find a heartbeat for {BOB_AGENT}; found: {:?}",
+        latest.keys().collect::<Vec<_>>()
+    );
+    // Bob's genuine heartbeat was stamped BEFORE before_spoof_ms; Alice's spoof
+    // AFTER. A ts < before_spoof_ms proves the genuine heartbeat was returned.
+    let hb = &latest[BOB_AGENT];
+    assert!(
+        hb.ts < before_spoof_ms,
+        "returned heartbeat ts ({}) must predate the spoof threshold ({}): \
+         a ts >= threshold means Alice's spoofed sender was incorrectly accepted",
+        hb.ts,
+        before_spoof_ms
+    );
+    assert_eq!(
+        hb.agent_id, BOB_AGENT,
+        "returned heartbeat must identify BOB_AGENT"
+    );
+}
+
+/// Pagination coverage for `read_latest_heartbeats` on busy timelines (issue #312 §4).
+///
+/// Emits one genuine heartbeat for BOB_AGENT, then pushes it beyond the
+/// first-page window by sending `HEARTBEAT_SCAN_LIMIT + 1` noise events.
+/// Asserts:
+///
+/// - A single-page scan (`max_events = HEARTBEAT_SCAN_LIMIT = 100`) does NOT
+///   find the heartbeat: it is buried at position 102 in the backward scan.
+///   This reproduces the pre-fix regression where exec-stream chunks could
+///   evict heartbeats from the one-page window.
+/// - A paginating scan (`max_events = MAX_HEARTBEAT_SCAN_EVENTS = 1000`) finds
+///   the heartbeat on the second page, proving that the bounded-pagination fix
+///   recovers buried heartbeats.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_heartbeat_pagination_finds_event_buried_under_noise() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+
+    let room = create_public_room(&bob, "mx-agent heartbeat pagination e2e").await;
+    let room_id = room.room_id().to_owned();
+
+    // Register BOB_AGENT. Bob (PL 100) can write agent state events.
+    let base = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &base);
+    paths_in(base.clone())
+        .ensure_data_dir()
+        .expect("create data dir");
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(BOB_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            cwd: "/tmp".to_string(),
+            project_id: "pagination-test".to_string(),
+            max_invocations: 1,
+        },
+    )
+    .await
+    .expect("register BOB_AGENT");
+    std::env::remove_var(ENV_DATA_DIR);
+
+    // Sync to populate the room's pagination token for room.messages().
+    bob.sync_once(SyncSettings::default())
+        .await
+        .expect("bob initial sync");
+
+    // Discover the registered agent state for the sender-pin map.
+    let bob_state = list_agents(
+        &bob,
+        &ListAgentsOptions {
+            room: room_id.to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await
+    .expect("list agents")
+    .into_iter()
+    .find(|a| a.agent_id == BOB_AGENT)
+    .expect("BOB_AGENT registered");
+
+    // Emit the heartbeat that will be buried under noise.
+    let hb_cfg = HeartbeatConfig {
+        state_refresh: Duration::from_secs(999_999),
+        ..HeartbeatConfig::default()
+    };
+    emit_heartbeat(&room, BOB_AGENT, "active", &hb_cfg, 0)
+        .await
+        .expect("emit genuine heartbeat");
+
+    // Push the heartbeat off the first scan page by emitting HEARTBEAT_SCAN_LIMIT + 1
+    // noise events. The backward scan sees newest-first, so the noise events
+    // occupy positions 1..=noise_count in the scan order, placing the heartbeat
+    // at position noise_count + 1 = HEARTBEAT_SCAN_LIMIT + 2.
+    // With per-page limit = HEARTBEAT_SCAN_LIMIT, the first page covers
+    // positions 1..=HEARTBEAT_SCAN_LIMIT and the heartbeat is beyond it.
+    let noise_count = HEARTBEAT_SCAN_LIMIT + 1;
+    for i in 0..noise_count {
+        room.send_raw(
+            "m.room.message",
+            json!({ "msgtype": "m.text", "body": format!("noise-{i}") }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("send noise event {i}: {e}"));
+    }
+
+    // ---- Negative test: single-page scan must NOT find the buried heartbeat. ----
+    let single_page = read_latest_heartbeats(
+        &room,
+        std::slice::from_ref(&bob_state),
+        HEARTBEAT_SCAN_LIMIT,
+    )
+    .await
+    .expect("single-page scan must succeed");
+    assert!(
+        !single_page.contains_key(BOB_AGENT),
+        "single-page scan (max_events={HEARTBEAT_SCAN_LIMIT}) must NOT find \
+         a heartbeat buried under {noise_count} noise events; \
+         this reproduces the pre-fix regression"
+    );
+
+    // ---- Positive test: paginating scan must find it on the second page. ----
+    let paginated = read_latest_heartbeats(&room, &[bob_state], MAX_HEARTBEAT_SCAN_EVENTS)
+        .await
+        .expect("paginating scan must succeed");
+    assert!(
+        paginated.contains_key(BOB_AGENT),
+        "paginating scan (max_events={MAX_HEARTBEAT_SCAN_EVENTS}) must find \
+         the heartbeat buried under {noise_count} noise events; \
+         found: {:?}",
+        paginated.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        paginated[BOB_AGENT].agent_id, BOB_AGENT,
+        "found heartbeat must identify BOB_AGENT"
+    );
+}
+
+/// In-flight invocation counter in heartbeats and heartbeat-enriched task
+/// diagnostics (issue #312 §2 and §3).
+///
+/// Exercises two of the four gaps fixed in issue #312 end-to-end against a
+/// live homeserver:
+///
+/// **running_invocations counter**: holding an
+/// [`mx_agent_daemon::inflight::InflightGuard`] for BOB_AGENT increments the
+/// process-global counter; the next [`emit_heartbeat`] call reads it and
+/// publishes it in the `com.mxagent.heartbeat.v1` timeline event.
+/// [`read_latest_heartbeats`] returns the emitted event with
+/// `load.running_invocations = 1`. After the guard drops, a subsequent
+/// heartbeat carries `running_invocations = 0`.
+///
+/// **task.graph liveness path**: [`list_agents_with_liveness_for_session`]
+/// scans the heartbeat timeline and enriches the liveness verdict; the
+/// resulting map passed to [`diagnose_tasks`] suppresses the false
+/// `assigned_to_inactive_agent` warning a stale durable `last_seen_ts` would
+/// otherwise trigger — reproducing the task.graph fix inline (issue #312 §3).
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_running_invocations_and_task_diagnostics_use_heartbeat_liveness() {
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+
+    let room = create_public_room(&bob, "mx-agent inflight + task-liveness e2e").await;
+    let room_id = room.room_id().to_owned();
+
+    let base = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &base);
+    paths_in(base.clone())
+        .ensure_data_dir()
+        .expect("create data dir");
+    register_agent(
+        &bob,
+        &RegisterAgentOptions {
+            room: room_id.to_string(),
+            agent_id: Some(BOB_AGENT.to_string()),
+            kind: "pi".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            cwd: "/tmp".to_string(),
+            project_id: "inflight-test".to_string(),
+            max_invocations: 4,
+        },
+    )
+    .await
+    .expect("register BOB_AGENT");
+    std::env::remove_var(ENV_DATA_DIR);
+
+    bob.sync_once(SyncSettings::default())
+        .await
+        .expect("bob initial sync");
+
+    let bob_state = list_agents(
+        &bob,
+        &ListAgentsOptions {
+            room: room_id.to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await
+    .expect("list agents")
+    .into_iter()
+    .find(|a| a.agent_id == BOB_AGENT)
+    .expect("BOB_AGENT registered");
+
+    // Force every emit_heartbeat call to also refresh the durable state, so the
+    // durable `load.running_invocations` stays in sync with the timeline events.
+    let hb_cfg = HeartbeatConfig {
+        state_refresh: Duration::ZERO,
+        ..HeartbeatConfig::default()
+    };
+
+    // ---- Criterion: running_invocations is published in heartbeat content. ----
+
+    // Baseline: no guard held → heartbeat must carry running_invocations=0.
+    emit_heartbeat(&room, BOB_AGENT, "active", &hb_cfg, 0)
+        .await
+        .expect("emit baseline heartbeat");
+    let baseline = read_latest_heartbeats(
+        &room,
+        std::slice::from_ref(&bob_state),
+        MAX_HEARTBEAT_SCAN_EVENTS,
+    )
+    .await
+    .expect("read baseline heartbeat");
+    assert_eq!(
+        baseline
+            .get(BOB_AGENT)
+            .expect("baseline heartbeat for BOB_AGENT")
+            .load
+            .running_invocations,
+        0,
+        "baseline heartbeat must carry running_invocations=0 when no guard is held"
+    );
+
+    // Hold one InflightGuard and emit a heartbeat. The guard increments the
+    // process-global counter; emit_heartbeat reads it via
+    // inflight::running_invocations and embeds it in the event.
+    let guard = mx_agent_daemon::inflight::InflightGuard::enter(BOB_AGENT);
+    emit_heartbeat(&room, BOB_AGENT, "active", &hb_cfg, 0)
+        .await
+        .expect("emit heartbeat while inflight guard held");
+    let inflight_hbs = read_latest_heartbeats(
+        &room,
+        std::slice::from_ref(&bob_state),
+        MAX_HEARTBEAT_SCAN_EVENTS,
+    )
+    .await
+    .expect("read heartbeat while inflight");
+    assert_eq!(
+        inflight_hbs
+            .get(BOB_AGENT)
+            .expect("in-flight heartbeat for BOB_AGENT")
+            .load
+            .running_invocations,
+        1,
+        "heartbeat while one InflightGuard is held must carry running_invocations=1"
+    );
+
+    // Drop the guard and emit another heartbeat: counter returns to 0.
+    drop(guard);
+    emit_heartbeat(&room, BOB_AGENT, "active", &hb_cfg, 0)
+        .await
+        .expect("emit heartbeat after guard dropped");
+    let after_hbs = read_latest_heartbeats(
+        &room,
+        std::slice::from_ref(&bob_state),
+        MAX_HEARTBEAT_SCAN_EVENTS,
+    )
+    .await
+    .expect("read heartbeat after guard dropped");
+    assert_eq!(
+        after_hbs
+            .get(BOB_AGENT)
+            .expect("post-drop heartbeat for BOB_AGENT")
+            .load
+            .running_invocations,
+        0,
+        "heartbeat after guard drop must carry running_invocations=0"
+    );
+
+    // ---- Criterion: task.graph diagnostics use heartbeat-enriched liveness. ----
+    // Create a planning task assigned to BOB_AGENT (no signed action needed).
+    create_task(
+        &bob,
+        &CreateTaskOptions {
+            room: room_id.to_string(),
+            task_id: Some("test-312-hb-liveness".to_string()),
+            title: "Heartbeat liveness e2e (issue #312)".to_string(),
+            description: String::new(),
+            state: None,
+            assigned_to: BOB_AGENT.to_string(),
+            created_by: None,
+            depends_on: vec![],
+            blocks: vec![],
+            action: None,
+        },
+    )
+    .await
+    .expect("create test task");
+
+    let tasks = list_tasks(
+        &bob,
+        &ListTasksOptions {
+            room: room_id.to_string(),
+            state: None,
+            assigned_to: None,
+        },
+    )
+    .await
+    .expect("list tasks");
+    assert!(!tasks.is_empty(), "at least one task must be in the room");
+
+    // Replicate the task.graph IPC handler path (lifecycle.rs §task.graph):
+    // call list_agents_with_liveness_for_session → build liveness map →
+    // diagnose_tasks. This is the same code path the IPC handler executes.
+    let listings = list_agents_with_liveness_for_session(
+        &bob_session,
+        &ListAgentsOptions {
+            room: room_id.to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await
+    .expect("list_agents_with_liveness_for_session must succeed");
+
+    let mut liveness_map: HashMap<String, Liveness> = HashMap::with_capacity(listings.len());
+    let agents: Vec<_> = listings
+        .into_iter()
+        .map(|l| {
+            liveness_map.insert(l.agent.agent_id.clone(), l.liveness);
+            l.agent
+        })
+        .collect();
+
+    // The heartbeat just emitted must have lifted the verdict to Active.
+    assert_eq!(
+        liveness_map.get(BOB_AGENT).copied(),
+        Some(Liveness::Active),
+        "list_agents_with_liveness_for_session must return Active for BOB_AGENT \
+         after a fresh heartbeat"
+    );
+
+    // Synthesize a stale durable state (last_seen_ts=0) to model the gap between
+    // the 300s durable-state refreshes. This is what triggers the false
+    // `assigned_to_inactive_agent` warning the heartbeat fix suppresses.
+    let mut stale = agents
+        .iter()
+        .find(|a| a.agent_id == BOB_AGENT)
+        .expect("BOB_AGENT in agents")
+        .clone();
+    stale.last_seen_ts = 0;
+    let stale_agents = [stale];
+
+    // Without enrichment: durable-only liveness sees last_seen_ts=0 → Offline
+    // → assigned_to_inactive_agent warning fires.
+    let diags_durable_only: Vec<TaskDiagnostic> =
+        diagnose_tasks(&tasks, &stale_agents, &HashMap::new());
+    assert!(
+        diags_durable_only
+            .iter()
+            .any(|d| d.kind == "assigned_to_inactive_agent"),
+        "stale durable state (last_seen_ts=0) with no heartbeat enrichment must warn \
+         assigned_to_inactive_agent; got: {diags_durable_only:?}"
+    );
+
+    // With heartbeat-enriched liveness map (Active): the warning is suppressed.
+    let diags_enriched: Vec<TaskDiagnostic> = diagnose_tasks(&tasks, &stale_agents, &liveness_map);
+    assert!(
+        !diags_enriched
+            .iter()
+            .any(|d| d.kind == "assigned_to_inactive_agent"),
+        "heartbeat-enriched Active verdict must suppress assigned_to_inactive_agent; \
+         got: {diags_enriched:?}"
+    );
 }

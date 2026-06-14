@@ -875,7 +875,7 @@ With `--json`, returns the `AgentState` object containing:
 - `capabilities` (array of strings)
 - `tools` (array of tool references)
 - `workspace` object: `cwd`, `project_id`, `git_commit`
-- `load` object: `running_invocations` (0 initially), `max_invocations`
+- `load` object: `running_invocations` (live in-memory count of currently-running invocations for this agent; resets to 0 on daemon restart), `max_invocations`
 - `last_seen_ts` (milliseconds since epoch)
 - `state_rev` (starting at 1, incremented on re-registration)
 
@@ -937,7 +937,7 @@ mx-agent [GLOBAL] agent list --room <ROOM> [--capability <CAP>...]
 
 **Behavior**
 
-Queries all `com.mxagent.agent.v1` room state events in the workspace and computes liveness for each agent by combining the state's `last_seen_ts` with recent heartbeats scanned from the room timeline (up to 100 events). Returns agents matching all specified capabilities (if any).
+Queries all `com.mxagent.agent.v1` room state events in the workspace and computes liveness for each agent by combining the state's `last_seen_ts` with recent heartbeats scanned from the room timeline. The scan paginates backward in 100-event pages up to ≈1,000 events total, stopping early once every agent has a heartbeat, so exec-stream traffic on a busy timeline cannot evict heartbeats from the scan window. Returns agents matching all specified capabilities (if any).
 
 Human output prints a summary table with columns:
 
@@ -986,7 +986,7 @@ mx-agent agent list --room '#workspace:matrix.org' --json
   - `active`: heartbeat seen within 90 seconds
   - `stale`: no heartbeat for 90–300 seconds (agent may be unhealthy)
   - `offline`: no heartbeat for 300+ seconds (agent presumed stopped)
-- The timeline is scanned backward up to 100 events; very old agents may not have recent heartbeats in the scan window.
+- The timeline is scanned backward in 100-event pages up to ≈1,000 events total, stopping early once every queried agent has a heartbeat. Each accepted heartbeat is sender-pinned: the homeserver-asserted Matrix `sender` must match the agent's registered `matrix_user_id`, so a room member cannot spoof a heartbeat for another agent.
 - Capability filtering is AND-combined: `--capability a --capability b` returns only agents declaring both capabilities.
 - Empty capability list (when no `--capability` flags are given) returns all agents.
 

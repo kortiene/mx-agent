@@ -989,20 +989,30 @@ trust store still decides whether the key id is authorized.
 The daemon emits a `com.mxagent.heartbeat.v1` timeline event every 30 s for
 each agent it owns, and rewrites the durable `com.mxagent.agent.v1` state event
 (refreshing `last_seen_ts`) at most every 300 s so steady-state heartbeats do not
-churn room state. `agent list` / `agent show` scan the most recent 100 timeline
-events to find the latest heartbeat per agent and compute the verdict server-side;
-the CLI receives a precomputed `AgentListing { agent, liveness }` over local IPC
-and remains stateless (architecture §10).
+churn room state. `agent list` / `agent show` and `task.graph` scan the timeline
+to find the latest heartbeat per agent and compute the verdict server-side; the
+CLI receives a precomputed `AgentListing { agent, liveness }` over local IPC and
+remains stateless (architecture §10). The scan **paginates `/messages` backward**
+in 100-event pages up to a bounded total (≈1000 events), stopping early once every
+queried agent has a heartbeat, so on a busy timeline (exec stream chunks share it)
+a heartbeat is not silently evicted from a single 100-event window. No server-side
+event-type filter is used: in an encrypted room a heartbeat is an
+`m.room.encrypted` event on the wire, so a `types` filter on the inner
+`com.mxagent.heartbeat.v1` type would hide it — `/messages` still decrypts what it
+returns, so bounded pagination is the load-bearing mechanism in both encrypted and
+unencrypted rooms.
+
+Each scanned heartbeat is **sender-pinned**: a heartbeat for an `agent_id` is
+accepted only when the homeserver-asserted Matrix `sender` equals that agent's
+registered `matrix_user_id`, so a room member cannot spoof a heartbeat for another
+agent's `agent_id` and inflate its displayed verdict (issue #312). This is a
+display-signal guard, consistent with the result/stream/artifact/share plane pin
+(§1.2, §7.3–§7.4, issue #304); it grants nothing — liveness is advisory and never
+an authorization input, and dispatch authority remains signature → trust → policy
+→ approval.
 
 > **Planned.** The remaining liveness signals (room membership, Matrix presence,
 > key status) described in the original §9.1 aspiration are not yet implemented.
-> The **heartbeat** sender is not yet pinned, so a room member could spoof a
-> heartbeat to inflate a displayed verdict (liveness is advisory, never an
-> authorization input — dispatch authority remains signature → trust → policy →
-> approval; issue #312). This caveat is now **scoped to heartbeats only**: the
-> result/stream/artifact/share plane *is* sender-pinned to the executing/producing
-> agent (§1.2, §7.3–§7.4, issue #304), so a member can no longer forge a result,
-> exit status, output chunk, or shadow an artifact.
 
 The `com.mxagent.heartbeat.v1` timeline event carries:
 
@@ -1014,6 +1024,15 @@ The `com.mxagent.heartbeat.v1` timeline event carries:
   "ts": 1780392000000
 }
 ```
+
+`load.running_invocations` reflects the **real** number of invocations the daemon
+is currently running for the agent (issue #312): a daemon-local, in-memory counter
+incremented when a remote `exec`/`call` starts and decremented when it finishes, is
+cancelled, is rejected, or errors. The counter is never persisted — a daemon
+restart kills every live invocation, so it correctly resets to `0` — and it is
+republished on the next heartbeat tick (timeline) and durable-state refresh, so the
+durable view can lag a very short invocation by up to one heartbeat interval. It is
+an advisory display signal only, never an authorization input.
 
 ### 9.2 Task State
 

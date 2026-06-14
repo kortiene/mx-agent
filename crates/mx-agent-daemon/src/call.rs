@@ -670,6 +670,15 @@ pub async fn handle_live_call_request(
         }
     };
 
+    // In-flight accounting: count this call as a running invocation for the
+    // local executing agent, but only while the tool actually runs (issue #312).
+    // A held-for-approval call is not yet running, so the guard is entered on the
+    // execute path below — not the hold path — and held across tool execution and
+    // the `call.response` emit, dropping when this handler returns. `target_agent`
+    // is the resolved local executing agent (the handler returned early above if
+    // it is unset or not local), so the counter is never keyed on an empty id.
+    let mut _inflight: Option<crate::inflight::InflightGuard> = None;
+
     let response = match authorize_live_call(
         &room,
         paths,
@@ -705,7 +714,12 @@ pub async fn handle_live_call_request(
                         .await;
                     return;
                 }
-                crate::approval::CallDisposition::Execute(_) => {}
+                crate::approval::CallDisposition::Execute(_) => {
+                    // Enter the in-flight guard now: the call is authorized and
+                    // about to run. It stays alive until the handler returns,
+                    // covering tool execution and the `call.response` emit below.
+                    _inflight = Some(crate::inflight::InflightGuard::enter(target_agent));
+                }
             }
             // Allowed and running immediately (allow-and-ran).
             audit_call_decision(

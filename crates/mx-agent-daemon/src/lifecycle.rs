@@ -591,10 +591,13 @@ fn dispatch(
         "task.graph" => match parse_params::<crate::ListTasksOptions>(req) {
             Ok(options) => block_on_task_response(req, |session| async move {
                 let tasks = crate::list_tasks_for_session(&session, &options).await?;
-                // Best-effort agent snapshot for agent-dependent diagnostics;
-                // when it cannot be read, agent checks are skipped rather than
-                // failing the graph query.
-                let agents = crate::list_agents_for_session(
+                // Best-effort heartbeat-enriched agent snapshot for agent-dependent
+                // diagnostics; when it cannot be read, agent checks are skipped
+                // rather than failing the graph query. Using the liveness-enriched
+                // path (combined durable + heartbeat verdict) means a healthy,
+                // heartbeating agent never reads as inactive between the slower
+                // durable-state refreshes (issue #312).
+                let listings = crate::list_agents_with_liveness_for_session(
                     &session,
                     &crate::ListAgentsOptions {
                         room: options.room.clone(),
@@ -603,7 +606,14 @@ fn dispatch(
                 )
                 .await
                 .unwrap_or_default();
-                let warnings = crate::diagnose_tasks(&tasks, &agents);
+                let mut liveness: std::collections::HashMap<String, crate::Liveness> =
+                    std::collections::HashMap::with_capacity(listings.len());
+                let mut agents = Vec::with_capacity(listings.len());
+                for listing in listings {
+                    liveness.insert(listing.agent.agent_id.clone(), listing.liveness);
+                    agents.push(listing.agent);
+                }
+                let warnings = crate::diagnose_tasks(&tasks, &agents, &liveness);
                 Ok(crate::TaskGraph::from_tasks(&tasks).with_diagnostics(warnings))
             }),
             Err(response) => *response,
