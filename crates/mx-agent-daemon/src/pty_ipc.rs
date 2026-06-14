@@ -98,6 +98,16 @@ pub struct ExecPtyParams {
     /// default.
     #[serde(default)]
     pub max_output_bytes: Option<u64>,
+    /// Caller-supplied environment overrides for a **remote** PTY command (issue
+    /// #314). Carried on the signed exec request; subordinate to the receiver's
+    /// policy (secrets scrubbed, `env_allowlist` applies). Empty by default.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Caller-requested wall-clock timeout in milliseconds for a **remote** PTY
+    /// command (issue #314). `None` uses [`crate::exec_ipc::DEFAULT_REMOTE_EXEC_TIMEOUT_MS`];
+    /// the receiver still clamps to `min(policy cap, requested)`.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_rows() -> u16 {
@@ -200,6 +210,8 @@ fn pty_loopback_run_spec(params: &ExecPtyParams, allowance: &Allowance) -> RunSp
     RunSpec {
         command: params.command.clone(),
         cwd,
+        // Honor the caller's `--env` overrides on the loopback PTY too (issue #314).
+        env: params.env.clone(),
         env_allowlist: allowance.env_allowlist.clone(),
         sandbox: sandbox_backend(allowance.sandbox),
         network: network_for(allowance.network),
@@ -443,11 +455,13 @@ async fn setup_remote_pty(
         requesting_agent: requester.agent_id,
         command: params.command.clone(),
         cwd,
-        env: Default::default(),
+        env: params.env.clone(),
         stdin: true,
         stream: true,
         pty: true,
-        timeout_ms: 600_000,
+        timeout_ms: params
+            .timeout_ms
+            .unwrap_or(crate::exec_ipc::DEFAULT_REMOTE_EXEC_TIMEOUT_MS),
         task_id: params.task.clone(),
     };
     let content = crate::build_signed_exec_request(

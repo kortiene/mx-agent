@@ -338,6 +338,39 @@ fn security_hardening_pty_routes_through_sandbox_backend() {
     );
 }
 
+// ── Issue #314: exec env/timeout transport + exit 129 — doc drift guards ──────
+//
+// Before #314 the user guide listed exec env/timeout forwarding as "still
+// landing" and architecture marked exit 129 (timeout) as planned. The fix ships
+// both. These guard the corrected wording.
+
+/// User guide must mark exec env/timeout forwarding as shipped, not "still landing".
+#[test]
+fn user_guide_exec_env_timeout_forwarding_shipped() {
+    assert!(
+        !USER_GUIDE.contains("Still landing: tight"),
+        "user-guide must not list exec env/timeout forwarding as still landing (issue #314)"
+    );
+    assert!(
+        USER_GUIDE.contains("#314"),
+        "user-guide must cite issue #314 for shipped exec env/timeout forwarding"
+    );
+}
+
+/// Architecture §5.3 must emit exit 129 for a requester-side timeout, not mark it
+/// planned, and must record the exec.cancelled / truncation decision.
+#[test]
+fn architecture_exit_129_emitted_and_cancelled_truncation_recorded() {
+    assert!(
+        !ARCHITECTURE.contains("129 | Timeout *(planned"),
+        "architecture must not mark exit 129 (timeout) as planned (issue #314)"
+    );
+    assert!(
+        ARCHITECTURE.contains("carries no `truncated` field"),
+        "architecture must record that exec.cancelled carries no truncated field (issue #314)"
+    );
+}
+
 /// The `ipc.rs` module doc must name the `auth`/`trust` carve-out so a reader
 /// of that file cannot conclude that ALL commands are daemon-IPC-mediated.
 ///

@@ -468,9 +468,15 @@ struct ExecArgs {
     /// Associate this execution with a task ID.
     #[arg(long)]
     task: Option<String>,
-    /// Stream stdout/stderr live.
-    #[arg(long)]
-    stream: bool,
+    /// Environment override `KEY=VALUE` for the command (repeatable). Carried on
+    /// the signed request; the receiver still scrubs secret-named variables and
+    /// applies its policy `env_allowlist`.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    /// Wall-clock timeout for the command, e.g. `300` (seconds), `5m`, `500ms`,
+    /// `2h`. The receiver caps the effective timeout at its policy `max_runtime_ms`.
+    #[arg(long = "timeout", value_name = "DURATION", value_parser = parse_timeout_ms)]
+    timeout: Option<u64>,
     /// Fail (exit 132) if the output stream is incomplete or corrupt instead of
     /// rendering best-effort. A missing chunk or one that fails validation
     /// (bad encoding or sha256 mismatch) becomes a hard error.
@@ -479,12 +485,56 @@ struct ExecArgs {
     /// Allocate a pseudo-terminal.
     #[arg(long)]
     pty: bool,
-    /// Forward local stdin to the remote command.
-    #[arg(long)]
-    stdin: bool,
     /// Command and arguments to run (after `--`).
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     command: Vec<String>,
+}
+
+/// Parse a `--timeout` duration into milliseconds (issue #314).
+///
+/// Accepts a bare integer as seconds (`300` → 300 000 ms) or a value with a unit
+/// suffix: `ms`, `s`, `m`, `h` (checked longest-first so `ms` is not read as
+/// `m`). Zero and unparseable values are rejected.
+fn parse_timeout_ms(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    let (digits, mult_ms): (&str, u64) = if let Some(n) = raw.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = raw.strip_suffix('s') {
+        (n, 1_000)
+    } else if let Some(n) = raw.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = raw.strip_suffix('h') {
+        (n, 3_600_000)
+    } else {
+        (raw, 1_000)
+    };
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid duration {raw:?}: expected e.g. 300, 5m, 500ms, 2h"))?;
+    let ms = value
+        .checked_mul(mult_ms)
+        .ok_or_else(|| format!("duration {raw:?} is too large"))?;
+    if ms == 0 {
+        return Err(format!("duration {raw:?} must be greater than zero"));
+    }
+    Ok(ms)
+}
+
+/// Parse `KEY=VALUE` env override pairs into a map (issue #314), rejecting a
+/// missing `=` or an empty key.
+fn parse_env_pairs(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("invalid --env {pair:?}: expected KEY=VALUE"))?;
+        if key.is_empty() {
+            return Err(format!("invalid --env {pair:?}: empty variable name"));
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(map)
 }
 
 #[derive(Debug, Subcommand)]
@@ -4092,18 +4142,28 @@ fn cmd_exec(global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
     // supervision and (for the live flow) the Matrix client, signing key, policy,
     // and trust context (architecture §10.1, issue #155). The CLI only forwards
     // the request and renders the structured frame stream it gets back.
+    let env = match parse_env_pairs(&args.env) {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("mx-agent: {e}");
+            return ExitCode::from(64);
+        }
+    };
     let params = mx_agent_daemon::ExecStartParams {
         room: args.room.clone(),
         agent: args.agent.clone(),
         command: args.command.clone(),
         cwd: Some(cwd),
         stdin,
-        stream: args.stream,
+        // Streaming intent is always on for the CLI; the daemon shapes emission.
+        stream: true,
         pty: false,
         task: args.task.clone(),
         strict_stream: args.strict_stream,
         // Direct CLI `exec` mints a fresh invocation id in the daemon.
         invocation_id: None,
+        env,
+        timeout_ms: args.timeout,
     };
     let result: mx_agent_daemon::ExecStartResult =
         match daemon_ipc_call(global, "exec.start", &params) {
@@ -4119,6 +4179,11 @@ fn cmd_exec(global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
             return match kind {
                 mx_agent_daemon::ExecErrorKind::NotFound => ExitCode::from(127),
                 mx_agent_daemon::ExecErrorKind::EmptyCommand => ExitCode::from(64),
+                // A requester-side timeout (the local CLI gave up waiting and sent
+                // a signed cancel) maps to exit 129 per architecture §5.3 (#314).
+                mx_agent_daemon::ExecErrorKind::Timeout => {
+                    ExitCode::from(crate::stream::EXIT_TIMEOUT)
+                }
                 mx_agent_daemon::ExecErrorKind::Spawn | mx_agent_daemon::ExecErrorKind::Remote => {
                     ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
                 }
@@ -4148,20 +4213,28 @@ fn cmd_exec(global: &GlobalArgs, args: &ExecArgs) -> ExitCode {
         }
         // Missing chunks (degraded mode) are surfaced to the user by the
         // renderer as they are detected; best-effort output continues here.
-        Ok(outcome) => match outcome.exit_code {
-            Some(code) if outcome.degraded() => {
-                eprintln!(
-                    "mx-agent: warning: output was degraded ({} chunk(s) missing)",
-                    outcome.missing.len()
-                );
-                ExitCode::from(code)
+        Ok(outcome) => {
+            // Tell the user when the daemon capped the output to the
+            // per-invocation byte budget, so a clipped log is never mistaken for
+            // the complete output (issue #314).
+            if outcome.truncated {
+                eprintln!("mx-agent: warning: output was truncated to the per-invocation byte cap");
             }
-            Some(code) => ExitCode::from(code),
-            None => {
-                eprintln!("mx-agent: stream ended without exec.finished");
-                ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
+            match outcome.exit_code {
+                Some(code) if outcome.degraded() => {
+                    eprintln!(
+                        "mx-agent: warning: output was degraded ({} chunk(s) missing)",
+                        outcome.missing.len()
+                    );
+                    ExitCode::from(code)
+                }
+                Some(code) => ExitCode::from(code),
+                None => {
+                    eprintln!("mx-agent: stream ended without exec.finished");
+                    ExitCode::from(crate::stream::EXIT_PROTOCOL_FAILURE)
+                }
             }
-        },
+        }
         Err(e) => {
             eprintln!("mx-agent: failed writing output: {e}");
             ExitCode::FAILURE
@@ -4198,6 +4271,13 @@ fn cmd_exec_pty(global: &GlobalArgs, args: &ExecArgs, cwd: PathBuf) -> ExitCode 
     // Match the PTY to the local terminal up front; fall back to the conventional
     // 24×80 when there is no local terminal (e.g. piped stdin).
     let initial = local_winsize().unwrap_or_default();
+    let env = match parse_env_pairs(&args.env) {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("mx-agent: {e}");
+            return ExitCode::from(64);
+        }
+    };
     let params = mx_agent_daemon::ExecPtyParams {
         room: args.room.clone(),
         agent: args.agent.clone(),
@@ -4208,6 +4288,8 @@ fn cmd_exec_pty(global: &GlobalArgs, args: &ExecArgs, cwd: PathBuf) -> ExitCode 
         task: args.task.clone(),
         // The CLI uses the daemon's default loopback output cap.
         max_output_bytes: None,
+        env,
+        timeout_ms: args.timeout,
     };
     let params_value = match serde_json::to_value(&params) {
         Ok(value) => value,
@@ -4329,8 +4411,17 @@ fn pty_render_loop(
                         }
                     }
                     mx_agent_daemon::PtyServerFrame::Finished {
-                        exit_code, signal, ..
+                        exit_code,
+                        signal,
+                        truncated,
                     } => {
+                        // Surface a capped PTY stream so the user knows terminal
+                        // output was clipped to the byte budget (issue #268/#314).
+                        if truncated {
+                            eprintln!(
+                                "mx-agent: warning: terminal output was truncated to the per-invocation byte cap"
+                            );
+                        }
                         let _ = code_tx.send(pty_exit_code(exit_code, signal));
                         return;
                     }
@@ -4647,6 +4738,66 @@ mod tests {
             }
             other => panic!("expected exec, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn exec_parses_env_and_timeout() {
+        // Issue #314: --env (repeatable) and --timeout round-trip into ExecArgs.
+        let cli = Cli::try_parse_from([
+            "mx-agent",
+            "exec",
+            "--env",
+            "FOO=bar",
+            "--env",
+            "BAZ=qux",
+            "--timeout",
+            "5m",
+            "--",
+            "true",
+        ])
+        .expect("parse exec");
+        match cli.command {
+            Command::Exec(args) => {
+                assert_eq!(args.env, vec!["FOO=bar".to_string(), "BAZ=qux".to_string()]);
+                assert_eq!(args.timeout, Some(300_000));
+                let map = parse_env_pairs(&args.env).expect("env parses");
+                assert_eq!(map.get("FOO").map(String::as_str), Some("bar"));
+                assert_eq!(map.get("BAZ").map(String::as_str), Some("qux"));
+            }
+            other => panic!("expected exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_rejects_removed_stream_and_stdin_flags() {
+        // Issue #314: the non-functional --stream/--stdin flags were removed.
+        for flag in ["--stream", "--stdin"] {
+            assert!(
+                Cli::try_parse_from(["mx-agent", "exec", flag, "--", "true"]).is_err(),
+                "{flag} should no longer be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_timeout_ms_units_and_errors() {
+        assert_eq!(parse_timeout_ms("300"), Ok(300_000)); // bare = seconds
+        assert_eq!(parse_timeout_ms("500ms"), Ok(500));
+        assert_eq!(parse_timeout_ms("45s"), Ok(45_000));
+        assert_eq!(parse_timeout_ms("5m"), Ok(300_000));
+        assert_eq!(parse_timeout_ms("2h"), Ok(7_200_000));
+        assert!(parse_timeout_ms("0").is_err(), "zero must be rejected");
+        assert!(parse_timeout_ms("abc").is_err());
+        assert!(parse_timeout_ms("10x").is_err());
+    }
+
+    #[test]
+    fn parse_env_pairs_rejects_malformed() {
+        assert!(parse_env_pairs(&["NOEQUALS".to_string()]).is_err());
+        assert!(parse_env_pairs(&["=novalue".to_string()]).is_err());
+        // An empty value is allowed (clears/sets to empty).
+        let map = parse_env_pairs(&["EMPTY=".to_string()]).expect("empty value ok");
+        assert_eq!(map.get("EMPTY").map(String::as_str), Some(""));
     }
 
     #[test]

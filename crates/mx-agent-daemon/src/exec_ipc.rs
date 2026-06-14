@@ -26,6 +26,7 @@
 //! - The command, cwd, and stdin can carry sensitive data and are never logged
 //!   here.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +58,19 @@ use crate::stream::{
 /// runner's process-group timeout rather than running forever — the timeout is
 /// the mitigation for the synchronous loopback path having no live cancel.
 pub const DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS: u64 = 600_000;
+
+/// Default wall-clock timeout (ms) for a **remote** exec request when the caller
+/// supplies none (issue #314). The receiver still clamps the effective timeout to
+/// `min(policy cap, requested)`, so this is only the request's upper bound.
+pub const DEFAULT_REMOTE_EXEC_TIMEOUT_MS: u64 = 600_000;
+
+/// Grace period added to the caller's requested timeout when deciding how long
+/// the requester waits for a remote result before abandoning (issue #314).
+///
+/// The receiver's own timeout (≤ the requested value) fires first and emits
+/// `exec.finished`, so under normal operation the requester never reaches this
+/// deadline; it only bounds a remote that hangs past its own timeout.
+pub const REQUESTER_TIMEOUT_GRACE: Duration = Duration::from_secs(30);
 
 /// Parameters for the `exec.start` IPC method.
 ///
@@ -102,6 +116,20 @@ pub struct ExecStartParams {
     /// #239).
     #[serde(default)]
     pub invocation_id: Option<String>,
+    /// Caller-supplied environment overrides for the command (issue #314).
+    ///
+    /// Carried on the signed exec request and layered on the receiver's sanitized
+    /// env. Subordinate to the receiver's policy: secret-named variables are still
+    /// scrubbed and the `env_allowlist` still applies. Empty by default.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Caller-requested wall-clock timeout in milliseconds (issue #314).
+    ///
+    /// `None` uses [`DEFAULT_REMOTE_EXEC_TIMEOUT_MS`]. The receiver clamps the
+    /// effective timeout to `min(policy cap, requested)`, so this can only tighten
+    /// the bound, never exceed the operator's `max_runtime_ms`.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// One frame in the forwarded exec output stream.
@@ -139,6 +167,9 @@ pub enum ExecErrorKind {
     Spawn,
     /// A live Matrix-backed remote exec failed or was rejected.
     Remote,
+    /// The requester gave up waiting for a remote exec result past its deadline
+    /// and sent a signed cancel (issue #314). The CLI maps this to exit 129.
+    Timeout,
 }
 
 /// The outcome of an `exec.start` invocation.
@@ -487,16 +518,17 @@ async fn start_exec_matrix_inner(
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let requested_timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_REMOTE_EXEC_TIMEOUT_MS);
     let options = crate::ExecRequestOptions {
         target_agent,
         requesting_agent: requester.agent_id,
         command: params.command.clone(),
         cwd,
-        env: Default::default(),
+        env: params.env.clone(),
         stdin: params.stdin.is_some(),
         stream: params.stream,
         pty: params.pty,
-        timeout_ms: 600_000,
+        timeout_ms: requested_timeout_ms,
         task_id: params.task.clone(),
     };
     let content = crate::build_signed_exec_request(
@@ -532,17 +564,45 @@ async fn start_exec_matrix_inner(
     }
 
     let mut frames = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    // Wait long enough to cover the timeout the remote was actually told to honor,
+    // plus a grace window, instead of a fixed 120 s that could abandon a healthy
+    // long run (issue #314). The receiver's own timeout (≤ requested) fires first
+    // and emits `exec.finished`, so this deadline only bounds a remote that hangs.
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(requested_timeout_ms)
+        + REQUESTER_TIMEOUT_GRACE;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err("timed out waiting for remote exec result".to_string());
+            // Abandon the run, but first tell the remote to stop: send a signed
+            // `exec.cancel` (verified on receipt) so a runaway is not left running
+            // unsupervised. Map the requester-side timeout to a distinct kind the
+            // CLI renders as exit 129 (issue #314).
+            let _ = crate::send_exec_cancel(
+                &room,
+                signing.signing_key(),
+                signing.key_id(),
+                invocation_id,
+                "requester timed out waiting for result",
+                rfc3339_after(Duration::ZERO),
+                generate_request_id(),
+            )
+            .await;
+            return Ok(ExecOutcome::Error {
+                kind: ExecErrorKind::Timeout,
+                message: "timed out waiting for remote exec result; sent cancel".to_string(),
+            });
         }
+        // Cap each receive at a short poll window so the deadline is re-checked,
+        // but a window expiring with no event just loops — it does not abandon.
         let event =
-            tokio::time::timeout(remaining.min(Duration::from_secs(5)), subscription.recv())
+            match tokio::time::timeout(remaining.min(Duration::from_secs(5)), subscription.recv())
                 .await
-                .map_err(|_| "timed out waiting for remote exec result".to_string())?
-                .ok_or_else(|| "remote exec subscriber closed".to_string())?;
+            {
+                Ok(Some(event)) => event,
+                Ok(None) => return Err("remote exec subscriber closed".to_string()),
+                Err(_elapsed) => continue,
+            };
         match event {
             ForwardedExecEvent::StreamChunk(chunk) => frames.push(ExecFrame::Chunk(chunk)),
             ForwardedExecEvent::StreamArtifact(artifact) => {
@@ -632,10 +692,16 @@ fn loopback_run_spec(params: &ExecStartParams, allowance: &Allowance) -> RunSpec
         command: params.command.clone(),
         cwd,
         stdin: params.stdin.clone(),
+        // Honor the caller's `--env` overrides on the loopback path too, layered
+        // on the sanitized env (secrets still scrubbed) so `exec --env K=V` is
+        // consistent local and remote (issue #314).
+        env: params.env.clone(),
         env_allowlist: allowance.env_allowlist.clone(),
+        // Caller `--timeout` wins, then a policy runtime cap, then the default.
         timeout: Some(Duration::from_millis(
-            allowance
-                .max_runtime_ms
+            params
+                .timeout_ms
+                .or(allowance.max_runtime_ms)
                 .unwrap_or(DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS),
         )),
         sandbox: sandbox_backend(allowance.sandbox),
@@ -783,6 +849,8 @@ mod tests {
             task: None,
             strict_stream: false,
             invocation_id: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
         }
     }
 
@@ -903,6 +971,35 @@ mod tests {
     }
 
     #[test]
+    fn timeout_error_kind_serializes() {
+        // Issue #314: the requester-side timeout kind the CLI maps to exit 129.
+        let err = ExecOutcome::Error {
+            kind: ExecErrorKind::Timeout,
+            message: "timed out".to_string(),
+        };
+        let value = serde_json::to_value(&err).unwrap();
+        assert_eq!(value["kind"], "timeout");
+    }
+
+    #[test]
+    fn params_round_trip_with_env_and_timeout() {
+        // Issue #314: env/timeout_ms ride ExecStartParams (and default when absent).
+        let mut p = params(&["true"]);
+        p.env = BTreeMap::from([("FOO".to_string(), "bar".to_string())]);
+        p.timeout_ms = Some(45_000);
+        let json = serde_json::to_value(&p).unwrap();
+        let back: ExecStartParams = serde_json::from_value(json).unwrap();
+        assert_eq!(back.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(back.timeout_ms, Some(45_000));
+
+        // Absent fields default (older CLIs / wire forms still parse).
+        let minimal: ExecStartParams =
+            serde_json::from_value(serde_json::json!({ "command": ["true"] })).unwrap();
+        assert!(minimal.env.is_empty());
+        assert_eq!(minimal.timeout_ms, None);
+    }
+
+    #[test]
     fn frame_serializes_with_kind_tag() {
         let frame = ExecFrame::Finished(ExecFinished {
             invocation_id: "inv_x".to_string(),
@@ -996,6 +1093,19 @@ writable_paths = ["/work"]
             spec.timeout,
             Some(Duration::from_millis(DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS))
         );
+    }
+
+    #[test]
+    fn loopback_run_spec_honors_caller_env_and_timeout() {
+        // Issue #314: `exec --env K=V --timeout` is consistent on the loopback
+        // path too — caller env overrides reach the spec and the caller timeout
+        // wins over the default.
+        let mut p = params(&["true"]);
+        p.env = BTreeMap::from([("FOO".to_string(), "bar".to_string())]);
+        p.timeout_ms = Some(12_000);
+        let spec = loopback_run_spec(&p, &Allowance::default());
+        assert_eq!(spec.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(spec.timeout, Some(Duration::from_millis(12_000)));
     }
 
     #[test]

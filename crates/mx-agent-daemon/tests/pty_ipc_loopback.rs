@@ -124,6 +124,8 @@ fn params(command: &[&str], rows: u16, cols: u16) -> ExecPtyParams {
         cols,
         task: None,
         max_output_bytes: None,
+        env: Default::default(),
+        timeout_ms: None,
     }
 }
 
@@ -230,6 +232,8 @@ fn loopback_pty_output_cap_reports_truncated_true() {
         cols: 80,
         task: None,
         max_output_bytes: Some(10),
+        env: Default::default(),
+        timeout_ms: None,
     };
     let server = spawn_server(path.clone(), p);
 
@@ -274,6 +278,8 @@ fn loopback_pty_within_cap_reports_truncated_false() {
         cols: 80,
         task: None,
         max_output_bytes: Some(4096),
+        env: Default::default(),
+        timeout_ms: None,
     };
     let server = spawn_server(path.clone(), p);
 

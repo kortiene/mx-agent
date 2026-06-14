@@ -1235,7 +1235,7 @@ echo '{"package":"api","coverage":true}' | mx-agent call \
 - Local loopback execution runs built-in tools immediately; remote execution over Matrix is asynchronous and may be held pending approval.
 - For signed Matrix-backed remote calls, the receiver verifies the Ed25519 request signature and checks the local trust store and policy before executing; room membership alone grants no execution rights.
 - Large artifacts (> 256 KiB) landing in future releases will be uploaded to Matrix media and referenced via `mxc://` URIs.
-- If the tool consumes stdin (e.g. for a prompt), stdin is not forwarded; use `exec --stdin` for bidirectional I/O.
+- If the tool consumes stdin (e.g. for a prompt), stdin is not forwarded; use `exec --pty` for bidirectional I/O.
 
 ## `exec` — Run a command on a remote agent
 
@@ -1263,11 +1263,13 @@ mx-agent [GLOBAL] exec [OPTIONS] -- <COMMAND>...
 | `--agent` | `<AGENT>` | No | None | Target agent name. Required if `--room` is specified. |
 | `--cwd` | `<PATH>` | No | Current directory | Working directory for the command. |
 | `--task` | `<TASK_ID>` | No | None | Associate the execution with a task ID for tracking in the distributed task DAG. |
-| `--stream` | — | No | false | Request streamed stdout/stderr capture. The flag is forwarded to the daemon (it influences chunk flushing on the daemon/remote streaming paths). Note: the direct CLI `exec` path buffers the output frames and renders them after the command finishes — its loopback frame source runs the command in one shot — so for live interactive I/O use `--pty`. |
+| `--env` | `<KEY=VALUE>` | No | — | Environment override for the command, repeatable. Carried on the signed request; the receiver still scrubs secret-named variables and applies its policy `env_allowlist`. |
+| `--timeout` | `<DURATION>` | No | 600 s | Wall-clock timeout, e.g. `300` (seconds), `5m`, `500ms`, `2h`. The receiver caps the effective timeout at its policy `max_runtime_ms` (`min(policy cap, requested)`). |
 | `--strict-stream` | — | No | false | Hard-fail (exit 132) if the output stream has missing or corrupt chunks instead of continuing best-effort. A missing chunk (one that fails integrity validation or cannot be decoded) becomes fatal. |
 | `--pty` | — | No | false | Allocate a pseudo-terminal (Unix only). The CLI puts the local terminal into raw mode and forwards keystrokes and window-resize signals live to the remote PTY. Interactive only; incompatible with piped stdin for non-PTY mode. |
-| `--stdin` | — | No | false | (Loopback) Forward piped stdin to the command if detected. In PTY mode, stdin is always forwarded. Note: stdin is auto-detected; this flag is reserved for future use. |
 | `<COMMAND>` | Command argv after `--` | Yes | — | The command to run and its arguments, provided after the `--` separator. |
+
+Piped stdin is auto-detected and forwarded to the command (close on EOF); there is no `--stdin` flag. The previous non-functional `--stream` flag was removed (the daemon shapes chunk flushing itself; use `--pty` for live interactive I/O).
 
 **Behavior**
 
@@ -1291,6 +1293,7 @@ When `--room` and `--agent` are specified, the command becomes a signed, Matrix-
 | 127 | Command or working directory not found (`ExecErrorKind::NotFound`). |
 | 128 | Stream protocol failure: stream ended without an `exec.finished` frame. |
 | 128+*n* | Remote process was killed by signal *n* (e.g., 130 = SIGINT = 2, 143 = SIGTERM = 15). |
+| 129 | Timeout: the requester abandoned the remote run after its deadline (requested `--timeout` + grace) and sent a signed `exec.cancel`. |
 | 132 | Stream integrity violation in strict mode (`--strict-stream`): a chunk was missing or failed validation (bad encoding or sha256 mismatch). |
 | 64 | Input validation error: empty command, bad `--cwd` path, or daemon IPC failure. |
 | 3 | Daemon not running (when `--pty` fails to connect to the daemon socket). |
@@ -1324,7 +1327,10 @@ mx-agent exec --cwd /tmp -- python3 -c "import sys; print(sys.stdin.read())" < i
 
 **Notes**
 
-- **Streaming vs batch:** the direct CLI `exec` renders captured frames after the command completes (its loopback frame source runs the command in one shot); `--stream` is forwarded to the daemon and shapes daemon/remote-side chunk flushing. Use `--pty` for live interactive I/O.
+- **Streaming vs batch:** the direct CLI `exec` renders captured frames after the command completes (its loopback frame source runs the command in one shot). Use `--pty` for live interactive I/O.
+- **Env / timeout:** `--env KEY=VALUE` (repeatable) and `--timeout <DURATION>` ride the signed request to a remote agent; the receiver applies the env override (secrets still scrubbed, `env_allowlist` still applies) and an effective timeout of `min(policy max_runtime_ms, requested)`.
+- **Truncation:** when the daemon caps output at the per-invocation byte budget, the CLI prints `mx-agent: warning: output was truncated …` (on both the non-PTY and `--pty` paths) so a clipped log is never mistaken for the full output.
+- **Requester timeout (exit 129):** for a remote exec the CLI waits the requested timeout plus a grace window; if no result arrives it sends a signed `exec.cancel` and exits 129 rather than leaving the remote running unsupervised.
 - **PTY semantics:** `--pty` is Unix-only. The CLI forwards Ctrl-C and other signals as if connected directly; the remote PTY behaves like a local terminal.
 - **Large output:** Exec output larger than 256 KiB is automatically uploaded to a Matrix media artifact; the CLI receives a reference URI and a 4 KiB tail for preview.
 - **Strict mode:** `--strict-stream` is useful for audit trails (e.g., build logs); degraded output (default) is suitable for interactive use.
@@ -1334,7 +1340,7 @@ mx-agent exec --cwd /tmp -- python3 -c "import sys; print(sys.stdin.read())" < i
 - **Confidentiality:** Remote exec is **Ed25519-signed** for integrity and authenticity, and the receiver authorizes it (verify → trust store → deny-by-default policy → optional verified-device and approval gates). Workspace rooms are **unencrypted by default** (see [`workspace create`](#mx-agent-workspace-create)), so the command line, stdin, and captured output transit as cleartext Matrix timeline events **readable by the homeserver operator**. Pass `--e2ee on` when creating the workspace to make it born encrypted (Megolm v1) — in an encrypted workspace, traffic is opaque to the homeserver. Encryption is a transport property only; signing + trust + policy + approval remain the execution gate. For real confidentiality pair `--e2ee on` with device verification and key backup.
 - **Restart durability:** a command held for approval survives a daemon restart — the approval queue is persisted (`approvals.json`). In-flight output of a running command is not guaranteed to survive a restart.
 - **Policy enforcement:** Remote exec checks `policy.toml` (`allow_commands` glob and `deny_args_regex`), optional verified-device gates, and optional approval before spawning.
-- **Stdin detection:** In non-PTY mode, stdin is auto-detected from `IsTerminal`; piped input is buffered and forwarded automatically. The `--stdin` flag is reserved for future use.
+- **Stdin detection:** In non-PTY mode, stdin is auto-detected from `IsTerminal`; piped input is buffered and forwarded automatically (there is no `--stdin` flag).
 
 ## `share` — Broadcast context (diffs, environment, files)
 

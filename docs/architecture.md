@@ -396,19 +396,25 @@ The local CLI should exit with the remote process exit code when possible.
 | 64 | Invalid CLI usage (e.g. an empty command) |
 | 126 | Local policy denied *(planned; currently surfaces as `128`)* |
 | 127 | Agent/tool/command not found |
-| 128 | Protocol/network failure — and, today, also a policy denial, a remote rejection, a remote cancellation, or a timeout (see note) |
+| 128 | Protocol/network failure — and, today, also a policy denial or a remote rejection (see note) |
 | 128 + signum | Process killed by a signal — e.g. `130` for SIGINT/Ctrl-C on the non-interactive path |
-| 129 | Timeout *(planned; currently surfaces as `128`)* |
+| 129 | Timeout — the requester abandoned a remote exec after its deadline (requested timeout + grace) and sent a signed `exec.cancel` (issue #314) |
 | 130 | Interrupted/cancelled locally (non-interactive path: `128 + SIGINT`) |
 | 131 | Remote rejected request *(planned; currently surfaces as `128`)* |
 | 132 | Stream integrity failure (strict mode) |
 
-> **Note (current behavior).** The daemon-mediated `exec` path does not yet
-> distinguish the finer-grained failure codes `126` (policy denied), `129`
-> (timeout), and `131` (remote rejected); each currently surfaces as `128`. A
+> **Note (current behavior).** The daemon-mediated `exec` path emits the distinct
+> `129` (requester-side timeout) code, but does not yet distinguish `126` (policy
+> denied) or `131` (remote rejected); those each currently surface as `128`. A
 > process killed by a signal exits `128 + signum` (so a Ctrl-C'd command on the
-> non-interactive path exits `130`). Emitting the distinct `126`/`129`/`131`
-> codes is planned follow-up work.
+> non-interactive path exits `130`). Emitting the distinct `126`/`131` codes is
+> planned follow-up work.
+>
+> **`exec.cancelled` and truncation.** A cancelled run's output is incomplete by
+> definition, so `com.mxagent.exec.cancelled.v1` carries no `truncated` field and
+> the cancel path intentionally drops the capture summary. The `truncated` flag is
+> reported only on the normal terminal frames (`exec.finished` / the PTY
+> `finished` frame), where the CLI surfaces it as a warning (issue #314).
 
 ---
 
