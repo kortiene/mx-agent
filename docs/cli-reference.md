@@ -914,6 +914,7 @@ mx-agent agent register --room '#workspace:matrix.org' \
 - The `--capability` and `--tool` flags are repeatable and concatenated into the agent state; they are used by callers to filter or discover agents.
 - Git commit is captured at registration time; it does not update with subsequent git changes.
 - Agent status is always set to `active` at registration and managed by the daemon's heartbeat loop thereafter.
+- The agent profile is published as a Matrix **state** event (refreshed by the heartbeat loop). Its capabilities, tools, `cwd`, `project_id`, and git commit are **plaintext readable by the homeserver operator even in an `--e2ee on` workspace** — Megolm does not cover state events (issue #308).
 
 ---
 
@@ -1332,12 +1333,12 @@ mx-agent exec --cwd /tmp -- python3 -c "import sys; print(sys.stdin.read())" < i
 - **Truncation:** when the daemon caps output at the per-invocation byte budget, the CLI prints `mx-agent: warning: output was truncated …` (on both the non-PTY and `--pty` paths) so a clipped log is never mistaken for the full output.
 - **Requester timeout (exit 129):** for a remote exec the CLI waits the requested timeout plus a grace window; if no result arrives it sends a signed `exec.cancel` and exits 129 rather than leaving the remote running unsupervised.
 - **PTY semantics:** `--pty` is Unix-only. The CLI forwards Ctrl-C and other signals as if connected directly; the remote PTY behaves like a local terminal.
-- **Large output:** Exec output larger than 256 KiB is automatically uploaded to a Matrix media artifact; the CLI receives a reference URI and a 4 KiB tail for preview.
+- **Large output:** Exec output larger than 256 KiB is automatically uploaded to a Matrix media artifact; the CLI receives a reference URI and a 4 KiB tail for preview. In an `--e2ee on` workspace the artifact media is uploaded as ciphertext (Matrix `EncryptedFile` scheme) and decrypted on retrieval, so the full log is not readable by the homeserver operator; in an unencrypted room it is uploaded as cleartext.
 - **Strict mode:** `--strict-stream` is useful for audit trails (e.g., build logs); degraded output (default) is suitable for interactive use.
 - **Task integration:** `--task` links the invocation to a scheduled task's DAG; the daemon records the invocation ID on the task state and can thus trace execution lineage.
 - **Loopback control (cancel/stdin):** mid-run control is a **remote-only** capability. A loopback `exec` (no `--room`/`--agent`) runs to completion in a single synchronous IPC request, so there is no live invocation to address — the `exec.stdin`/`exec.cancel` IPC methods reject a no-`--room` request with an error rather than silently no-op'ing. Use `--pty` for an interactive local session, or target a remote agent with `--room`/`--agent` for cancellable execution. A runaway loopback command is bounded by the default timeout instead (issue #307).
 - **Loopback large output:** loopback has no homeserver to upload to, so when output crosses the 256 KiB artifact threshold the `StreamArtifact`/`ExecFinished` frames carry an **empty `mxc_uri`** and the full log is delivered inline as chunks with a tail preview; the `mxc://` upload path applies to remote execution only.
-- **Confidentiality:** Remote exec is **Ed25519-signed** for integrity and authenticity, and the receiver authorizes it (verify → trust store → deny-by-default policy → optional verified-device and approval gates). Workspace rooms are **unencrypted by default** (see [`workspace create`](#mx-agent-workspace-create)), so the command line, stdin, and captured output transit as cleartext Matrix timeline events **readable by the homeserver operator**. Pass `--e2ee on` when creating the workspace to make it born encrypted (Megolm v1) — in an encrypted workspace, traffic is opaque to the homeserver. Encryption is a transport property only; signing + trust + policy + approval remain the execution gate. For real confidentiality pair `--e2ee on` with device verification and key backup.
+- **Confidentiality:** Remote exec is **Ed25519-signed** for integrity and authenticity, and the receiver authorizes it (verify → trust store → deny-by-default policy → optional verified-device and approval gates). Workspace rooms are **unencrypted by default** (see [`workspace create`](#mx-agent-workspace-create)), so the command line, stdin, and captured output transit as cleartext Matrix timeline events **readable by the homeserver operator**. Pass `--e2ee on` when creating the workspace to make it born encrypted (Megolm v1): **timeline** events (the exec request, stream chunks, results) **and the media offload** for >256 KiB output are then Megolm/`EncryptedFile`-encrypted and **not readable by the homeserver operator**. Matrix **state** events are a different channel — Megolm never covers them, so the `com.mxagent.task.v1` action (`command`/`cwd`/`env`) and `com.mxagent.invocation.v1`/`com.mxagent.agent.v1`/`com.mxagent.workspace.v1` state stay **plaintext readable by the operator even under `--e2ee on`** (issue #308); do not place secrets in a task action's `env`. Encryption is a transport property only; signing + trust + policy + approval remain the execution gate. For real confidentiality pair `--e2ee on` with device verification and key backup.
 - **Restart durability:** a command held for approval survives a daemon restart — the approval queue is persisted (`approvals.json`). In-flight output of a running command is not guaranteed to survive a restart.
 - **Policy enforcement:** Remote exec checks `policy.toml` (`allow_commands` glob and `deny_args_regex`), optional verified-device gates, and optional approval before spawning.
 - **Stdin detection:** In non-PTY mode, stdin is auto-detected from `IsTerminal`; piped input is buffered and forwarded automatically (there is no `--stdin` flag).
@@ -1400,7 +1401,7 @@ echo '{"status":"complete"}' | mx-agent share file --room '#work:example.com' --
 **Notes**
 
 - Payloads over 256 KiB are automatically offloaded to Matrix media (mxc://) to avoid bloating room state.
-- Shares transit an **unencrypted** workspace room unless the workspace was created with `--e2ee on`; without encryption, shares are readable by the homeserver operator. Payloads are integrity-checked via their recorded SHA-256 digest regardless of encryption state.
+- Shares transit an **unencrypted** workspace room unless the workspace was created with `--e2ee on`; without encryption, shares are readable by the homeserver operator. Under `--e2ee on`, **inline (small) shares** ride the Megolm-encrypted timeline event, and **media-offloaded (large) shares** are uploaded as ciphertext (Matrix `EncryptedFile` scheme) and decrypted on retrieval — so neither is readable by the homeserver operator. (Before this landed, the offloaded media blob was plaintext even in an encrypted room.) Payloads are integrity-checked via their recorded SHA-256 digest regardless of encryption state.
 - The context_id is sortable (ulid format, e.g. `ctx_01HZ...`) and can be used with `share get` to retrieve the artifact later.
 
 ---
@@ -1719,6 +1720,7 @@ mx-agent task create --room '#project:server' \
 - The daemon signs `--tool`/`--exec` actions on the local IPC caller's behalf (Ed25519, addressed to the assigned agent) so they are admissible to the live scheduler. An unassigned task's action is left unsigned until an assigning `task update` names a target, at which point the daemon re-signs for the new assignee. Policy, trust, and any approval gate still determine whether a signed action is actually executed — see **Action signing** above.
 - Output larger than 256 KiB is offloaded to a SHA-256 mxc:// artifact with a 4 KiB tail preview.
 - Tasks are durable across daemon restarts (persisted in the Matrix room).
+- The task is published as a Matrix **state** event, which Megolm never encrypts. Its action (`command`/`cwd`/`env`) and result are **plaintext readable by the homeserver operator even in an `--e2ee on` workspace** — the scheduler needs the real action in state to execute it. **Do not place secrets in a task action's `env`**; the daemon emits an advisory warning (env key count only) when a non-empty `env` is published into an encrypted room (issue #308).
 
 ---
 
@@ -2061,7 +2063,9 @@ mx-agent task cancel --room '#project:server' task_001 --json
 
 ## `invocation` — Inspect and cancel running invocations
 
-Invocations are remote agent executions initiated by `call` or `exec` commands. The `invocation` group allows operators to list, inspect, cancel, and retrieve output artifacts from running or finished invocations in a workspace room. All commands require daemon IPC contact and a valid room identity. Output artifacts (stdout, stderr, pty) are transparently decompressed and SHA-256 verified before delivery.
+Invocations are remote agent executions initiated by `call` or `exec` commands. The `invocation` group allows operators to list, inspect, cancel, and retrieve output artifacts from running or finished invocations in a workspace room. All commands require daemon IPC contact and a valid room identity. Output artifacts (stdout, stderr, pty) are transparently decompressed and SHA-256 verified before delivery; in an `--e2ee on` workspace they are also stored as ciphertext (Matrix `EncryptedFile` scheme) and decrypted on retrieval.
+
+Invocation lifecycle is published as a `com.mxagent.invocation.v1` Matrix **state** event. Megolm does not cover state events, so the requester/target identities and exit code are **plaintext readable by the homeserver operator even in an `--e2ee on` workspace** (issue #308).
 
 | Subcommand | Purpose |
 |---|---|

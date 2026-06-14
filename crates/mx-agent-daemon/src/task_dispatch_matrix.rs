@@ -311,6 +311,7 @@ mod tests {
             sha256: String::new(),
             mxc_uri: mxc.to_string(),
             tail_preview: String::new(),
+            encrypted_file: None,
             extra: Extra::default(),
         })
     }
@@ -487,5 +488,92 @@ mod tests {
             dispatcher.dispatch(&tool, &tool_action, "inv_orch", &allowance()),
             Err(TaskDispatchError::Failed(_))
         ));
+    }
+
+    // ── Issue #308: encrypted artifact linking tests ───────────────────────────
+
+    /// Build an artifact frame that carries `EncryptedFile` key material — as
+    /// produced by an exec in an `--e2ee on` room (issue #308). The `mxc_uri`
+    /// is the ciphertext blob's URL.
+    fn encrypted_artifact_frame(mxc: &str) -> ExecFrame {
+        ExecFrame::Artifact(StreamArtifact {
+            invocation_id: "inv_remote".to_string(),
+            stream: StreamKind::Stdout,
+            name: "stdout.log.zst".to_string(),
+            mime_type: "text/plain+zstd".to_string(),
+            size_bytes: 512 * 1024,
+            sha256: "base64sha256".to_string(),
+            mxc_uri: mxc.to_string(),
+            tail_preview: "…last 4KB…".to_string(),
+            encrypted_file: Some(json!({
+                "url": mxc,
+                "key": {
+                    "kty": "oct",
+                    "alg": "A256CTR",
+                    "k": "base64url",
+                    "ext": true,
+                    "key_ops": ["encrypt", "decrypt"]
+                },
+                "iv": "base64iv",
+                "hashes": { "sha256": "base64sha256" },
+                "v": "v2"
+            })),
+            extra: Extra::default(),
+        })
+    }
+
+    #[test]
+    fn exec_dispatcher_links_ciphertext_mxc_from_encrypted_artifact() {
+        // When the remote exec uploaded the artifact to an encrypted room the
+        // `StreamArtifact` frame carries `EncryptedFile` key material and the
+        // ciphertext `mxc_uri`. The dispatcher must still record that `mxc_uri`
+        // on the task result so the scheduler can surface the artifact link
+        // even though the blob is ciphertext (issue #308).
+        let mut dispatcher = MatrixExecTaskDispatcher::new("!room:server", |_p| ExecStartResult {
+            invocation_id: "inv_exec_enc".to_string(),
+            request_id: "req_exec_enc".to_string(),
+            outcome: ExecOutcome::Ok {
+                frames: vec![
+                    encrypted_artifact_frame("mxc://server/ciphertext"),
+                    finished_frame(Some(0), None),
+                ],
+            },
+        });
+        let task = exec_task();
+        let action = task.action.clone().unwrap();
+        let result = dispatcher
+            .dispatch(&task, &action, "inv_orch", &allowance())
+            .unwrap();
+        assert_eq!(
+            result.artifact_mxc.as_deref(),
+            Some("mxc://server/ciphertext"),
+            "the ciphertext mxc_uri from an encrypted artifact must be linked on the task result"
+        );
+    }
+
+    #[test]
+    fn exec_dispatcher_skips_artifact_with_empty_mxc_uri() {
+        // Loopback execs (no homeserver) emit `StreamArtifact` frames with an
+        // empty `mxc_uri` because there is no Matrix media to upload to.
+        // The dispatcher must not record an empty string as the artifact link.
+        let mut dispatcher = MatrixExecTaskDispatcher::new("!room:server", |_p| ExecStartResult {
+            invocation_id: "inv_loopback".to_string(),
+            request_id: "req_loopback".to_string(),
+            outcome: ExecOutcome::Ok {
+                frames: vec![
+                    artifact_frame(""), // empty mxc — loopback mode
+                    finished_frame(Some(0), None),
+                ],
+            },
+        });
+        let task = exec_task();
+        let action = task.action.clone().unwrap();
+        let result = dispatcher
+            .dispatch(&task, &action, "inv_orch", &allowance())
+            .unwrap();
+        assert!(
+            result.artifact_mxc.is_none(),
+            "an empty mxc_uri must not be recorded as the artifact link"
+        );
     }
 }

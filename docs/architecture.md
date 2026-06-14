@@ -507,6 +507,15 @@ the inline payload) and its SHA-256 is recomputed over the raw bytes and checked
 against `sha256`; a mismatch is rejected as an integrity failure rather than
 returned to the caller.
 
+In an `--e2ee on` room the media-backed share is encrypted end to end (issue
+#308): the bytes are uploaded as ciphertext via the Matrix `EncryptedFile`
+scheme, the event carries an optional `encrypted_file` field (the `EncryptedFile`
+key material) alongside a ciphertext `mxc_uri`, and retrieval decrypts via
+`MediaSource::Encrypted` before the digest check. Inline (small) shares ride the
+already-encrypted timeline event and need no media encryption. In an unencrypted
+room the blob is plaintext and `encrypted_file` is omitted, so pre-change
+plaintext references remain download-compatible.
+
 ---
 
 ## 7. Matrix Protocol Mapping
@@ -898,11 +907,37 @@ zstd-encoded — so the command emits the original output. `--stream` selects
 `stdout` (default), `stderr`, or `pty`; `--output PATH` writes to a file instead
 of stdout.
 
+**Encrypted media in `--e2ee on` rooms (issue #308).** When the destination room
+is end-to-end encrypted, the artifact bytes are encrypted client-side and
+uploaded as ciphertext via the Matrix `EncryptedFile` attachment scheme
+(`upload_encrypted_file`); the event then carries the `EncryptedFile` key
+material in an optional `encrypted_file` field alongside a ciphertext `mxc_uri`,
+and retrieval selects `MediaSource::Encrypted` to decrypt before the `sha256`
+check and decompression. So the full log is not readable by the homeserver
+operator. In an unencrypted room the blob is uploaded as plaintext and the event
+omits `encrypted_file` (the only form produced before this field existed), so old
+plaintext references stay download-compatible. The `sha256` covers the
+pre-encryption (compressed-or-raw) bytes; the SDK additionally verifies the
+ciphertext via `EncryptedFile.hashes`.
+
 ---
 
 ## 9. Distributed State Machine and DAG Tracking
 
 Matrix room state is used for durable state. Timeline events are used for activity and stream logs.
+
+> **State events are plaintext, even under `--e2ee on` (issue #308).** Matrix
+> never Megolm-encrypts state events, so every `com.mxagent.*` state event in
+> this section — agent state (capabilities, `cwd`, `project_id`, git commit),
+> task state (the `TaskAction::Exec` `command`/`cwd`/`env` and the result),
+> invocation state, and workspace state — is readable by the homeserver operator
+> in an encrypted room. The scheduler needs the real task action in state to
+> execute it, so these are documented-and-warned (the daemon logs an advisory,
+> env key *count* only, when a non-empty task-action `env` is published into an
+> encrypted room), not redacted. Do not place secrets in a task action's `env`.
+> Confidential payloads belong in the Megolm-encrypted timeline / encrypted media
+> offload (§6, §8.4), not in state. Moving action/result into encrypted timeline
+> events referenced from state is a deferred follow-up.
 
 ### 9.1 Agent State
 

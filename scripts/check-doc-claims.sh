@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # check-doc-claims.sh — guard the docs against E2EE confidentiality over-claims.
 #
-# Remote exec/call/share and workspace traffic are Ed25519-SIGNED (integrity +
-# authenticity) and authorized by the receiver's deny-by-default policy, but in
-# this alpha they transit an UNENCRYPTED Matrix room — readable by the homeserver
-# operator. Docs must not claim end-to-end encryption / confidentiality for that
-# traffic. This regression already happened once (#270 re-introduced the claim
-# that #252 removed); this lint stops it recurring until workspace E2EE lands.
+# Under `workspace create --e2ee on` (issue #249, shipped) workspace **timeline**
+# traffic — exec/call requests, results, stream chunks, the artifact/share
+# referencing events, heartbeats — and the **media offload** (>256 KiB exec
+# output and large shares, issue #308) are Megolm/`EncryptedFile`-encrypted and
+# not readable by the homeserver operator. Matrix **state** events are a separate
+# channel that Megolm NEVER covers: the `com.mxagent.task.v1` action
+# (`command`/`cwd`/`env`) and result, and the `invocation`/`agent`/`workspace`
+# state, stay plaintext readable by the operator even in an encrypted room. So
+# docs must not claim *whole-workspace* confidentiality, and must not use the
+# unscoped phrase "opaque to the homeserver" — confidentiality has to be scoped
+# to timeline + media, with the plaintext-state caveat stated.
 #
 # The check uses a DENYLIST of substrings that only ever appear in over-claims,
 # rather than a broad `E2EE` match — legitimate mentions ("E2EE encryption
-# disabled", device-transport identity, #249 references) must NOT trip it.
-#
-# RELAX WHEN #249 (workspace room-level E2EE on create) LANDS: once exec/call/
-# share traffic is genuinely end-to-end encrypted, remove the now-accurate
-# phrases from the denylist below.
+# disabled", device-transport identity) must NOT trip it. This regression
+# already happened once (#270 re-introduced the claim that #252 removed); this
+# lint stops it recurring.
 #
 # Usage: scripts/check-doc-claims.sh
 # Exit:  0 = clean, 1 = over-claim(s) found (offending file:line printed).
@@ -24,12 +27,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-# Files scanned for confidentiality over-claims.
-files=(
-  "docs/cli-reference.md"
-  "README.md"
-  "docs/user-guide.md"
-)
+# Files scanned for confidentiality over-claims: README plus all of docs/.
+files=("README.md")
+while IFS= read -r doc; do
+  files+=("$doc")
+done < <(find docs -maxdepth 1 -name '*.md' -type f | sort)
 
 # Forbidden substrings: phrasings that assert confidentiality for exec/call/
 # share/workspace traffic. Case-insensitive. These appear ONLY in over-claims.
@@ -42,6 +44,7 @@ patterns=(
   "end-to-end-encrypted remote"
   "encrypted room state \(E2EE\)"
   "encrypts and uploads"
+  "opaque to the homeserver"
 )
 
 found=0
@@ -60,10 +63,13 @@ done
 if [ "$found" -ne 0 ]; then
   echo ""
   echo "ERROR: E2EE/confidentiality over-claim(s) found in docs." >&2
-  echo "Remote exec/call/share traffic is Ed25519-signed but NOT end-to-end" >&2
-  echo "encrypted in this alpha (workspace rooms are unencrypted; see #249)." >&2
-  echo "Reword to state the true trust boundary, or relax this lint once" >&2
-  echo "workspace E2EE lands. See scripts/check-doc-claims.sh." >&2
+  echo "Under --e2ee on, workspace TIMELINE traffic and MEDIA offload are" >&2
+  echo "encrypted, but Matrix STATE events (task action command/env/result," >&2
+  echo "invocation/agent/workspace state) stay plaintext readable by the" >&2
+  echo "homeserver operator. Do not claim whole-workspace confidentiality or" >&2
+  echo "use the unscoped phrase 'opaque to the homeserver'; scope it to" >&2
+  echo "timeline + media and keep the plaintext-state caveat. See #308 and" >&2
+  echo "scripts/check-doc-claims.sh." >&2
   exit 1
 fi
 

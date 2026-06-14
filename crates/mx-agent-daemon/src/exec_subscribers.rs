@@ -296,6 +296,7 @@ mod tests {
             sha256: String::new(),
             mxc_uri: "mxc://s/a".to_string(),
             tail_preview: String::new(),
+            encrypted_file: None,
             extra: Extra::default(),
         })
     }
