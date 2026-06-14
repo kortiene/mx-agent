@@ -8,8 +8,9 @@ on:
 jobs:
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Check markdown links are relative where expected
         run: |
           test -f README.md
@@ -23,8 +24,9 @@ jobs:
 
   shell:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: ShellCheck scripts
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
@@ -43,15 +45,29 @@ jobs:
         # correct header comment wording. Runs on every PR so regressions are
         # caught before they reach a tag push.
         run: bash scripts/test_release_yml.sh
+      - name: Validate CI/supply-chain static acceptance criteria
+        # Greps every .github/workflows/*.yml for the supply-chain invariants from
+        # issue #315: all actions SHA-pinned (40-hex), --locked on every CI/harness
+        # cargo invocation, a timeout-minutes on every job, the MSRV job present and
+        # version-locked to Cargo.toml/clippy.toml, and the scheduled advisories
+        # workflow present. Fails the PR if any of these silently regress.
+        run: bash scripts/test_ci_yml.sh
+      - name: Self-test CI supply-chain validator
+        # Fixture-based tests for test_ci_yml.sh itself: each invariant check must
+        # fire (exit 1) on a minimal fixture that violates exactly that invariant,
+        # and a fully compliant fixture must exit 0. Mirrors the pattern used by
+        # test_check_doc_claims.sh / test_release_yml.sh (issue #315).
+        run: bash scripts/test_ci_yml_checks.sh
 
   adw:
     # Runs the Agent Development Workflow helper unit tests (adw/). They are
     # stdlib-only and never invoke pi/claude/gh/git/cargo (everything is mocked
     # or exercised via --dry-run/--print-prompt), so no extra setup is needed.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: '3.x'
       - name: ADW Python unit tests
@@ -63,13 +79,14 @@ jobs:
     # vitest suite. No network APIs, no keys, no runner binaries are
     # exercised — runner SDKs are optionalDependencies and tests mock them.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
         node: [20, 22]
     steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
@@ -84,37 +101,68 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Detect Cargo workspace
         id: cargo
         run: |
           if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
         if: steps.cargo.outputs.present == 'true'
         with:
+          # A SHA pin loses the @stable branch's implied default toolchain, so
+          # name it explicitly (issue #315).
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: steps.cargo.outputs.present == 'true'
       - name: cargo fmt
         if: steps.cargo.outputs.present == 'true'
         run: cargo fmt --check
       - name: cargo clippy
         if: steps.cargo.outputs.present == 'true'
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: cargo build
         if: steps.cargo.outputs.present == 'true'
-        run: cargo build --all
+        run: cargo build --all --locked
       - name: cargo test
         if: steps.cargo.outputs.present == 'true'
-        run: cargo test --all
+        run: cargo test --all --locked
       - name: CLI artifact generation smoke check
         # Confirms the clap command tree still generates completions + man pages
         # cleanly, so the CLI reference cannot silently drift from the binary.
         if: steps.cargo.outputs.present == 'true'
         run: |
-          cargo build --release -p mx-agent-cli
+          cargo build --release -p mx-agent-cli --locked
           scripts/gen-cli-artifacts.sh "$RUNNER_TEMP/cli-artifacts" target/release/mx-agent
+
+  msrv:
+    # Compiles the whole workspace on the declared MSRV so rust-version in
+    # Cargo.toml / msrv in clippy.toml cannot silently drift from what actually
+    # builds (issue #315). matrix-sdk 0.18 declares rust-version 1.93, which is
+    # the workspace floor — far above the historically-declared 1.74. Build-only
+    # (not test): dev-dependencies frequently require a newer Rust than the
+    # crate, so a full `cargo test` on the MSRV toolchain can fail for reasons
+    # unrelated to the shipped MSRV. Do not run clippy here (lints differ across
+    # versions).
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Detect Cargo workspace
+        id: cargo
+        run: |
+          if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
+        if: steps.cargo.outputs.present == 'true'
+        with:
+          toolchain: "1.93" # keep in lockstep with Cargo.toml rust-version / clippy.toml msrv
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: steps.cargo.outputs.present == 'true'
+      - name: cargo build (MSRV)
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo build --all --locked
 
   rust-macos:
     # The peer-credential UID check has a macOS/BSD arm (`LOCAL_PEERCRED`, issue
@@ -123,16 +171,18 @@ jobs:
     # Scoped to `mx-agent-ipc` to keep the (costlier) macOS runner minimal and
     # avoid pulling the full Matrix/daemon toolchain.
     runs-on: macos-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
         with:
+          toolchain: stable # SHA pin drops the @stable default toolchain; name it
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo clippy (mx-agent-ipc)
-        run: cargo clippy -p mx-agent-ipc --all-targets -- -D warnings
+        run: cargo clippy -p mx-agent-ipc --all-targets --locked -- -D warnings
       - name: cargo test (mx-agent-ipc)
-        run: cargo test -p mx-agent-ipc
+        run: cargo test -p mx-agent-ipc --locked
 
   sandbox-linux:
     # Installs bubblewrap and runs the real-sandbox tests un-skipped, so a
@@ -140,10 +190,11 @@ jobs:
     # jobs take (none install bwrap). MX_AGENT_REQUIRE_BWRAP makes the tests panic
     # instead of skipping if bwrap is somehow not usable on the runner (issue #310).
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       MX_AGENT_REQUIRE_BWRAP: "1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Detect Cargo workspace
         id: cargo
         run: |
@@ -158,25 +209,30 @@ jobs:
         # (issue #310). `|| true` keeps this a no-op on images without the knob.
         if: steps.cargo.outputs.present == 'true'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
         if: steps.cargo.outputs.present == 'true'
-      - uses: Swatinem/rust-cache@v2
+        with:
+          toolchain: stable # SHA pin drops the @stable default toolchain; name it
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: steps.cargo.outputs.present == 'true'
       - name: Real-sandbox tests (mx-agent-sandbox)
         if: steps.cargo.outputs.present == 'true'
-        run: cargo test -p mx-agent-sandbox
+        run: cargo test -p mx-agent-sandbox --locked
       - name: Real-bwrap orchestration e2e (mx-agent-daemon)
         if: steps.cargo.outputs.present == 'true'
-        run: cargo test -p mx-agent-daemon --test task_orchestration_e2e sandbox_policy_settings_flow_through_task_orchestration
+        run: cargo test -p mx-agent-daemon --test task_orchestration_e2e --locked sandbox_policy_settings_flow_through_task_orchestration
 
   cargo-deny:
     # Enforces the dependency policy in deny.toml: security advisories, the
     # allowed-license set, and trusted crate sources. Denied licenses or
-    # advisories fail this job (and therefore the PR).
+    # advisories fail this job (and therefore the PR). The scheduled audit.yml
+    # re-runs `check advisories` weekly so a newly published advisory surfaces
+    # without waiting for the next push (issue #315).
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check advisories bans licenses sources
 
@@ -185,9 +241,14 @@ jobs:
     # `#[ignore]`d Matrix integration test against it (issue #60). Docker, curl,
     # and jq are preinstalled on the GitHub-hosted ubuntu runner.
     runs-on: ubuntu-latest
+    # The live homeserver suite legitimately runs ~35-44 min and has been growing
+    # (34m -> 44m over recent runs); 35 was too tight and canceled green runs.
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
+        with:
+          toolchain: stable # SHA pin drops the @stable default toolchain; name it
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Matrix integration test
         run: scripts/matrix_integration_test.sh --teardown

@@ -1830,11 +1830,11 @@ fn trust_list(global: &GlobalArgs, args: &TrustListArgs) -> ExitCode {
     let entries: Vec<&mx_agent_daemon::TrustEntry> = store
         .entries()
         .iter()
-        .filter(|e| args.agent.as_deref().map_or(true, |a| e.agent_id == a))
+        .filter(|e| args.agent.as_deref().is_none_or(|a| e.agent_id == a))
         .filter(|e| {
             args.room
                 .as_deref()
-                .map_or(true, |r| e.room.as_deref() == Some(r))
+                .is_none_or(|r| e.room.as_deref() == Some(r))
         })
         .collect();
     if global.json {
@@ -2007,12 +2007,12 @@ fn trust_state(global: &GlobalArgs, args: &TrustStateArgs) -> ExitCode {
         Ok(states) => {
             let states: Vec<_> = states
                 .into_iter()
-                .filter(|s| args.agent.as_deref().map_or(true, |a| s.agent_id == a))
+                .filter(|s| args.agent.as_deref().is_none_or(|a| s.agent_id == a))
                 .collect();
             let effective = mx_agent_daemon::effective_trust_table(&local, &states);
             let effective: Vec<_> = effective
                 .into_iter()
-                .filter(|t| args.agent.as_deref().map_or(true, |a| t.agent_id == a))
+                .filter(|t| args.agent.as_deref().is_none_or(|a| t.agent_id == a))
                 .collect();
             if global.json {
                 let obj = serde_json::json!({

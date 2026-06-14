@@ -40,7 +40,7 @@ other, then running a tool call and a remote-style `exec`.
 
 ### Prerequisites
 
-- A Rust stable toolchain (install via [rustup](https://rustup.rs); MSRV 1.74).
+- A Rust stable toolchain (install via [rustup](https://rustup.rs); MSRV 1.93).
 - [Docker](https://docs.docker.com/get-docker/) with Compose v2, plus `curl`
   and `jq` — only needed for the local homeserver used by this guide.
 

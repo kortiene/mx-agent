@@ -7,7 +7,11 @@ name: mx-agent-matrix-dev
 
 services:
   homeserver:
-    image: ghcr.io/matrix-construct/tuwunel:latest
+    # Pinned by digest for reproducible e2e runs (issue #315). This is the
+    # multi-arch index digest of the `:latest` tag as of 2026-06-14; bump it
+    # deliberately (or via Dependabot's docker ecosystem entry) rather than
+    # silently tracking whatever `:latest` happens to be on a given day.
+    image: ghcr.io/matrix-construct/tuwunel@sha256:1319f9fd40a92a46251e86bd7865facf24d1c974b30731f1bd3059eb446e318f
     container_name: mx-agent-tuwunel
     command: ["--config", "/etc/tuwunel/tuwunel.toml"]
     # Publish only to loopback on the host so the homeserver is never exposed

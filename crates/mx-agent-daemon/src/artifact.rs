@@ -749,7 +749,7 @@ mod tests {
         // Acceptance: the terminal shows a useful preview — the *tail* of the
         // output, bounded to the configured size.
         let mut data = b"START".to_vec();
-        data.extend(std::iter::repeat(b'.').take(10_000));
+        data.extend(std::iter::repeat_n(b'.', 10_000));
         data.extend_from_slice(b"THE-END");
         let config = ArtifactConfig {
             compress: false,

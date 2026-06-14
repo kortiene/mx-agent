@@ -113,7 +113,7 @@ ensure_user "$USER_LOGREDACT" "$PASS_LOGREDACT"
 # the `mx-agent-cli` crate, which the daemon test target does not pull in, so
 # build it explicitly before running the suite.
 note "building mx-agent CLI binary"
-( cd "$REPO_DIR" && cargo build -p mx-agent-cli --bin mx-agent )
+( cd "$REPO_DIR" && cargo build -p mx-agent-cli --bin mx-agent --locked )
 
 note "running integration test against $HOMESERVER"
 set +e
@@ -134,7 +134,7 @@ set +e
   MX_AGENT_TEST_SAS_PASSWORD2="$PASS_SAS2" \
   MX_AGENT_TEST_LOGREDACT_USER="$USER_LOGREDACT" \
   MX_AGENT_TEST_LOGREDACT_PASSWORD="$PASS_LOGREDACT" \
-    cargo test -p mx-agent-daemon --test matrix_integration -- --ignored --nocapture --test-threads=1
+    cargo test -p mx-agent-daemon --test matrix_integration --locked -- --ignored --nocapture --test-threads=1
 )
 status=$?
 set -e

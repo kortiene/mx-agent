@@ -5,7 +5,7 @@
 [![CI](https://github.com/kortiene/mx-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/kortiene/mx-agent/actions/workflows/ci.yml)
 [![Status: public alpha](https://img.shields.io/badge/status-public%20alpha-orange)](#project-status)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
-[![MSRV: 1.74](https://img.shields.io/badge/rustc-1.74%2B-93450a)](#prerequisites)
+[![MSRV: 1.93](https://img.shields.io/badge/rustc-1.93%2B-93450a)](#prerequisites)
 [![Platform: Unix](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-555)](#project-status)
 
 mx-agent turns Matrix rooms into **federated workspaces** where agents discover peers, share execution context (diffs, plans, env snapshots), invoke named tools, stream terminal I/O, and coordinate a distributed task graph — **without a central orchestration server and without any inbound firewall port**.
@@ -69,7 +69,13 @@ Everything here runs today. (For the full conceptual walkthrough, see the [Getti
 ### Prerequisites
 
 - A Unix host (Linux or macOS)
-- Rust stable toolchain, **1.74+** (install via [rustup](https://rustup.rs))
+- Rust stable toolchain, **1.93+** (install via [rustup](https://rustup.rs))
+
+  > **MSRV note:** the project MSRV was raised from 1.74 to **1.93** because
+  > `matrix-sdk 0.18` (a core dependency) declares `rust-version = "1.93"`. The
+  > old 1.74 was never compiled by CI; a dedicated `msrv` job now builds the
+  > whole workspace on the declared version so it cannot silently drift again
+  > (issue #315). There is no `CHANGELOG`, so the bump is recorded here.
 
 ### Build
 
@@ -175,7 +181,8 @@ The same checks run in CI (`.github/workflows/ci.yml`) and must pass on every PR
 - Shared lints are declared once in `[workspace.lints]` in the root `Cargo.toml` and
   inherited by each crate via `[lints] workspace = true`. Notably, `unsafe_code` is
   forbidden and `missing_docs` is a warning (treated as an error in CI via `-D warnings`).
-- Minimum supported Rust version (MSRV): 1.74.
+- Minimum supported Rust version (MSRV): 1.93 (raised from 1.74 for
+  `matrix-sdk 0.18`; enforced by the `msrv` CI job — issue #315).
 
 ### Logging
 

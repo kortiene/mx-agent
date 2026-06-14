@@ -13,7 +13,11 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.74"
+# MSRV is enforced by the `msrv` CI job (issue #315). matrix-sdk 0.18 declares
+# rust-version 1.93, which is the real workspace floor; the historically
+# declared 1.74 was never actually built. Keep this in lockstep with
+# clippy.toml `msrv` and the `msrv` job's `toolchain:` in .github/workflows/ci.yml.
+rust-version = "1.93"
 license = "Apache-2.0"
 repository = "https://github.com/kortiene/mx-agent"
 authors = ["mx-agent contributors"]
