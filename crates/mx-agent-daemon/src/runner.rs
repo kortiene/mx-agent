@@ -67,6 +67,12 @@ pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const SECRET_VARS: &[&str] = &[
     "MATRIX_ACCESS_TOKEN",
     "MX_AGENT_TOKEN",
+    // mx-agent's own credential inputs: an operator must never be able to leak
+    // these to a spawned child, even by explicitly allowlisting them. The login
+    // password is also caught by `is_sensitive_key` (it contains `password`),
+    // but the recovery key matches no needle, so the explicit entry is required.
+    "MX_AGENT_PASSWORD",
+    "MX_AGENT_RECOVERY_KEY",
     "SSH_AUTH_SOCK",
     "GITHUB_TOKEN",
     "OPENAI_API_KEY",
@@ -94,11 +100,17 @@ pub const DEFAULT_ALLOWED_VARS: &[&str] = &[
 
 /// Whether `name` names a known secret environment variable.
 ///
-/// A name is considered secret if it matches one of [`SECRET_VARS`] exactly or
-/// begins with one of [`SECRET_PREFIXES`]. This is the predicate used to scrub
-/// the inherited environment before spawning a child.
+/// A name is considered secret if it matches one of [`SECRET_VARS`] exactly
+/// (including mx-agent's own `MX_AGENT_PASSWORD` / `MX_AGENT_RECOVERY_KEY`),
+/// begins with one of [`SECRET_PREFIXES`], or has a key that looks sensitive per
+/// [`mx_agent_telemetry::is_sensitive_key`] (e.g. a future `MX_AGENT_*_TOKEN` or
+/// `*_SECRET`). The `is_sensitive_key` fallback is substring/case-insensitive,
+/// so it can only ever *widen* what is scrubbed (fail-safe). This is the
+/// predicate used to scrub the inherited environment before spawning a child.
 pub fn is_secret_var(name: &str) -> bool {
-    SECRET_VARS.contains(&name) || SECRET_PREFIXES.iter().any(|p| name.starts_with(p))
+    SECRET_VARS.contains(&name)
+        || SECRET_PREFIXES.iter().any(|p| name.starts_with(p))
+        || mx_agent_telemetry::is_sensitive_key(name)
 }
 
 /// Build the sanitized environment for a child process.
@@ -590,6 +602,12 @@ mod tests {
         assert!(is_secret_var("AWS_SECRET_ACCESS_KEY"));
         assert!(is_secret_var("GOOGLE_APPLICATION_CREDENTIALS"));
         assert!(is_secret_var("AZURE_CLIENT_SECRET"));
+        // mx-agent's own credential inputs (issue #311).
+        assert!(is_secret_var("MX_AGENT_PASSWORD"));
+        assert!(is_secret_var("MX_AGENT_RECOVERY_KEY"));
+        // `is_sensitive_key` fallback catches future names by shape.
+        assert!(is_secret_var("MX_AGENT_SOMETHING_TOKEN"));
+        assert!(is_secret_var("SOME_PASSWORD"));
     }
 
     #[test]
@@ -659,6 +677,34 @@ mod tests {
         let allow = vec!["GITHUB_TOKEN".to_string()];
         let env = sanitize_env(inherited, &BTreeMap::new(), &allow);
         assert!(!env.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn sanitize_env_drops_mx_agent_secrets_even_when_allowlisted() {
+        // Issue #311: an operator who allowlists mx-agent's own credential inputs
+        // must still not leak them to a spawned child.
+        let inherited = vec![
+            ("MX_AGENT_PASSWORD".to_string(), "hunter2".to_string()),
+            (
+                "MX_AGENT_RECOVERY_KEY".to_string(),
+                "EsTL secret key".to_string(),
+            ),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        let allow = vec![
+            "MX_AGENT_PASSWORD".to_string(),
+            "MX_AGENT_RECOVERY_KEY".to_string(),
+        ];
+        let env = sanitize_env(inherited, &BTreeMap::new(), &allow);
+        assert!(
+            !env.contains_key("MX_AGENT_PASSWORD"),
+            "password must be dropped"
+        );
+        assert!(
+            !env.contains_key("MX_AGENT_RECOVERY_KEY"),
+            "recovery key must be dropped"
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
     }
 
     #[test]

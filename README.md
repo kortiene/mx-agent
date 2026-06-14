@@ -197,8 +197,12 @@ MX_AGENT_LOG=mx_agent_daemon=debug,info mx-agent daemon status
 ```
 
 Credentials are wrapped in `mx_agent_telemetry::Secret`, which renders as
-`***redacted***` in `Debug`/`Display`, and `mx_agent_telemetry::redact` blanks values
-for secret-looking keys. Never log raw tokens or keys.
+`***redacted***` in `Debug`/`Display`. As a backstop, the telemetry subscriber
+also redacts the value of any structured log field whose key looks sensitive
+(via `mx_agent_telemetry::is_sensitive_key`) in both the human and JSON formats.
+Never log raw tokens or keys. Interactive credential prompts (the Matrix
+password and the `recovery recover` recovery key) suppress terminal echo, and
+`--recovery-key` warns that argv is exposed in shell history and `ps`.
 
 ### Daemon lifecycle
 

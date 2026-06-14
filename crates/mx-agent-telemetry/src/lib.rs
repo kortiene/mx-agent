@@ -19,7 +19,14 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::field::{MakeVisitor, VisitFmt, VisitOutput};
 use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::fmt::format::{DefaultFields, JsonFields, JsonVisitor, Writer};
+use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 
 /// Environment variable selecting the log filter (preferred over `RUST_LOG`).
 pub const ENV_FILTER: &str = "MX_AGENT_LOG";
@@ -79,10 +86,176 @@ pub fn init(default_directive: &str) -> Result<(), Box<dyn std::error::Error + S
         .with_writer(std::io::stderr)
         .with_target(true);
 
+    // Install a field-redaction backstop so any structured field whose key looks
+    // sensitive (see [`is_sensitive_key`]) is written as [`REDACTED`] instead of
+    // its real value, in both the human and JSON output formats. This is the
+    // operational-log counterpart to the [`Secret`] wrapper and makes the
+    // redaction guarantee in `docs/security-hardening.md` real: a stray
+    // `tracing::debug!(token = …)` can no longer leak a credential in the clear.
     match LogFormat::from_env() {
-        LogFormat::Json => builder.json().try_init(),
-        LogFormat::Human => builder.try_init(),
+        // The built-in JSON event formatter serializes an event's own fields
+        // with `tracing-serde`, bypassing the configured field formatter, so a
+        // redacting field formatter alone cannot reach them. [`RedactingJson`]
+        // emits the JSON envelope itself and redacts event fields directly.
+        LogFormat::Json => builder
+            .fmt_fields(JsonFields::new())
+            .event_format(RedactingJson)
+            .try_init(),
+        // The default (human) event formatter renders an event's own fields
+        // through the configured field formatter, so wrapping [`DefaultFields`]
+        // in [`Redacting`] is enough to redact event and span fields alike.
+        LogFormat::Human => builder
+            .fmt_fields(Redacting(DefaultFields::new()))
+            .try_init(),
     }
+}
+
+/// A field-visitor factory that redacts sensitive field values.
+///
+/// Wraps another [`MakeVisitor`] (a format's own field visitor) and substitutes
+/// only the value of fields whose key satisfies [`is_sensitive_key`], so the
+/// same wrapper redacts for both the human ([`DefaultFields`]) and JSON
+/// ([`JsonFields`]) field formatters without re-implementing either layout. The
+/// inner visitor keeps producing the correct per-format rendering for every
+/// other field.
+struct Redacting<M>(M);
+
+impl<'a, M> MakeVisitor<Writer<'a>> for Redacting<M>
+where
+    M: MakeVisitor<Writer<'a>>,
+{
+    type Visitor = RedactingVisitor<M::Visitor>;
+
+    fn make_visitor(&self, target: Writer<'a>) -> Self::Visitor {
+        RedactingVisitor(self.0.make_visitor(target))
+    }
+}
+
+/// The [`Visit`] wrapper produced by [`Redacting`].
+///
+/// Forwards every record to the inner visitor unchanged, except that a field
+/// whose key is sensitive is recorded as the [`REDACTED`] string regardless of
+/// its original value type. Numeric and boolean secrets are coerced to the
+/// placeholder string, which renders consistently in both output formats; the
+/// `message` pseudo-field is never sensitive by name, so log messages are
+/// untouched.
+struct RedactingVisitor<V>(V);
+
+/// Generate a `Visit` method that records [`REDACTED`] for a sensitive key and
+/// otherwise forwards to the same method on the inner visitor (preserving its
+/// per-format rendering for non-sensitive fields).
+macro_rules! redact_or_forward {
+    ($method:ident, $ty:ty) => {
+        fn $method(&mut self, field: &Field, value: $ty) {
+            if is_sensitive_key(field.name()) {
+                self.0.record_str(field, REDACTED);
+            } else {
+                self.0.$method(field, value);
+            }
+        }
+    };
+}
+
+impl<V: Visit> Visit for RedactingVisitor<V> {
+    redact_or_forward!(record_f64, f64);
+    redact_or_forward!(record_i64, i64);
+    redact_or_forward!(record_u64, u64);
+    redact_or_forward!(record_i128, i128);
+    redact_or_forward!(record_u128, u128);
+    redact_or_forward!(record_bool, bool);
+    redact_or_forward!(record_str, &str);
+    redact_or_forward!(record_bytes, &[u8]);
+    redact_or_forward!(record_error, &(dyn std::error::Error + 'static));
+    redact_or_forward!(record_debug, &dyn fmt::Debug);
+}
+
+impl<V: VisitOutput<fmt::Result>> VisitOutput<fmt::Result> for RedactingVisitor<V> {
+    fn finish(self) -> fmt::Result {
+        self.0.finish()
+    }
+}
+
+impl<V: VisitFmt> VisitFmt for RedactingVisitor<V> {
+    fn writer(&mut self) -> &mut dyn fmt::Write {
+        self.0.writer()
+    }
+}
+
+/// A JSON event formatter that redacts sensitive event-field values.
+///
+/// `tracing-subscriber`'s built-in JSON formatter serializes an event's own
+/// fields with `tracing-serde` directly, bypassing the configured field
+/// formatter, so [`Redacting`] (a [`MakeVisitor`] wrapper) cannot reach them —
+/// and [`JsonFields`] is not a `MakeVisitor` to wrap in the first place. This
+/// formatter emits the JSON envelope itself (`timestamp`, `level`, `target`, and
+/// a nested `fields` object) and records the event fields through
+/// [`RedactingVisitor`] over [`JsonVisitor`], so sensitive event fields are
+/// redacted. The output is one JSON object per line.
+struct RedactingJson;
+
+impl<S, N> FormatEvent<S, N> for RedactingJson
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        _ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let meta = event.metadata();
+
+        let mut timestamp = String::new();
+        if SystemTime
+            .format_time(&mut Writer::new(&mut timestamp))
+            .is_err()
+        {
+            timestamp.clear();
+        }
+        let level = match *meta.level() {
+            tracing::Level::ERROR => "ERROR",
+            tracing::Level::WARN => "WARN",
+            tracing::Level::INFO => "INFO",
+            tracing::Level::DEBUG => "DEBUG",
+            tracing::Level::TRACE => "TRACE",
+        };
+
+        writer.write_str("{\"timestamp\":")?;
+        write_json_string(&mut writer, &timestamp)?;
+        writer.write_str(",\"level\":")?;
+        write_json_string(&mut writer, level)?;
+        writer.write_str(",\"target\":")?;
+        write_json_string(&mut writer, meta.target())?;
+        writer.write_str(",\"fields\":")?;
+        // `JsonVisitor` writes a complete `{ ... }` object; wrapping it in
+        // `RedactingVisitor` swaps sensitive values for `REDACTED` first.
+        {
+            let mut visitor = RedactingVisitor(JsonVisitor::new(&mut writer));
+            event.record(&mut visitor);
+            visitor.finish()?;
+        }
+        writer.write_str("}")?;
+        writeln!(writer)
+    }
+}
+
+/// Write `value` to `writer` as a JSON string literal (quoted and escaped) so
+/// the hand-built envelope in [`RedactingJson`] stays valid JSON for any input.
+fn write_json_string(writer: &mut Writer<'_>, value: &str) -> fmt::Result {
+    writer.write_char('"')?;
+    for ch in value.chars() {
+        match ch {
+            '"' => writer.write_str("\\\"")?,
+            '\\' => writer.write_str("\\\\")?,
+            '\n' => writer.write_str("\\n")?,
+            '\r' => writer.write_str("\\r")?,
+            '\t' => writer.write_str("\\t")?,
+            c if (c as u32) < 0x20 => write!(writer, "\\u{:04x}", c as u32)?,
+            c => writer.write_char(c)?,
+        }
+    }
+    writer.write_char('"')
 }
 
 /// Returns true if `key` names an obviously sensitive field.
@@ -161,6 +334,93 @@ impl<T> From<T> for Secret<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A [`MakeWriter`](tracing_subscriber::fmt::MakeWriter) that appends every
+    /// byte to a shared buffer, so a scoped subscriber's output can be captured
+    /// and inspected by a test.
+    #[derive(Clone)]
+    struct BufMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufMakeWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn human_subscriber_redacts_sensitive_event_fields() {
+        // Wire the same human field formatter `init` installs into a scoped
+        // subscriber (a process-global `init` could only run once per process),
+        // emit an event with a sensitive `token` field, and confirm the value is
+        // redacted while non-sensitive fields and the message survive.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufMakeWriter(Arc::clone(&buf)))
+            .with_ansi(false)
+            .fmt_fields(Redacting(DefaultFields::new()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(token = "syt_leakme", user = "@a:hs", "hello world");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains(REDACTED), "must redact the token: {out}");
+        assert!(!out.contains("syt_leakme"), "secret leaked into log: {out}");
+        assert!(out.contains("@a:hs"), "non-secret field was dropped: {out}");
+        assert!(out.contains("hello world"), "message was dropped: {out}");
+    }
+
+    #[test]
+    fn json_subscriber_redacts_sensitive_event_fields() {
+        // The JSON path uses a custom event formatter; assert it still emits one
+        // valid JSON object per line with the sensitive field redacted.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufMakeWriter(Arc::clone(&buf)))
+            .fmt_fields(JsonFields::new())
+            .event_format(RedactingJson)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(token = "syt_leakme", user = "@a:hs", "hello world");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(!out.contains("syt_leakme"), "secret leaked into log: {out}");
+
+        let line = out.lines().next().expect("at least one JSON line");
+        let v: serde_json::Value = serde_json::from_str(line).expect("output must be valid JSON");
+        assert_eq!(
+            v["fields"]["token"],
+            serde_json::json!(REDACTED),
+            "token field must be redacted in JSON: {line}"
+        );
+        assert_eq!(
+            v["fields"]["user"],
+            serde_json::json!("@a:hs"),
+            "non-secret field must be preserved in JSON: {line}"
+        );
+        assert_eq!(
+            v["fields"]["message"],
+            serde_json::json!("hello world"),
+            "message must be preserved in JSON: {line}"
+        );
+        assert_eq!(v["level"], serde_json::json!("INFO"));
+    }
 
     #[test]
     fn parses_known_formats() {

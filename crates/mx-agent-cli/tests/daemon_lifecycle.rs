@@ -61,6 +61,19 @@ fn daemon_start_status_stop_cycle() {
     assert!(running_json.contains("\"socket_path\":"));
     assert!(running_json.contains("\"version\":"));
 
+    // Issue #311: the background log capturing the daemon's stdout/stderr must be
+    // owner-only (0600) regardless of the umask, like the rest of its state.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let log_path = runtime_dir.join("daemon.log");
+        let mode = std::fs::metadata(&log_path)
+            .expect("daemon.log should exist after start")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "daemon.log must be private (0600)");
+    }
+
     // Starting again is a no-op success.
     let out = run(&runtime_dir, &["daemon", "start"]);
     assert!(out.status.success());
