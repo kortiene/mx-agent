@@ -52,6 +52,10 @@ pub const EXIT_PROTOCOL_FAILURE: u8 = 128;
 /// a chunk is missing or fails validation (architecture §5.3).
 pub const EXIT_STREAM_INTEGRITY: u8 = 132;
 
+/// Local exit code when the requester abandons a remote exec after its deadline
+/// (and sends a signed cancel): a timeout, architecture §5.3 code 129 (issue #314).
+pub const EXIT_TIMEOUT: u8 = 129;
+
 /// Default reorder window: how many chunks may be buffered ahead of a gap on a
 /// single stream before the missing sequence number is declared lost. Bounds
 /// the head-of-line blocking introduced by waiting for an out-of-order chunk.
@@ -114,6 +118,10 @@ pub struct StreamOutcome {
     /// stands in for a stream that was uploaded as Matrix media rather than
     /// streamed as chunks (architecture §8.4).
     pub artifacts: Vec<StreamArtifact>,
+    /// `true` if the `exec.finished` frame reported that output was capped to the
+    /// per-invocation byte budget (issue #268/#314). The caller surfaces this to
+    /// the user so a silently-truncated log is never mistaken for the full output.
+    pub truncated: bool,
 }
 
 impl StreamOutcome {
@@ -523,6 +531,7 @@ where
                     render_chunk(&ready, out, err)?;
                 }
                 surface_missing(&detected, &mut outcome, config.strict, err)?;
+                outcome.truncated = finished.truncated;
                 outcome.exit_code = Some(resolve_exit_code(&finished));
                 finished_seen = true;
                 break;
@@ -587,6 +596,24 @@ mod tests {
             artifact_mxc: None,
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn finished_truncated_flag_is_surfaced_in_outcome() {
+        // Issue #314: the renderer must carry the exec.finished `truncated` flag
+        // out to the caller so it can warn the user about a clipped log.
+        let mut truncated = finished(Some(0), None);
+        truncated.truncated = true;
+        let frames = vec![StreamFrame::Finished(truncated)];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = render_stream(frames, &mut out, &mut err).unwrap();
+        assert!(outcome.truncated, "outcome must report truncation");
+
+        // A non-truncated finish leaves it false.
+        let frames = vec![StreamFrame::Finished(finished(Some(0), None))];
+        let outcome = render_stream(frames, &mut Vec::new(), &mut Vec::new()).unwrap();
+        assert!(!outcome.truncated);
     }
 
     fn artifact(stream: StreamKind, mxc: &str, tail: &str) -> StreamArtifact {

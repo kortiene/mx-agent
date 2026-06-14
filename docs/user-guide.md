@@ -264,12 +264,14 @@ command's exit code. Put the command after `--`:
 
 ```bash
 mx-agent exec -- echo "hello from mx-agent"
-mx-agent exec --stream -- sh -c 'echo out; echo err 1>&2; exit 3'   # exits 3
+mx-agent exec -- sh -c 'echo out; echo err 1>&2; exit 3'   # exits 3
 ```
 
-Useful flags: `--stream` (live stdout/stderr), `--strict-stream` (treat a
-missing or corrupt chunk as a hard error), `--pty` (allocate a pseudo-terminal),
-`--stdin` (forward local stdin), and `--cwd <dir>`.
+Useful flags: `--strict-stream` (treat a missing or corrupt chunk as a hard
+error), `--pty` (allocate a pseudo-terminal), `--env KEY=VALUE` (repeatable
+environment override), `--timeout <dur>` (e.g. `5m`), and `--cwd <dir>`. Piped
+stdin is auto-detected and forwarded; for a remote run the receiver caps the
+effective timeout at its policy `max_runtime_ms`.
 
 > In this alpha, `exec` is mediated by the daemon over local IPC, so a daemon
 > must be running (`mx-agent daemon start`); otherwise `exec` exits `3`. The
@@ -416,9 +418,10 @@ anything runs:
 > verify → trust → policy → runner pipeline as a direct CLI invocation, with the
 > task result carrying the exit code, summary, and any output artifact (#200).
 > Task state stays advisory: an unsigned, untrusted, expired, replayed, or
-> policy-denied action is blocked and never spawns. Still landing: tight
-> task↔remote-invocation id unification and forwarding exec `env`/`timeout`
-> through the Matrix transport.
+> policy-denied action is blocked and never spawns. Task↔remote-invocation id
+> unification (#239) and forwarding exec `env`/`timeout` through the Matrix
+> transport (#314) have both shipped, so a task action's environment and timeout
+> now reach the remote daemon's signed request.
 
 ## Two-agent demo (end to end)
 

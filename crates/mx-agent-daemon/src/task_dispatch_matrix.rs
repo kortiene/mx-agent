@@ -198,12 +198,17 @@ where
             TaskAction::Exec {
                 command,
                 cwd,
+                env,
+                timeout_ms,
                 stream,
                 ..
             } => {
                 // Preset the orchestrator's invocation id so the remote exec —
                 // and its `com.mxagent.invocation.v1` state — run under the same
-                // id the owning task records (issue #239).
+                // id the owning task records (issue #239). Forward the action's
+                // env/timeout to the signed request, matching local dispatch so
+                // both transports honor the task's configured execution
+                // parameters (issue #314).
                 let params = ExecStartParams {
                     room: Some(self.room.clone()),
                     agent: Some(task.assigned_to.clone()),
@@ -215,6 +220,8 @@ where
                     task: Some(task.task_id.clone()),
                     strict_stream: false,
                     invocation_id: Some(invocation_id.to_string()),
+                    env: env.clone(),
+                    timeout_ms: *timeout_ms,
                 };
                 map_exec_outcome((self.run_exec)(params))
             }
@@ -252,7 +259,7 @@ mod tests {
         base_task(Some(TaskAction::Exec {
             command: vec!["cargo".to_string(), "test".to_string()],
             cwd: "/repo".to_string(),
-            env: Default::default(),
+            env: std::collections::BTreeMap::from([("CI".to_string(), "1".to_string())]),
             timeout_ms: Some(60_000),
             stream: true,
             authorization: None,
@@ -398,6 +405,10 @@ mod tests {
                 // The orchestrator's invocation id is preset so the remote exec —
                 // and its invocation state — run under the unified id (issue #239).
                 assert_eq!(params.invocation_id.as_deref(), Some("inv_orch"));
+                // The action's env/timeout are forwarded to the signed request,
+                // matching local dispatch (issue #314).
+                assert_eq!(params.env.get("CI").map(String::as_str), Some("1"));
+                assert_eq!(params.timeout_ms, Some(60_000));
                 ExecStartResult {
                     invocation_id: "inv_exec".to_string(),
                     request_id: "req_exec".to_string(),
