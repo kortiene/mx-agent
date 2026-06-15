@@ -37,7 +37,7 @@ Architecture and security constraints:
 - Do not log secrets. Use existing redaction/`Secret` patterns.
 
 Current status to preserve:
-This is public alpha v0.2.0. All command groups run against a real Matrix homeserver through the daemon: auth/workspace/agent/trust/approval/share/invocation/task, plus signed Matrix-backed remote `call` and `exec` (batch and interactive `--pty`) and a live task scheduler. Sandbox backends (`none`/`bubblewrap`/container) are policy-selectable. Remaining planned work: production E2EE hardening and very-large-output artifact tuning. Do not imply unimplemented behavior exists unless you implement it.
+This is public alpha v0.2.1. All command groups run against a real Matrix homeserver through the daemon: auth/workspace/agent/trust/approval/share/invocation/task, plus signed Matrix-backed remote `call` and `exec` (batch and interactive `--pty`) and a live task scheduler. Sandbox backends (`none`/`bubblewrap`/container) are policy-selectable. Remaining planned work: production E2EE hardening and very-large-output artifact tuning. Do not imply unimplemented behavior exists unless you implement it.
 
 Working rules:
 - Identify the owning crate and existing patterns before editing.

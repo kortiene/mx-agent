@@ -2,8 +2,8 @@
 
 <!-- markdownlint-disable MD013 MD036 MD060 -->
 
-> Complete command reference for the `mx-agent` binary (workspace **v0.2.0**, public alpha).
-> Verified against the v0.2.0 source tree. Platform: **Unix only** (Linux and macOS).
+> Complete command reference for the `mx-agent` binary (workspace **v0.2.1**, public alpha).
+> Verified against the v0.2.1 source tree. Platform: **Unix only** (Linux and macOS).
 
 `mx-agent` is a Matrix-backed CLI for decentralized orchestration between coding agents. The
 CLI is **stateless**: it holds no Matrix session, keys, or policy of its own. Every command is
@@ -3169,7 +3169,7 @@ require_verified_device = false       # When true, Matrix device must be verifie
 
 > **Implemented backends vs. accepted values.** `policy.toml` *parses* all six `sandbox` /
 > `default_sandbox` values, but only `bubblewrap` (Linux) and `docker`/`podman` (the container
-> backend) are implemented runners in v0.2.0; `none` is the default fallback and applies no
+> backend) are implemented runners in v0.2.1; `none` is the default fallback and applies no
 > isolation. `firejail` and `chroot` are **rejected at policy load** — naming either in
 > `execution.default_sandbox` or an agent `sandbox` fails validation with a dotted-path error (no
 > silent unsandboxed fallthrough). Path and network confinement is enforced end-to-end for both
