@@ -194,10 +194,26 @@ pub fn verify_approval_decision(
     verify(verifying_key, &value)
 }
 
+/// Verify the signature embedded in a serializable **result-plane** event
+/// (`ExecAccepted`/`ExecRejected`/`ExecFinished`/`ExecCancelled`/`StreamChunk`/
+/// `StreamArtifact`/`CallResponse`) against `verifying_key`.
+///
+/// Serializes the typed event to JSON, then runs [`verify`] (which excludes the
+/// `signature` field from the signed bytes). Returns
+/// [`SignatureError::MissingSignature`] when the event carries no signature (a
+/// legacy/unsigned/forged event), so the caller can fail closed (issue #348).
+pub fn verify_signed<T: serde::Serialize>(
+    verifying_key: &VerifyingKey,
+    event: &T,
+) -> Result<(), SignatureError> {
+    let value = serde_json::to_value(event).map_err(|_| SignatureError::NotAnObject)?;
+    verify(verifying_key, &value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::ApprovalDecision;
+    use crate::schema::{ApprovalDecision, CallResponse, ExecFinished, StreamChunk, StreamKind};
     use ed25519_dalek::SigningKey;
     use serde_json::json;
 
@@ -274,6 +290,119 @@ mod tests {
         let decision: ApprovalDecision = serde_json::from_value(legacy).unwrap();
         assert!(decision.nonce.is_none());
         assert!(decision.signature.is_none());
+    }
+
+    // ── Result plane (issue #348): exec.finished / stream.chunk / call.response ──
+
+    fn exec_finished() -> ExecFinished {
+        ExecFinished {
+            invocation_id: "inv_01HZ".to_string(),
+            exit_code: Some(0),
+            signal: None,
+            duration_ms: 1234,
+            stdout_bytes: 10,
+            stderr_bytes: 0,
+            truncated: false,
+            artifact_mxc: None,
+            signature: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// Sign a result-plane struct the way the daemon egress does: serialize to a
+    /// JSON value, [`sign_into`] it, and deserialize back so the embedded
+    /// signature lands in the typed `signature` field.
+    fn sign_result<T: serde::Serialize + serde::de::DeserializeOwned>(
+        key: &SigningKey,
+        event: &T,
+    ) -> T {
+        let mut value = serde_json::to_value(event).unwrap();
+        sign_into(key, "mxagent-ed25519:test", &mut value).unwrap();
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn result_plane_sign_then_verify_round_trips() {
+        let key = test_key();
+        let signed = sign_result(&key, &exec_finished());
+        assert!(signed.signature.is_some());
+        assert!(verify_signed(&key.verifying_key(), &signed).is_ok());
+    }
+
+    #[test]
+    fn unsigned_result_reports_missing_signature() {
+        let key = test_key();
+        assert_eq!(
+            verify_signed(&key.verifying_key(), &exec_finished()),
+            Err(SignatureError::MissingSignature)
+        );
+    }
+
+    #[test]
+    fn tampered_result_fails_verification() {
+        let key = test_key();
+        let mut signed = sign_result(&key, &exec_finished());
+        // An attacker flipping a successful exit code to a failure must break the
+        // signature (the signature binds the outcome bytes, not just identity).
+        signed.exit_code = Some(1);
+        assert_eq!(
+            verify_signed(&key.verifying_key(), &signed),
+            Err(SignatureError::Invalid)
+        );
+    }
+
+    #[test]
+    fn result_signed_by_wrong_key_fails_verification() {
+        let key = test_key();
+        let signed = sign_result(&key, &exec_finished());
+        let other = SigningKey::from_bytes(&[7u8; 32]);
+        assert_eq!(
+            verify_signed(&other.verifying_key(), &signed),
+            Err(SignatureError::Invalid)
+        );
+    }
+
+    #[test]
+    fn stream_chunk_signature_binds_streamed_bytes() {
+        let key = test_key();
+        let chunk = StreamChunk {
+            invocation_id: "inv_01HZ".to_string(),
+            stream: StreamKind::Stdout,
+            seq: 3,
+            encoding: "utf-8".to_string(),
+            data: "hello".to_string(),
+            eof: false,
+            compressed: false,
+            sha256: None,
+            timestamp: "2026-06-15T00:00:00Z".to_string(),
+            signature: None,
+            extra: Default::default(),
+        };
+        let signed = sign_result(&key, &chunk);
+        assert!(verify_signed(&key.verifying_key(), &signed).is_ok());
+        // Tampering with the streamed bytes invalidates the signature.
+        let mut evil = signed.clone();
+        evil.data = "evil".to_string();
+        assert_eq!(
+            verify_signed(&key.verifying_key(), &evil),
+            Err(SignatureError::Invalid)
+        );
+    }
+
+    #[test]
+    fn call_response_round_trips_with_arbitrary_result() {
+        let key = test_key();
+        let resp = CallResponse {
+            request_id: "req_01HZ".to_string(),
+            ok: true,
+            result: Some(json!({ "rows": 7, "name": "ok" })),
+            error: None,
+            signature: None,
+            extra: Default::default(),
+        };
+        let signed = sign_result(&key, &resp);
+        assert!(signed.signature.is_some());
+        assert!(verify_signed(&key.verifying_key(), &signed).is_ok());
     }
 
     /// Deterministic signing key from a fixed seed, so tests act as stable

@@ -682,24 +682,74 @@ pub fn invocation_state_for(request: &ExecRequest, now: impl Into<String>) -> In
     }
 }
 
-/// Emit a `com.mxagent.exec.accepted.v1` timeline event into `room`.
+/// Sign an already-serialized result-plane `content` value in place with the
+/// executor daemon's own key (issue #348).
+///
+/// `sign_into` embeds a detached Ed25519 signature over the content's canonical
+/// JSON (the `signature` field excluded), so the caller (on receipt) can verify
+/// the result was produced by the executing daemon and not forged by a
+/// compromised homeserver. Result payloads are plain scalars/strings, so signing
+/// cannot realistically fail; on the unexpected error path we log a warning and
+/// return `false` so the caller skips the send (never sends unsigned). The
+/// signing key is loaded once per invocation and reused — never per-chunk.
+fn sign_result_content(
+    content: &mut Value,
+    signing_key: &SigningKey,
+    key_id: &str,
+    invocation_id: &str,
+) -> bool {
+    match signing::sign_into(signing_key, key_id.to_string(), content) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, invocation_id, "failed to sign result event; skipping send");
+            false
+        }
+    }
+}
+
+/// Load the executor daemon's signing key from `paths`, logging and returning
+/// `None` on failure so the (terminal-rejection) caller fails closed by not
+/// emitting an unsigned event (issue #348).
+fn load_result_signing_key(
+    paths: &crate::SessionPaths,
+    invocation_id: &str,
+) -> Option<crate::signing::DaemonSigningKey> {
+    match crate::signing::load_or_create_signing_key(paths) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            tracing::warn!(error = %e, invocation_id, "could not load daemon signing key; cannot emit signed result");
+            None
+        }
+    }
+}
+
+/// Emit a `com.mxagent.exec.accepted.v1` timeline event into `room`, signed with
+/// the executor daemon's key (issue #348).
 pub async fn emit_exec_accepted(
     room: &Room,
     invocation_id: impl Into<String>,
+    signing_key: &SigningKey,
+    key_id: &str,
 ) -> Result<(), WorkspaceError> {
+    let invocation_id = invocation_id.into();
     let accepted = ExecAccepted {
-        invocation_id: invocation_id.into(),
+        invocation_id: invocation_id.clone(),
+        signature: None,
         extra: Default::default(),
     };
-    let content = serde_json::to_value(&accepted)
+    let mut content = serde_json::to_value(&accepted)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    if !sign_result_content(&mut content, signing_key, key_id, &invocation_id) {
+        return Ok(());
+    }
     room.send_raw(EXEC_ACCEPTED, content)
         .await
         .map_err(WorkspaceError::from)?;
     Ok(())
 }
 
-/// Emit a `com.mxagent.exec.rejected.v1` timeline event into `room`.
+/// Emit a `com.mxagent.exec.rejected.v1` timeline event into `room`, signed with
+/// the executor daemon's key (issue #348).
 ///
 /// Carries the stable, machine-readable [`ExecRejection::reason`]. Emitting a
 /// rejection never spawns a process.
@@ -707,14 +757,21 @@ pub async fn emit_exec_rejected(
     room: &Room,
     invocation_id: impl Into<String>,
     rejection: &ExecRejection,
+    signing_key: &SigningKey,
+    key_id: &str,
 ) -> Result<(), WorkspaceError> {
+    let invocation_id = invocation_id.into();
     let rejected = ExecRejected {
-        invocation_id: invocation_id.into(),
+        invocation_id: invocation_id.clone(),
         reason: rejection.reason(),
+        signature: None,
         extra: Default::default(),
     };
-    let content = serde_json::to_value(&rejected)
+    let mut content = serde_json::to_value(&rejected)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    if !sign_result_content(&mut content, signing_key, key_id, &invocation_id) {
+        return Ok(());
+    }
     room.send_raw(EXEC_REJECTED, content)
         .await
         .map_err(WorkspaceError::from)?;
@@ -770,6 +827,21 @@ pub async fn handle_live_exec_request(
         return;
     }
 
+    // Load the executor daemon's signing key ONCE for this invocation and reuse
+    // it for every result-plane event we emit (accepted/rejected/finished/
+    // cancelled/stream chunks/artifacts), so each is Ed25519-signed at the Matrix
+    // egress (issue #348). Loaded once, never per-chunk; wrapped in an `Arc` so it
+    // can move into the spawned run/stream tasks (`SigningKey` is `Clone`, but the
+    // `Arc` keeps a single load shared).
+    let signing = match crate::signing::load_or_create_signing_key(paths) {
+        Ok(key) => Arc::new(key),
+        Err(e) => {
+            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "could not load daemon signing key; cannot emit signed results");
+            return;
+        }
+    };
+    let key_id = signing.key_id();
+
     // The idempotency key is fully derived from the invocation id (`exec:<id>`)
     // and is part of the signed content, so it can carry no out-of-band value.
     // Reject a mismatch as a malformed request before doing any work, so the
@@ -779,6 +851,8 @@ pub async fn handle_live_exec_request(
             &room,
             request.invocation_id.clone(),
             &ExecRejection::Malformed,
+            signing.signing_key(),
+            &key_id,
         )
         .await
         {
@@ -819,8 +893,14 @@ pub async fn handle_live_exec_request(
                 // to a trusted requester and are intentionally not audited.
                 _ => {}
             }
-            if let Err(e) =
-                emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await
+            if let Err(e) = emit_exec_rejected(
+                &room,
+                request.invocation_id.clone(),
+                &rejection,
+                signing.signing_key(),
+                &key_id,
+            )
+            .await
             {
                 tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec rejection");
             }
@@ -840,7 +920,14 @@ pub async fn handle_live_exec_request(
             invocation_id = %request.invocation_id,
             "duplicate exec request for a live invocation; re-emitting accepted instead of spawning again"
         );
-        if let Err(e) = emit_exec_accepted(&room, request.invocation_id.clone()).await {
+        if let Err(e) = emit_exec_accepted(
+            &room,
+            request.invocation_id.clone(),
+            signing.signing_key(),
+            &key_id,
+        )
+        .await
+        {
             tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to re-emit exec accepted for duplicate request");
         }
         return;
@@ -877,7 +964,7 @@ pub async fn handle_live_exec_request(
         &request,
         &Outcome::Allow(allowance.clone()),
     );
-    spawn_authorized_live_exec(client, &room, request, allowance).await;
+    spawn_authorized_live_exec(client, &room, request, allowance, signing).await;
 }
 
 /// Spawn an authorized live `exec` invocation: emit accepted → running, register
@@ -887,13 +974,27 @@ pub async fn handle_live_exec_request(
 /// Extracted from [`handle_live_exec_request`] so both the direct live dispatch
 /// and the approval-release path ([`release_held_exec`]) produce byte-for-byte
 /// the same lifecycle. Behaviour-preserving: the non-approval path is unchanged.
+///
+/// `signing` is the executor daemon's signing key (loaded once by the caller);
+/// every result-plane event this invocation emits is Ed25519-signed with it
+/// (issue #348). It is an `Arc` so it can be cloned into the spawned run/stream
+/// tasks without reloading from disk.
 pub(crate) async fn spawn_authorized_live_exec(
     client: &matrix_sdk::Client,
     room: &Room,
     request: ExecRequest,
     allowance: Allowance,
+    signing: Arc<crate::signing::DaemonSigningKey>,
 ) {
-    if let Err(e) = emit_exec_accepted(room, request.invocation_id.clone()).await {
+    let key_id = signing.key_id();
+    if let Err(e) = emit_exec_accepted(
+        room,
+        request.invocation_id.clone(),
+        signing.signing_key(),
+        &key_id,
+    )
+    .await
+    {
         tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec accepted");
     }
     let now = rfc3339_now();
@@ -934,6 +1035,7 @@ pub(crate) async fn spawn_authorized_live_exec(
     // and (sender-authorized) resize controls (issue #238).
     if request.pty {
         let room = room.clone();
+        let signing = Arc::clone(&signing);
         tokio::spawn(async move {
             // Count this invocation as in-flight for the executing (local) agent
             // for its whole lifetime (issue #312). The guard is created *inside*
@@ -942,7 +1044,7 @@ pub(crate) async fn spawn_authorized_live_exec(
             // on every terminal path without per-path bookkeeping.
             let _inflight = crate::inflight::InflightGuard::enter(&request.target_agent);
             run_pty_exec_task(
-                room, request, allowance, stdin_rx, resize_rx, cancel_rx, state,
+                room, request, allowance, stdin_rx, resize_rx, cancel_rx, state, signing,
             )
             .await;
         });
@@ -951,7 +1053,9 @@ pub(crate) async fn spawn_authorized_live_exec(
 
     let client = client.clone();
     let room = room.clone();
+    let signing = Arc::clone(&signing);
     tokio::spawn(async move {
+        let key_id = signing.key_id();
         // In-flight accounting for the non-PTY run (issue #312); see the PTY arm.
         let _inflight = crate::inflight::InflightGuard::enter(&request.target_agent);
         let started = std::time::Instant::now();
@@ -972,6 +1076,8 @@ pub(crate) async fn spawn_authorized_live_exec(
                     &output.stdout,
                     &output.stderr,
                     &allowance,
+                    signing.signing_key(),
+                    &key_id,
                 )
                 .await;
                 let finished_at = rfc3339_now();
@@ -981,6 +1087,8 @@ pub(crate) async fn spawn_authorized_live_exec(
                     crate::runner::CANCEL_SIGNAL,
                     killed_process_group,
                     finished_at.clone(),
+                    signing.signing_key(),
+                    &key_id,
                 )
                 .await;
                 state.state = crate::invocation::STATE_CANCELLED.to_string();
@@ -996,7 +1104,14 @@ pub(crate) async fn spawn_authorized_live_exec(
                 let rejection = ExecRejection::PolicyDenied(DenyReason::CommandNotAllowed {
                     command: err.to_string(),
                 });
-                let _ = emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await;
+                let _ = emit_exec_rejected(
+                    &room,
+                    request.invocation_id.clone(),
+                    &rejection,
+                    signing.signing_key(),
+                    &key_id,
+                )
+                .await;
                 return;
             }
         };
@@ -1008,6 +1123,8 @@ pub(crate) async fn spawn_authorized_live_exec(
             &output.stdout,
             &output.stderr,
             &allowance,
+            signing.signing_key(),
+            &key_id,
         )
         .await;
 
@@ -1021,11 +1138,19 @@ pub(crate) async fn spawn_authorized_live_exec(
             stderr_bytes: output.stderr.len() as u64,
             truncated: summary.truncated,
             artifact_mxc: None,
+            signature: None,
             extra: Default::default(),
         };
-        if let Ok(content) = serde_json::to_value(&finished) {
-            if let Err(e) = room.send_raw(EXEC_FINISHED, content).await {
-                tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.finished");
+        if let Ok(mut content) = serde_json::to_value(&finished) {
+            if sign_result_content(
+                &mut content,
+                signing.signing_key(),
+                &key_id,
+                &request.invocation_id,
+            ) {
+                if let Err(e) = room.send_raw(EXEC_FINISHED, content).await {
+                    tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.finished");
+                }
             }
         }
 
@@ -1065,10 +1190,19 @@ pub(crate) async fn release_held_exec(
             return;
         }
     };
+    // Load the executor's signing key once for the release lifecycle so the
+    // re-spawned invocation and any rejection are signed at egress (issue #348).
+    let signing = match crate::signing::load_or_create_signing_key(paths) {
+        Ok(key) => Arc::new(key),
+        Err(e) => {
+            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "could not load daemon signing key; cannot release held exec");
+            return;
+        }
+    };
     match authorize_live_exec(room, paths, &content, &request, room_id).await {
         Ok((request, allowance)) => {
             audit_exec_released(paths, room_id, &request, &allowance);
-            spawn_authorized_live_exec(client, room, request, allowance).await;
+            spawn_authorized_live_exec(client, room, request, allowance, signing).await;
         }
         Err(rejection) => {
             match &rejection {
@@ -1080,8 +1214,14 @@ pub(crate) async fn release_held_exec(
                 }
                 _ => {}
             }
-            if let Err(e) =
-                emit_exec_rejected(room, request.invocation_id.clone(), &rejection).await
+            if let Err(e) = emit_exec_rejected(
+                room,
+                request.invocation_id.clone(),
+                &rejection,
+                signing.signing_key(),
+                &signing.key_id(),
+            )
+            .await
             {
                 tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec rejection on release");
             }
@@ -1099,10 +1239,15 @@ pub(crate) async fn deny_held_exec(
     request: &ExecRequest,
 ) {
     audit_exec_rejection(paths, room_id, request, &ExecRejection::ApprovalDenied);
+    let Some(signing) = load_result_signing_key(paths, &request.invocation_id) else {
+        return;
+    };
     if let Err(e) = emit_exec_rejected(
         room,
         request.invocation_id.clone(),
         &ExecRejection::ApprovalDenied,
+        signing.signing_key(),
+        &signing.key_id(),
     )
     .await
     {
@@ -1120,10 +1265,15 @@ pub(crate) async fn expire_held_exec(
     request: &ExecRequest,
 ) {
     audit_exec_expired(paths, room_id, request);
+    let Some(signing) = load_result_signing_key(paths, &request.invocation_id) else {
+        return;
+    };
     if let Err(e) = emit_exec_rejected(
         room,
         request.invocation_id.clone(),
         &ExecRejection::ApprovalExpired,
+        signing.signing_key(),
+        &signing.key_id(),
     )
     .await
     {
@@ -1348,6 +1498,7 @@ async fn authorize_live_exec(
 /// `allowance.max_output_bytes` and the returned [`CaptureSummary`] carries the
 /// real `truncated` flag so the caller can populate `exec.finished` truthfully
 /// (issue #268).
+#[allow(clippy::too_many_arguments)]
 async fn emit_output_events(
     client: &matrix_sdk::Client,
     room: &Room,
@@ -1355,6 +1506,8 @@ async fn emit_output_events(
     stdout: &[u8],
     stderr: &[u8],
     allowance: &Allowance,
+    signing_key: &SigningKey,
+    key_id: &str,
 ) -> CaptureSummary {
     let total = stdout.len() + stderr.len();
     let artifact_config = crate::ArtifactConfig::default();
@@ -1371,8 +1524,14 @@ async fn emit_output_events(
                 crate::prepare_artifact(invocation_id, stream, data, &artifact_config).await;
             match crate::upload_artifact(client, prepared, encrypted).await {
                 Ok(event) => {
-                    if let Ok(content) = serde_json::to_value(&event) {
-                        let _ = room.send_raw(STREAM_ARTIFACT, content).await;
+                    if let Ok(mut content) = serde_json::to_value(&event) {
+                        // Sign the artifact event so the offloaded large-output
+                        // substitute for `stream.chunk` is authenticated too
+                        // (issue #348, Decision D3); the signature binds
+                        // `mxc_uri`+`sha256`+`size_bytes`.
+                        if sign_result_content(&mut content, signing_key, key_id, invocation_id) {
+                            let _ = room.send_raw(STREAM_ARTIFACT, content).await;
+                        }
                     }
                 }
                 Err(e) => {
@@ -1406,7 +1565,12 @@ async fn emit_output_events(
         .await
     });
     while let Some(chunk) = rx.recv().await {
-        if let Ok(content) = serde_json::to_value(&chunk) {
+        if let Ok(mut content) = serde_json::to_value(&chunk) {
+            // Sign each buffered chunk at this single Matrix egress (issue #348,
+            // Decision D2). The key is reused for every chunk — never reloaded.
+            if !sign_result_content(&mut content, signing_key, key_id, invocation_id) {
+                continue;
+            }
             if let Err(e) = room.send_raw(STREAM_CHUNK, content).await {
                 tracing::warn!(error = %e, invocation_id, "failed to emit stream.chunk");
                 break;
@@ -1595,10 +1759,21 @@ async fn run_pty_exec_task(
     resize_rx: tokio::sync::mpsc::Receiver<PtyWinsize>,
     cancel_rx: tokio::sync::watch::Receiver<Option<String>>,
     mut state: InvocationState,
+    signing: Arc<crate::signing::DaemonSigningKey>,
 ) {
+    let key_id = signing.key_id();
     let started = std::time::Instant::now();
-    let outcome =
-        run_controlled_pty_exec(&request, &allowance, &room, stdin_rx, resize_rx, cancel_rx).await;
+    let outcome = run_controlled_pty_exec(
+        &request,
+        &allowance,
+        &room,
+        stdin_rx,
+        resize_rx,
+        cancel_rx,
+        signing.signing_key(),
+        &key_id,
+    )
+    .await;
     remove_live_exec_control(&request.invocation_id);
     let outcome = match outcome {
         Ok(outcome) => outcome,
@@ -1606,7 +1781,14 @@ async fn run_pty_exec_task(
             let rejection = ExecRejection::PolicyDenied(DenyReason::CommandNotAllowed {
                 command: err.to_string(),
             });
-            let _ = emit_exec_rejected(&room, request.invocation_id.clone(), &rejection).await;
+            let _ = emit_exec_rejected(
+                &room,
+                request.invocation_id.clone(),
+                &rejection,
+                signing.signing_key(),
+                &key_id,
+            )
+            .await;
             return;
         }
     };
@@ -1619,6 +1801,8 @@ async fn run_pty_exec_task(
             crate::runner::CANCEL_SIGNAL,
             outcome.killed_process_group,
             finished_at.clone(),
+            signing.signing_key(),
+            &key_id,
         )
         .await;
         state.state = crate::invocation::STATE_CANCELLED.to_string();
@@ -1640,11 +1824,19 @@ async fn run_pty_exec_task(
         stderr_bytes: 0,
         truncated: outcome.truncated,
         artifact_mxc: None,
+        signature: None,
         extra: Default::default(),
     };
-    if let Ok(content) = serde_json::to_value(&finished) {
-        if let Err(e) = room.send_raw(EXEC_FINISHED, content).await {
-            tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.finished for pty");
+    if let Ok(mut content) = serde_json::to_value(&finished) {
+        if sign_result_content(
+            &mut content,
+            signing.signing_key(),
+            &key_id,
+            &request.invocation_id,
+        ) {
+            if let Err(e) = room.send_raw(EXEC_FINISHED, content).await {
+                tracing::warn!(error = %e, invocation_id = %request.invocation_id, "failed to emit exec.finished for pty");
+            }
         }
     }
     state.state = match outcome.exit_code {
@@ -1664,6 +1856,7 @@ async fn run_pty_exec_task(
 /// OS threads that bridge to the async chunker and the control channels. The
 /// child runs in its own process group, so a cancel or timeout signals the whole
 /// group (architecture §7.4/§7.5).
+#[allow(clippy::too_many_arguments)]
 async fn run_controlled_pty_exec(
     request: &ExecRequest,
     allowance: &Allowance,
@@ -1671,6 +1864,8 @@ async fn run_controlled_pty_exec(
     stdin_rx: tokio::sync::mpsc::Receiver<StdinFrame>,
     resize_rx: tokio::sync::mpsc::Receiver<PtyWinsize>,
     mut cancel_rx: tokio::sync::watch::Receiver<Option<String>>,
+    signing_key: &SigningKey,
+    key_id: &str,
 ) -> Result<PtyExecOutcome, crate::runner::RunError> {
     use std::io::{Read as _, Write as _};
 
@@ -1762,6 +1957,10 @@ async fn run_controlled_pty_exec(
     // truncation accounting used by the capture stage.
     let chunk_room = room.clone();
     let chunk_invocation = request.invocation_id.clone();
+    // Clone the signing key + key id once into the chunker task and reuse them
+    // for every chunk; the key is NEVER reloaded per-chunk (issue #348, D2).
+    let chunk_signing_key = signing_key.clone();
+    let chunk_key_id = key_id.to_string();
     let limiter = CaptureLimiter::new(OutputCaps {
         max_output_bytes: allowance.max_output_bytes,
         max_events_per_second: None,
@@ -1779,6 +1978,8 @@ async fn run_controlled_pty_exec(
                     &bytes[..allowed],
                     false,
                     &mut seq,
+                    &chunk_signing_key,
+                    &chunk_key_id,
                 )
                 .await;
             }
@@ -1788,7 +1989,16 @@ async fn run_controlled_pty_exec(
             // child). The child is still bounded by the exec timeout.
         }
         // The EOF chunk always terminates the stream, even after truncation.
-        emit_pty_chunk(&chunk_room, &chunk_invocation, &[], true, &mut seq).await;
+        emit_pty_chunk(
+            &chunk_room,
+            &chunk_invocation,
+            &[],
+            true,
+            &mut seq,
+            &chunk_signing_key,
+            &chunk_key_id,
+        )
+        .await;
         (total, limiter.truncated())
     });
 
@@ -1863,7 +2073,15 @@ async fn terminate_then_kill(
 
 /// Emit one `com.mxagent.stream.chunk.v1` of merged PTY output (base64) into
 /// `room`, advancing `seq`.
-async fn emit_pty_chunk(room: &Room, invocation_id: &str, data: &[u8], eof: bool, seq: &mut u64) {
+async fn emit_pty_chunk(
+    room: &Room,
+    invocation_id: &str,
+    data: &[u8],
+    eof: bool,
+    seq: &mut u64,
+    signing_key: &SigningKey,
+    key_id: &str,
+) {
     use base64::Engine as _;
     use sha2::{Digest as _, Sha256};
     // Populate the per-chunk integrity digest over the raw bytes (the same bytes
@@ -1881,10 +2099,15 @@ async fn emit_pty_chunk(room: &Room, invocation_id: &str, data: &[u8], eof: bool
         compressed: false,
         sha256,
         timestamp: rfc3339_now(),
+        signature: None,
         extra: Default::default(),
     };
     *seq += 1;
-    if let Ok(content) = serde_json::to_value(&chunk) {
+    if let Ok(mut content) = serde_json::to_value(&chunk) {
+        // Sign each PTY chunk with the per-invocation key (issue #348, D2).
+        if !sign_result_content(&mut content, signing_key, key_id, invocation_id) {
+            return;
+        }
         if let Err(e) = room.send_raw(STREAM_CHUNK, content).await {
             tracing::warn!(error = %e, invocation_id, "failed to emit pty stream.chunk");
         }
@@ -2495,16 +2718,23 @@ pub async fn emit_exec_cancelled(
     signal_sent: impl Into<String>,
     killed_process_group: bool,
     finished_at: impl Into<String>,
+    signing_key: &SigningKey,
+    key_id: &str,
 ) -> Result<(), WorkspaceError> {
+    let invocation_id = invocation_id.into();
     let cancelled = ExecCancelled {
-        invocation_id: invocation_id.into(),
+        invocation_id: invocation_id.clone(),
         signal_sent: signal_sent.into(),
         killed_process_group,
         finished_at: finished_at.into(),
+        signature: None,
         extra: Default::default(),
     };
-    let content = serde_json::to_value(&cancelled)
+    let mut content = serde_json::to_value(&cancelled)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    if !sign_result_content(&mut content, signing_key, key_id, &invocation_id) {
+        return Ok(());
+    }
     room.send_raw(EXEC_CANCELLED, content)
         .await
         .map_err(WorkspaceError::from)?;

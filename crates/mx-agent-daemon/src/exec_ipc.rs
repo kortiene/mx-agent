@@ -826,6 +826,7 @@ async fn run_loopback_with(
         stderr_bytes: output.stderr.len() as u64,
         truncated,
         artifact_mxc,
+        signature: None,
         extra: Default::default(),
     }));
 
@@ -1010,6 +1011,7 @@ mod tests {
             stderr_bytes: 0,
             truncated: false,
             artifact_mxc: None,
+            signature: None,
             extra: Default::default(),
         });
         let value = serde_json::to_value(&frame).unwrap();
@@ -1165,6 +1167,7 @@ writable_paths = ["/work"]
             stderr_bytes: 0,
             truncated: false,
             artifact_mxc: None,
+            signature: None,
             extra: Default::default(),
         }));
         let value = serde_json::to_value(notification).unwrap();
@@ -1187,6 +1190,7 @@ writable_paths = ["/work"]
                     stderr_bytes: 0,
                     truncated: false,
                     artifact_mxc: None,
+                    signature: None,
                     extra: Default::default(),
                 })],
             },
