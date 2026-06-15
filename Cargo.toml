@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # MSRV is enforced by the `msrv` CI job (issue #315). matrix-sdk 0.18 declares
 # rust-version 1.93, which is the real workspace floor; the historically
@@ -43,12 +43,12 @@ getrandom = "0.4"
 nix = { version = "0.31", features = ["signal", "process", "user"] }
 rustix = { version = "1", default-features = false, features = ["std", "pty", "termios"] }
 signal-hook = "0.4"
-mx-agent-protocol = { path = "crates/mx-agent-protocol", version = "0.2.0" }
-mx-agent-telemetry = { path = "crates/mx-agent-telemetry", version = "0.2.0" }
-mx-agent-ipc = { path = "crates/mx-agent-ipc", version = "0.2.0" }
-mx-agent-policy = { path = "crates/mx-agent-policy", version = "0.2.0" }
-mx-agent-sandbox = { path = "crates/mx-agent-sandbox", version = "0.2.0" }
-mx-agent-daemon = { path = "crates/mx-agent-daemon", version = "0.2.0" }
+mx-agent-protocol = { path = "crates/mx-agent-protocol", version = "0.2.1" }
+mx-agent-telemetry = { path = "crates/mx-agent-telemetry", version = "0.2.1" }
+mx-agent-ipc = { path = "crates/mx-agent-ipc", version = "0.2.1" }
+mx-agent-policy = { path = "crates/mx-agent-policy", version = "0.2.1" }
+mx-agent-sandbox = { path = "crates/mx-agent-sandbox", version = "0.2.1" }
+mx-agent-daemon = { path = "crates/mx-agent-daemon", version = "0.2.1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
