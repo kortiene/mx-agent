@@ -625,6 +625,7 @@ async fn send_chunk(
         compressed: false,
         sha256: chunk_sha256(data),
         timestamp: now_rfc3339_millis(),
+        signature: None,
         extra: Default::default(),
     };
     *seq += 1;

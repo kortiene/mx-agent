@@ -580,6 +580,7 @@ mod tests {
             compressed: false,
             sha256: None,
             timestamp: "2026-06-02T12:00:00.000Z".to_string(),
+            signature: None,
             extra: Default::default(),
         }
     }
@@ -594,6 +595,7 @@ mod tests {
             stderr_bytes: 0,
             truncated: false,
             artifact_mxc: None,
+            signature: None,
             extra: Default::default(),
         }
     }
@@ -627,6 +629,7 @@ mod tests {
             mxc_uri: mxc.to_string(),
             tail_preview: tail.to_string(),
             encrypted_file: None,
+            signature: None,
             extra: Default::default(),
         }
     }

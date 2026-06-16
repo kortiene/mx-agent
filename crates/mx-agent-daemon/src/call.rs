@@ -348,6 +348,7 @@ pub fn success_response(request_id: impl Into<String>, result: Value) -> CallRes
         ok: true,
         result: Some(result),
         error: None,
+        signature: None,
         extra: Default::default(),
     }
 }
@@ -377,6 +378,7 @@ pub async fn execute_authorized_call(
             ok: false,
             result: None,
             error: Some(err.to_string()),
+            signature: None,
             extra: Default::default(),
         },
     }
@@ -392,17 +394,63 @@ pub fn rejection_response(
         ok: false,
         result: None,
         error: Some(rejection.reason()),
+        signature: None,
         extra: Default::default(),
     }
 }
 
-/// Emit a `com.mxagent.call.response.v1` timeline event into `room`.
+/// Emit a `com.mxagent.call.response.v1` timeline event into `room`, signed with
+/// the executor daemon's key (issue #348).
+///
+/// The response `content` is Ed25519-signed at this single Matrix egress so the
+/// caller can verify the result was produced by the executing daemon (not forged
+/// by a compromised homeserver). If signing fails because the tool `result` is
+/// not canonicalizable (e.g. it carries a float), the success response is **not**
+/// sent unsigned: a signed error `CallResponse` (`ok:false`, `error:"result not
+/// canonicalizable"`, `result:None`) is emitted instead — fail closed, consistent
+/// with `CallRequest.args` (issue #348, spec D5). Any other signing failure logs
+/// a warning and skips the send (never sends unsigned).
 pub async fn emit_call_response(
     room: &Room,
     response: &CallResponse,
+    signing_key: &SigningKey,
+    key_id: &str,
 ) -> Result<(), WorkspaceError> {
-    let content = serde_json::to_value(response)
+    let mut content = serde_json::to_value(response)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+    match signing::sign_into(signing_key, key_id.to_string(), &mut content) {
+        Ok(()) => {}
+        Err(SignatureError::NonCanonical(_)) => {
+            // The tool result cannot be canonicalized (and thus cannot be signed
+            // over Matrix-canonical bytes). Fail closed: send a signed error
+            // instead of an unsigned success.
+            let error = CallResponse {
+                request_id: response.request_id.clone(),
+                ok: false,
+                result: None,
+                error: Some("result not canonicalizable".to_string()),
+                signature: None,
+                extra: Default::default(),
+            };
+            let mut error_content = serde_json::to_value(&error)
+                .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
+            // The error response has only scalar/string fields, so signing it
+            // cannot fail; if it somehow does, skip the send (never unsigned).
+            if let Err(e) = signing::sign_into(signing_key, key_id.to_string(), &mut error_content)
+            {
+                tracing::warn!(error = %e, request_id = %response.request_id, "failed to sign call.response error; skipping send");
+                return Ok(());
+            }
+            room.send_raw(CALL_RESPONSE, error_content)
+                .await
+                .map_err(WorkspaceError::from)?;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, request_id = %response.request_id, "failed to sign call.response; skipping send");
+            return Ok(());
+        }
+    }
     room.send_raw(CALL_RESPONSE, content)
         .await
         .map_err(WorkspaceError::from)?;
@@ -612,12 +660,78 @@ async fn wait_for_call_response(
                 );
                 continue;
             }
+            // Fail-closed Ed25519 verification of the result plane, in *series*
+            // with the sender-pin above (issue #348, spec D5): verify the
+            // signature against the executing agent's published, locally-trusted
+            // key before matching the request id, so a homeserver-forged or
+            // tampered response is dropped and the wait times out. Verify the raw
+            // content `Value` (which carries the embedded `signature`).
+            if let Err(reason) =
+                verify_call_response_signature(client, &event, expected_sender).await
+            {
+                tracing::warn!(
+                    sender = %event.sender,
+                    request_id = %request_id,
+                    reason,
+                    "dropping call.response with an unverified signature"
+                );
+                continue;
+            }
             if let Ok(response) = serde_json::from_value::<CallResponse>(event.content) {
                 if response.request_id == request_id {
                     return Ok(response);
                 }
             }
         }
+    }
+}
+
+/// Verify the Ed25519 signature on a received `call.response` against the
+/// executing agent's published, locally-trusted key (issue #348, spec D5).
+///
+/// Resolves the executor's [`AgentState`] in the event's room by its Matrix user
+/// id (`expected_sender`, the already-pinned executing agent), then applies the
+/// centralized fail-closed policy in
+/// [`crate::result_verify::verify_result_signature`]. Returns a stable,
+/// non-sensitive reason label on failure (logged by the caller); the
+/// `MX_AGENT_ALLOW_UNSIGNED_RESULTS` override applies only to a *missing*
+/// signature. Never logs key bytes or payloads.
+async fn verify_call_response_signature(
+    client: &matrix_sdk::Client,
+    event: &crate::event_router::IncomingEvent,
+    expected_sender: &str,
+) -> Result<(), &'static str> {
+    use crate::result_verify::{verify_result_signature, ResultVerifyError, VerifyOutcome};
+
+    let response: CallResponse =
+        serde_json::from_value(event.content.clone()).map_err(|_| "malformed")?;
+
+    let room_id = matrix_sdk::ruma::RoomId::parse(&event.room_id)
+        .map_err(|_| ResultVerifyError::UnresolvableKey.reason())?;
+    let room = client
+        .get_room(&room_id)
+        .ok_or(ResultVerifyError::UnresolvableKey.reason())?;
+    let agent_state = crate::agent::read_all_agent_states(&room)
+        .await
+        .map_err(|_| ResultVerifyError::UnresolvableKey.reason())?
+        .into_iter()
+        .find(|agent| agent.matrix_user_id == expected_sender)
+        .ok_or(ResultVerifyError::UnresolvableKey.reason())?;
+
+    let paths = SessionPaths::resolve();
+    let trust = TrustStore::load(&paths).unwrap_or_default();
+
+    match verify_result_signature(&response, &agent_state, &trust) {
+        Ok(VerifyOutcome::Verified) => Ok(()),
+        Ok(VerifyOutcome::AcceptedUnsigned) => {
+            tracing::warn!(
+                sender = %expected_sender,
+                request_id = %response.request_id,
+                "accepting an UNSIGNED call.response because MX_AGENT_ALLOW_UNSIGNED_RESULTS is set"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err.reason()),
     }
 }
 
@@ -661,6 +775,16 @@ pub async fn handle_live_call_request(
     if !is_local_target {
         return;
     }
+
+    // Load the executor daemon's signing key ONCE for this call so the emitted
+    // `call.response` is Ed25519-signed at the Matrix egress (issue #348).
+    let signing = match load_or_create_signing_key(paths) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(error = %e, request_id = %request.request_id, "could not load daemon signing key; cannot emit signed call response");
+            return;
+        }
+    };
 
     let content = match serde_json::to_value(request) {
         Ok(value) => value,
@@ -750,7 +874,9 @@ pub async fn handle_live_call_request(
         }
     };
 
-    if let Err(e) = emit_call_response(&room, &response).await {
+    if let Err(e) =
+        emit_call_response(&room, &response, signing.signing_key(), &signing.key_id()).await
+    {
         tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call response");
     }
 }
@@ -819,9 +945,11 @@ pub(crate) async fn execute_and_respond_call(
     room: &Room,
     request: &CallRequest,
     allowance: &mx_agent_policy::Allowance,
+    signing_key: &SigningKey,
+    key_id: &str,
 ) {
     let response = execute_authorized_call(request, allowance).await;
-    if let Err(e) = emit_call_response(room, &response).await {
+    if let Err(e) = emit_call_response(room, &response, signing_key, key_id).await {
         tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call response");
     }
 }
@@ -853,6 +981,15 @@ pub(crate) async fn release_held_call(
             return;
         }
     };
+    // Load the executor's signing key once for the release lifecycle so the
+    // response (or rejection) is signed at egress (issue #348).
+    let signing = match load_or_create_signing_key(paths) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(error = %e, request_id = %request.request_id, "could not load daemon signing key; cannot release held call");
+            return;
+        }
+    };
     match authorize_live_call(room, paths, &content, &request, &requesting_agent, room_id).await {
         Ok((authorized, allowance)) => {
             audit_call_released(
@@ -863,7 +1000,14 @@ pub(crate) async fn release_held_call(
                 &target_agent,
                 &allowance,
             );
-            execute_and_respond_call(room, &authorized, &allowance).await;
+            execute_and_respond_call(
+                room,
+                &authorized,
+                &allowance,
+                signing.signing_key(),
+                &signing.key_id(),
+            )
+            .await;
         }
         Err(rejection) => {
             if let Some(record) = call_rejection_audit_record(
@@ -876,7 +1020,9 @@ pub(crate) async fn release_held_call(
                 append_audit(paths, &request.invocation_id, record);
             }
             let response = rejection_response(request.request_id.clone(), &rejection);
-            if let Err(e) = emit_call_response(room, &response).await {
+            if let Err(e) =
+                emit_call_response(room, &response, signing.signing_key(), &signing.key_id()).await
+            {
                 tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call rejection on release");
             }
         }
@@ -903,8 +1049,17 @@ pub(crate) async fn deny_held_call(
         &CallRejection::ApprovalDenied.reason(),
     );
     append_audit(paths, &request.invocation_id, record);
+    let signing = match load_or_create_signing_key(paths) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(error = %e, request_id = %request.request_id, "could not load daemon signing key; cannot emit signed call.response for denied hold");
+            return;
+        }
+    };
     let response = rejection_response(request.request_id.clone(), &CallRejection::ApprovalDenied);
-    if let Err(e) = emit_call_response(room, &response).await {
+    if let Err(e) =
+        emit_call_response(room, &response, signing.signing_key(), &signing.key_id()).await
+    {
         tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call.response for denied hold");
     }
 }
@@ -919,8 +1074,17 @@ pub(crate) async fn expire_held_call(
     request: &CallRequest,
 ) {
     audit_call_expired(paths, room_id, request);
+    let signing = match load_or_create_signing_key(paths) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(error = %e, request_id = %request.request_id, "could not load daemon signing key; cannot emit signed call.response for expired hold");
+            return;
+        }
+    };
     let response = rejection_response(request.request_id.clone(), &CallRejection::ApprovalExpired);
-    if let Err(e) = emit_call_response(room, &response).await {
+    if let Err(e) =
+        emit_call_response(room, &response, signing.signing_key(), &signing.key_id()).await
+    {
         tracing::warn!(error = %e, request_id = %request.request_id, "failed to emit call.response for expired hold");
     }
 }

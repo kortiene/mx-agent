@@ -8110,6 +8110,380 @@ allow_cwd = ["{cwd}"]
     );
 }
 
+/// Result-plane **signature** rejection: a result-plane event forged from the
+/// executing agent's *own* Matrix sender — so it passes the sender-pin (issue
+/// #304) — must still be dropped by Ed25519 signature verification (issue #348).
+///
+/// Security invariant under test: a compromised/malicious homeserver that spoofs
+/// `sender` defeats the sender-pin, but cannot forge a valid Ed25519 signature
+/// over the executor's published, locally-trusted key. `publish_forwarded` now
+/// runs `verify_forwarded_event` → `result_verify::verify_result_signature`
+/// (resolve the executor's `AgentState` key by `meta.sender`, verify the detached
+/// signature, cross-check `signature.key_id`, re-check trust) *in series* with
+/// the sender-pin, and **fails closed** on the Matrix transport (spec D5). A
+/// missing signature is rejected (`Unsigned`) unless `MX_AGENT_ALLOW_UNSIGNED_RESULTS`
+/// is set (it is not here); an invalid/wrong-key signature is *always* rejected.
+///
+/// This complements [`live_result_plane_forge_is_rejected`]: that test sends the
+/// forge from a *different* sender (Bob), so the sender-pin drops it before
+/// signature verification is ever reached. Here every forge is sent from
+/// **Alice's own sender** (the pinned executor), so the sender-pin passes and the
+/// *signature check* is the only thing that can reject it — directly exercising
+/// the new #348 invariant.
+///
+/// Setup (mirrors the #304 harness):
+/// - Alice is the **executor** (TARGET_AGENT): runs the target command, publishes
+///   her daemon signing key in `com.mxagent.agent.v1`, and emits the genuine
+///   daemon-signed `exec.finished`.
+/// - Bob is the **requester**. The forged events are injected from **Alice's own
+///   client** (her sender == the pinned executor), so they clear the sender-pin.
+///
+/// Cases proven against the caller's exec-subscriber receive path
+/// (`publish_forwarded`):
+/// - (a) POSITIVE: Alice's genuine, daemon-signed `exec.finished` (exit 77) is
+///   verified, delivered, and resolves the waiter.
+/// - (b) UNSIGNED forge: an `exec.finished` with NO `signature`, from Alice's
+///   sender (exit 42), is dropped (`Unsigned`, override off) and never resolves
+///   the waiter.
+/// - (c) WRONG-KEY forge: an `exec.finished` signed by a *different* Ed25519 key
+///   than Alice's published one, from Alice's sender (exit 43), is dropped
+///   (`Invalid`) and never resolves the waiter.
+///
+/// Run via `scripts/matrix_integration_test.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_result_plane_unsigned_or_misigned_is_rejected() {
+    let _serial = enter_single_threaded_section();
+    use ed25519_dalek::SigningKey as Ed25519SigningKey;
+    use mx_agent_protocol::signing::sign_into;
+
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .try_init();
+
+    // The unsigned-results escape hatch must be OFF so the missing-signature
+    // forge is rejected rather than logged-accepted (spec D5).
+    std::env::remove_var(mx_agent_daemon::result_verify::ALLOW_UNSIGNED_RESULTS_ENV);
+
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+    let bob_user = required_env("MX_AGENT_TEST_USER2");
+    let bob_pass = required_env("MX_AGENT_TEST_PASSWORD2");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::env::set_var("MX_AGENT_CONFIG_DIR", &config_dir);
+    let cwd = data_dir.join("work");
+    std::fs::create_dir_all(&cwd).expect("create work dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    let bob_session = login_password(&config, &bob_user, &bob_pass)
+        .await
+        .expect("bob login");
+    let bob = restore_client(&bob_session).await.expect("bob restore");
+    let requester_agent = bob.user_id().expect("bob user id").to_string();
+    let alice_id = alice.user_id().expect("alice user id").to_owned();
+
+    let room = create_public_room(&bob, "mx-agent result-plane signature test").await;
+    let room_id = room.room_id().to_owned();
+    alice.join_room_by_id(&room_id).await.expect("alice joins");
+    wait_for_joined_member(&room, &alice_id).await;
+    room.send_state_event_raw(
+        "m.room.power_levels",
+        "",
+        json!({
+            "users_default": 0,
+            "state_default": 50,
+            "events_default": 0,
+            "users": {
+                bob.user_id().expect("bob user id").as_str(): 100,
+                alice_id.as_str(): 50,
+            },
+            "events": { mx_agent_protocol::events::state::AGENT: 50 },
+        }),
+    )
+    .await
+    .expect("grant state-event power to alice");
+    alice
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("alice observes power levels");
+
+    for (client, agent_id) in [
+        (&bob, requester_agent.clone()),
+        (&alice, TARGET_AGENT.to_string()),
+    ] {
+        register_agent(
+            client,
+            &RegisterAgentOptions {
+                room: room_id.to_string(),
+                agent_id: Some(agent_id),
+                kind: "pi".to_string(),
+                capabilities: vec!["exec".to_string()],
+                tools: vec![],
+                cwd: cwd.to_string_lossy().into_owned(),
+                project_id: "mx-agent-it".to_string(),
+                max_invocations: 1,
+            },
+        )
+        .await
+        .expect("register agent");
+    }
+
+    // The daemon signing key. `register_agent` published this key as
+    // Alice's (the executor's) `AgentState.signing_public_key`/`signing_key_id`,
+    // and seeded it into the local trust store, so:
+    //   * the genuine result Alice's daemon signs with it verifies (positive); and
+    //   * the verifier resolves *this* key for `meta.sender == alice_id`, so a
+    //     differently-keyed or unsigned forge from Alice's sender fails (b/c).
+    let signing = load_or_create_signing_key(&paths).expect("signing key");
+    let mut trust = TrustStore::default();
+    trust.approve(
+        requester_agent.clone(),
+        signing.key_id(),
+        None,
+        Some(room_id.to_string()),
+        None,
+    );
+    trust.save(&paths).expect("save trust store");
+    std::fs::write(
+        config_dir.join("policy.toml"),
+        format!(
+            r#"
+[rooms."{room}"]
+trusted = true
+
+[rooms."{room}".agents."{agent}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{cwd}"]
+"#,
+            room = room_id.as_str(),
+            agent = requester_agent,
+            cwd = cwd.to_string_lossy(),
+        ),
+    )
+    .expect("write policy");
+
+    let subscribers = ExecSubscriberRegistry::new();
+    let running = Arc::new(AtomicBool::new(true));
+    let alice_sync = {
+        let alice = alice.clone();
+        let paths = paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &alice,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+    let bob_sync_paths = paths_in(data_dir.join("bob-sync"));
+    bob_sync_paths.ensure_data_dir().expect("bob sync dir");
+    let bob_sync = {
+        let bob = bob.clone();
+        let paths = bob_sync_paths.clone();
+        let running = running.clone();
+        let subscribers = subscribers.clone();
+        tokio::spawn(async move {
+            run_matrix_sync_with_subscribers(
+                &bob,
+                &paths,
+                Arc::new(Mutex::new(SyncHealth::initializing(false))),
+                BackoffConfig::default(),
+                running,
+                Some(subscribers),
+            )
+            .await
+        })
+    };
+
+    // Subscribe pinned to alice_id (the executor). Forged events are sent below
+    // FROM Alice's own sender, so they all pass the sender-pin; only the
+    // signature check can drop them.
+    let invocation_id = format!("inv_sig_{}", std::process::id());
+    let mut subscription = subscribers.subscribe(
+        ExecSubscriptionKey::Invocation(invocation_id.clone()),
+        alice_id.to_string(),
+    );
+
+    // Build and send a signed exec request. The command sleeps 1 s then exits
+    // with code 77, giving the forger time to inject fake results first (exactly
+    // as in the #304 model) so a broken signature gate would surface exit 42/43.
+    let options = ExecRequestOptions {
+        target_agent: TARGET_AGENT.to_string(),
+        requesting_agent: requester_agent.clone(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 1; exit 77".to_string(),
+        ],
+        cwd: cwd.to_string_lossy().into_owned(),
+        env: Default::default(),
+        stdin: false,
+        stream: true,
+        pty: false,
+        timeout_ms: 600_000,
+        task_id: None,
+    };
+    let exec_content = build_signed_exec_request(
+        signing.signing_key(),
+        signing.key_id(),
+        &invocation_id,
+        format!("req_sig_{}", std::process::id()),
+        format!("sig-nonce-{}", std::process::id()),
+        "2026-01-01T00:00:00Z",
+        "2099-01-01T00:00:00Z",
+        &options,
+    )
+    .expect("sign exec request");
+
+    // Alice's own view of the room. Sending the forges from here makes their
+    // Matrix `sender` equal alice_id, the pinned executor — so they clear the
+    // sender-pin and reach the #348 signature check.
+    let alice_room = alice.get_room(&room_id).expect("alice has the room");
+    // Bob sends the legitimate request that drives Alice's daemon to run the
+    // command and emit the genuine, daemon-signed exec.finished (case a).
+    let bob_room = bob.get_room(&room_id).expect("bob has the room");
+    bob_room
+        .send_raw(timeline::EXEC_REQUEST, exec_content)
+        .await
+        .expect("send signed exec request");
+
+    // ── Case (b): UNSIGNED forge from the executor's own sender ──
+    // An `exec.finished` with NO `signature` field (exit 42). The sender-pin
+    // passes (sender == alice_id), so `verify_forwarded_event` must reject it as
+    // `Unsigned` (the MX_AGENT_ALLOW_UNSIGNED_RESULTS override is off) and it
+    // must never resolve the waiter.
+    alice_room
+        .send_raw(
+            timeline::EXEC_FINISHED,
+            json!({
+                "invocation_id": invocation_id,
+                "exit_code": 42,
+                "signal": null,
+                "duration_ms": 1,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "truncated": false,
+                "artifact_mxc": null
+            }),
+        )
+        .await
+        .expect("alice publishes UNSIGNED forged exec.finished (exit 42)");
+
+    // ── Case (c): WRONG-KEY forge from the executor's own sender ──
+    // An `exec.finished` (exit 43) signed with a throwaway Ed25519 key that is
+    // NOT Alice's published `signing_public_key`. The sender-pin passes, but the
+    // signature will not verify against Alice's resolved key, so it is dropped as
+    // `Invalid` and must never resolve the waiter.
+    let wrong_key = Ed25519SigningKey::from_bytes(&[99u8; 32]);
+    let wrong_key_id = key_id_for_verifying_key(&wrong_key.verifying_key());
+    let mut wrong_signed = json!({
+        "invocation_id": invocation_id,
+        "exit_code": 43,
+        "signal": null,
+        "duration_ms": 1,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "truncated": false,
+        "artifact_mxc": null
+    });
+    sign_into(&wrong_key, wrong_key_id, &mut wrong_signed)
+        .expect("sign forged exec.finished with the wrong key");
+    alice_room
+        .send_raw(timeline::EXEC_FINISHED, wrong_signed)
+        .await
+        .expect("alice publishes WRONG-KEY forged exec.finished (exit 43)");
+
+    // Collect frames until the genuine ExecFinished arrives or the deadline
+    // expires. A forged exit (42 or 43) reaching us would mean the signature
+    // gate is broken: both forges were sent before Alice's real result (the
+    // command sleeps 1 s first), so a broken gate would surface them first.
+    let mut seen_exit: Option<Option<i32>> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_secs(5), subscription.recv()).await {
+            Ok(Some(ForwardedExecEvent::ExecFinished(finished))) => {
+                seen_exit = Some(finished.exit_code);
+                break;
+            }
+            Ok(Some(ForwardedExecEvent::ExecRejected(rejected))) => {
+                panic!(
+                    "exec request was rejected by alice's daemon (policy/trust error): {:?}; \
+                     check that policy.toml and trust store are set up correctly",
+                    rejected.reason
+                );
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let _ = alice_sync.await.expect("alice sync task joins");
+    let _ = bob_sync.await.expect("bob sync task joins");
+    std::env::remove_var(ENV_DATA_DIR);
+    std::env::remove_var("MX_AGENT_CONFIG_DIR");
+
+    let exit_code = seen_exit.expect(
+        "live exec invocation must deliver a genuine, signed ExecFinished frame within the \
+         30 s deadline; check alice's daemon logs for exec execution or policy rejection",
+    );
+    // Security assertion (b): the UNSIGNED forge (exit 42) must never have been
+    // delivered. It cleared the sender-pin (Alice's own sender), so only the
+    // #348 signature check (missing signature → `Unsigned`) can have dropped it.
+    assert_ne!(
+        exit_code,
+        Some(42),
+        "UNSIGNED forged exec.finished (exit 42) from the executor's OWN sender must be \
+         dropped by signature verification — result-plane signing gate is broken for the \
+         missing-signature case (issue #348)"
+    );
+    // Security assertion (c): the WRONG-KEY forge (exit 43) must never have been
+    // delivered. It cleared the sender-pin, so only the #348 signature check
+    // (signature does not verify against Alice's published key → `Invalid`) can
+    // have dropped it.
+    assert_ne!(
+        exit_code,
+        Some(43),
+        "WRONG-KEY forged exec.finished (exit 43) from the executor's OWN sender must be \
+         dropped by signature verification — result-plane signing gate is broken for the \
+         invalid-signature case (issue #348)"
+    );
+    // Positive assertion (a): the genuine, daemon-signed result (exit 77) is
+    // verified and delivered, proving the signing gate does not reject a real
+    // result and resolves the waiter correctly.
+    assert_eq!(
+        exit_code,
+        Some(77),
+        "the legitimate executor (alice) must deliver its genuine daemon-signed exit code 77 \
+         after the signature gate drops both forges; got {exit_code:?}"
+    );
+}
+
 /// Live trust-store anchor: a decision signed by a key published in
 /// `com.mxagent.agent.v1` room state but absent from the local trust store is
 /// rejected with `untrusted_key` and the held task is never released (issue #309).

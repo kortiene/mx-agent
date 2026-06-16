@@ -454,28 +454,64 @@ async fn handle_routed_events(
                 crate::call::handle_live_call_request(client, paths, &meta, &request).await;
             }
             RoutedEvent::StreamChunk(event) => {
-                publish_forwarded(subscribers, &meta, ForwardedExecEvent::StreamChunk(*event))
+                publish_forwarded(
+                    client,
+                    paths,
+                    subscribers,
+                    &meta,
+                    ForwardedExecEvent::StreamChunk(*event),
+                )
+                .await
             }
-            RoutedEvent::StreamArtifact(event) => publish_forwarded(
-                subscribers,
-                &meta,
-                ForwardedExecEvent::StreamArtifact(*event),
-            ),
+            RoutedEvent::StreamArtifact(event) => {
+                publish_forwarded(
+                    client,
+                    paths,
+                    subscribers,
+                    &meta,
+                    ForwardedExecEvent::StreamArtifact(*event),
+                )
+                .await
+            }
             RoutedEvent::ExecRejected(event) => {
-                publish_forwarded(subscribers, &meta, ForwardedExecEvent::ExecRejected(event));
+                publish_forwarded(
+                    client,
+                    paths,
+                    subscribers,
+                    &meta,
+                    ForwardedExecEvent::ExecRejected(event),
+                )
+                .await;
             }
             RoutedEvent::ExecFinished(event) => {
-                publish_forwarded(subscribers, &meta, ForwardedExecEvent::ExecFinished(*event))
+                publish_forwarded(
+                    client,
+                    paths,
+                    subscribers,
+                    &meta,
+                    ForwardedExecEvent::ExecFinished(*event),
+                )
+                .await
             }
             RoutedEvent::ExecCancelled(event) => {
                 publish_forwarded(
+                    client,
+                    paths,
                     subscribers,
                     &meta,
                     ForwardedExecEvent::ExecCancelled(*event),
-                );
+                )
+                .await;
             }
             RoutedEvent::CallResponse(event) => {
-                publish_forwarded(subscribers, &meta, ForwardedExecEvent::CallResponse(*event));
+                publish_forwarded(
+                    client,
+                    paths,
+                    subscribers,
+                    &meta,
+                    ForwardedExecEvent::CallResponse(*event),
+                )
+                .await;
             }
             RoutedEvent::ApprovalDecision(decision) => {
                 // Consume a decision for a held live exec/call (issue #306):
@@ -499,7 +535,9 @@ async fn handle_routed_events(
     }
 }
 
-fn publish_forwarded(
+async fn publish_forwarded(
+    client: &matrix_sdk::Client,
+    paths: &SessionPaths,
     subscribers: Option<&ExecSubscriberRegistry>,
     meta: &EventMeta,
     event: ForwardedExecEvent,
@@ -513,6 +551,37 @@ fn publish_forwarded(
         );
         return;
     };
+
+    // Verify the executor's Ed25519 signature on the result-plane event before
+    // delivering it, fail-closed on the Matrix transport — defense-in-depth in
+    // *series* with the sender-pin below (issue #348, spec D5). A compromised
+    // homeserver that spoofs `sender` and forges a result cannot also forge a
+    // signature over the executor's trusted key, so a forged/tampered/unsigned
+    // result is dropped here and the caller's waiter times out.
+    match verify_forwarded_event(client, paths, meta, &event).await {
+        Ok(crate::result_verify::VerifyOutcome::Verified) => {}
+        Ok(crate::result_verify::VerifyOutcome::AcceptedUnsigned) => {
+            tracing::warn!(
+                event_type = %meta.event_type,
+                room = %meta.room_id,
+                sender = %meta.sender,
+                invocation_id = %forwarded_correlation_id(&event),
+                "accepting an UNSIGNED result-plane event because MX_AGENT_ALLOW_UNSIGNED_RESULTS is set"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                event_type = %meta.event_type,
+                room = %meta.room_id,
+                sender = %meta.sender,
+                invocation_id = %forwarded_correlation_id(&event),
+                reason = err.reason(),
+                "dropping result-plane event with an unverified signature"
+            );
+            return;
+        }
+    }
+
     let key = event.key();
     // Sender-pin the result plane: the registry delivers this event only to
     // subscribers that pinned `meta.sender` as the executing agent, so a forged
@@ -528,6 +597,65 @@ fn publish_forwarded(
         pruned = stats.pruned,
         "forwarded routed Matrix result event to exec subscribers"
     );
+}
+
+/// The invocation/request correlation id for a forwarded result event, for
+/// non-sensitive log lines.
+fn forwarded_correlation_id(event: &ForwardedExecEvent) -> String {
+    match event {
+        ForwardedExecEvent::StreamChunk(ev) => ev.invocation_id.clone(),
+        ForwardedExecEvent::StreamArtifact(ev) => ev.invocation_id.clone(),
+        ForwardedExecEvent::ExecRejected(ev) => ev.invocation_id.clone(),
+        ForwardedExecEvent::ExecFinished(ev) => ev.invocation_id.clone(),
+        ForwardedExecEvent::ExecCancelled(ev) => ev.invocation_id.clone(),
+        ForwardedExecEvent::CallResponse(ev) => ev.request_id.clone(),
+    }
+}
+
+/// Verify the Ed25519 signature on a forwarded result-plane event against the
+/// executing agent's published, locally-trusted key (issue #348).
+///
+/// Resolves the executor's [`AgentState`](mx_agent_protocol::schema::AgentState)
+/// from `meta.sender` (the already-pinned executing Matrix user) in the event's
+/// room, then applies the centralized fail-closed policy in
+/// [`crate::result_verify::verify_result_signature`] (verify → key-id match →
+/// trust re-check, with the `MX_AGENT_ALLOW_UNSIGNED_RESULTS` override applying
+/// only to a *missing* signature).
+async fn verify_forwarded_event(
+    client: &matrix_sdk::Client,
+    paths: &SessionPaths,
+    meta: &EventMeta,
+    event: &ForwardedExecEvent,
+) -> Result<crate::result_verify::VerifyOutcome, crate::result_verify::ResultVerifyError> {
+    use crate::result_verify::{verify_result_signature, ResultVerifyError};
+
+    // Resolve the executor's AgentState by its Matrix user id (`meta.sender`),
+    // the same identity the sender-pin uses. Any failure to resolve a single
+    // matching agent state fails closed.
+    let room_id = matrix_sdk::ruma::RoomId::parse(&meta.room_id)
+        .map_err(|_| ResultVerifyError::UnresolvableKey)?;
+    let room = client
+        .get_room(&room_id)
+        .ok_or(ResultVerifyError::UnresolvableKey)?;
+    let agent_state = crate::agent::read_all_agent_states(&room)
+        .await
+        .map_err(|_| ResultVerifyError::UnresolvableKey)?
+        .into_iter()
+        .find(|agent| agent.matrix_user_id == meta.sender)
+        .ok_or(ResultVerifyError::UnresolvableKey)?;
+
+    let trust = crate::trust::TrustStore::load(paths).unwrap_or_default();
+
+    // Verify the typed inner event (its serialized form carries the embedded
+    // `signature`). The policy helper handles the unsigned-results override.
+    match event {
+        ForwardedExecEvent::StreamChunk(ev) => verify_result_signature(ev, &agent_state, &trust),
+        ForwardedExecEvent::StreamArtifact(ev) => verify_result_signature(ev, &agent_state, &trust),
+        ForwardedExecEvent::ExecRejected(ev) => verify_result_signature(ev, &agent_state, &trust),
+        ForwardedExecEvent::ExecFinished(ev) => verify_result_signature(ev, &agent_state, &trust),
+        ForwardedExecEvent::ExecCancelled(ev) => verify_result_signature(ev, &agent_state, &trust),
+        ForwardedExecEvent::CallResponse(ev) => verify_result_signature(ev, &agent_state, &trust),
+    }
 }
 
 /// Classify a Matrix sync error: an unknown/missing access token is fatal

@@ -261,6 +261,7 @@ mod tests {
             compressed: false,
             sha256: None,
             timestamp: "2026-06-06T00:00:00Z".to_string(),
+            signature: None,
             extra: Extra::default(),
         })
     }
@@ -274,6 +275,7 @@ mod tests {
             signal_sent: "SIGTERM".to_string(),
             killed_process_group: false,
             finished_at: "2026-06-06T00:00:00Z".to_string(),
+            signature: None,
             extra: Extra::default(),
         })
     }
@@ -282,6 +284,7 @@ mod tests {
         ForwardedExecEvent::ExecRejected(ExecRejected {
             invocation_id: invocation_id.to_string(),
             reason: "policy_denied".to_string(),
+            signature: None,
             extra: Extra::default(),
         })
     }
@@ -297,6 +300,7 @@ mod tests {
             mxc_uri: "mxc://s/a".to_string(),
             tail_preview: String::new(),
             encrypted_file: None,
+            signature: None,
             extra: Extra::default(),
         })
     }
@@ -307,6 +311,7 @@ mod tests {
             ok: true,
             result: None,
             error: None,
+            signature: None,
             extra: Extra::default(),
         })
     }
@@ -393,6 +398,7 @@ mod tests {
             stderr_bytes: 0,
             truncated: false,
             artifact_mxc: None,
+            signature: None,
             extra: Extra::default(),
         });
         let stats = registry.publish(finished, MEMBER);
@@ -424,6 +430,7 @@ mod tests {
             ok: true,
             result: None,
             error: None,
+            signature: None,
             extra: Extra::default(),
         });
         assert_eq!(
@@ -443,6 +450,7 @@ mod tests {
             stderr_bytes: 0,
             truncated: false,
             artifact_mxc: None,
+            signature: None,
             extra: Extra::default(),
         });
         assert_eq!(

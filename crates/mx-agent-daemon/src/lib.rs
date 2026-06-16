@@ -29,6 +29,7 @@ pub mod pty;
 pub mod pty_ipc;
 pub mod recovery_ipc;
 pub mod replay;
+pub mod result_verify;
 pub mod runner;
 pub mod scheduler;
 pub mod scheduler_loop;

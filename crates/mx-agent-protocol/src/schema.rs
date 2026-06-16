@@ -95,6 +95,12 @@ pub struct ExecRequest {
 pub struct ExecAccepted {
     /// Invocation identifier.
     pub invocation_id: String,
+    /// Detached Ed25519 signature over this event's canonical JSON (the
+    /// `signature` field excluded), mirroring [`ApprovalDecision`]. `Option` so
+    /// legacy/unsigned events still deserialize; the caller treats a missing or
+    /// invalid signature as unverifiable and fails closed (issue #348).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -107,6 +113,12 @@ pub struct ExecRejected {
     pub invocation_id: String,
     /// Machine-readable rejection reason.
     pub reason: String,
+    /// Detached Ed25519 signature over this event's canonical JSON (the
+    /// `signature` field excluded), mirroring [`ApprovalDecision`]. `Option` so
+    /// legacy/unsigned events still deserialize; the caller treats a missing or
+    /// invalid signature as unverifiable and fails closed (issue #348).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -131,6 +143,12 @@ pub struct ExecFinished {
     pub truncated: bool,
     /// MXC URI of an output artifact, if any.
     pub artifact_mxc: Option<String>,
+    /// Detached Ed25519 signature over this event's canonical JSON (the
+    /// `signature` field excluded), mirroring [`ApprovalDecision`]. `Option` so
+    /// legacy/unsigned events still deserialize; the caller treats a missing or
+    /// invalid signature as unverifiable and fails closed (issue #348).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -185,6 +203,12 @@ pub struct ExecCancelled {
     pub killed_process_group: bool,
     /// Finish timestamp (RFC 3339).
     pub finished_at: String,
+    /// Detached Ed25519 signature over this event's canonical JSON (the
+    /// `signature` field excluded), mirroring [`ApprovalDecision`]. `Option` so
+    /// legacy/unsigned events still deserialize; the caller treats a missing or
+    /// invalid signature as unverifiable and fails closed (issue #348).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -211,6 +235,13 @@ pub struct StreamChunk {
     pub sha256: Option<String>,
     /// Chunk timestamp (RFC 3339).
     pub timestamp: String,
+    /// Detached Ed25519 signature over this chunk's canonical JSON (the
+    /// `signature` field excluded), mirroring [`ApprovalDecision`]. Binds
+    /// `seq`+`data`+`sha256` to the executor's key so a hostile homeserver
+    /// cannot reorder, insert, or forge chunks. `Option` so legacy/unsigned
+    /// events still deserialize; the caller fails closed (issue #348).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -247,6 +278,14 @@ pub struct StreamArtifact {
     /// hashes; never log them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_file: Option<Value>,
+    /// Detached Ed25519 signature over this event's canonical JSON (the
+    /// `signature` field excluded), mirroring [`ApprovalDecision`]. Binds the
+    /// artifact's `mxc_uri`+`sha256`+`size_bytes` to the executor's key so the
+    /// offloaded large-output path is authenticated like inline chunks. `Option`
+    /// so legacy/unsigned events still deserialize; the caller fails closed
+    /// (issue #348).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,
@@ -416,6 +455,12 @@ pub struct CallResponse {
     pub result: Option<Value>,
     /// Error message on failure.
     pub error: Option<String>,
+    /// Detached Ed25519 signature over this response's canonical JSON (the
+    /// `signature` field excluded), mirroring [`ApprovalDecision`]. `Option` so
+    /// legacy/unsigned events still deserialize; the caller treats a missing or
+    /// invalid signature as unverifiable and fails closed (issue #348).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Forward-compatible unknown fields.
     #[serde(flatten)]
     pub extra: Extra,

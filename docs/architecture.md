@@ -110,13 +110,20 @@ member who merely learns an in-flight `request_id`/`invocation_id` cannot forge 
 result. `stream.chunk` additionally carries a populated `sha256` digest of its
 decoded bytes, which the CLI verifies in strict mode so a tampered chunk is
 rejected. Sender-pinning uses the homeserver-asserted `sender`: a cheap,
-always-on, transport-level denial that defeats other room members. Rooting the
-highest-stakes result events (`exec.finished` / `call.response`) in Ed25519 +
-the local trust store as well — mirroring the request plane and `ApprovalDecision`
-(§12) so authority never rests on the homeserver-asserted `sender` against a
-hostile homeserver — is the tracked next step; the cross-build/mixed-fleet
-rollout of result signing is deferred so a pre-upgrade remote executor's results
-still interoperate.
+always-on, transport-level denial that defeats other room members. **In series
+with the pin, every result-plane event also carries a detached Ed25519
+`signature`** over its canonical JSON (the `signature` field excluded), produced
+by the executing daemon's key and verified on receipt against that agent's
+published, locally-trusted verifying key — mirroring the request plane and
+`ApprovalDecision` (§12), so authority never rests on the homeserver-asserted
+`sender` even against a hostile/compromised homeserver that spoofs it (issue
+#348). Result verification **fails closed** on the Matrix transport: a missing,
+invalid, wrong-key, or untrusted-key signature is dropped and the consumer's wait
+times out. The lone escape hatch `MX_AGENT_ALLOW_UNSIGNED_RESULTS=1` (default off)
+downgrades only a *missing* signature to a logged-accept for a mixed-fleet upgrade
+window; an *invalid* signature is always rejected, and the hatch is removable at
+the first stable release. Loopback / local-IPC results are not signed (no
+untrusted hop and no separate identity to verify).
 
 ---
 
@@ -628,10 +635,10 @@ encoder and the PTY emitter): it is the base64 SHA-256 of the chunk's *decoded*
 bytes — the exact bytes the consumer reconstructs from `data`/`encoding`. The CLI
 recomputes it and, in strict mode (`--strict-stream`), rejects a chunk whose
 digest does not match (exit `132`, `EXIT_STREAM_INTEGRITY`). It is an *integrity*
-guard, not authenticity: chunk authenticity comes from the sender-pin (§1.2), and
-the signed-result roadmap's `exec.finished` carries the authoritative byte
-totals/exit status that bound the whole stream. The EOF marker carries no payload
-and so carries no digest.
+guard, not authenticity: chunk authenticity comes from the per-chunk Ed25519
+`signature` (§1.2, issue #348) in series with the sender-pin, and the signed
+`exec.finished` carries the authoritative byte totals/exit status that bound the
+whole stream. The EOF marker carries no payload and so carries no digest.
 
 ### 7.4 Finished Event
 
@@ -658,7 +665,10 @@ that agent's `com.mxagent.agent.v1` `matrix_user_id`). A faked exit status from
 another room member never resolves the invocation — it is dropped, fail-closed
 (§1.2, issue #304). The same pin guards `call.response` (matched to the targeted
 agent before the `request_id`) and artifact/share retrieval (matched to the
-invocation's `target`, or to an explicitly supplied producer).
+invocation's `target`, or to an explicitly supplied producer). Since issue #348
+each of these result events additionally carries a verified Ed25519 `signature`
+(§1.2), so a hostile homeserver that spoofs the `sender` still cannot forge a
+result.
 
 ### 7.5 Stdin and Cancellation
 

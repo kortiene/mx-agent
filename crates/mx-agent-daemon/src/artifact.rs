@@ -169,6 +169,7 @@ impl PreparedArtifact {
             mxc_uri: mxc_uri.into(),
             tail_preview: self.tail_preview,
             encrypted_file,
+            signature: None,
             extra: Default::default(),
         }
     }
@@ -840,6 +841,7 @@ mod tests {
             mxc_uri: "mxc://s/plain".into(),
             tail_preview: String::new(),
             encrypted_file: None,
+            signature: None,
             extra: Default::default(),
         };
         assert!(matches!(
@@ -921,6 +923,7 @@ mod tests {
             mxc_uri: "mxc://s/a".into(),
             tail_preview: String::new(),
             encrypted_file: None,
+            signature: None,
             extra: Default::default(),
         };
         assert!(is_compressed(&prepared));
@@ -947,6 +950,7 @@ mod tests {
                 mxc_uri: "mxc://s/a".into(),
                 tail_preview: String::new(),
                 encrypted_file: None,
+                signature: None,
                 extra: Default::default(),
             },
             producer: producer.into(),
@@ -1123,6 +1127,7 @@ mod tests {
             mxc_uri: "https://example.org/not-mxc".into(),
             tail_preview: String::new(),
             encrypted_file: None,
+            signature: None,
             extra: Default::default(),
         };
         assert!(
