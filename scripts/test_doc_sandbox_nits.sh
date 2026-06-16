@@ -115,24 +115,31 @@ else
   fail=$((fail + 1))
 fi
 
-# ─── 4. architecture.md §13.5: no seccomp/rlimit/cgroup implemented claim ────
+# ─── 4. architecture.md §13.5: seccomp/rlimit/cgroup framing (post-#349) ─────
+#
+# Issue #349 shipped resource caps (rlimit/cgroup) and the seccomp config
+# machinery (off by default; BPF profile installation is a documented follow-up).
+# Checks:
+#   a. rlimit/cgroup caps are documented (they are implemented).
+#   b. Seccomp is documented as off-by-default and the BPF profile installation
+#      is a follow-up — the doc must NOT silently omit the deferral.
 
-# The doc must say seccomp/rlimit/cgroup are NOT implemented.  Any line that
-# mentions seccomp without also saying "no" / "not" / "yet" / "never" would be
-# an over-claim.
-if grep -qiE 'seccomp|rlimit|cgroup' "$arch"; then
-  # grep -v exits 1 when nothing passes the filter (i.e. all lines are "good").
-  # Use || true so set -e does not abort on the empty-result case.
-  bad_seccomp="$(grep -niE 'seccomp|rlimit|cgroup' "$arch" | grep -viE '\bno\b|\bnot\b|\byet\b|\bnever\b|\bwithout\b|\bno seccomp\b' || true)"
-  if [ -z "$bad_seccomp" ]; then
-    ok "docs/architecture.md: seccomp/rlimit/cgroup only appear in 'not implemented' context"
+if grep -qiE '\brlimit\b|\bcgroup\b' "$arch"; then
+  ok "docs/architecture.md: rlimit/cgroup resource caps are documented"
+else
+  not_ok "docs/architecture.md: rlimit/cgroup not mentioned (expected implementation note after #349)"
+fi
+
+if grep -qiE '\bseccomp\b' "$arch"; then
+  # The BPF filter ships off by default; the curated allowlist / bwrap byte
+  # format is a documented follow-up.  The doc must say so explicitly.
+  if grep -qiE 'off by default|follow-up|deferred' "$arch"; then
+    ok "docs/architecture.md: seccomp documented as off-by-default / BPF profile deferred"
   else
-    not_ok "docs/architecture.md: seccomp/rlimit/cgroup appear without 'not implemented' qualifier:"
-    echo "$bad_seccomp" >&2
-    fail=$((fail + 1))
+    not_ok "docs/architecture.md: seccomp mentioned but not framed as off-by-default or deferred (over-claim risk)"
   fi
 else
-  not_ok "docs/architecture.md: seccomp/rlimit/cgroup not mentioned at all (expected explicit 'not implemented' note)"
+  not_ok "docs/architecture.md: seccomp not mentioned (expected implementation note after #349)"
 fi
 
 # ─── 5. architecture.md §13.5: the four real backends are listed ─────────────
