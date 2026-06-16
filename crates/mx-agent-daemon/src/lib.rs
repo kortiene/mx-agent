@@ -24,6 +24,7 @@ pub mod invocation;
 pub mod ipc;
 pub mod lifecycle;
 pub mod matrix;
+pub mod policy;
 #[cfg(unix)]
 pub mod pty;
 pub mod pty_ipc;
@@ -141,6 +142,10 @@ pub use matrix::{
     LoginError, LogoutOutcome, MatrixConfig,
 };
 pub use mx_agent_protocol::schema::{TaskAction, TaskActionAuthorization, TaskResult};
+pub use policy::{
+    resolve_policy, resolve_policy_for_enforcement, PolicyResolution, PolicyStatus,
+    POLICY_STATE_MALFORMED,
+};
 #[cfg(unix)]
 pub use pty::{PtySession, PtyWinsize};
 pub use pty_ipc::{
@@ -324,5 +329,17 @@ mod tests {
         let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert!(output.contains("daemon configuration"), "got: {output}");
         assert!(output.contains("protocol_version"), "got: {output}");
+    }
+
+    /// Serialize tests that mutate the process-global `MX_AGENT_CONFIG_DIR`
+    /// environment variable. A single crate-level lock is needed because
+    /// multiple test modules (`scheduler_loop`, `policy`) modify this variable
+    /// and a module-local lock in each cannot prevent them from racing each
+    /// other (env vars are process-wide).
+    pub(crate) fn config_dir_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use mx_agent_policy::{Allowance, Policy};
+use mx_agent_policy::Allowance;
 use mx_agent_protocol::events::timeline::EXEC_REQUEST;
 use mx_agent_protocol::id::{generate_invocation_id, generate_request_id};
 use mx_agent_protocol::schema::{
@@ -668,10 +668,7 @@ pub(crate) fn rfc3339_after(offset: Duration) -> String {
 /// Shared with the loopback PTY path ([`crate::pty_ipc`]) so both loopback exec
 /// entry points apply the identical confinement floor.
 pub(crate) fn loopback_execution_allowance() -> Allowance {
-    Policy::default_path()
-        .and_then(|path| Policy::load(path).ok())
-        .unwrap_or_default()
-        .execution_allowance()
+    crate::policy::resolve_policy_for_enforcement("exec_ipc.floor").execution_allowance()
 }
 
 /// Build the confined [`RunSpec`] for a loopback batch exec from `params` and the
@@ -836,6 +833,7 @@ async fn run_loopback_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mx_agent_policy::Policy;
     use mx_agent_protocol::id::{validate, IdKind};
 
     fn params(command: &[&str]) -> ExecStartParams {

@@ -473,9 +473,7 @@ pub fn verifying_key_from_agent_state(agent: &AgentState) -> Result<VerifyingKey
 }
 
 fn policy_for_live_call() -> Policy {
-    Policy::default_path()
-        .and_then(|path| Policy::load(path).ok())
-        .unwrap_or_default()
+    crate::policy::resolve_policy_for_enforcement("call.authorize")
 }
 
 fn response_to_outcome(response: CallResponse) -> CallOutcome {
