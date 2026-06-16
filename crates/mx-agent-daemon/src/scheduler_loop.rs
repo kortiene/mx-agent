@@ -399,9 +399,7 @@ fn scheduler_pass(
     // store is also the authority anchoring approval-decision verification (issue
     // #309), so it is read here and threaded into both the per-room decision
     // verification and each agent's orchestrator.
-    let policy = Policy::default_path()
-        .and_then(|path| Policy::load(path).ok())
-        .unwrap_or_default();
+    let policy = crate::policy::resolve_policy_for_enforcement("scheduler.pass");
     let trust = TrustStore::load(paths).unwrap_or_default();
 
     // The on-disk approval queue is daemon-global. Load it once per pass behind a
@@ -955,21 +953,12 @@ mod tests {
     const PLANNER: &str = "@planner:server";
     const ROOM: &str = "!room:server";
 
-    /// Serializes tests that mutate the process-global `MX_AGENT_CONFIG_DIR`
-    /// env var so they cannot race each other (env vars are process-wide).
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
     /// Points [`AuditLog::default_path`] at a private per-test tempdir by setting
     /// `MX_AGENT_CONFIG_DIR`, so the scheduler-orchestrator audit tests resolve
     /// their audit log into the tempdir instead of touching the real
-    /// `~/.config/mx-agent/audit.log` (test isolation, issue #266). The env lock
-    /// is held for the lifetime of the guard so a parallel test cannot observe a
-    /// half-set value.
+    /// `~/.config/mx-agent/audit.log` (test isolation, issue #266). The crate-level
+    /// env lock ([`crate::tests::config_dir_env_lock`]) is held for the lifetime of
+    /// the guard so no other test module can observe a half-set value.
     struct ConfigDirGuard {
         dir: std::path::PathBuf,
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -977,7 +966,7 @@ mod tests {
 
     impl ConfigDirGuard {
         fn new(tag: &str) -> Self {
-            let guard = env_lock();
+            let guard = crate::tests::config_dir_env_lock();
             let dir =
                 std::env::temp_dir().join(format!("mx-agent-sched-{}-{}", tag, std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);

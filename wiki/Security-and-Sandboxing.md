@@ -102,6 +102,8 @@ This means a remote agent cannot exfiltrate your cloud or model-provider credent
 
 A complete, fully-commented `policy.toml`. Place it at `~/.config/mx-agent/policy.toml` (override the config dir with `MX_AGENT_CONFIG_DIR`) and set it to mode `0600`. The engine is **deny-by-default**: anything not explicitly allowed is denied — the local CLI exits with code `128` today (a dedicated `126` for policy denial is planned; see `docs/architecture.md §5.3`).
 
+> **Absent vs. malformed.** An *absent* `policy.toml` is the intended deny-all default and the daemon starts silently. A *present-but-malformed* one (unreadable, bad TOML, or failing validation) **fails loudly** instead of silently degrading to deny-all: the daemon refuses to start with a non-zero exit and a precise diagnostic, and `mx-agent daemon status` reports `policy: MALFORMED — authorizing nothing (deny-all) until fixed`. Authorization stays fail-closed throughout; only the signal is added (issue #350).
+
 ```toml
 # ~/.config/mx-agent/policy.toml
 #

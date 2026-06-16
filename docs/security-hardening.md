@@ -75,6 +75,19 @@ own host — but with no `policy.toml` it still runs under the fail-closed
 confinement floor: no sandbox override, network denied, only the 13 benign env
 vars (secrets scrubbed), and a default timeout/output cap (issue #307).
 
+A *missing* policy is the intended deny-all default; a **malformed** one is not.
+A `policy.toml` that is present but unreadable, unparseable, or fails validation
+no longer silently degrades to deny-all — that was indistinguishable from "policy
+applied and everything denied." The daemon now **refuses to start** with a
+non-zero exit and a precise diagnostic (file path, the parse/validation failure,
+and the dotted field path), `mx-agent daemon status` reports a prominent
+`policy: MALFORMED — authorizing nothing (deny-all) until fixed` block (with the
+file and error; the `--json` output carries a `policy` object), and a file broken
+*after* startup logs an `error` at each authorization. Authorization stays
+fail-closed throughout (a malformed policy still permits nothing); only the
+signal is added. There is deliberately no env-var opt-out to "start anyway" — that
+would re-create the silent footgun (issue #350).
+
 ## Workspace power levels (state-write integrity)
 
 A workspace room is born with an explicit Matrix `m.room.power_levels`:
@@ -398,6 +411,12 @@ Policy lives in `policy.toml`, resolved in this order:
 2. `${XDG_CONFIG_HOME}/mx-agent/policy.toml`
 3. `~/.config/mx-agent/policy.toml`
 
+If that file is **absent**, the deny-all default applies silently. If it is
+**present but malformed** (unreadable, bad TOML, or failing validation), the
+daemon refuses to start and `daemon status` flags it — it never silently
+deny-alls without a signal (issue #350; see "the single most important fact"
+above).
+
 The engine is a pure deny-by-default function. Every field defaults to
 empty / `false` / `None`, and an **empty allowlist permits nothing** (it is not
 a wildcard). For a raw `exec` to run, *all* of these must hold: the room is
@@ -615,6 +634,7 @@ the rest of the daemon's private state.
 ## Hardening checklist
 
 - [ ] No `policy.toml` until you intend to allow execution (default = deny all).
+- [ ] After editing `policy.toml`, verify it is valid before starting the daemon: `mx-agent daemon start` (or `daemon status` if already running) will report `policy: MALFORMED …` and exit non-zero if the file is present but broken; a parse error includes the TOML line/column, a validation error includes the dotted field path (issue #350).
 - [ ] Each room left `trusted = false` unless you actively use it.
 - [ ] `allow_commands` lists specific tools, never shells/interpreters.
 - [ ] `allow_cwd` scoped to a project tree, never `/` or `$HOME`.

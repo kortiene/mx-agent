@@ -2038,6 +2038,23 @@ Policy recommendations:
 - Apply network deny-by-default for remote execution.
 - Enforce output and runtime caps.
 
+**Absent vs. malformed policy (issue #350).** The daemon distinguishes a
+*missing* `policy.toml` from a *present-but-unusable* one. A missing file is the
+intended deny-all default and is silent (the daemon must run before login, before
+any policy exists). A present file that cannot be read, does not parse, or fails
+validation is an operator misconfiguration and **fails loudly**: every
+enforcement site resolves policy through one daemon helper
+(`mx_agent_daemon::resolve_policy_for_enforcement`, which logs an `error` once per
+load on a malformed file), `run_foreground` refuses to start with a non-zero exit
+and a precise diagnostic (path + the parse/validation error + dotted field path),
+`start_background` pre-checks the same so the operator sees it immediately rather
+than after the readiness timeout, and `daemon.status` re-resolves the policy and
+reports an additive, optional `policy` block (`{ state, path, error }`, omitted
+when healthy/absent) when it is malformed. Authorization is unchanged in every
+case — a malformed policy still authorizes nothing
+(fail-closed); only the *signal* is added. There is intentionally no opt-out to
+start with a broken policy.
+
 ### 13.4 Environment Scrubbing
 
 Child process environment should be allowlist-based.

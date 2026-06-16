@@ -110,6 +110,11 @@ pub struct RunningStatus {
     /// Matrix sync-loop health, if the sync loop is running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncHealth>,
+    /// Operator-policy health. Present only when the policy file is unusable
+    /// (malformed); omitted for a healthy or absent policy, keeping the payload
+    /// backward-compatible (issue #350).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::policy::PolicyStatus>,
 }
 
 impl RunningStatus {
@@ -200,6 +205,9 @@ pub fn status() -> io::Result<Option<RunningStatus>> {
         // The on-disk status file does not carry live sync health; the live
         // value is obtained from the running daemon over IPC.
         sync: None,
+        // Likewise, policy health is resolved fresh on the live IPC path (which
+        // the CLI prefers); the on-disk fallback has no live view (issue #350).
+        policy: None,
     }))
 }
 
@@ -209,6 +217,30 @@ pub fn status() -> io::Result<Option<RunningStatus>> {
 pub fn run_foreground() -> io::Result<()> {
     let paths = Paths::resolve();
     paths.ensure_runtime_dir()?;
+
+    // Refuse to start on a present-but-unusable policy (issue #350). An absent
+    // policy is the intended deny-all default and starts normally; a malformed
+    // one would otherwise deny everything silently the moment a request arrives.
+    // This gate is authoritative — it also covers a direct `daemon start
+    // --foreground` and a TOCTOU edit between the `start_background` pre-check and
+    // this spawn. Policy is independent of the Matrix session, so the gate runs
+    // unconditionally (even before login).
+    if let crate::policy::PolicyResolution::Malformed {
+        path,
+        display: detail,
+    } = crate::policy::resolve_policy()
+    {
+        tracing::error!(
+            path = %path.display(),
+            error = %detail,
+            "refusing to start: policy file is present but unusable; fix or remove it"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed policy {}: {detail}", path.display()),
+        ));
+    }
+
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
 
     // Bind the IPC socket before announcing readiness. The guard unlinks the
@@ -676,6 +708,11 @@ fn dispatch(
                 .health()
                 .as_ref()
                 .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone());
+            // Re-resolve the policy fresh so a file broken *after* startup is
+            // surfaced persistently here; healthy/absent policies report nothing
+            // (issue #350). `daemon.status` is operator-initiated and
+            // low-frequency, so re-reading the file on demand is cheap.
+            let policy = crate::policy::resolve_policy().status();
             let status = RunningStatus {
                 running: true,
                 pid,
@@ -683,6 +720,7 @@ fn dispatch(
                 socket_path: socket_path.to_string(),
                 version: DAEMON_VERSION.to_string(),
                 sync,
+                policy,
             };
             match serde_json::to_value(&status) {
                 Ok(value) => Response::result(req.id.clone(), value),
@@ -1438,6 +1476,19 @@ pub fn start_background() -> io::Result<RunningStatus> {
     // Fail fast (before spawning) if the runtime directory is unsafe.
     mx_agent_ipc::ensure_safe_parent_dir(&paths.runtime_dir)?;
 
+    // Refuse before spawning on a present-but-unusable policy, so the operator
+    // gets the precise diagnostic immediately instead of the generic 5s
+    // readiness timeout (issue #350). The `run_foreground` gate remains the
+    // authoritative check; this is a UX nicety for a precise immediate error.
+    if let crate::policy::PolicyResolution::Malformed { path, display } =
+        crate::policy::resolve_policy()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed policy {}: {display}", path.display()),
+        ));
+    }
+
     let exe = std::env::current_exe()?;
     let log = open_log_file(&paths.log_file)?;
     let log_err = log.try_clone()?;
@@ -1913,5 +1964,212 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // ── Policy-aware lifecycle tests (issue #350) ─────────────────────────────
+    //
+    // Tests that set MX_AGENT_CONFIG_DIR hold the crate-level
+    // `crate::tests::config_dir_env_lock` AFTER the module-local `env_lock` (via
+    // TempRuntime), so they are serialized against each other and against the
+    // `policy` and `scheduler_loop` module tests. TempRuntime always takes
+    // env_lock first; acquiring config_dir_env_lock second is consistent and
+    // deadlock-free.
+
+    /// RAII guard that points MX_AGENT_CONFIG_DIR at a temp dir and cleans up.
+    struct PolicySetup {
+        config_dir: std::path::PathBuf,
+        _config_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl PolicySetup {
+        fn new_malformed(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let lock = crate::tests::config_dir_env_lock();
+            let dir = std::env::temp_dir().join(format!(
+                "mx-agent-lc-policy-{}-{}-{}",
+                tag,
+                std::process::id(),
+                n
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("policy.toml"), "not valid toml !! [[[").unwrap();
+            std::env::set_var(mx_agent_policy::ENV_CONFIG_DIR, &dir);
+            Self {
+                config_dir: dir,
+                _config_lock: lock,
+            }
+        }
+
+        fn new_absent(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let lock = crate::tests::config_dir_env_lock();
+            let dir = std::env::temp_dir().join(format!(
+                "mx-agent-lc-policy-absent-{}-{}-{}",
+                tag,
+                std::process::id(),
+                n
+            ));
+            // Dir does not exist → policy.toml cannot exist → Absent.
+            std::env::set_var(mx_agent_policy::ENV_CONFIG_DIR, &dir);
+            Self {
+                config_dir: dir,
+                _config_lock: lock,
+            }
+        }
+    }
+
+    impl Drop for PolicySetup {
+        fn drop(&mut self) {
+            std::env::remove_var(mx_agent_policy::ENV_CONFIG_DIR);
+            let _ = fs::remove_dir_all(&self.config_dir);
+        }
+    }
+
+    /// `run_foreground` must refuse to start (Err(InvalidData)) when the policy
+    /// file is present but unparseable. The gate fires before socket binding so
+    /// the function returns without side effects (issue #350).
+    #[test]
+    fn run_foreground_refuses_malformed_policy() {
+        let _rt = TempRuntime::new("fg-malformed");
+        let _policy = PolicySetup::new_malformed("fg");
+        let err = run_foreground().expect_err("run_foreground must refuse a malformed policy");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "must be InvalidData, got {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("malformed policy"),
+            "error must name the malformed state: {msg}"
+        );
+    }
+
+    // No separate test for run_foreground on absent policy: the full event loop
+    // is impractical in a unit test. The absent-policy path is covered by the
+    // daemon.status dispatch tests below, which use resolve_policy() directly.
+
+    /// The `daemon.status` IPC handler must populate `RunningStatus.policy` with
+    /// a `PolicyStatus` when the policy file is present but malformed. This is
+    /// the persistent runtime warning surface (issue #350).
+    #[test]
+    fn daemon_status_dispatch_policy_populated_when_malformed() {
+        let _rt = TempRuntime::new("status-malformed-policy");
+        let _policy = PolicySetup::new_malformed("dispatch");
+        let req = Request::new(serde_json::json!(1), "daemon.status", serde_json::json!({}));
+        let response = dispatch(
+            &req,
+            1,
+            now_unix(),
+            "/tmp/daemon.sock",
+            &test_supervisor(),
+            None,
+        );
+        let result = response
+            .result
+            .expect("daemon.status must succeed even when policy is malformed");
+        let running: RunningStatus = serde_json::from_value(result).unwrap();
+        let policy_status = running
+            .policy
+            .expect("daemon.status must include policy field when malformed");
+        assert_eq!(
+            policy_status.state,
+            crate::policy::POLICY_STATE_MALFORMED,
+            "state must be the canonical malformed string"
+        );
+        assert!(!policy_status.path.is_empty(), "path must be set");
+        assert!(
+            !policy_status.error.is_empty(),
+            "error must carry the diagnostic"
+        );
+    }
+
+    /// The `daemon.status` IPC handler must omit `RunningStatus.policy` when the
+    /// policy file is absent (deny-all default). The JSON output must not contain
+    /// the `policy` key so that older consumers remain unaffected (issue #350).
+    #[test]
+    fn daemon_status_dispatch_policy_absent_when_no_policy() {
+        let _rt = TempRuntime::new("status-absent-policy");
+        let _policy = PolicySetup::new_absent("dispatch-absent");
+        let req = Request::new(serde_json::json!(1), "daemon.status", serde_json::json!({}));
+        let response = dispatch(
+            &req,
+            1,
+            now_unix(),
+            "/tmp/daemon.sock",
+            &test_supervisor(),
+            None,
+        );
+        let result = response
+            .result
+            .expect("daemon.status must succeed when policy is absent");
+        let running: RunningStatus = serde_json::from_value(result).unwrap();
+        assert!(
+            running.policy.is_none(),
+            "daemon.status must omit policy when absent"
+        );
+        let json = running.to_json();
+        assert!(
+            !json.contains("\"policy\""),
+            "JSON must not contain policy key when absent: {json}"
+        );
+    }
+
+    /// `RunningStatus::to_json()` must include the `policy` object when it is
+    /// `Some`, so `--json` consumers can detect and surface a malformed policy
+    /// programmatically (issue #350).
+    #[test]
+    fn running_status_to_json_includes_policy_when_set() {
+        let status = RunningStatus {
+            running: true,
+            pid: 1234,
+            uptime_seconds: 60,
+            socket_path: "/tmp/daemon.sock".to_string(),
+            version: DAEMON_VERSION.to_string(),
+            sync: None,
+            policy: Some(crate::policy::PolicyStatus {
+                state: crate::policy::POLICY_STATE_MALFORMED.to_string(),
+                path: "/home/user/.config/mx-agent/policy.toml".to_string(),
+                error: "failed to parse policy: expected key at line 1 col 1".to_string(),
+            }),
+        };
+        let json = status.to_json();
+        assert!(
+            json.contains("\"policy\""),
+            "JSON must include policy key: {json}"
+        );
+        assert!(
+            json.contains(crate::policy::POLICY_STATE_MALFORMED),
+            "JSON must include the state value: {json}"
+        );
+        assert!(
+            json.contains("policy.toml"),
+            "JSON must include the file path: {json}"
+        );
+    }
+
+    /// `RunningStatus::to_json()` must NOT include the `policy` key when it is
+    /// `None`, keeping the status payload backward-compatible for healthy daemons
+    /// and older CLI consumers (issue #350).
+    #[test]
+    fn running_status_to_json_omits_policy_when_none() {
+        let status = RunningStatus {
+            running: true,
+            pid: 1234,
+            uptime_seconds: 60,
+            socket_path: "/tmp/daemon.sock".to_string(),
+            version: DAEMON_VERSION.to_string(),
+            sync: None,
+            policy: None,
+        };
+        let json = status.to_json();
+        assert!(
+            !json.contains("\"policy\""),
+            "JSON must not contain policy key when None: {json}"
+        );
     }
 }

@@ -35,7 +35,7 @@ use ed25519_dalek::VerifyingKey;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::{Client, Room};
-use mx_agent_policy::{Allowance, NetworkPolicy, Policy, Sandbox};
+use mx_agent_policy::{Allowance, NetworkPolicy, Sandbox};
 use mx_agent_protocol::events::timeline::{APPROVAL_DECISION, APPROVAL_REQUEST};
 use mx_agent_protocol::id::generate_request_id;
 use mx_agent_protocol::schema::{ApprovalDecision, ApprovalRequest, CallRequest, ExecRequest};
@@ -988,9 +988,7 @@ pub(crate) async fn handle_live_approval_decision(
         }
     }
     let trust = TrustStore::load(paths).unwrap_or_default();
-    let policy = Policy::default_path()
-        .and_then(|path| Policy::load(path).ok())
-        .unwrap_or_default();
+    let policy = crate::policy::resolve_policy_for_enforcement("approval.decision");
     let approvers: BTreeSet<String> = policy
         .rooms
         .get(&meta.room_id)

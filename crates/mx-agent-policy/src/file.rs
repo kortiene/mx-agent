@@ -289,6 +289,30 @@ impl Policy {
         Self::parse(&input)
     }
 
+    /// Load a policy only if the file exists.
+    ///
+    /// Returns `Ok(None)` when the file is **absent** (the deny-all default
+    /// applies — this is the correct, silent fallback), `Ok(Some(policy))` when
+    /// the file is present and valid, and `Err(PolicyError)` when the file is
+    /// present but cannot be read, parsed, or validated. This lets callers fail
+    /// loudly on a malformed policy while still treating a missing file as the
+    /// intended deny-all default (issue #350).
+    ///
+    /// A file that exists but is unreadable (e.g. permission denied) is **not**
+    /// "absent" — it is an unusable, present file, so it returns `Err`. Only a
+    /// genuine `NotFound` returns `Ok(None)`.
+    pub fn load_optional(path: impl AsRef<Path>) -> Result<Option<Self>, PolicyError> {
+        let path = path.as_ref();
+        match std::fs::read_to_string(path) {
+            Ok(input) => Self::parse(&input).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PolicyError::Io {
+                path: path.to_path_buf(),
+                source: e.to_string(),
+            }),
+        }
+    }
+
     /// Apply semantic validation rules, returning the first violation with a
     /// precise dotted path.
     pub fn validate(&self) -> Result<(), PolicyError> {
@@ -744,6 +768,100 @@ sandbox = \"firejail\"
                 );
             }
             other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    // ── load_optional: absent vs. present-but-broken (issue #350) ────────────
+
+    fn unique_tmp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: std::sync::atomic::AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "mx-agent-policy-{}-{}-{}",
+            label,
+            std::process::id(),
+            n
+        ))
+    }
+
+    #[test]
+    fn load_optional_absent_file_returns_ok_none() {
+        // A path that does not exist must return Ok(None) — the silent deny-all
+        // default (absent is fine, issue #350).
+        let path = unique_tmp_dir("absent").join("policy.toml");
+        let result = Policy::load_optional(&path);
+        assert!(
+            result.unwrap().is_none(),
+            "absent policy file must return Ok(None)"
+        );
+    }
+
+    #[test]
+    fn load_optional_valid_file_returns_ok_some() {
+        // A present, well-formed file must return Ok(Some(policy)).
+        let dir = unique_tmp_dir("valid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(&path, "[execution]\nnetwork = \"deny\"\n").unwrap();
+        let result = Policy::load_optional(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let policy = result
+            .expect("valid file must return Ok")
+            .expect("valid file must return Some");
+        assert_eq!(policy.execution.network, Some(NetworkPolicy::Deny));
+    }
+
+    #[test]
+    fn load_optional_malformed_toml_returns_err_parse() {
+        // A present file with broken TOML must return Err(Parse) — not Ok(None).
+        // This is the "fail loudly" case for issue #350.
+        let dir = unique_tmp_dir("malformed-toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(&path, "this is not valid toml !! [[[").unwrap();
+        let result = Policy::load_optional(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        match result.expect_err("malformed TOML must return Err") {
+            PolicyError::Parse(_) => {}
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_optional_invalid_policy_returns_err_validation() {
+        // A present file that is syntactically valid TOML but fails semantic
+        // validation (e.g. bad room id) must return Err(Validation), not Ok(None).
+        let dir = unique_tmp_dir("invalid-policy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(&path, "[rooms.\"not-a-room\"]\ntrusted = true\n").unwrap();
+        let result = Policy::load_optional(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        match result.expect_err("invalid policy must return Err") {
+            PolicyError::Validation { .. } => {}
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_optional_unreadable_file_returns_err_io() {
+        // A present file that cannot be read (permission denied) must return
+        // Err(Io) — it is present but unusable, not absent.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_tmp_dir("unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(&path, "[execution]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = Policy::load_optional(&path);
+        // Restore permissions before cleanup.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(&dir);
+        match result.expect_err("unreadable file must return Err") {
+            PolicyError::Io { .. } => {}
+            other => panic!("expected Io error, got {other:?}"),
         }
     }
 }

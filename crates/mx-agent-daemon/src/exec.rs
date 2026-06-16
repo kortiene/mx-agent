@@ -1457,9 +1457,7 @@ async fn authorize_live_exec(
     let verifying_key = crate::call::verifying_key_from_agent_state(&requester)
         .map_err(|_| ExecRejection::InvalidSignature)?;
     let trust = TrustStore::load(paths).unwrap_or_default();
-    let policy = Policy::default_path()
-        .and_then(|path| Policy::load(path).ok())
-        .unwrap_or_default();
+    let policy = crate::policy::resolve_policy_for_enforcement("exec.authorize");
     let (request, allowance) = authorize_exec_request_with_allowance(
         content,
         &verifying_key,

@@ -32,7 +32,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use mx_agent_policy::Policy;
 use mx_agent_protocol::id::{generate_invocation_id, generate_request_id};
 
 use crate::tool_exec::{execute_tool, ToolError};
@@ -130,10 +129,8 @@ pub fn start_call_loopback(params: &CallStartParams) -> CallStartResult {
     // and, crucially, the env allowlist that scrubs the daemon's secrets) the
     // same way the live `call` path loads policy, falling back to the safe
     // defaults when no policy file is present.
-    let allowance = Policy::default_path()
-        .and_then(|path| Policy::load(path).ok())
-        .unwrap_or_default()
-        .execution_allowance();
+    let allowance =
+        crate::policy::resolve_policy_for_enforcement("call_ipc.floor").execution_allowance();
     run_loopback_with(params, allowance, execute_tool)
 }
 

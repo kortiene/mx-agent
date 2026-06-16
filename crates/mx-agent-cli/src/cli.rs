@@ -3764,6 +3764,15 @@ fn daemon_status(global: &GlobalArgs) -> ExitCode {
                 println!("  uptime:  {}s", running.uptime_seconds);
                 println!("  socket:  {}", running.socket_path);
                 println!("  version: {}", running.version);
+                if let Some(policy) = &running.policy {
+                    // Surface a malformed policy prominently rather than burying
+                    // it: the daemon is authorizing nothing (deny-all) until the
+                    // file is fixed, mirroring the `sync: STOPPED` treatment
+                    // (issue #350).
+                    println!("  policy:  MALFORMED — authorizing nothing (deny-all) until fixed");
+                    println!("    file:  {}", policy.path);
+                    println!("    error: {}", policy.error);
+                }
                 if let Some(sync) = &running.sync {
                     // Surface a dead/degraded sync loop prominently rather than
                     // burying it: a Stopped loop means the daemon is no longer
