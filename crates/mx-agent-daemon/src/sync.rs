@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
 use serde::{Deserialize, Serialize};
 
 use crate::event_router::{
@@ -67,6 +68,12 @@ pub struct SyncHealth {
     /// Human-readable description of the most recent error, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// When the most recent failure was a homeserver rate limit (HTTP 429 /
+    /// `M_LIMIT_EXCEEDED`), the backoff the loop is honoring, in whole seconds;
+    /// `None` otherwise. Lets `daemon status` distinguish a server-directed
+    /// rate-limit pause from a generic transient failure (issue #351).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited_secs: Option<u64>,
     /// Whether the loop resumed from a persisted sync token.
     pub resumed_from_token: bool,
 }
@@ -80,6 +87,7 @@ impl SyncHealth {
             consecutive_failures: 0,
             last_success_unix: None,
             last_error: None,
+            rate_limited_secs: None,
             resumed_from_token,
         }
     }
@@ -91,6 +99,7 @@ impl SyncHealth {
         self.consecutive_failures = 0;
         self.last_success_unix = Some(now);
         self.last_error = None;
+        self.rate_limited_secs = None;
     }
 
     /// Record a transient failure that will be retried.
@@ -98,12 +107,32 @@ impl SyncHealth {
         self.state = SyncState::Degraded;
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_error = Some(error.into());
+        // A generic transient supersedes any earlier rate-limit pause.
+        self.rate_limited_secs = None;
+    }
+
+    /// Record a homeserver rate-limit (HTTP 429) that the loop will retry after
+    /// honoring a server-directed (or backoff-derived) `delay`.
+    ///
+    /// Keeps the coarse state [`SyncState::Degraded`] — the loop is alive and
+    /// retrying, not stopped — but records the honored wait in
+    /// [`SyncHealth::rate_limited_secs`] and a clear `last_error`, so an operator
+    /// reading `daemon status` sees *why* sync is paused (issue #351). The
+    /// snapshot stays token-free: only the duration and a fixed message are
+    /// recorded.
+    pub fn record_rate_limited(&mut self, delay: Duration) {
+        self.state = SyncState::Degraded;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let secs = delay.as_secs();
+        self.rate_limited_secs = Some(secs);
+        self.last_error = Some(format!("rate limited by homeserver; retrying in {secs}s"));
     }
 
     /// Record a fatal failure that stops the loop.
     pub fn record_fatal(&mut self, error: impl Into<String>) {
         self.state = SyncState::Stopped;
         self.last_error = Some(error.into());
+        self.rate_limited_secs = None;
     }
 
     /// Mark the loop as cleanly stopped (e.g. shutdown requested).
@@ -126,6 +155,13 @@ pub struct BackoffConfig {
     pub max: Duration,
     /// Multiplier applied per consecutive failure.
     pub factor: u32,
+    /// Ceiling on a server-directed `Retry-After` honored after a homeserver
+    /// rate limit (HTTP 429). A hostile or misconfigured homeserver cannot wedge
+    /// the sync loop offline for an unbounded time with a giant `retry_after_ms`
+    /// or a far-future HTTP-date: the honored delay is clamped to this value
+    /// (issue #351). This caps a *single* wait, not the total number of retries,
+    /// so a long-lived daemon keeps retrying.
+    pub rate_limit_ceiling: Duration,
 }
 
 impl Default for BackoffConfig {
@@ -134,6 +170,7 @@ impl Default for BackoffConfig {
             base: Duration::from_secs(1),
             max: Duration::from_secs(60),
             factor: 2,
+            rate_limit_ceiling: Duration::from_secs(300),
         }
     }
 }
@@ -177,6 +214,14 @@ impl Backoff {
 pub enum StepError {
     /// A transient error; the loop should back off and retry.
     Transient(String),
+    /// A homeserver rate-limit (HTTP 429 / `M_LIMIT_EXCEEDED`). `retry_after` is
+    /// the server-directed wait (already clamped to the configured ceiling) when
+    /// one was supplied; `None` falls back to the exponential backoff schedule.
+    RateLimited {
+        /// The clamped, server-directed retry delay, if the homeserver supplied
+        /// one; `None` means fall back to the exponential backoff floor.
+        retry_after: Option<Duration>,
+    },
     /// A fatal error (e.g. an invalid token); the loop should stop.
     Fatal(String),
 }
@@ -241,6 +286,24 @@ where
                     h.record_failure(msg);
                 }
                 let delay = backoff.next_delay();
+                sleep_interruptible(delay, &running).await;
+            }
+            Err(StepError::RateLimited { retry_after }) => {
+                // Advance the exponential schedule so *repeated* rate limits
+                // ratchet up rather than hammering at exactly the server minimum,
+                // but never wait less than the homeserver asked for. When the
+                // server gave no usable delay, fall back to the backoff floor.
+                let floor = backoff.next_delay();
+                let delay = retry_after.map_or(floor, |after| after.max(floor));
+                tracing::warn!(
+                    delay_secs = delay.as_secs(),
+                    server_directed = retry_after.is_some(),
+                    "rate limited by homeserver; backing off"
+                );
+                {
+                    let mut h = health.lock().unwrap_or_else(|e| e.into_inner());
+                    h.record_rate_limited(delay);
+                }
                 sleep_interruptible(delay, &running).await;
             }
             Err(StepError::Fatal(msg)) => {
@@ -317,6 +380,9 @@ pub async fn run_matrix_sync_with_subscribers(
         }
     };
 
+    // Captured by the step so the 429 classifier clamps the honored
+    // `Retry-After` to the same ceiling the loop's backoff uses.
+    let rate_limit_ceiling = backoff_config.rate_limit_ceiling;
     run_sync_loop(paths, health, backoff_config, running, move |token| {
         let router = router.clone();
         let subscribers = subscribers.clone();
@@ -348,8 +414,15 @@ pub async fn run_matrix_sync_with_subscribers(
                     Ok(response.next_batch)
                 }
                 Err(e) => {
+                    // Classify in order: fatal (re-auth) → rate-limited (429,
+                    // honor Retry-After) → generic transient (blind backoff).
                     if is_fatal_sync_error(&e) {
                         Err(StepError::Fatal(e.to_string()))
+                    } else if is_rate_limit_error(&e) {
+                        let retry_after = e.client_api_error_kind().and_then(|kind| {
+                            rate_limit_retry_after(kind, SystemTime::now(), rate_limit_ceiling)
+                        });
+                        Err(StepError::RateLimited { retry_after })
                     } else {
                         Err(StepError::Transient(e.to_string()))
                     }
@@ -661,11 +734,58 @@ async fn verify_forwarded_event(
 /// Classify a Matrix sync error: an unknown/missing access token is fatal
 /// (re-auth required); everything else is treated as transient.
 pub(crate) fn is_fatal_sync_error(error: &matrix_sdk::Error) -> bool {
-    use matrix_sdk::ruma::api::error::ErrorKind;
     matches!(
         error.client_api_error_kind(),
         Some(ErrorKind::UnknownToken(_)) | Some(ErrorKind::MissingToken)
     )
+}
+
+/// Whether a Matrix sync error is a homeserver rate limit (HTTP 429 /
+/// `M_LIMIT_EXCEEDED`).
+///
+/// The step closure branches on this alongside [`is_fatal_sync_error`] so a
+/// rate limit becomes a [`StepError::RateLimited`] (honoring `Retry-After`)
+/// rather than a blindly-backed-off [`StepError::Transient`] (issue #351).
+pub(crate) fn is_rate_limit_error(error: &matrix_sdk::Error) -> bool {
+    matches!(
+        error.client_api_error_kind(),
+        Some(ErrorKind::LimitExceeded(_))
+    )
+}
+
+/// Extract a server-directed retry delay from a rate-limit [`ErrorKind`],
+/// clamped to `[Duration::ZERO, ceiling]`.
+///
+/// Returns `None` when `kind` is not a rate limit or carries no usable delay, in
+/// which case the caller falls back to the exponential backoff schedule. The
+/// `now` parameter is passed in (rather than read internally) so the HTTP-date
+/// (`DateTime`) form is deterministically testable.
+///
+/// - [`RetryAfter::Delay`] → `Some(delay.min(ceiling))`.
+/// - [`RetryAfter::DateTime`] → `Some((instant - now).min(ceiling))`, with a
+///   past instant collapsing to `Duration::ZERO`.
+/// - Any other kind, or `retry_after == None` → `None`.
+///
+/// Clamping to `ceiling` is a DoS guard: a hostile or misconfigured homeserver
+/// cannot pin the sync loop offline with a giant `retry_after_ms` or a far-future
+/// HTTP-date (issue #351).
+pub(crate) fn rate_limit_retry_after(
+    kind: &ErrorKind,
+    now: SystemTime,
+    ceiling: Duration,
+) -> Option<Duration> {
+    let ErrorKind::LimitExceeded(data) = kind else {
+        return None;
+    };
+    match data.retry_after? {
+        RetryAfter::Delay(delay) => Some(delay.min(ceiling)),
+        RetryAfter::DateTime(instant) => Some(
+            instant
+                .duration_since(now)
+                .unwrap_or(Duration::ZERO)
+                .min(ceiling),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -714,6 +834,7 @@ mod tests {
             base: Duration::from_millis(1),
             max: Duration::from_millis(4),
             factor: 2,
+            rate_limit_ceiling: Duration::from_millis(50),
         }
     }
 
@@ -723,6 +844,7 @@ mod tests {
             base: Duration::from_millis(100),
             max: Duration::from_millis(500),
             factor: 2,
+            rate_limit_ceiling: Duration::from_secs(300),
         });
         assert_eq!(b.next_delay(), Duration::from_millis(100));
         assert_eq!(b.next_delay(), Duration::from_millis(200));
@@ -948,5 +1070,316 @@ mod tests {
             h.last_error.is_some(),
             "the save error must be recorded for status"
         );
+    }
+
+    // ---- Rate-limit (HTTP 429 / Retry-After) handling, issue #351 ----
+
+    /// Build an `M_LIMIT_EXCEEDED` error kind with the given `Retry-After`.
+    ///
+    /// `LimitExceededErrorData` is `#[non_exhaustive]`, so it is built via its
+    /// constructor and the public field is then set (a struct literal would not
+    /// compile outside ruma).
+    fn limit_exceeded(retry_after: Option<RetryAfter>) -> ErrorKind {
+        use matrix_sdk::ruma::api::error::LimitExceededErrorData;
+        let mut data = LimitExceededErrorData::new();
+        data.retry_after = retry_after;
+        ErrorKind::LimitExceeded(data)
+    }
+
+    #[test]
+    fn rate_limit_retry_after_extracts_and_clamps() {
+        let ceiling = Duration::from_secs(300);
+        let now = SystemTime::now();
+
+        // A `Delay` within the ceiling is honored verbatim.
+        let kind = limit_exceeded(Some(RetryAfter::Delay(Duration::from_secs(5))));
+        assert_eq!(
+            rate_limit_retry_after(&kind, now, ceiling),
+            Some(Duration::from_secs(5))
+        );
+
+        // A `Delay` above the ceiling is clamped (DoS guard).
+        let kind = limit_exceeded(Some(RetryAfter::Delay(Duration::from_secs(10_000))));
+        assert_eq!(rate_limit_retry_after(&kind, now, ceiling), Some(ceiling));
+
+        // A future `DateTime` resolves to (instant - now), within the ceiling.
+        let kind = limit_exceeded(Some(RetryAfter::DateTime(now + Duration::from_secs(7))));
+        assert_eq!(
+            rate_limit_retry_after(&kind, now, ceiling),
+            Some(Duration::from_secs(7))
+        );
+
+        // A far-future `DateTime` is clamped to the ceiling.
+        let kind = limit_exceeded(Some(RetryAfter::DateTime(
+            now + Duration::from_secs(100_000),
+        )));
+        assert_eq!(rate_limit_retry_after(&kind, now, ceiling), Some(ceiling));
+
+        // A past `DateTime` collapses to zero (never negative).
+        let kind = limit_exceeded(Some(RetryAfter::DateTime(now - Duration::from_secs(10))));
+        assert_eq!(
+            rate_limit_retry_after(&kind, now, ceiling),
+            Some(Duration::ZERO)
+        );
+
+        // `LimitExceeded` with no `Retry-After` -> fall back to backoff.
+        assert_eq!(
+            rate_limit_retry_after(&limit_exceeded(None), now, ceiling),
+            None
+        );
+
+        // A non-rate-limit kind is never treated as a rate limit.
+        assert_eq!(
+            rate_limit_retry_after(&ErrorKind::MissingToken, now, ceiling),
+            None
+        );
+    }
+
+    #[test]
+    fn record_rate_limited_sets_and_clears() {
+        let mut h = SyncHealth::initializing(false);
+        h.record_rate_limited(Duration::from_secs(12));
+        // Stays Degraded (alive, retrying) but surfaces *why* sync is paused.
+        assert_eq!(h.state, SyncState::Degraded);
+        assert_eq!(h.rate_limited_secs, Some(12));
+        assert_eq!(h.consecutive_failures, 1);
+        assert!(h
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("rate limited")));
+
+        let json = h.to_json();
+        assert!(json.contains("\"rate_limited_secs\":12"), "json: {json}");
+
+        // A success clears the rate-limit surface (and omits it from JSON).
+        h.record_success(2000);
+        assert_eq!(h.rate_limited_secs, None);
+        assert!(h.last_error.is_none());
+        assert!(
+            !h.to_json().contains("rate_limited_secs"),
+            "cleared field must be omitted"
+        );
+    }
+
+    #[test]
+    fn backoff_default_has_sane_rate_limit_ceiling() {
+        assert_eq!(
+            BackoffConfig::default().rate_limit_ceiling,
+            Duration::from_secs(300)
+        );
+    }
+
+    // A subsequent generic transient failure must clear the rate-limit surface
+    // so `daemon status` does not continue to show "rate limited" after the
+    // homeserver lifts the rate limit and the next failure is unrelated (issue #351).
+    #[test]
+    fn record_failure_clears_rate_limited_secs() {
+        let mut h = SyncHealth::initializing(false);
+        h.record_rate_limited(Duration::from_secs(30));
+        assert_eq!(h.rate_limited_secs, Some(30), "precondition");
+        h.record_failure("network blip");
+        assert_eq!(
+            h.rate_limited_secs, None,
+            "generic transient must supersede an earlier rate-limit pause"
+        );
+        assert!(
+            !h.to_json().contains("rate_limited_secs"),
+            "cleared field must be absent from JSON"
+        );
+    }
+
+    // A fatal failure must also clear the rate-limit surface so a dead loop
+    // does not persist a stale "rate limited" annotation.
+    #[test]
+    fn record_fatal_clears_rate_limited_secs() {
+        let mut h = SyncHealth::initializing(false);
+        h.record_rate_limited(Duration::from_secs(60));
+        assert_eq!(h.rate_limited_secs, Some(60), "precondition");
+        h.record_fatal("token revoked");
+        assert_eq!(
+            h.rate_limited_secs, None,
+            "fatal failure must clear a prior rate-limit annotation"
+        );
+        assert_eq!(h.state, SyncState::Stopped);
+        assert!(
+            !h.to_json().contains("rate_limited_secs"),
+            "cleared field must be absent from JSON after fatal"
+        );
+    }
+
+    // Edge cases for `rate_limit_retry_after`:
+    //   - `Delay(ZERO)` → `Some(ZERO)` (a zero server delay is honored, not filtered)
+    //   - `Delay(ceiling)` exactly → `Some(ceiling)` (boundary: min(ceiling, ceiling))
+    //   - `DateTime(now)` exactly → `Some(ZERO)` (now - now = zero, same as a past instant)
+    #[test]
+    fn rate_limit_retry_after_boundary_edges() {
+        let ceiling = Duration::from_secs(120);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        // A zero server delay is returned as `Some(ZERO)`, not `None`.
+        let kind = limit_exceeded(Some(RetryAfter::Delay(Duration::ZERO)));
+        assert_eq!(
+            rate_limit_retry_after(&kind, now, ceiling),
+            Some(Duration::ZERO),
+            "zero delay must be honored as Some(ZERO)"
+        );
+
+        // A delay exactly at the ceiling is returned verbatim (min(ceiling, ceiling)).
+        let kind = limit_exceeded(Some(RetryAfter::Delay(ceiling)));
+        assert_eq!(
+            rate_limit_retry_after(&kind, now, ceiling),
+            Some(ceiling),
+            "delay exactly at ceiling must not be clamped further"
+        );
+
+        // A `DateTime` exactly at `now` collapses to zero (not negative, not None).
+        let kind = limit_exceeded(Some(RetryAfter::DateTime(now)));
+        assert_eq!(
+            rate_limit_retry_after(&kind, now, ceiling),
+            Some(Duration::ZERO),
+            "DateTime(now) must collapse to ZERO"
+        );
+    }
+
+    // The sync loop advances the exponential floor on each rate-limited step,
+    // so repeated 429s ratchet the wait upward rather than hammering at exactly
+    // the server minimum (issue #351).  This tests the `Backoff` state machine
+    // in isolation using the same `floor = backoff.next_delay(); delay = server.max(floor)`
+    // idiom the loop uses.
+    #[test]
+    fn backoff_floor_ratchets_under_repeated_rate_limits() {
+        let mut b = Backoff::new(BackoffConfig {
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(8),
+            factor: 2,
+            rate_limit_ceiling: Duration::from_secs(300),
+        });
+        // Server sends a very short retry delay (100 ms) — the floor should dominate
+        // on all four attempts, and the floor should double each time.
+        let server = Duration::from_millis(100);
+
+        let floor0 = b.next_delay(); // attempt 0 → 1s
+        assert_eq!(floor0, Duration::from_secs(1));
+        assert_eq!(server.max(floor0), Duration::from_secs(1));
+
+        let floor1 = b.next_delay(); // attempt 1 → 2s (ratcheted)
+        assert_eq!(floor1, Duration::from_secs(2));
+        assert_eq!(server.max(floor1), Duration::from_secs(2));
+
+        let floor2 = b.next_delay(); // attempt 2 → 4s
+        assert_eq!(floor2, Duration::from_secs(4));
+        assert_eq!(server.max(floor2), Duration::from_secs(4));
+
+        let floor3 = b.next_delay(); // attempt 3 → 8s (capped by max)
+        assert_eq!(floor3, Duration::from_secs(8));
+        assert_eq!(server.max(floor3), Duration::from_secs(8));
+
+        // A large server delay supersedes the floor even at the cap.
+        let large_server = Duration::from_secs(50);
+        let floor4 = b.next_delay(); // attempt 4 → still 8s (capped)
+        assert_eq!(floor4, Duration::from_secs(8));
+        assert_eq!(
+            large_server.max(floor4),
+            Duration::from_secs(50),
+            "server delay exceeding the floor must be honored"
+        );
+
+        // After a success the floor resets to base.
+        b.reset();
+        assert_eq!(
+            b.next_delay(),
+            Duration::from_secs(1),
+            "reset must restore base"
+        );
+    }
+
+    // A rate-limited step is honored (not treated as fatal): the loop records
+    // the rate-limited pause and keeps running.
+    #[tokio::test]
+    async fn loop_honors_rate_limit_and_records_health() {
+        let _data = TempData::new("ratelimit");
+        let paths = SessionPaths::resolve();
+        let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+        let running = Arc::new(AtomicBool::new(true));
+        let running_step = running.clone();
+
+        run_sync_loop(
+            &paths,
+            health.clone(),
+            fast_backoff(),
+            running.clone(),
+            move |_token| {
+                let running = running_step.clone();
+                async move {
+                    // Stop after this iteration so the loop exits right after
+                    // honoring the rate limit (record_stopped does not clear the
+                    // rate-limited surface), leaving it observable.
+                    running.store(false, Ordering::SeqCst);
+                    Err::<String, _>(StepError::RateLimited {
+                        retry_after: Some(Duration::from_millis(1)),
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let h = health.lock().unwrap();
+        // It recorded a rate-limit pause (not record_fatal, which clears it).
+        assert_eq!(h.rate_limited_secs, Some(0));
+        assert_eq!(h.consecutive_failures, 1);
+        assert!(h
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("rate limited")));
+    }
+
+    // The loop recovers to Healthy after rate limits, exercising both the
+    // server-directed (`Some`) and fall-back-to-backoff (`None`) paths.
+    #[tokio::test]
+    async fn loop_recovers_after_rate_limit() {
+        let _data = TempData::new("ratelimitrecover");
+        let paths = SessionPaths::resolve();
+        let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+        let running = Arc::new(AtomicBool::new(true));
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_step = counter.clone();
+        let running_step = running.clone();
+
+        run_sync_loop(
+            &paths,
+            health.clone(),
+            fast_backoff(),
+            running.clone(),
+            move |_token| {
+                let counter = counter_step.clone();
+                let running = running_step.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    match n {
+                        0 => Err(StepError::RateLimited {
+                            retry_after: Some(Duration::from_millis(1)),
+                        }),
+                        // No server delay -> falls back to the exponential floor.
+                        1 => Err(StepError::RateLimited { retry_after: None }),
+                        2 => Ok("recovered".to_string()),
+                        _ => {
+                            running.store(false, Ordering::SeqCst);
+                            Ok("final".to_string())
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let h = health.lock().unwrap();
+        // At least one success happened after the rate limits — they were
+        // honored and retried, never treated as fatal. (The loop ends in
+        // `Stopped` via the clean shutdown, as the transient-recovery test
+        // above also relies on, so state is not asserted here.)
+        assert!(h.total_syncs >= 1, "should recover after rate limits");
+        assert!(h.rate_limited_secs.is_none(), "cleared on success");
     }
 }

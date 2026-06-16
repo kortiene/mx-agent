@@ -3781,6 +3781,13 @@ fn daemon_status(global: &GlobalArgs) -> ExitCode {
                         mx_agent_daemon::SyncState::Stopped => {
                             println!("  sync:    STOPPED (unhealthy — re-login + `daemon reload` to resume)");
                         }
+                        mx_agent_daemon::SyncState::Degraded
+                            if sync.rate_limited_secs.is_some() =>
+                        {
+                            // Distinguish a server-directed rate-limit pause from
+                            // a generic transient failure (issue #351).
+                            println!("  sync:    DEGRADED (rate limited by homeserver)");
+                        }
                         mx_agent_daemon::SyncState::Degraded => {
                             println!("  sync:    DEGRADED (retrying)");
                         }
@@ -3789,6 +3796,9 @@ fn daemon_status(global: &GlobalArgs) -> ExitCode {
                     println!("    syncs:    {}", sync.total_syncs);
                     if sync.consecutive_failures > 0 {
                         println!("    failures: {}", sync.consecutive_failures);
+                    }
+                    if let Some(secs) = sync.rate_limited_secs {
+                        println!("    rate-limited: retrying in {secs}s");
                     }
                     if let Some(err) = &sync.last_error {
                         println!("    last err: {err}");

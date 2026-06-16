@@ -206,9 +206,15 @@ mx-agent daemon: running
   version: <VERSION>
   sync:    <STATE>
     syncs:    <COUNT>
-    failures: <COUNT>  (only if > 0)
-    last err: <ERROR>  (only if set)
+    failures: <COUNT>       (only if > 0)
+    rate-limited: <SECS>s  (only when rate-limited by homeserver)
+    last err: <ERROR>       (only if set)
 ```
+
+When the homeserver is actively rate-limiting the `/sync` loop, `<STATE>` is
+`DEGRADED (rate limited by homeserver)` and a `rate-limited: retrying in <N>s`
+line is appended showing the honored `Retry-After` delay. A generic transient
+failure prints `DEGRADED (retrying)` without the `rate-limited` line.
 
 If not running, prints `"mx-agent daemon: not running"`.
 
@@ -222,15 +228,20 @@ With `--json`, emits `{"running":true,"pid":<PID>,"uptime_seconds":<SECONDS>,"so
   "socket_path": "<PATH>",
   "version": "<VERSION>",
   "sync": {
-    "state": "initializing",
+    "state": "degraded",
     "total_syncs": 42,
-    "consecutive_failures": 0,
+    "consecutive_failures": 1,
     "last_success_unix": 1234567890,
-    "last_error": null,
+    "last_error": "rate limited by homeserver; retrying in 30s",
+    "rate_limited_secs": 30,
     "resumed_from_token": true
   }
 }
 ```
+
+`rate_limited_secs` is omitted from the JSON object when the sync loop is not
+currently honoring a homeserver rate limit; it is present only while the loop
+is sleeping through a server-directed `Retry-After` pause (issue #351).
 
 **Exit codes**
 
@@ -252,7 +263,7 @@ mx-agent daemon status; echo $?
 ```
 
 **Notes**
-A stale status file (referencing a dead PID) is automatically removed and treated as "not running". The sync field's `state` in JSON is one of `initializing`, `healthy`, `degraded`, or `stopped` (snake_case). In human-readable output, the state is printed with the PascalCase variant name (e.g., `Initializing`, `Healthy`, `Degraded`, `Stopped`). Scripts can use exit code 3 to distinguish "daemon not running" from "status check error" (exit code 1).
+A stale status file (referencing a dead PID) is automatically removed and treated as "not running". The sync field's `state` in JSON is one of `initializing`, `healthy`, `degraded`, or `stopped` (snake_case). Human-readable output distinguishes two `degraded` sub-states: `DEGRADED (rate limited by homeserver)` when the loop is pausing for a server-directed `Retry-After`, and `DEGRADED (retrying)` for a generic transient failure. The optional `rate_limited_secs` JSON field (omitted when `null`) carries the honored wait in whole seconds, letting scripts distinguish a homeserver-directed pause from an ordinary network blip. Scripts can use exit code 3 to distinguish "daemon not running" from "status check error" (exit code 1).
 
 ---
 

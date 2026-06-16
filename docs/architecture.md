@@ -871,9 +871,19 @@ Trigger conditions:
 
 ```text
 output_bytes > max_timeline_output_bytes
-or events_per_second exceeds homeserver rate limits
 or receiver explicitly requested --artifact-output
 ```
+
+> **Implemented today:** artifact mode triggers on output *size*
+> (`max_timeline_output_bytes`) and on an explicit `--artifact-output` request.
+>
+> **Planned (not yet wired):** switching to artifact mode — or dynamically
+> throttling the stream emitter — in response to *observed* homeserver rate
+> limits. The stream emitter's `max_events_per_second` token bucket is a static,
+> per-invocation cap and does not observe `/sync` 429s. A homeserver rate limit
+> is honored where it actually surfaces: the daemon's `/sync` loop sizes its
+> backoff from the server's `Retry-After` (§11.4). Wiring that live 429 signal
+> into stream throttling / artifact-mode selection is future work (issue #351).
 
 Artifact event:
 
@@ -1695,7 +1705,7 @@ On daemon startup or reconnect:
 | Failure | Expected behavior |
 |---|---|
 | Target agent offline | request remains pending until timeout or is rejected by caller policy |
-| Homeserver rate limit | daemon backs off, chunks less frequently, may switch to artifact mode |
+| Homeserver rate limit | the daemon's `/sync` loop honors the homeserver's `Retry-After` (HTTP 429 / `M_LIMIT_EXCEEDED`) to size its backoff — clamped to a ceiling so a hostile/misconfigured server cannot wedge it, and interruptible so `daemon stop` still wakes promptly; `daemon status` shows the rate-limited pause. matrix-sdk additionally retries individual rate-limited requests (bounded `max_retry_time`) honoring `retry_after_ms`. The per-invocation stream rate cap and large-output artifact offload are **static** and are not driven by sync 429s (see §8.4 future work). |
 | Missing stream chunk | receiver buffers then marks degraded or fails in strict mode |
 | Daemon crashes while child runs | no child supervisor runs between crashes; the live-pgid sidecar lets the restart janitor reap orphaned process groups on next startup or `daemon stop` |
 | Request arrives after expiry | target rejects without execution |
