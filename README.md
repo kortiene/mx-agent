@@ -97,6 +97,7 @@ cargo run -p mx-agent-cli -- --help        # or ./target/release/mx-agent --help
 mx-agent daemon start                 # start detached in the background
 mx-agent daemon status                # human-readable status (exit 3 if not running)
 mx-agent daemon status --json         # pid, uptime, socket path, version as JSON
+mx-agent daemon reload                # reload the stored session; (re)start sync/scheduler/heartbeat without a full restart
 mx-agent daemon stop                  # graceful shutdown (SIGTERM, then SIGKILL)
 ```
 

@@ -513,5 +513,3 @@ scripts/matrix_dev.sh reset   # stop and wipe all homeserver data
 - **Approvals gate privileged work.** When a request requires human sign-off it
   is held until you decide it. Review the queue with `mx-agent approval list`
   and resolve entries with `mx-agent approval approve` / `deny`.
-</content>
-</invoke>
