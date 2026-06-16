@@ -155,12 +155,18 @@ it here before release.
   for auto-executed task DAGs **and** the interactive `exec --pty` path, which
   routes through the selected backend too. Bubblewrap adds a user namespace,
   `--cap-drop ALL`, private `/proc`/`/dev`/tmpfs, and `--new-session` (batch);
-  containers add `no-new-privileges`. However there is still no seccomp filtering
-  and no rlimit/cgroup resource capping. The built-in
+  containers add `no-new-privileges`, run as the daemon's own identity
+  (`--user`/`--userns=keep-id`), and `--cap-drop ALL` (issue #349). Policy-driven
+  resource caps (`max_processes` / `max_memory_bytes` / `max_cpu_seconds`) bound
+  host fork-bomb/memory/CPU exhaustion — exact cgroup flags in containers,
+  `setrlimit` via a re-exec launcher on the host paths. Seccomp ships as opt-in
+  machinery (`seccomp = "off"` default); the curated default-deny BPF profile
+  installation is still a follow-up. The built-in
   fallback backend is `none` (zero isolation) — operators must choose
-  `bubblewrap`/`docker`/`podman`. Bound the blast radius with policy (cwd, env
-  scrub, network, path-bind confinement, runtime/output caps) and a real sandbox
-  backend.
+  `bubblewrap`/`docker`/`podman`, and can set `execution.require_sandbox = true`
+  to deny any execution that would resolve to `none`. Bound the blast radius with
+  policy (cwd, env scrub, network, path-bind confinement, runtime/output/resource
+  caps) and a real sandbox backend.
 - **Workspace rooms are unencrypted by default; turn on E2EE for confidentiality from the
   homeserver operator.** A plain `workspace create` leaves the room unencrypted, so every
   `EXEC_REQUEST`, `EXEC_FINISHED`, `STREAM_CHUNK`, `CALL_REQUEST`, `CALL_RESPONSE`, and

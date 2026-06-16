@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use mx_agent_policy::{
-    Allowance, DenyReason, ExecContext, NetworkPolicy, Outcome, Policy, Sandbox,
+    Allowance, DenyReason, ExecContext, NetworkPolicy, Outcome, Policy, Sandbox, Seccomp,
 };
 use mx_agent_protocol::events::state::INVOCATION;
 use mx_agent_protocol::events::timeline::{
@@ -373,6 +373,11 @@ pub enum ExecRejection {
     /// swept fail-closed (issue #306). A terminal, post-policy outcome surfaced
     /// to the requester so a held invocation does not hang silently on expiry.
     ApprovalExpired,
+    /// Policy set `execution.require_sandbox = true` but the request's resolved
+    /// sandbox backend is `none` (zero isolation), so it is denied fail-closed
+    /// (issue #349). A post-policy gate applied once the concrete backend is
+    /// known; like the verified-device gate it can only add a denial.
+    SandboxRequired,
 }
 
 impl ExecRejection {
@@ -388,6 +393,7 @@ impl ExecRejection {
             Self::UnverifiedDevice => "unverified_device".to_string(),
             Self::ApprovalDenied => "approval_denied".to_string(),
             Self::ApprovalExpired => "approval_expired".to_string(),
+            Self::SandboxRequired => "sandbox_required".to_string(),
         }
     }
 }
@@ -411,6 +417,12 @@ impl std::fmt::Display for ExecRejection {
             Self::ApprovalDenied => write!(f, "approval-required exec was denied"),
             Self::ApprovalExpired => {
                 write!(f, "approval-required exec expired without a decision")
+            }
+            Self::SandboxRequired => {
+                write!(
+                    f,
+                    "policy requires a sandbox but the resolved backend is none"
+                )
             }
         }
     }
@@ -882,10 +894,11 @@ pub async fn handle_live_exec_request(
                     request,
                     &Outcome::Deny(reason.clone()),
                 ),
-                // The post-policy verified-device gate denial is audited too, so
-                // a require_verified_device rejection is "denied … and audited"
-                // like any other privileged denial (issue #240).
-                ExecRejection::UnverifiedDevice => {
+                // The post-policy verified-device and require-sandbox gate denials
+                // are audited too, so a require_verified_device / require_sandbox
+                // rejection is "denied … and audited" like any other privileged
+                // denial (issues #240, #349).
+                ExecRejection::UnverifiedDevice | ExecRejection::SandboxRequired => {
                     audit_exec_rejection(paths, &meta.room_id, request, &rejection)
                 }
                 // Pre-policy authentication failures (unsigned, bad signature,
@@ -1209,7 +1222,7 @@ pub(crate) async fn release_held_exec(
                 ExecRejection::PolicyDenied(reason) => {
                     audit_exec_decision(paths, room_id, &request, &Outcome::Deny(reason.clone()))
                 }
-                ExecRejection::UnverifiedDevice => {
+                ExecRejection::UnverifiedDevice | ExecRejection::SandboxRequired => {
                     audit_exec_rejection(paths, room_id, &request, &rejection)
                 }
                 _ => {}
@@ -1485,7 +1498,122 @@ async fn authorize_live_exec(
             "executing privileged request from an unverified Matrix device (authority from signing key; require_verified_device is off)"
         );
     }
+
+    // Post-policy sandbox floor (issue #349): now that the concrete backend is
+    // known, deny fail-closed if the operator requires a sandbox but the request
+    // resolved to the zero-isolation `none` backend; otherwise run, but emit a
+    // prominent advisory so an unsandboxed execution is never silent. Both log
+    // only non-sensitive room/requester/target ids (the established posture).
+    enforce_sandbox_floor(
+        &allowance,
+        room_id,
+        &request.requesting_agent,
+        &request.target_agent,
+        &request.invocation_id,
+    )?;
     Ok((request, allowance))
+}
+
+/// Non-sensitive identifying context for a [`check_sandbox_floor`] decision,
+/// recorded on the advisory/denial audit log. The live Matrix exec path carries
+/// the full room/requester/target/invocation set; the local loopback, task-DAG,
+/// and tool entry points have fewer identifiers, so every field beyond `source`
+/// is optional.
+pub(crate) struct SandboxFloorContext<'a> {
+    /// The execution entry point requesting the check, e.g. `"live exec"`,
+    /// `"loopback exec"`, `"loopback pty"`, `"task dag"`, `"tool exec"`.
+    pub source: &'a str,
+    /// Matrix room id (live exec only).
+    pub room_id: Option<&'a str>,
+    /// Requesting agent id (live exec only).
+    pub requesting_agent: Option<&'a str>,
+    /// Target agent id (live exec only).
+    pub target_agent: Option<&'a str>,
+    /// Invocation id, when the entry point has one.
+    pub invocation_id: Option<&'a str>,
+}
+
+impl<'a> SandboxFloorContext<'a> {
+    /// Context for a local, non-Matrix entry point (loopback / task-DAG / tool),
+    /// which has no room/requester/target — only an optional invocation id.
+    pub(crate) fn local(source: &'a str, invocation_id: Option<&'a str>) -> Self {
+        Self {
+            source,
+            room_id: None,
+            requesting_agent: None,
+            target_agent: None,
+            invocation_id,
+        }
+    }
+}
+
+/// Shared core of the additive sandbox-floor gate (issue #349), invoked at every
+/// RunSpec assembly site once the concrete sandbox backend is known.
+///
+/// When the resolved backend is [`Backend::None`][mx_agent_sandbox::Backend::None]
+/// (zero isolation) this returns `Err(())` to deny the request fail-closed if the
+/// operator set `execution.require_sandbox`; otherwise it returns `Ok(())` but
+/// emits a prominent `warn!` so an unsandboxed execution is never silent. It can
+/// only *deny*, never grant; the log carries only the non-sensitive ids in `ctx`.
+///
+/// Each call site maps the `Err(())` denial onto its own error channel (the live
+/// path to [`ExecRejection::SandboxRequired`], the task DAG to a policy-denied
+/// dispatch error, the loopback/tool paths to a spawn-refused error/frame), so
+/// the documented "deny any execution that resolves to the none backend" control
+/// holds for *every* entry point, not just live Matrix exec.
+pub(crate) fn check_sandbox_floor(
+    allowance: &Allowance,
+    ctx: &SandboxFloorContext<'_>,
+) -> Result<(), ()> {
+    if sandbox_backend(allowance.sandbox) != mx_agent_sandbox::Backend::None {
+        return Ok(());
+    }
+    if allowance.require_sandbox {
+        tracing::warn!(
+            source = %ctx.source,
+            room_id = ?ctx.room_id,
+            requesting_agent = ?ctx.requesting_agent,
+            target_agent = ?ctx.target_agent,
+            invocation_id = ?ctx.invocation_id,
+            "denying exec: execution.require_sandbox is set but the resolved sandbox backend is none"
+        );
+        return Err(());
+    }
+    tracing::warn!(
+        source = %ctx.source,
+        room_id = ?ctx.room_id,
+        requesting_agent = ?ctx.requesting_agent,
+        target_agent = ?ctx.target_agent,
+        invocation_id = ?ctx.invocation_id,
+        "executing an authorized command UNSANDBOXED (resolved backend is none); set \
+         execution.require_sandbox = true to deny, or configure a sandbox backend"
+    );
+    Ok(())
+}
+
+/// Live Matrix exec sandbox-floor gate (issue #349), applied *after* the
+/// signature → trust → policy gate once the concrete backend is known.
+///
+/// Thin wrapper over [`check_sandbox_floor`] that maps a denial onto
+/// [`ExecRejection::SandboxRequired`].
+fn enforce_sandbox_floor(
+    allowance: &Allowance,
+    room_id: &str,
+    requesting_agent: &str,
+    target_agent: &str,
+    invocation_id: &str,
+) -> Result<(), ExecRejection> {
+    check_sandbox_floor(
+        allowance,
+        &SandboxFloorContext {
+            source: "live exec",
+            room_id: Some(room_id),
+            requesting_agent: Some(requesting_agent),
+            target_agent: Some(target_agent),
+            invocation_id: Some(invocation_id),
+        },
+    )
+    .map_err(|()| ExecRejection::SandboxRequired)
 }
 
 /// Stream a finished command's captured output to `room` and report whether it
@@ -1601,6 +1729,8 @@ async fn run_controlled_exec(
 ) -> Result<ControlledExecResult, crate::runner::RunError> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+    let backend = sandbox_backend(allowance.sandbox);
+    let (run_uid, run_gid) = container_run_identity(backend);
     let spec = RunSpec {
         command: request.command.clone(),
         cwd: PathBuf::from(&request.cwd),
@@ -1610,12 +1740,16 @@ async fn run_controlled_exec(
         timeout: Some(Duration::from_millis(
             allowance.max_runtime_ms.unwrap_or(request.timeout_ms),
         )),
-        sandbox: sandbox_backend(allowance.sandbox),
+        sandbox: backend,
         network: network_for(allowance.network),
         read_only_paths: allowance.read_only_paths.clone(),
         writable_paths: allowance.writable_paths.clone(),
         container_runtime: container_runtime_for(allowance.sandbox),
         container_image: allowance.container_image.clone(),
+        resources: resource_limits_for(allowance),
+        seccomp: seccomp_for(allowance.seccomp),
+        run_uid,
+        run_gid,
         ..Default::default()
     };
     let mut command = build_command(&spec)?;
@@ -1867,6 +2001,8 @@ async fn run_controlled_pty_exec(
 ) -> Result<PtyExecOutcome, crate::runner::RunError> {
     use std::io::{Read as _, Write as _};
 
+    let backend = sandbox_backend(allowance.sandbox);
+    let (run_uid, run_gid) = container_run_identity(backend);
     let spec = RunSpec {
         command: request.command.clone(),
         cwd: PathBuf::from(&request.cwd),
@@ -1875,12 +2011,16 @@ async fn run_controlled_pty_exec(
         timeout: Some(Duration::from_millis(
             allowance.max_runtime_ms.unwrap_or(request.timeout_ms),
         )),
-        sandbox: sandbox_backend(allowance.sandbox),
+        sandbox: backend,
         network: network_for(allowance.network),
         read_only_paths: allowance.read_only_paths.clone(),
         writable_paths: allowance.writable_paths.clone(),
         container_runtime: container_runtime_for(allowance.sandbox),
         container_image: allowance.container_image.clone(),
+        resources: resource_limits_for(allowance),
+        seccomp: seccomp_for(allowance.seccomp),
+        run_uid,
+        run_gid,
         ..Default::default()
     };
     // The requester sends an initial `pty.resize` with the real terminal size
@@ -2285,6 +2425,51 @@ pub(crate) fn network_for(network: Option<NetworkPolicy>) -> mx_agent_sandbox::N
         Some(NetworkPolicy::Allow) => mx_agent_sandbox::Network::Allow,
         Some(NetworkPolicy::Deny) | None => mx_agent_sandbox::Network::Deny,
     }
+}
+
+/// Map an [`Allowance`]'s resolved resource caps to the sandbox-layer
+/// [`ResourceLimits`][mx_agent_sandbox::ResourceLimits] (issue #349).
+///
+/// Carries the policy-resolved process/memory/CPU caps onto the spec so the
+/// container backend emits the matching `run` flags and the `none`/`bubblewrap`
+/// launcher applies `setrlimit`. Shared with the task-dispatch and loopback paths.
+pub(crate) fn resource_limits_for(allowance: &Allowance) -> mx_agent_sandbox::ResourceLimits {
+    mx_agent_sandbox::ResourceLimits {
+        max_processes: allowance.max_processes,
+        max_memory_bytes: allowance.max_memory_bytes,
+        max_cpu_seconds: allowance.max_cpu_seconds,
+    }
+}
+
+/// Map the policy [`Seccomp`] selection to the sandbox-layer
+/// [`SeccompMode`][mx_agent_sandbox::SeccompMode] (issue #349).
+pub(crate) fn seccomp_for(seccomp: Seccomp) -> mx_agent_sandbox::SeccompMode {
+    match seccomp {
+        Seccomp::Off => mx_agent_sandbox::SeccompMode::Off,
+        Seccomp::Default => mx_agent_sandbox::SeccompMode::Default,
+    }
+}
+
+/// Resolve the `(run_uid, run_gid)` the container backend should run the command
+/// as (issue #349).
+///
+/// For the container backend this is the daemon's own uid/gid, so the container
+/// process owns the host-side `writable_paths` mounts and `--cap-drop ALL` is
+/// viable without `CAP_DAC_OVERRIDE`. The other backends ignore it (they confine
+/// via a user namespace or not at all), so it resolves to `(None, None)`. On
+/// non-Unix it is always `(None, None)`.
+pub(crate) fn container_run_identity(
+    backend: mx_agent_sandbox::Backend,
+) -> (Option<u32>, Option<u32>) {
+    #[cfg(unix)]
+    if backend == mx_agent_sandbox::Backend::Container {
+        let uid = nix::unistd::Uid::current().as_raw();
+        let gid = nix::unistd::Gid::current().as_raw();
+        return (Some(uid), Some(gid));
+    }
+    #[cfg(not(unix))]
+    let _ = backend;
+    (None, None)
 }
 
 fn signal_name(n: i32) -> Option<String> {
@@ -3583,6 +3768,120 @@ allow_cwd = ["/home/me/code/project"]
             mx_agent_sandbox::Backend::None,
             "chroot must never silently widen to an isolating backend"
         );
+    }
+
+    #[test]
+    fn resource_limits_and_seccomp_map_from_allowance() {
+        // The allowance's resolved caps + seccomp map onto the sandbox-layer types
+        // the spec consumes (issue #349).
+        let allowance = Allowance {
+            max_processes: Some(256),
+            max_memory_bytes: Some(2_147_483_648),
+            max_cpu_seconds: Some(120),
+            seccomp: Seccomp::Default,
+            ..Allowance::default()
+        };
+        let limits = resource_limits_for(&allowance);
+        assert_eq!(limits.max_processes, Some(256));
+        assert_eq!(limits.max_memory_bytes, Some(2_147_483_648));
+        assert_eq!(limits.max_cpu_seconds, Some(120));
+        assert_eq!(
+            seccomp_for(allowance.seccomp),
+            mx_agent_sandbox::SeccompMode::Default
+        );
+        assert_eq!(
+            seccomp_for(Seccomp::Off),
+            mx_agent_sandbox::SeccompMode::Off
+        );
+    }
+
+    #[test]
+    fn container_run_identity_only_for_container_backend() {
+        // The daemon's own uid/gid are supplied only for the container backend, so
+        // `--user`/`--cap-drop ALL` land together (issue #349); the host backends
+        // confine via a user namespace (bwrap) or not at all (none).
+        let (uid, gid) = container_run_identity(mx_agent_sandbox::Backend::Container);
+        assert!(
+            uid.is_some() && gid.is_some(),
+            "container must map an identity"
+        );
+        for backend in [
+            mx_agent_sandbox::Backend::None,
+            mx_agent_sandbox::Backend::Bubblewrap,
+        ] {
+            assert_eq!(
+                container_run_identity(backend),
+                (None, None),
+                "{backend:?} must not request a uid mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_floor_denies_none_only_when_required() {
+        // require_sandbox + resolved `none` ⇒ fail-closed SandboxRequired.
+        let required = Allowance {
+            require_sandbox: true,
+            sandbox: None, // resolves to Backend::None
+            ..Allowance::default()
+        };
+        assert_eq!(
+            enforce_sandbox_floor(&required, "!r:s", "@a:s", "@b:s", "inv_1"),
+            Err(ExecRejection::SandboxRequired)
+        );
+
+        // require_sandbox off ⇒ runs (advisory warning only).
+        let advisory = Allowance {
+            require_sandbox: false,
+            sandbox: None,
+            ..Allowance::default()
+        };
+        assert!(enforce_sandbox_floor(&advisory, "!r:s", "@a:s", "@b:s", "inv_1").is_ok());
+
+        // A real backend is never gated, even with require_sandbox on.
+        let sandboxed = Allowance {
+            require_sandbox: true,
+            sandbox: Some(Sandbox::Bubblewrap),
+            ..Allowance::default()
+        };
+        assert!(enforce_sandbox_floor(&sandboxed, "!r:s", "@a:s", "@b:s", "inv_1").is_ok());
+    }
+
+    #[test]
+    fn check_sandbox_floor_local_context_denies_none_only_when_required() {
+        // The shared core used by the loopback / task-DAG / tool entry points must
+        // deny fail-closed under require_sandbox + resolved `none`, but allow an
+        // unsandboxed run (advisory only) when require_sandbox is off, and never
+        // gate a real backend.
+        let ctx = SandboxFloorContext::local("test path", Some("inv_1"));
+
+        let required = Allowance {
+            require_sandbox: true,
+            sandbox: None,
+            ..Allowance::default()
+        };
+        assert_eq!(check_sandbox_floor(&required, &ctx), Err(()));
+
+        let advisory = Allowance {
+            require_sandbox: false,
+            sandbox: None,
+            ..Allowance::default()
+        };
+        assert_eq!(check_sandbox_floor(&advisory, &ctx), Ok(()));
+
+        let sandboxed = Allowance {
+            require_sandbox: true,
+            sandbox: Some(Sandbox::Bubblewrap),
+            ..Allowance::default()
+        };
+        assert_eq!(check_sandbox_floor(&sandboxed, &ctx), Ok(()));
+    }
+
+    #[test]
+    fn sandbox_required_rejection_reason_is_stable() {
+        // Audited as `deny:sandbox_required` (the rejection reason carries the
+        // suffix; the audit layer prepends `deny:`).
+        assert_eq!(ExecRejection::SandboxRequired.reason(), "sandbox_required");
     }
 
     #[test]

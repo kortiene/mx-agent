@@ -116,6 +116,31 @@ enum Command {
     /// Generate shell completions and man pages (tooling for packagers).
     #[command(subcommand, hide = true)]
     Generate(GenerateCommand),
+
+    /// Internal sandbox launcher trampoline (issue #349); not a user command.
+    ///
+    /// The daemon re-execs its own binary as this hidden subcommand to apply
+    /// `setrlimit` resource caps to a `none`/`bubblewrap` execution before
+    /// `exec`-ing the target command — the safe stand-in for the `unsafe`
+    /// `pre_exec` the workspace forbids. It confers no privilege (it only
+    /// *narrows*), so it needs no caller authentication. Hidden from `--help`.
+    #[command(name = mx_agent_sandbox::LAUNCHER_SUBCOMMAND, hide = true)]
+    SandboxExec(SandboxExecArgs),
+}
+
+/// Arguments for the hidden [`Command::SandboxExec`] trampoline: the resource-cap
+/// and seccomp flags plus the target command, all captured verbatim and parsed by
+/// [`mx_agent_sandbox::LauncherArgs::parse`] (the single source of truth shared
+/// with the daemon that builds them).
+#[derive(Debug, Args)]
+struct SandboxExecArgs {
+    /// The launcher flags followed by `-- <command>`, taken verbatim.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "ARGS"
+    )]
+    args: Vec<String>,
 }
 
 /// `generate` subcommands: emit shell completions and man pages directly from
@@ -1050,7 +1075,35 @@ pub fn run() -> ExitCode {
         Command::Device(cmd) => handle_device(g, cmd),
         Command::Recovery(cmd) => handle_recovery(g, cmd),
         Command::Generate(cmd) => handle_generate(cmd),
+        Command::SandboxExec(args) => cmd_sandbox_exec(args),
     }
+}
+
+/// Run the hidden sandbox launcher trampoline (issue #349): parse the resource
+/// caps + target command, apply them, and `exec` the command in place.
+///
+/// On success [`run_launcher`](mx_agent_sandbox::run_launcher) never returns (it
+/// replaces this process image). It returns only on failure — a malformed
+/// argument set or a failed `setrlimit`/`exec` — in which case this prints a
+/// diagnostic to stderr and exits 127 (the conventional "command could not be
+/// executed" code), fail-closed: the target command does not run unconfined.
+fn cmd_sandbox_exec(args: &SandboxExecArgs) -> ExitCode {
+    let launcher_args = match mx_agent_sandbox::LauncherArgs::parse(&args.args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!(
+                "mx-agent {}: {message}",
+                mx_agent_sandbox::LAUNCHER_SUBCOMMAND
+            );
+            return ExitCode::from(127);
+        }
+    };
+    let error = mx_agent_sandbox::run_launcher(launcher_args);
+    eprintln!(
+        "mx-agent {}: could not launch the sandboxed command: {error}",
+        mx_agent_sandbox::LAUNCHER_SUBCOMMAND
+    );
+    ExitCode::from(127)
 }
 
 /// Handle the hidden `generate` command group: emit shell completions and man
@@ -3973,6 +4026,7 @@ fn command_path(command: &Command) -> String {
                 GenerateCommand::Man(_) => "man",
             }
         ),
+        Command::SandboxExec(_) => mx_agent_sandbox::LAUNCHER_SUBCOMMAND.to_string(),
     }
 }
 

@@ -207,18 +207,25 @@ pub(crate) fn write_server_frame(
 /// allowance-wiring is unit-testable without allocating a PTY.
 fn pty_loopback_run_spec(params: &ExecPtyParams, allowance: &Allowance) -> RunSpec {
     let cwd = params.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+    let backend = sandbox_backend(allowance.sandbox);
+    let (run_uid, run_gid) = crate::exec::container_run_identity(backend);
     RunSpec {
         command: params.command.clone(),
         cwd,
         // Honor the caller's `--env` overrides on the loopback PTY too (issue #314).
         env: params.env.clone(),
         env_allowlist: allowance.env_allowlist.clone(),
-        sandbox: sandbox_backend(allowance.sandbox),
+        sandbox: backend,
         network: network_for(allowance.network),
         read_only_paths: allowance.read_only_paths.clone(),
         writable_paths: allowance.writable_paths.clone(),
         container_runtime: crate::exec::container_runtime_for(allowance.sandbox),
         container_image: allowance.container_image.clone(),
+        // Confinement floor (issue #349): caps confine the interactive PTY too.
+        resources: crate::exec::resource_limits_for(allowance),
+        seccomp: crate::exec::seccomp_for(allowance.seccomp),
+        run_uid,
+        run_gid,
         ..Default::default()
     }
 }
@@ -243,6 +250,23 @@ pub fn run_pty_loopback(
     // running with no isolation (issue #307). `PtySession::spawn` routes the spec
     // through the sandbox backend, so these fields take effect.
     let allowance = loopback_execution_allowance();
+    // Sandbox floor (issue #349): an interactive loopback PTY honors
+    // `execution.require_sandbox` too — refuse with an error frame when the
+    // resolved backend is `none`, otherwise the shared gate warns it runs
+    // unsandboxed.
+    if crate::exec::check_sandbox_floor(
+        &allowance,
+        &crate::exec::SandboxFloorContext::local("loopback pty", None),
+    )
+    .is_err()
+    {
+        let frame = PtyServerFrame::Error {
+            message: "refusing to run unsandboxed: execution.require_sandbox is set but the \
+                      resolved sandbox backend is none"
+                .to_string(),
+        };
+        return write_server_frame(stream, request_id, &frame);
+    }
     let spec = pty_loopback_run_spec(params, &allowance);
     let winsize = PtyWinsize::new(params.rows, params.cols);
     let mut session = match PtySession::spawn(&spec, winsize) {

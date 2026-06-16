@@ -473,6 +473,11 @@ network = "deny"
 | `writable_paths` | `[]` | Bound writable — **keep minimal**. |
 | `env_allowlist` | `[]` | Extra env names (still subject to the secret scrub). |
 | `container_image` | `debian:stable-slim` | Image the `docker`/`podman` backend runs in. The runtime follows the `sandbox` value. |
+| `max_processes` | none | Process-count cap (`RLIMIT_NPROC` on host paths, `--pids-limit` on containers). Unset ⇒ uncapped. Recommended starting point: `256`. |
+| `max_memory_bytes` | none | Address-space cap in bytes (`RLIMIT_AS` / `--memory`). Unset ⇒ uncapped. Recommended: `2147483648` (2 GiB). |
+| `max_cpu_seconds` | none | Total CPU-seconds cap (`RLIMIT_CPU` / `--ulimit cpu`). Distinct from wall-clock `max_runtime_ms`. Unset ⇒ uncapped. Recommended: `120`. |
+| `seccomp` | `"off"` | Syscall-filtering mode: `"off"` (default) or `"default"` (opt-in curated default-deny profile, Linux-only; BPF profile installation is a documented follow-up — selecting `"default"` today logs a loud enforcement-pending warning rather than silently leaving the command unfiltered). |
+| `require_sandbox` | `false` | Deny any execution that resolves to the `none` backend, fail-closed (`deny:sandbox_required`). Set `true` in environments where falling back to zero isolation is unacceptable. |
 
 `[rooms."<room>"]`:
 
@@ -496,6 +501,10 @@ network = "deny"
 | `max_output_bytes` | none | Captured-output cap; unset ⇒ unbounded for batch exec/call. For live remote `--pty` sessions the same value is applied; a loopback `--pty` falls back to a 64 MiB default when unset. |
 | `requires_approval` | `false` | Hold the request for human sign-off. |
 | `sandbox` / `network` | none | Per-agent overrides. |
+| `max_processes` | none | Overrides `execution.max_processes` for this agent. |
+| `max_memory_bytes` | none | Overrides `execution.max_memory_bytes` for this agent. |
+| `max_cpu_seconds` | none | Overrides `execution.max_cpu_seconds` for this agent. |
+| `seccomp` | inherits | Overrides `execution.seccomp` for this agent (`"off"` or `"default"`). |
 | `require_verified_device` | `false` | Per-agent verified-device gate (deny-only; OR-ed with the room default). |
 
 ### Unsafe options to use deliberately, if ever
@@ -524,7 +533,7 @@ The sandbox decides *how* an allowed command is isolated. Backends:
 |---|---|
 | `none` | **No isolation.** Only the centralized controls (cwd, env scrub, timeout, output cap) apply. |
 | `bubblewrap` | PID/UTS/IPC/**user** namespaces, `--die-with-parent`, `--cap-drop ALL`, private `/proc` + minimal `/dev` + tmpfs `/tmp`, bind-mounted filesystem, network namespace dropped when `network = "deny"`, and `--new-session` on the batch path (omitted for an interactive `--pty` so Ctrl-C still works). |
-| `docker` / `podman` | Read-only root (`--read-only`), `--security-opt no-new-privileges`, `--network none` when denied, explicit `--volume` mounts, env passed **by name** (`--env KEY`, values never in argv), `--rm` cleanup. The runtime follows the `sandbox` value (`podman` runs `podman run …`); the image is `execution.container_image` (default `debian:stable-slim`). (No `--cap-drop ALL`: the container runs as root and dropping `CAP_DAC_OVERRIDE` would block writes to operator-owned `writable_paths`; that needs a `--user` mapping, deferred.) |
+| `docker` / `podman` | Read-only root (`--read-only`), `--security-opt no-new-privileges`, `--network none` when denied, explicit `--volume` mounts, env passed **by name** (`--env KEY`, values never in argv), `--rm` cleanup. The runtime follows the `sandbox` value (`podman` runs `podman run …`); the image is `execution.container_image` (default `debian:stable-slim`). Runs as the daemon's own identity (`--user <uid>:<gid>` on docker, `--userns=keep-id` on rootless podman) so it owns operator-owned `writable_paths`, and with that mapping drops **all** capabilities (`--cap-drop ALL`) — bubblewrap parity (issue #349). Resource caps map to `--pids-limit` / `--memory` / `--ulimit cpu`. |
 | `firejail` / `chroot` | **Not implemented — rejected at policy load.** Naming either in `execution.default_sandbox` or an agent `sandbox` fails validation with a dotted-path error (no silent unsandboxed fallthrough). |
 
 **Default backend.** The library's built-in fallback is `Backend::None` (zero
@@ -552,15 +561,47 @@ stream.
 not on the daemon's `PATH`, the run fails with an actionable diagnostic naming the
 backend and the missing launcher — it never silently falls back to no isolation.
 
+**Resource limits (issue #349).** A confinement floor bounds host resource
+consumption by an authorized-but-misbehaving command (fork bomb, memory/CPU
+exhaustion). Three policy keys resolve through the engine (agent override, else
+the `execution` default):
+
+| Key | Host paths (`none`/`bubblewrap`) | Container backend |
+|---|---|---|
+| `max_processes` | `RLIMIT_NPROC` (best-effort under the user namespace) | `--pids-limit` (exact, cgroup) |
+| `max_memory_bytes` | `RLIMIT_AS` (address space) | `--memory` (cgroup) |
+| `max_cpu_seconds` | `RLIMIT_CPU` (CPU-seconds, not wall clock) | `--ulimit cpu` |
+
+On the `none`/`bubblewrap` paths the caps are applied by a hidden self-re-exec
+launcher (`mx-agent __sandbox-exec …`) that calls `setrlimit` (a safe API — the
+workspace forbids the `unsafe` `pre_exec`) before `exec`. Recommended starting
+points: `max_processes = 256`, `max_memory_bytes = 2 GiB`, `max_cpu_seconds = 120`.
+For exact process capping prefer a container backend (`--pids-limit` is cgroup-
+enforced); on macOS `RLIMIT_NPROC` is skipped.
+
+**Syscall filtering (seccomp, issue #349).** `execution.seccomp` selects `"off"`
+(default) or a curated default-deny `"default"` profile (Linux-only, agent
+override available). It ships **off by default** so deployments do not suddenly
+`EPERM` syscalls their commands rely on. The mode threads end to end through the
+launcher; installing the default-deny BPF profile (in-process for `none`, via
+`bwrap --seccomp` / container `--security-opt seccomp=`) is a documented follow-up
+(the allowlist breadth and the `bwrap --seccomp` byte format are open questions
+pending a real-Linux acceptance test), so selecting `"default"` today logs a loud
+"enforcement pending" notice rather than silently leaving the command unfiltered.
+
+**Require a sandbox (issue #349).** When an authorized execution resolves to the
+`none` backend the daemon emits a prominent warning naming the room / requester /
+target (no secrets). Set `execution.require_sandbox = true` to turn that warning
+into a hard, fail-closed denial (`deny:sandbox_required`).
+
 **What the sandbox does *not* do.** Bubblewrap runs the command in a user
 namespace (`--unshare-user`, so it is not the daemon's privileged identity) and
 drops all capabilities; containers block privilege escalation
-(`no-new-privileges`). There is still **no seccomp syscall filtering and no
-rlimit/cgroup resource capping** — runtime and output are bounded by
-`max_runtime_ms` / `max_output_bytes` from policy, and per-process/memory limits
-(`--pids-limit` / `--memory`) and a container `--cap-drop ALL` (with a `--user`
-mapping) are not yet wired from policy. For stronger isolation, prefer a
-container backend and configure those limits in your runtime.
+(`no-new-privileges`), run as the daemon's identity, and `--cap-drop ALL`.
+Resource caps mitigate host exhaustion but do not defend against a kernel
+vulnerability, and the default-deny seccomp profile installation is still pending
+(see above). For the strongest isolation, prefer a container backend, set the
+resource caps, and consider `require_sandbox = true`.
 
 > **Safe vs unsafe:** `sandbox = "bubblewrap"` (or a container) + `network =
 > "deny"` + tight `writable_paths` is the safe baseline. `sandbox = "none"`,
@@ -639,9 +680,11 @@ the rest of the daemon's private state.
 - [ ] `allow_commands` lists specific tools, never shells/interpreters.
 - [ ] `allow_cwd` scoped to a project tree, never `/` or `$HOME`.
 - [ ] `max_runtime_ms` and `max_output_bytes` set for every privileged agent.
+- [ ] `max_processes`, `max_memory_bytes`, and `max_cpu_seconds` set where fork-bomb / memory / CPU exhaustion is a concern. Prefer the container backend for exact process capping (`--pids-limit` is cgroup-enforced); on macOS `RLIMIT_NPROC` is skipped.
 - [ ] `requires_approval = true` for anything not fully constrained.
 - [ ] Non-daemon approvers added to `approvers` in `policy.toml` **only after** running `trust approve` for each; `approvers` is necessary-not-sufficient — an approver still needs a locally-trusted signing key (issue #309).
 - [ ] `default_sandbox` set to `bubblewrap`/`docker`/`podman`; `none` avoided.
+- [ ] `execution.require_sandbox = true` in environments where resolving to `none` is unacceptable.
 - [ ] `network = "deny"` except where a command genuinely needs it.
 - [ ] `writable_paths` minimal; secrets kept out of `read_only_paths` too.
 - [ ] `env_allowlist` short; rely on the built-in secret scrub.

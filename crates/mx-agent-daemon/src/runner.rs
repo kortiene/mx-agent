@@ -227,6 +227,23 @@ pub struct RunSpec {
     /// [`Backend::Container`]. Resolved from `execution.container_image`; `None`
     /// uses the backend's built-in default image. Ignored by the other backends.
     pub container_image: Option<String>,
+    /// Post-authorization resource caps (process count, memory, CPU-seconds) the
+    /// command runs under (architecture §13.5, issue #349). The container backend
+    /// emits the matching `run` flags; the `none`/`bubblewrap` backends are wrapped
+    /// in the [`launcher`][mx_agent_sandbox::launcher] trampoline by
+    /// [`build_command`]. Resolved from policy; defaults to no caps.
+    pub resources: mx_agent_sandbox::ResourceLimits,
+    /// The seccomp-bpf syscall-filtering mode (issue #349). Resolved from policy;
+    /// defaults to [`SeccompMode::Off`][mx_agent_sandbox::SeccompMode::Off].
+    pub seccomp: mx_agent_sandbox::SeccompMode,
+    /// The uid the [`Backend::Container`] backend runs the command as so it owns
+    /// the host `writable_paths` mounts and `--cap-drop ALL` is viable (issue
+    /// #349). Set by the assembly sites to the daemon's own uid for the container
+    /// backend; `None` for the others.
+    pub run_uid: Option<u32>,
+    /// The gid paired with [`run_uid`](RunSpec::run_uid) for the container
+    /// `--user <uid>:<gid>` mapping.
+    pub run_gid: Option<u32>,
 }
 
 impl Default for RunSpec {
@@ -245,6 +262,10 @@ impl Default for RunSpec {
             writable_paths: Vec::new(),
             container_runtime: Runtime::Docker,
             container_image: None,
+            resources: mx_agent_sandbox::ResourceLimits::default(),
+            seccomp: mx_agent_sandbox::SeccompMode::Off,
+            run_uid: None,
+            run_gid: None,
         }
     }
 }
@@ -334,6 +355,14 @@ pub(crate) fn restrictions_for(spec: &RunSpec, env: BTreeMap<String, String>) ->
         // `PtySession::spawn` only (the container backend then allocates an
         // in-container TTY). Batch `exec`/`call` keep the non-interactive argv.
         interactive: false,
+        // Confinement floor (issue #349): the container backend emits these as
+        // `run` flags; for `none`/`bubblewrap` the launcher prefix added in
+        // `build_command` enforces the resource caps. `run_uid`/`run_gid` are only
+        // consumed by the container backend.
+        resources: spec.resources,
+        seccomp: spec.seccomp,
+        run_uid: spec.run_uid,
+        run_gid: spec.run_gid,
     }
 }
 
@@ -353,6 +382,61 @@ pub(crate) fn resolve_sandbox(spec: &RunSpec) -> Box<dyn Sandbox> {
         }
         other => sandbox_for(other),
     }
+}
+
+/// Wrap the prepared argv in the self-re-exec [`launcher`][mx_agent_sandbox::launcher]
+/// trampoline for the `none`/`bubblewrap` paths when a resource cap (or, on the
+/// `none` path, seccomp) must be enforced (issue #349).
+///
+/// The container backend enforces caps with its own `run` flags, so it is never
+/// wrapped (returned unchanged). When nothing needs enforcing the argv is also
+/// returned unchanged, so existing specs spawn exactly as before. The launcher
+/// runs the daemon's own binary ([`std::env::current_exe`], as `lifecycle.rs`
+/// already does) as a hidden subcommand; a binary that cannot be resolved fails
+/// with an actionable diagnostic rather than a bare error, mirroring
+/// [`preflight_backend`].
+///
+/// On the bubblewrap path seccomp is **not** carried by the launcher: it would
+/// filter `bwrap`'s own namespace-setup syscalls and break it (bwrap installs the
+/// filter itself). The launcher only applies the resource caps there.
+///
+/// Shared with the interactive PTY spawn so resource caps confine interactive
+/// sessions too.
+pub(crate) fn launcher_wrap(
+    spec: &RunSpec,
+    prepared_argv: Vec<String>,
+) -> Result<Vec<String>, RunError> {
+    let is_none = match spec.sandbox {
+        Backend::None => true,
+        Backend::Bubblewrap => false,
+        // The container backend enforces caps/seccomp via its own run flags.
+        Backend::Container => return Ok(prepared_argv),
+    };
+    if !mx_agent_sandbox::LauncherArgs::is_needed(spec.resources, spec.seccomp, is_none) {
+        return Ok(prepared_argv);
+    }
+    let launcher_exe = std::env::current_exe().map_err(|e| {
+        RunError::Spawn(std::io::Error::new(
+            e.kind(),
+            format!("could not resolve the daemon binary to apply sandbox resource limits: {e}"),
+        ))
+    })?;
+    let seccomp = if is_none {
+        spec.seccomp
+    } else {
+        mx_agent_sandbox::SeccompMode::Off
+    };
+    let args = mx_agent_sandbox::LauncherArgs {
+        resources: spec.resources,
+        seccomp,
+        command: prepared_argv,
+    };
+    let mut argv = vec![
+        launcher_exe.to_string_lossy().into_owned(),
+        mx_agent_sandbox::LAUNCHER_SUBCOMMAND.to_string(),
+    ];
+    argv.extend(args.to_args());
+    Ok(argv)
 }
 
 /// Build a configured [`Command`] from a [`RunSpec`].
@@ -390,7 +474,12 @@ pub(crate) fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
     // the argv to launch the command inside their wrapper.
     let restrictions = restrictions_for(spec, env);
     let prepared = resolve_sandbox(spec).prepare(spec.command.clone(), restrictions);
-    let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
+    // For the `none`/`bubblewrap` paths, wrap the prepared argv in the self-re-exec
+    // launcher when a resource cap (or, on the `none` path, seccomp) must be
+    // enforced — there is no runtime to do it for them and `pre_exec` is `unsafe`
+    // (issue #349). The container backend enforces caps via its own `run` flags.
+    let argv = launcher_wrap(spec, prepared.argv)?;
+    let (program, args) = argv.split_first().ok_or(RunError::EmptyCommand)?;
     let Restrictions { cwd, env, .. } = prepared.restrictions;
 
     let stdin = if spec.stdin.is_some() {
@@ -1263,6 +1352,119 @@ mod tests {
     // restrictions_for. If restrictions_for ever changed this invariant, the
     // container backend would emit -i/-t for all batch runs.
 
+    // --- launcher prefix wiring (issue #349) ----------------------------------
+
+    #[test]
+    fn launcher_wrap_is_noop_without_caps_or_seccomp() {
+        // A default spec (no caps, seccomp off) must spawn exactly the prepared
+        // argv on every host backend — existing behaviour is unchanged.
+        for sandbox in [Backend::None, Backend::Bubblewrap, Backend::Container] {
+            let spec = RunSpec {
+                command: vec!["echo".to_string(), "hi".to_string()],
+                cwd: std::env::temp_dir(),
+                sandbox,
+                ..RunSpec::default()
+            };
+            let prepared = vec!["echo".to_string(), "hi".to_string()];
+            let wrapped = launcher_wrap(&spec, prepared.clone()).expect("wrap");
+            assert_eq!(wrapped, prepared, "backend {sandbox:?} must be unchanged");
+        }
+    }
+
+    #[test]
+    fn launcher_wrap_prepends_prefix_for_host_backends_with_caps() {
+        // A resource cap on the `none`/`bubblewrap` path prepends the hidden
+        // `__sandbox-exec` launcher; the container path is never wrapped (it uses
+        // its own run flags).
+        let resources = mx_agent_sandbox::ResourceLimits {
+            max_processes: Some(256),
+            ..Default::default()
+        };
+        for (sandbox, wraps) in [
+            (Backend::None, true),
+            (Backend::Bubblewrap, true),
+            (Backend::Container, false),
+        ] {
+            let spec = RunSpec {
+                command: vec!["echo".to_string()],
+                cwd: std::env::temp_dir(),
+                sandbox,
+                resources,
+                ..RunSpec::default()
+            };
+            let prepared = vec!["echo".to_string()];
+            let wrapped = launcher_wrap(&spec, prepared.clone()).expect("wrap");
+            if wraps {
+                assert_eq!(
+                    wrapped.get(1).map(String::as_str),
+                    Some(mx_agent_sandbox::LAUNCHER_SUBCOMMAND),
+                    "backend {sandbox:?} must prepend the launcher: {wrapped:?}"
+                );
+                assert!(
+                    wrapped.windows(2).any(|w| w == ["--nproc", "256"]),
+                    "launcher must carry the nproc cap: {wrapped:?}"
+                );
+                // The original command survives after the launcher's `--`.
+                assert_eq!(wrapped.last().map(String::as_str), Some("echo"));
+            } else {
+                assert_eq!(wrapped, prepared, "container must not be wrapped");
+            }
+        }
+    }
+
+    #[test]
+    fn launcher_wrap_drops_seccomp_on_bubblewrap_path() {
+        // seccomp must NOT be carried by the launcher around bwrap (it would filter
+        // bwrap's own setup). With seccomp on but no caps, the bwrap path is left
+        // unwrapped; the `none` path is wrapped (carrying the seccomp flag).
+        let spec_bwrap = RunSpec {
+            command: vec!["echo".to_string()],
+            cwd: std::env::temp_dir(),
+            sandbox: Backend::Bubblewrap,
+            seccomp: mx_agent_sandbox::SeccompMode::Default,
+            ..RunSpec::default()
+        };
+        assert_eq!(
+            launcher_wrap(&spec_bwrap, vec!["echo".to_string()]).unwrap(),
+            vec!["echo".to_string()],
+            "bwrap + seccomp-only must not be wrapped by the launcher"
+        );
+
+        let spec_none = RunSpec {
+            sandbox: Backend::None,
+            ..spec_bwrap.clone()
+        };
+        let wrapped = launcher_wrap(&spec_none, vec!["echo".to_string()]).unwrap();
+        assert!(
+            wrapped.windows(2).any(|w| w == ["--seccomp", "default"]),
+            "none + seccomp must carry the seccomp flag: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn restrictions_for_threads_resources_seccomp_and_uid() {
+        // restrictions_for must copy the new confinement-floor fields onto the
+        // Restrictions every backend consumes (issue #349).
+        let spec = RunSpec {
+            command: vec!["true".to_string()],
+            cwd: std::env::temp_dir(),
+            resources: mx_agent_sandbox::ResourceLimits {
+                max_processes: Some(8),
+                max_memory_bytes: Some(1024),
+                max_cpu_seconds: Some(5),
+            },
+            seccomp: mx_agent_sandbox::SeccompMode::Default,
+            run_uid: Some(1000),
+            run_gid: Some(1000),
+            ..RunSpec::default()
+        };
+        let r = restrictions_for(&spec, BTreeMap::new());
+        assert_eq!(r.resources, spec.resources);
+        assert_eq!(r.seccomp, mx_agent_sandbox::SeccompMode::Default);
+        assert_eq!(r.run_uid, Some(1000));
+        assert_eq!(r.run_gid, Some(1000));
+    }
+
     #[test]
     fn restrictions_for_always_returns_interactive_false() {
         // Regression guard: restrictions_for must return interactive=false for
@@ -1311,5 +1513,62 @@ mod tests {
             "batch container argv must not contain -t/--tty: {:?}",
             prepared.argv
         );
+    }
+
+    // --- resource-cap launcher flag coverage (issue #349) ----------------------
+
+    #[test]
+    fn launcher_wrap_carries_memory_and_cpu_cap_flags() {
+        // max_memory_bytes produces --as and max_cpu_seconds produces --cpu in
+        // the launcher argv. Combined with the existing nproc test this gives
+        // complete coverage of all three cap flags.
+        let spec_mem = RunSpec {
+            command: vec!["echo".to_string()],
+            cwd: std::env::temp_dir(),
+            sandbox: Backend::None,
+            resources: mx_agent_sandbox::ResourceLimits {
+                max_memory_bytes: Some(1_073_741_824),
+                ..Default::default()
+            },
+            ..RunSpec::default()
+        };
+        let wrapped = launcher_wrap(&spec_mem, vec!["echo".to_string()]).expect("wrap");
+        assert!(
+            wrapped.windows(2).any(|w| w == ["--as", "1073741824"]),
+            "--as must appear in launcher argv for max_memory_bytes: {wrapped:?}"
+        );
+
+        let spec_cpu = RunSpec {
+            command: vec!["echo".to_string()],
+            cwd: std::env::temp_dir(),
+            sandbox: Backend::None,
+            resources: mx_agent_sandbox::ResourceLimits {
+                max_cpu_seconds: Some(60),
+                ..Default::default()
+            },
+            ..RunSpec::default()
+        };
+        let wrapped_cpu = launcher_wrap(&spec_cpu, vec!["echo".to_string()]).expect("wrap");
+        assert!(
+            wrapped_cpu.windows(2).any(|w| w == ["--cpu", "60"]),
+            "--cpu must appear in launcher argv for max_cpu_seconds: {wrapped_cpu:?}"
+        );
+    }
+
+    #[test]
+    fn restrictions_for_run_gid_none_passes_through_as_none() {
+        // When run_gid is absent from the RunSpec, restrictions_for must carry
+        // None so the container backend's gid-fallback logic (`run_gid.unwrap_or(uid)`)
+        // is evaluated there rather than being short-circuited here.
+        let spec = RunSpec {
+            command: vec!["true".to_string()],
+            cwd: std::env::temp_dir(),
+            run_uid: Some(500),
+            run_gid: None,
+            ..RunSpec::default()
+        };
+        let r = restrictions_for(&spec, BTreeMap::new());
+        assert_eq!(r.run_uid, Some(500), "run_uid must thread through");
+        assert_eq!(r.run_gid, None, "run_gid must pass through as None");
     }
 }
