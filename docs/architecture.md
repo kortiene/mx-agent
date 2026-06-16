@@ -1893,6 +1893,7 @@ Daemon-owned paths on Linux:
 ~/.local/share/mx-agent/crypto-store/        # SQLite crypto/state store (created; issue #240)
 ~/.local/share/mx-agent/crypto-store-key     # Secret-wrapped store passphrase (created; issue #240)
 ~/.local/share/mx-agent/signing_key.ed25519
+~/.local/share/mx-agent/audit.log            # privileged-decision audit log (0600, never logs content)
 ~/.config/mx-agent/config.toml
 ~/.config/mx-agent/policy.toml
 $XDG_RUNTIME_DIR/mx-agent/daemon.sock
@@ -1914,6 +1915,7 @@ chmod 0600 ~/.local/share/mx-agent/session.json
 chmod 0700 ~/.local/share/mx-agent/crypto-store
 chmod 0600 ~/.local/share/mx-agent/crypto-store-key
 chmod 0600 ~/.local/share/mx-agent/signing_key.ed25519
+chmod 0600 ~/.local/share/mx-agent/audit.log
 chmod 0600 ~/.config/mx-agent/policy.toml
 ```
 
@@ -2094,16 +2096,34 @@ Minimum controls:
 - output cap
 - kill process group on timeout/cancel
 
-Stronger controls:
+Stronger controls (policy-selectable sandbox backends):
 
-- Docker or Podman
-- bubblewrap or firejail
-- chroot
-- user namespace
-- seccomp
-- read-only root filesystem
-- writable workspace and temp only
-- network disabled by default
+The `sandbox` value selects one of four backends. `firejail` and `chroot` are
+**rejected at policy load** with a dotted-path validation error — naming either
+in `execution.default_sandbox` or an agent `sandbox` is a hard failure, never a
+silent unsandboxed fallthrough.
+
+- **`none`** — zero-isolation fallback (the library default). Only the minimum
+  controls above apply; use it only for code you fully trust.
+- **`bubblewrap`** — a user namespace, `--cap-drop ALL`, private `/proc` +
+  minimal `/dev` + tmpfs, a network namespace dropped when `network = "deny"`,
+  and `--new-session` on the batch path (omitted under interactive `--pty` so
+  Ctrl-C still works).
+- **`docker` / `podman`** — a read-only root filesystem (`--read-only`),
+  `--security-opt no-new-privileges`, `--network none` when denied, explicit
+  `--volume` binds, and the sanitized env passed **by name** (`--env KEY`,
+  values never in argv). The runtime follows the `sandbox` value and the image
+  is `execution.container_image`. The container backend deliberately does
+  **not** `--cap-drop ALL`: it runs as root, so dropping `CAP_DAC_OVERRIDE`
+  would block writes to a `writable_paths` mount owned by the host operator's
+  non-root uid; full capability dropping is deferred pending a `--user` uid
+  mapping.
+
+Across every backend the network is **disabled by default** (`Network::Deny`).
+There is **no `seccomp` filtering and no rlimit/cgroup resource capping yet** —
+isolation is namespace- and filesystem-based only. See the [security hardening
+guide](security-hardening.md) backend table and the cli-reference "Implemented
+backends vs. accepted values" note for the canonical list.
 
 Example:
 
