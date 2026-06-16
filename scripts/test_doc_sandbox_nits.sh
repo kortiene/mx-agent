@@ -178,8 +178,8 @@ for doc in "${docs_with_rejection[@]}"; do
   # Check that the file mentions firejail or chroot AND has a rejection phrase.
   has_name=false
   has_rejection=false
-  grep -qiE 'firejail|chroot' "$doc"       && has_name=true      || true
-  grep -qiE 'rejected|not implemented' "$doc" && has_rejection=true || true
+  if grep -qiE 'firejail|chroot' "$doc"; then has_name=true; fi
+  if grep -qiE 'rejected|not implemented' "$doc"; then has_rejection=true; fi
   if $has_name && $has_rejection; then
     ok "cross-doc consistency: $name has firejail/chroot + rejection note"
   else
