@@ -132,6 +132,21 @@
 //!   cross-signing) for the process-level
 //!   [`live_no_secrets_in_daemon_log_after_login_and_recover`]; falls back to the
 //!   recovery user, then the shared user, when unset
+//!
+//! [`live_rate_limited_step_records_health_and_recovers`] (issue #351) proves
+//! the rate-limit path end-to-end against a real homeserver by injecting
+//! `StepError::RateLimited` (both with a server-directed delay and without)
+//! after a real initial sync. It asserts that: (a) the health transitions to
+//! `Degraded` with `rate_limited_secs` set and a clear `last_error`; (b) the
+//! loop retries rather than stopping; and (c) after a successful recovery step
+//! the health returns to clean (`rate_limited_secs` cleared,
+//! `consecutive_failures` reset). This complements the unit coverage in
+//! `sync.rs` — which tests the pure logic without a homeserver — by exercising
+//! the full live path: real SDK sync → injected rate-limit → health update →
+//! sleep → retry → success. No real 429 from the homeserver is required because
+//! the classification happens inside `run_matrix_sync`'s step closure; the
+//! generic `run_sync_loop` tested here is the same loop that wires to the real
+//! client, so injecting `StepError::RateLimited` is an accurate stand-in.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11095,6 +11110,7 @@ async fn live_fatal_sync_error_reported_as_stopped_in_health() {
                 base: std::time::Duration::from_millis(10),
                 max: std::time::Duration::from_millis(10),
                 factor: 1,
+                rate_limit_ceiling: std::time::Duration::from_secs(300),
             },
             running_inner,
             move |token| {
@@ -11144,6 +11160,203 @@ async fn live_fatal_sync_error_reported_as_stopped_in_health() {
             .contains("Access token has expired"),
         "recorded error must include the fatal message; got: {:?}",
         h.last_error
+    );
+
+    std::env::remove_var(ENV_DATA_DIR);
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// A rate-limited (HTTP 429 / `M_LIMIT_EXCEEDED`) sync step is honored — not
+/// treated as fatal — and the daemon's health surface reflects the backoff so
+/// `daemon status` can distinguish a rate-limit pause from a generic transient
+/// failure (issue #351).
+///
+/// The test uses a real homeserver for the first sync step to obtain a valid
+/// batch token, then injects `StepError::RateLimited` (with and without a
+/// server-directed delay) to exercise both branches of the rate-limit arm in
+/// `run_sync_loop`, and finally succeeds to prove the loop recovers cleanly.
+/// No real 429 from the homeserver is required because classification happens
+/// in `run_matrix_sync`'s step closure; the generic `run_sync_loop` tested
+/// here is the same loop that the live daemon runs.
+///
+/// Assertions:
+/// - After step 1 (`RateLimited { retry_after: Some(...) }`), health is
+///   `Degraded`, `rate_limited_secs` is populated, `last_error` describes the
+///   pause, and `consecutive_failures == 1`.
+/// - The loop reaches all four steps without short-circuiting to `Stopped`.
+/// - After the recovery step (`Ok`), `rate_limited_secs` is `None`,
+///   `consecutive_failures` is `0`, `last_error` is `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
+async fn live_rate_limited_step_records_health_and_recovers() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
+    let alice_user = required_env("MX_AGENT_TEST_USER");
+    let alice_pass = required_env("MX_AGENT_TEST_PASSWORD");
+
+    let data_dir = throwaway_data_dir();
+    std::env::set_var(ENV_DATA_DIR, &data_dir);
+    let paths = SessionPaths::resolve();
+    paths.ensure_data_dir().expect("create data dir");
+
+    let config = MatrixConfig {
+        homeserver_url: homeserver,
+    };
+    let alice_session = login_password(&config, &alice_user, &alice_pass)
+        .await
+        .expect("alice login");
+    let alice = restore_client(&alice_session).await.expect("alice restore");
+    persist_login_session(&paths, &alice_session).expect("persist login session");
+
+    let health = Arc::new(Mutex::new(SyncHealth::initializing(false)));
+    let running = Arc::new(AtomicBool::new(true));
+    let step_count = Arc::new(AtomicU32::new(0));
+    // Snapshot of SyncHealth captured at the start of step 2, after the loop
+    // has already processed step 1's RateLimited result and called
+    // record_rate_limited — proves the health surface was updated correctly.
+    let captured_rl_health: Arc<Mutex<Option<SyncHealth>>> = Arc::new(Mutex::new(None));
+
+    {
+        use matrix_sdk::config::SyncSettings;
+        let paths_inner = paths.clone();
+        let health_inner = Arc::clone(&health);
+        let running_for_loop = Arc::clone(&running);
+        let running_for_step = Arc::clone(&running);
+        let step_count_inner = Arc::clone(&step_count);
+        let health_for_capture = Arc::clone(&health);
+        let capture_sink = Arc::clone(&captured_rl_health);
+
+        run_sync_loop(
+            &paths_inner,
+            health_inner,
+            BackoffConfig {
+                base: std::time::Duration::from_millis(1),
+                max: std::time::Duration::from_millis(4),
+                factor: 2,
+                rate_limit_ceiling: std::time::Duration::from_millis(50),
+            },
+            running_for_loop,
+            move |token| {
+                let alice = alice.clone();
+                let running = Arc::clone(&running_for_step);
+                let health_cap = Arc::clone(&health_for_capture);
+                let cap = Arc::clone(&capture_sink);
+                let count = step_count_inner.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match count {
+                        0 => {
+                            // Step 0: real sync to get a valid batch token. The loop
+                            // records a success; this ties the injected steps to a
+                            // real homeserver round-trip.
+                            let mut settings =
+                                SyncSettings::default().timeout(std::time::Duration::from_secs(30));
+                            if let Some(t) = token {
+                                settings = settings.token(t);
+                            }
+                            alice
+                                .sync_once(settings)
+                                .await
+                                .map(|r| r.next_batch)
+                                .map_err(|e| StepError::Transient(e.to_string()))
+                        }
+                        1 => {
+                            // Step 1: inject a server-directed rate-limit delay. The
+                            // loop will call record_rate_limited, sleep briefly, then
+                            // call step 2. The health snapshot at step 2 must reflect
+                            // the rate-limited state written after this return.
+                            Err(StepError::RateLimited {
+                                retry_after: Some(std::time::Duration::from_millis(1)),
+                            })
+                        }
+                        2 => {
+                            // Step 2: capture health after step 1's RateLimited was
+                            // processed (the loop updated health before sleeping and
+                            // before calling us). Then inject a second rate-limit with
+                            // no server delay, exercising the backoff-fallback branch.
+                            *cap.lock().unwrap() = Some(health_cap.lock().unwrap().clone());
+                            Err(StepError::RateLimited { retry_after: None })
+                        }
+                        3 => {
+                            // Step 3: success — the loop honored both rate-limited
+                            // steps without treating them as fatal. Stop after this
+                            // success so the loop exits cleanly.
+                            running.store(false, Ordering::SeqCst);
+                            Ok("recovered_after_rate_limit".to_string())
+                        }
+                        _ => panic!(
+                            "unexpected step {count}; loop short-circuited or spun unexpectedly"
+                        ),
+                    }
+                }
+            },
+        )
+        .await
+        .expect(
+            "run_sync_loop must return Ok after RateLimited steps; \
+             rate limits must never stop the loop (issue #351)",
+        );
+    }
+
+    // Verify the health snapshot taken at the start of step 2 (after the loop
+    // processed step 1's RateLimited result and invoked record_rate_limited).
+    {
+        let guard = captured_rl_health.lock().unwrap();
+        let rl = guard
+            .as_ref()
+            .expect("health snapshot must have been captured at step 2 (issue #351)");
+        assert_eq!(
+            rl.state,
+            SyncState::Degraded,
+            "SyncHealth must be Degraded (not Stopped) while backing off after a \
+             rate-limited step — the loop is alive and retrying (issue #351); got: {rl:?}"
+        );
+        assert!(
+            rl.rate_limited_secs.is_some(),
+            "rate_limited_secs must be set while the loop honors a 429 backoff so \
+             daemon status can distinguish it from a generic transient (issue #351); \
+             got: {rl:?}"
+        );
+        assert!(
+            rl.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("rate limited")),
+            "last_error must describe the rate-limit pause (issue #351); got: {rl:?}"
+        );
+        assert_eq!(
+            rl.consecutive_failures, 1,
+            "consecutive_failures must be 1 after the first rate-limited step; got: {rl:?}"
+        );
+    }
+
+    // All four steps must have run — no fatal short-circuit occurred.
+    assert_eq!(
+        step_count.load(Ordering::SeqCst),
+        4,
+        "all 4 steps must have run (real sync, two rate-limits, recovery); \
+         a shorter count means the loop short-circuited on a rate-limited step"
+    );
+
+    // After recovery the loop exits cleanly. record_stopped only sets state;
+    // record_success already cleared the rate-limit fields before the stop.
+    let h = health.lock().unwrap();
+    assert!(
+        h.total_syncs >= 1,
+        "at least one successful sync must be recorded (issue #351); got: {h:?}"
+    );
+    assert!(
+        h.rate_limited_secs.is_none(),
+        "rate_limited_secs must be None after a successful sync clears it (issue #351); \
+         got: {h:?}"
+    );
+    assert_eq!(
+        h.consecutive_failures, 0,
+        "consecutive_failures must reset to 0 after a successful sync; got: {h:?}"
+    );
+    assert!(
+        h.last_error.is_none(),
+        "last_error must be None after a successful sync clears it; got: {h:?}"
     );
 
     std::env::remove_var(ENV_DATA_DIR);

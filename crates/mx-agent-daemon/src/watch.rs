@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::{Client, Room};
@@ -32,7 +32,9 @@ use serde::Serialize;
 
 use crate::matrix::restore_client;
 use crate::session::StoredSession;
-use crate::sync::{is_fatal_sync_error, sleep_interruptible, Backoff, BackoffConfig};
+use crate::sync::{
+    is_fatal_sync_error, rate_limit_retry_after, sleep_interruptible, Backoff, BackoffConfig,
+};
 use crate::task::ListTasksOptions;
 use crate::workspace::{
     build_workspace_status, parse_room_or_alias, resolve_room_id, WorkspaceError, WorkspaceStatus,
@@ -231,7 +233,23 @@ where
                     attempt: failures,
                     error: error.to_string(),
                 });
-                sleep_interruptible(backoff.next_delay(), running).await;
+                // Honor a homeserver `Retry-After` on a 429 (clamped to the
+                // backoff ceiling) instead of blindly backing off, mirroring the
+                // daemon sync loop (issue #351). `rate_limit_retry_after` returns
+                // `None` for any non-rate-limit error, so this falls straight
+                // through to the exponential floor in the common case.
+                let floor = backoff.next_delay();
+                let delay = error
+                    .client_api_error_kind()
+                    .and_then(|kind| {
+                        rate_limit_retry_after(
+                            kind,
+                            SystemTime::now(),
+                            config.backoff.rate_limit_ceiling,
+                        )
+                    })
+                    .map_or(floor, |after| after.max(floor));
+                sleep_interruptible(delay, running).await;
             }
         }
     }

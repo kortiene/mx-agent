@@ -10,10 +10,33 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
 
+use matrix_sdk::config::RequestConfig;
 use matrix_sdk::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+/// Bound on matrix-sdk's internal per-request retry budget.
+///
+/// The SDK's default retry budget is ~15 minutes with no attempt cap, so a
+/// sustained homeserver rate limit (HTTP 429 / `M_LIMIT_EXCEEDED`) would be
+/// absorbed *inside* a single `sync_once` — honoring `retry_after_ms` but
+/// blocking for minutes, hiding the rate limit from the daemon's sync loop and
+/// delaying clean shutdown (the SDK's internal sleep is not interruptible by the
+/// loop's `running` flag). Bounding `max_retry_time` to this value keeps the SDK
+/// smoothing *momentary* 429s while letting a *sustained* one surface promptly to
+/// [`crate::sync::run_matrix_sync`], which owns the visible, interruptible,
+/// `Retry-After`-honoring backoff (issue #351).
+const SDK_MAX_RETRY_TIME: Duration = Duration::from_secs(30);
+
+/// The retry policy applied to every daemon-built Matrix client.
+///
+/// Set explicitly (rather than relying on SDK defaults) so the SDK's internal
+/// retry is intentional and bounded; see [`SDK_MAX_RETRY_TIME`].
+fn daemon_request_config() -> RequestConfig {
+    RequestConfig::default().max_retry_time(SDK_MAX_RETRY_TIME)
+}
 
 use crate::session::{clear_session, load_session, Secret, SessionPaths, StoredSession};
 
@@ -175,6 +198,9 @@ pub async fn build_client(config: &MatrixConfig) -> Result<Client, ClientError> 
     let url = validated_url(config)?;
     Client::builder()
         .homeserver_url(url)
+        // Bound the SDK's internal retry so a sustained rate limit surfaces to
+        // the sync loop instead of blocking inside one request (issue #351).
+        .request_config(daemon_request_config())
         .build()
         .await
         .map_err(ClientError::Build)
@@ -206,6 +232,10 @@ pub async fn build_client_with_store(
         .map_err(|e| ClientError::Store(e.to_string()))?;
     Client::builder()
         .homeserver_url(url)
+        // Same bounded retry policy as `build_client` so loopback and
+        // store-backed daemon clients behave identically under rate limits
+        // (issue #351).
+        .request_config(daemon_request_config())
         .sqlite_store(&paths.crypto_store_dir, Some(passphrase.expose()))
         .build()
         .await
@@ -625,6 +655,22 @@ mod tests {
             err,
             ClientError::Config(ConfigError::EmptyHomeserverUrl)
         ));
+    }
+
+    // The SDK's internal retry budget is bounded well below its 15-minute default
+    // so a sustained rate-limit surfaces to the sync loop promptly rather than
+    // blocking inside `sync_once` for minutes (issue #351). Pin the constant so a
+    // future increase does not silently regress the shutdown-responsiveness
+    // property: if you need to raise this, update the doc comment in `matrix.rs`
+    // and explain the trade-off in the PR.
+    #[test]
+    fn sdk_max_retry_time_is_short() {
+        assert!(
+            SDK_MAX_RETRY_TIME <= Duration::from_secs(60),
+            "SDK_MAX_RETRY_TIME must be ≤60s so sustained rate limits surface to the \
+             daemon sync loop promptly; got {:?}",
+            SDK_MAX_RETRY_TIME,
+        );
     }
 
     fn sample_session() -> StoredSession {
