@@ -121,6 +121,33 @@ impl Sandbox {
     }
 }
 
+/// The seccomp-bpf syscall-filtering mode applied to a sandboxed command
+/// (issue #349).
+///
+/// Ships **off by default** for the first release so existing deployments do not
+/// suddenly start `EPERM`-ing syscalls their commands rely on; the curated
+/// `default` profile is opt-in. Only two modes exist — a per-syscall policy DSL
+/// or custom profiles are out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Seccomp {
+    /// No syscall filtering (the default).
+    #[default]
+    Off,
+    /// The built-in curated default-deny allowlist profile.
+    Default,
+}
+
+impl Seccomp {
+    /// The stable, lowercase name of this mode, matching the policy vocabulary.
+    pub fn name(self) -> &'static str {
+        match self {
+            Seccomp::Off => "off",
+            Seccomp::Default => "default",
+        }
+    }
+}
+
 /// Workspace-wide execution defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,6 +182,34 @@ pub struct ExecutionPolicy {
     /// not here. Ignored by the `none` and `bubblewrap` backends (issue #310).
     #[serde(default)]
     pub container_image: Option<String>,
+    /// Default cap on the sandboxed process count (`RLIMIT_NPROC` on the host
+    /// paths, `--pids-limit` for the container backend), unless an agent rule
+    /// overrides it. `None` leaves it uncapped (issue #349).
+    #[serde(default)]
+    pub max_processes: Option<u64>,
+    /// Default cap on the sandboxed address space in bytes (`RLIMIT_AS` on the
+    /// host paths, `--memory` for the container backend), unless an agent rule
+    /// overrides it. `None` leaves it uncapped (issue #349).
+    #[serde(default)]
+    pub max_memory_bytes: Option<u64>,
+    /// Default cap on consumed CPU time in seconds (`RLIMIT_CPU`, distinct from
+    /// the wall-clock `max_runtime_ms`), unless an agent rule overrides it. `None`
+    /// leaves it uncapped (issue #349).
+    #[serde(default)]
+    pub max_cpu_seconds: Option<u64>,
+    /// Default seccomp-bpf mode applied to sandboxed commands unless an agent rule
+    /// overrides it. Defaults to [`Seccomp::Off`] (issue #349).
+    #[serde(default)]
+    pub seccomp: Seccomp,
+    /// Deny an otherwise-allowed execution whose resolved sandbox backend is
+    /// `none` (zero isolation), fail-closed (issue #349).
+    ///
+    /// Execution-scope only (there is no per-agent override). Defaults to `false`,
+    /// which preserves backward compatibility: an execution that resolves to the
+    /// `none` backend still runs, but the daemon emits a prominent warning. Set to
+    /// `true` to turn that warning into a hard `deny:sandbox_required`.
+    #[serde(default)]
+    pub require_sandbox: bool,
 }
 
 /// Per-agent authorization rules within a room.
@@ -192,6 +247,20 @@ pub struct AgentPolicy {
     /// Network policy overriding the execution default.
     #[serde(default)]
     pub network: Option<NetworkPolicy>,
+    /// Process-count cap overriding `execution.max_processes` (issue #349).
+    #[serde(default)]
+    pub max_processes: Option<u64>,
+    /// Address-space (bytes) cap overriding `execution.max_memory_bytes`
+    /// (issue #349).
+    #[serde(default)]
+    pub max_memory_bytes: Option<u64>,
+    /// CPU-seconds cap overriding `execution.max_cpu_seconds` (issue #349).
+    #[serde(default)]
+    pub max_cpu_seconds: Option<u64>,
+    /// Seccomp-bpf mode overriding `execution.seccomp` (issue #349). `None`
+    /// inherits the execution default.
+    #[serde(default)]
+    pub seccomp: Option<Seccomp>,
     /// Require the sending Matrix device to be verified before a privileged
     /// request from this agent executes (issue #240).
     ///
@@ -319,6 +388,12 @@ impl Policy {
         validate_paths("execution.read_only_paths", &self.execution.read_only_paths)?;
         validate_paths("execution.writable_paths", &self.execution.writable_paths)?;
         validate_sandbox("execution.default_sandbox", self.execution.default_sandbox)?;
+        validate_resource_caps(
+            "execution",
+            self.execution.max_processes,
+            self.execution.max_memory_bytes,
+            self.execution.max_cpu_seconds,
+        )?;
 
         if let Some((idx, _)) = self
             .execution
@@ -397,6 +472,12 @@ fn validate_sandbox(path: &str, sandbox: Option<Sandbox>) -> Result<(), PolicyEr
 fn validate_agent(prefix: &str, agent: &AgentPolicy) -> Result<(), PolicyError> {
     validate_paths(&format!("{prefix}.allow_cwd"), &agent.allow_cwd)?;
     validate_sandbox(&format!("{prefix}.sandbox"), agent.sandbox)?;
+    validate_resource_caps(
+        prefix,
+        agent.max_processes,
+        agent.max_memory_bytes,
+        agent.max_cpu_seconds,
+    )?;
 
     for (idx, pattern) in agent.deny_args_regex.iter().enumerate() {
         if let Err(err) = regex::Regex::new(pattern) {
@@ -439,6 +520,31 @@ fn validate_agent(prefix: &str, agent: &AgentPolicy) -> Result<(), PolicyError> 
         });
     }
 
+    Ok(())
+}
+
+/// Reject a zero resource cap with a precise dotted path, mirroring the
+/// `max_runtime_ms == Some(0)` check: a zero cap is a misconfiguration (it would
+/// forbid all work) rather than "uncapped", which is expressed by omitting the
+/// key (issue #349).
+fn validate_resource_caps(
+    prefix: &str,
+    max_processes: Option<u64>,
+    max_memory_bytes: Option<u64>,
+    max_cpu_seconds: Option<u64>,
+) -> Result<(), PolicyError> {
+    for (value, field) in [
+        (max_processes, "max_processes"),
+        (max_memory_bytes, "max_memory_bytes"),
+        (max_cpu_seconds, "max_cpu_seconds"),
+    ] {
+        if value == Some(0) {
+            return Err(PolicyError::Validation {
+                path: format!("{prefix}.{field}"),
+                message: format!("{field} must be greater than zero"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -753,6 +859,94 @@ sandbox = \"firejail\"
             }
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resource_caps_and_seccomp_parse_at_both_scopes() {
+        // Acceptance (issue #349): the new caps + seccomp parse at execution and
+        // agent scope, and omitting them keeps the current defaults.
+        let toml = r#"
+[execution]
+max_processes = 256
+max_memory_bytes = 2147483648
+max_cpu_seconds = 120
+seccomp = "default"
+require_sandbox = true
+
+[rooms."!r:s"]
+trusted = true
+
+[rooms."!r:s".agents."@a:s"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/work"]
+max_processes = 64
+seccomp = "off"
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        assert_eq!(p.execution.max_processes, Some(256));
+        assert_eq!(p.execution.max_memory_bytes, Some(2_147_483_648));
+        assert_eq!(p.execution.max_cpu_seconds, Some(120));
+        assert_eq!(p.execution.seccomp, Seccomp::Default);
+        assert!(p.execution.require_sandbox);
+        let agent = p.rooms["!r:s"].agents["@a:s"].clone();
+        assert_eq!(agent.max_processes, Some(64));
+        assert_eq!(agent.seccomp, Some(Seccomp::Off));
+
+        // A bare policy keeps the defaults: uncapped, seccomp off, sandbox not
+        // required (backward compatible).
+        let bare = Policy::parse("[execution]\n").expect("parses");
+        assert_eq!(bare.execution.max_processes, None);
+        assert_eq!(bare.execution.seccomp, Seccomp::Off);
+        assert!(!bare.execution.require_sandbox);
+    }
+
+    #[test]
+    fn zero_resource_cap_reports_precise_path() {
+        for (key, field) in [
+            ("max_processes", "execution.max_processes"),
+            ("max_memory_bytes", "execution.max_memory_bytes"),
+            ("max_cpu_seconds", "execution.max_cpu_seconds"),
+        ] {
+            let err = Policy::parse(&format!("[execution]\n{key} = 0\n")).unwrap_err();
+            match err {
+                PolicyError::Validation { path, message } => {
+                    assert_eq!(path, field);
+                    assert!(message.contains("greater than zero"), "got {message}");
+                }
+                other => panic!("expected validation error, got {other:?}"),
+            }
+        }
+        // Agent-scope zero caps carry the agent's dotted path. Test all three
+        // cap fields at agent scope so the validation loop is fully covered.
+        for (key, suffix) in [
+            ("max_processes", "max_processes"),
+            ("max_memory_bytes", "max_memory_bytes"),
+            ("max_cpu_seconds", "max_cpu_seconds"),
+        ] {
+            let err = Policy::parse(&format!("[rooms.\"!r:s\".agents.\"@a:s\"]\n{key} = 0\n"))
+                .unwrap_err();
+            match err {
+                PolicyError::Validation { path, message } => {
+                    assert_eq!(path, format!("rooms.\"!r:s\".agents.\"@a:s\".{suffix}"));
+                    assert!(message.contains("greater than zero"), "got {message}");
+                }
+                other => panic!("expected validation error for {key}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn seccomp_name_is_stable() {
+        // The policy vocabulary names must match what the engine and docs use.
+        assert_eq!(Seccomp::Off.name(), "off");
+        assert_eq!(Seccomp::Default.name(), "default");
+    }
+
+    #[test]
+    fn unknown_seccomp_variant_is_rejected() {
+        let err = Policy::parse("[execution]\nseccomp = \"strict\"\n").unwrap_err();
+        assert!(matches!(err, PolicyError::Parse(_)), "got {err:?}");
     }
 
     #[test]

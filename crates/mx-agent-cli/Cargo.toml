@@ -16,6 +16,7 @@ path = "src/main.rs"
 mx-agent-protocol.workspace = true
 mx-agent-telemetry.workspace = true
 mx-agent-daemon.workspace = true
+mx-agent-sandbox.workspace = true
 mx-agent-ipc.workspace = true
 clap.workspace = true
 clap_complete.workspace = true

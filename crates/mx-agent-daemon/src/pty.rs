@@ -32,7 +32,9 @@ use mx_agent_sandbox::{preflight_backend, Restrictions};
 use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 use rustix::termios::{tcgetwinsize, tcsetwinsize, Winsize};
 
-use crate::runner::{resolve_sandbox, restrictions_for, sanitize_env, RunError, RunSpec};
+use crate::runner::{
+    launcher_wrap, resolve_sandbox, restrictions_for, sanitize_env, RunError, RunSpec,
+};
 
 /// A terminal window size: character grid plus optional pixel dimensions.
 ///
@@ -182,7 +184,11 @@ impl PtySession {
         // parent's PTY slave directly and ignore this flag.
         restrictions.interactive = true;
         let prepared = resolve_sandbox(spec).prepare(spec.command.clone(), restrictions);
-        let (program, args) = prepared.argv.split_first().ok_or(RunError::EmptyCommand)?;
+        // Resource caps confine the interactive session too: wrap the prepared
+        // argv in the launcher trampoline for the `none`/`bubblewrap` paths when a
+        // cap (or seccomp, on the `none` path) is set (issue #349).
+        let argv = launcher_wrap(spec, prepared.argv)?;
+        let (program, args) = argv.split_first().ok_or(RunError::EmptyCommand)?;
         let Restrictions { cwd, env, .. } = prepared.restrictions;
         let mut command = Command::new(program);
         command

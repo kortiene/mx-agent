@@ -149,6 +149,17 @@ pub struct ExecRunRequest {
     /// Container image for the container backend, resolved from
     /// `execution.container_image`; `None` uses the backend default (issue #310).
     pub container_image: Option<String>,
+    /// Resource caps (process/memory/CPU) the auto-executed task action runs
+    /// under, resolved from policy (issue #349).
+    pub resources: mx_agent_sandbox::ResourceLimits,
+    /// Seccomp-bpf mode for the task action, resolved from policy (issue #349).
+    pub seccomp: mx_agent_sandbox::SeccompMode,
+    /// Container-backend uid/gid mapping (`--user`), set to the daemon's own
+    /// identity for the container backend so `--cap-drop ALL` is viable (issue
+    /// #349).
+    pub run_uid: Option<u32>,
+    /// The gid paired with [`run_uid`](ExecRunRequest::run_uid).
+    pub run_gid: Option<u32>,
 }
 
 /// A function that runs an exec request and returns the captured outcome.
@@ -176,6 +187,10 @@ fn default_command_runner(request: &ExecRunRequest) -> Result<RunOutput, RunErro
         writable_paths: request.writable_paths.clone(),
         container_runtime: request.container_runtime,
         container_image: request.container_image.clone(),
+        resources: request.resources,
+        seccomp: request.seccomp,
+        run_uid: request.run_uid,
+        run_gid: request.run_gid,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -267,7 +282,7 @@ where
         &mut self,
         _task: &TaskState,
         action: &TaskAction,
-        _invocation_id: &str,
+        invocation_id: &str,
         allowance: &mx_agent_policy::Allowance,
     ) -> Result<TaskExecutionResult, TaskDispatchError> {
         match action {
@@ -278,22 +293,44 @@ where
                 timeout_ms,
                 ..
             } => {
+                // Sandbox floor (issue #349): the auto-executed task DAG honors
+                // `execution.require_sandbox` too — deny without spawning when the
+                // resolved backend is `none`, else the shared gate warns it runs
+                // unsandboxed.
+                if crate::exec::check_sandbox_floor(
+                    allowance,
+                    &crate::exec::SandboxFloorContext::local("task dag", Some(invocation_id)),
+                )
+                .is_err()
+                {
+                    return Err(TaskDispatchError::PolicyDenied(
+                        "execution.require_sandbox is set but the resolved sandbox backend is none"
+                            .to_string(),
+                    ));
+                }
                 // Honor the policy-resolved isolation for this task action rather
                 // than running it unsandboxed (architecture §13.5). The backend
                 // and network decision use the same mapping as the direct `exec`
                 // path so both stay consistent and fail closed.
+                let backend = crate::exec::sandbox_backend(allowance.sandbox);
+                let (run_uid, run_gid) = crate::exec::container_run_identity(backend);
                 let request = ExecRunRequest {
                     command: command.clone(),
                     cwd: PathBuf::from(cwd),
                     env: env.clone(),
                     timeout: timeout_ms.map(Duration::from_millis),
-                    sandbox: crate::exec::sandbox_backend(allowance.sandbox),
+                    sandbox: backend,
                     network: crate::exec::network_for(allowance.network),
                     read_only_paths: allowance.read_only_paths.clone(),
                     writable_paths: allowance.writable_paths.clone(),
                     env_allowlist: allowance.env_allowlist.clone(),
                     container_runtime: crate::exec::container_runtime_for(allowance.sandbox),
                     container_image: allowance.container_image.clone(),
+                    // Confinement floor (issue #349) for the auto-executed task DAG.
+                    resources: crate::exec::resource_limits_for(allowance),
+                    seccomp: crate::exec::seccomp_for(allowance.seccomp),
+                    run_uid,
+                    run_gid,
                 };
                 match (self.run_command)(&request) {
                     Ok(output) => Ok(exec_result_from_output(&output, None)),
@@ -785,6 +822,41 @@ allow_cwd = ["/repo"]
         assert!(
             req.writable_paths.is_empty(),
             "default allowance must yield empty writable_paths"
+        );
+    }
+
+    #[test]
+    fn exec_dispatcher_denies_without_spawning_when_sandbox_required_but_none() {
+        // Sandbox floor (issue #349): require_sandbox + a resolved `none` backend
+        // must deny the task action as PolicyDenied and never invoke the runner.
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let called = Rc::new(Cell::new(false));
+        let flag = called.clone();
+
+        let t = exec_task("true");
+        let action = t.action.clone().unwrap();
+
+        let allowance = mx_agent_policy::Allowance {
+            require_sandbox: true,
+            sandbox: None, // resolves to Backend::None
+            ..mx_agent_policy::Allowance::default()
+        };
+
+        let mut dispatcher = ExecTaskDispatcher::with_runner(move |_req| {
+            flag.set(true);
+            Ok(run_output(Some(0), None, false))
+        });
+
+        let result = dispatcher.dispatch(&t, &action, "inv-1", &allowance);
+        assert!(
+            matches!(result, Err(TaskDispatchError::PolicyDenied(_))),
+            "require_sandbox + none backend must be PolicyDenied, got {result:?}"
+        );
+        assert!(
+            !called.get(),
+            "the runner must not be invoked when the sandbox floor denies"
         );
     }
 

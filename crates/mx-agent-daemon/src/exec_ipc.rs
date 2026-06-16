@@ -685,6 +685,8 @@ fn loopback_run_spec(params: &ExecStartParams, allowance: &Allowance) -> RunSpec
         Some(cwd) => cwd.clone(),
         None => PathBuf::new(),
     };
+    let backend = sandbox_backend(allowance.sandbox);
+    let (run_uid, run_gid) = crate::exec::container_run_identity(backend);
     RunSpec {
         command: params.command.clone(),
         cwd,
@@ -701,12 +703,18 @@ fn loopback_run_spec(params: &ExecStartParams, allowance: &Allowance) -> RunSpec
                 .or(allowance.max_runtime_ms)
                 .unwrap_or(DEFAULT_LOOPBACK_EXEC_TIMEOUT_MS),
         )),
-        sandbox: sandbox_backend(allowance.sandbox),
+        sandbox: backend,
         network: network_for(allowance.network),
         read_only_paths: allowance.read_only_paths.clone(),
         writable_paths: allowance.writable_paths.clone(),
         container_runtime: crate::exec::container_runtime_for(allowance.sandbox),
         container_image: allowance.container_image.clone(),
+        // Confinement floor (issue #349): resource caps + seccomp + the container
+        // uid mapping apply to the loopback path too.
+        resources: crate::exec::resource_limits_for(allowance),
+        seccomp: crate::exec::seccomp_for(allowance.seccomp),
+        run_uid,
+        run_gid,
         ..Default::default()
     }
 }
@@ -743,6 +751,22 @@ async fn run_loopback_with(
     params: &ExecStartParams,
     allowance: &Allowance,
 ) -> ExecOutcome {
+    // Sandbox floor (issue #349): the loopback path honors
+    // `execution.require_sandbox` too — deny fail-closed when the resolved
+    // backend is `none`, otherwise the shared gate warns it runs unsandboxed.
+    if crate::exec::check_sandbox_floor(
+        allowance,
+        &crate::exec::SandboxFloorContext::local("loopback exec", Some(invocation_id)),
+    )
+    .is_err()
+    {
+        return ExecOutcome::Error {
+            kind: ExecErrorKind::Spawn,
+            message: "refusing to run unsandboxed: execution.require_sandbox is set but the \
+                      resolved sandbox backend is none"
+                .to_string(),
+        };
+    }
     let spec = loopback_run_spec(params, allowance);
     let started = Instant::now();
     let output = match run(&spec).await {
@@ -1138,6 +1162,30 @@ writable_paths = ["/work"]
             f.truncated,
             "output beyond the cap must be marked truncated"
         );
+    }
+
+    #[tokio::test]
+    async fn loopback_denied_when_sandbox_required_but_none() {
+        // Sandbox floor (issue #349): require_sandbox + a resolved `none` backend
+        // must fail closed on the loopback path rather than run unsandboxed. The
+        // command (`false`, which would exit 1) must never run — the outcome is an
+        // Error, not a Finished frame.
+        let allowance = Allowance {
+            require_sandbox: true,
+            sandbox: None, // resolves to Backend::None
+            ..Allowance::default()
+        };
+        let outcome = run_loopback_with("inv_floor", &params(&["false"]), &allowance).await;
+        match outcome {
+            ExecOutcome::Error { kind, message } => {
+                assert_eq!(kind, ExecErrorKind::Spawn);
+                assert!(
+                    message.contains("require_sandbox"),
+                    "denial message must name the control, got {message:?}"
+                );
+            }
+            other => panic!("expected a fail-closed Error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

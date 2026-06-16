@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
-use crate::file::{AgentPolicy, NetworkPolicy, Policy, RawExecDefault, RoomPolicy, Sandbox};
+use crate::file::{
+    AgentPolicy, NetworkPolicy, Policy, RawExecDefault, RoomPolicy, Sandbox, Seccomp,
+};
 
 /// The outcome of evaluating a request against the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +92,26 @@ pub struct Allowance {
     /// backend's built-in default image. Ignored by the `none`/`bubblewrap`
     /// backends (issue #310).
     pub container_image: Option<String>,
+    /// Cap on the sandboxed process count (`RLIMIT_NPROC` / `--pids-limit`),
+    /// resolved as the agent override or the `execution.max_processes` default.
+    /// `None` leaves it uncapped (issue #349).
+    pub max_processes: Option<u64>,
+    /// Cap on the sandboxed address space in bytes (`RLIMIT_AS` / `--memory`),
+    /// resolved as the agent override or the `execution.max_memory_bytes` default.
+    /// `None` leaves it uncapped (issue #349).
+    pub max_memory_bytes: Option<u64>,
+    /// Cap on consumed CPU-seconds (`RLIMIT_CPU` / `--ulimit cpu`), resolved as the
+    /// agent override or the `execution.max_cpu_seconds` default. `None` leaves it
+    /// uncapped (issue #349).
+    pub max_cpu_seconds: Option<u64>,
+    /// Seccomp-bpf mode, resolved as the agent override or the `execution.seccomp`
+    /// default (issue #349).
+    pub seccomp: Seccomp,
+    /// Whether an execution that resolves to the `none` (zero-isolation) backend
+    /// must be denied fail-closed (`execution.require_sandbox`). Execution-scope
+    /// only; the daemon enforces it once it has resolved the concrete backend
+    /// (issue #349).
+    pub require_sandbox: bool,
 }
 
 /// Machine-readable reason a request was denied.
@@ -265,6 +287,11 @@ impl Policy {
             read_only_paths: self.execution.read_only_paths.clone(),
             writable_paths: self.execution.writable_paths.clone(),
             container_image: self.execution.container_image.clone(),
+            max_processes: self.execution.max_processes,
+            max_memory_bytes: self.execution.max_memory_bytes,
+            max_cpu_seconds: self.execution.max_cpu_seconds,
+            seccomp: self.execution.seccomp,
+            require_sandbox: self.execution.require_sandbox,
             ..Allowance::default()
         }
     }
@@ -294,6 +321,14 @@ impl Policy {
             read_only_paths: self.execution.read_only_paths.clone(),
             writable_paths: self.execution.writable_paths.clone(),
             container_image: self.execution.container_image.clone(),
+            // Resource caps and seccomp resolve like sandbox/network: the agent
+            // rule overrides the execution default (issue #349).
+            max_processes: agent.max_processes.or(self.execution.max_processes),
+            max_memory_bytes: agent.max_memory_bytes.or(self.execution.max_memory_bytes),
+            max_cpu_seconds: agent.max_cpu_seconds.or(self.execution.max_cpu_seconds),
+            seccomp: agent.seccomp.unwrap_or(self.execution.seccomp),
+            // `require_sandbox` is execution-scope only (no per-agent override).
+            require_sandbox: self.execution.require_sandbox,
             // The verified-device requirement applies if either the room default
             // or the agent rule sets it (issue #240).
             require_verified_device: room.require_verified_device || agent.require_verified_device,
@@ -886,6 +921,69 @@ requires_approval = true
     }
 
     #[test]
+    fn allowance_resolves_resource_caps_and_seccomp_with_agent_override() {
+        // Acceptance (issue #349): caps + seccomp + require_sandbox flow onto the
+        // allowance, and the agent rule overrides the execution default (mirroring
+        // the network-override test).
+        let toml = r#"
+[execution]
+max_processes = 256
+max_memory_bytes = 2147483648
+max_cpu_seconds = 120
+seccomp = "default"
+require_sandbox = true
+
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+max_processes = 64
+seccomp = "off"
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        let cmd = argv(&["cargo", "test"]);
+        let a = p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .allowance()
+            .unwrap()
+            .clone();
+        // Agent overrides win for the keys it sets…
+        assert_eq!(a.max_processes, Some(64));
+        assert_eq!(a.seccomp, Seccomp::Off);
+        // …and the execution defaults fill the rest.
+        assert_eq!(a.max_memory_bytes, Some(2_147_483_648));
+        assert_eq!(a.max_cpu_seconds, Some(120));
+        // require_sandbox is execution-scope only.
+        assert!(a.require_sandbox);
+
+        // The execution-only confinement floor carries the same caps.
+        let floor = p.execution_allowance();
+        assert_eq!(floor.max_processes, Some(256));
+        assert_eq!(floor.seccomp, Seccomp::Default);
+        assert!(floor.require_sandbox);
+    }
+
+    #[test]
+    fn allowance_resource_caps_default_unset() {
+        // policy() configures no caps, so the allowance must carry None/Off/false.
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let a = p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .allowance()
+            .unwrap()
+            .clone();
+        assert_eq!(a.max_processes, None);
+        assert_eq!(a.max_memory_bytes, None);
+        assert_eq!(a.max_cpu_seconds, None);
+        assert_eq!(a.seccomp, Seccomp::Off);
+        assert!(!a.require_sandbox);
+    }
+
+    #[test]
     fn allowance_network_resolves_agent_override_then_execution_default() {
         // Agent-level `network` overrides the execution-level default.
         let toml = r#"
@@ -912,6 +1010,38 @@ network = "allow"
             a.network,
             Some(NetworkPolicy::Allow),
             "agent-level network must override the execution default"
+        );
+    }
+
+    #[test]
+    fn agent_inherits_execution_seccomp_when_not_set() {
+        // When an agent rule omits `seccomp`, the allowance inherits the
+        // execution-level default — mirroring how `sandbox` and `network`
+        // resolve. This is the common operational case: operator sets
+        // `execution.seccomp = "default"` once and all agents pick it up.
+        let toml = r#"
+[execution]
+seccomp = "default"
+
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        let cmd = argv(&["cargo", "test"]);
+        let a = p
+            .evaluate_exec(&exec(&cmd, "/home/me/code/project"))
+            .allowance()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            a.seccomp,
+            Seccomp::Default,
+            "agent must inherit execution.seccomp when its own rule omits it"
         );
     }
 }

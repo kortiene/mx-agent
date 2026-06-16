@@ -10,7 +10,7 @@ mod file;
 pub use engine::{Allowance, CallContext, DenyReason, ExecContext, Outcome};
 pub use file::{
     AgentPolicy, ExecutionPolicy, NetworkPolicy, Policy, PolicyError, RawExecDefault, RoomPolicy,
-    Sandbox, ENV_CONFIG_DIR, POLICY_FILE_NAME,
+    Sandbox, Seccomp, ENV_CONFIG_DIR, POLICY_FILE_NAME,
 };
 
 /// The outcome of a policy evaluation.

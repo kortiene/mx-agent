@@ -590,3 +590,78 @@ fn wiki_exec_finished_and_chunk_examples_deserialize() {
         "wiki exec.finished example must show artifact_mxc: null (issue #313)"
     );
 }
+
+// ── Issue #349: sandbox seccomp/rlimit floor + container cap-drop — guards ─────
+//
+// Before #349 the docs asserted the container backend "deliberately does not
+// `--cap-drop ALL`" (deferred pending a `--user` mapping) and that there was "no
+// seccomp filtering and no rlimit/cgroup resource capping". Slice (A)/(C)/(D)
+// shipped the container `--user`/`--cap-drop ALL`, the policy-driven resource caps
+// (RLIMIT/cgroup), and the `require_sandbox` gate, so those stale claims must not
+// drift back. The seccomp *profile installation* remains a documented follow-up,
+// so we do NOT assert seccomp is fully enforced — only that the now-shipped
+// controls are described.
+
+/// architecture §13.5 must no longer claim the container cap-drop is deferred.
+#[test]
+fn architecture_drops_deferred_cap_drop_claim() {
+    assert!(
+        !ARCHITECTURE.contains("full capability dropping is deferred"),
+        "architecture must not claim container --cap-drop ALL is deferred (issue #349)"
+    );
+    assert!(
+        !ARCHITECTURE.contains("no `seccomp` filtering and no rlimit/cgroup resource capping yet"),
+        "architecture must not claim there is no rlimit/cgroup resource capping (issue #349)"
+    );
+    // Positive: the new resource-cap floor and require_sandbox gate are described.
+    assert!(
+        ARCHITECTURE.contains("max_cpu_seconds") && ARCHITECTURE.contains("require_sandbox"),
+        "architecture §13.5 must document the resource caps + require_sandbox (issue #349)"
+    );
+}
+
+/// security-hardening's backend table must reflect the container `--cap-drop ALL`
+/// and the resource-cap floor, not the stale "deferred"/"no rlimit" wording.
+#[test]
+fn security_hardening_describes_resource_floor_and_cap_drop() {
+    assert!(
+        !SECURITY_HARDENING.contains("No `--cap-drop ALL`"),
+        "security-hardening must not claim the container omits --cap-drop ALL (issue #349)"
+    );
+    assert!(
+        !SECURITY_HARDENING.contains("no seccomp syscall filtering and no\nrlimit/cgroup"),
+        "security-hardening must not claim there is no rlimit/cgroup resource capping (issue #349)"
+    );
+    assert!(
+        SECURITY_HARDENING.contains("max_processes")
+            && SECURITY_HARDENING.contains("require_sandbox"),
+        "security-hardening must document the resource caps + require_sandbox (issue #349)"
+    );
+}
+
+/// The cli-reference policy table must document the new execution keys.
+#[test]
+fn cli_reference_documents_resource_and_seccomp_keys() {
+    for key in [
+        "execution.max_processes",
+        "execution.max_memory_bytes",
+        "execution.max_cpu_seconds",
+        "execution.seccomp",
+        "execution.require_sandbox",
+    ] {
+        assert!(
+            CLI_REFERENCE.contains(key),
+            "cli-reference policy table must document {key} (issue #349)"
+        );
+    }
+}
+
+/// The README sandbox status row must drop the stale "no seccomp/rlimit/cgroup
+/// caps" claim now that the resource caps and container cap-drop ship.
+#[test]
+fn readme_drops_no_resource_caps_claim() {
+    assert!(
+        !README.contains("still no seccomp/rlimit/cgroup caps"),
+        "README sandbox row must not claim there are no resource caps (issue #349)"
+    );
+}

@@ -2247,6 +2247,7 @@ dependencies = [
  "mx-agent-daemon",
  "mx-agent-ipc",
  "mx-agent-protocol",
+ "mx-agent-sandbox",
  "mx-agent-telemetry",
  "rustix",
  "serde",
@@ -2317,6 +2318,10 @@ dependencies = [
 [[package]]
 name = "mx-agent-sandbox"
 version = "0.2.1"
+dependencies = [
+ "nix",
+ "tracing",
+]
 
 [[package]]
 name = "mx-agent-telemetry"

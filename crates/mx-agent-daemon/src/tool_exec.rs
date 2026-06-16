@@ -101,9 +101,10 @@ impl std::error::Error for ToolError {
 /// `sanitize_env`. The runner spawns this exactly like a raw `exec`, so a named
 /// tool is confined at least as strictly as `exec` (architecture §13.5).
 ///
-/// Pure and side-effect-free (the `cwd` is resolved by the caller) so tests can
-/// assert the resulting spec without spawning a process. Unknown-tool /
-/// invalid-args validation happens here, before any runtime is spun up.
+/// Resolves no `cwd` (the caller does) and spawns nothing, so tests can assert
+/// the resulting spec directly. Unknown-tool / invalid-args validation and the
+/// sandbox-floor gate (issue #349) both happen here, before any runtime is spun
+/// up; the gate may emit an advisory `warn!` when an unsandboxed tool is allowed.
 ///
 /// Under an isolating sandbox the `cwd` must be inside the configured
 /// `writable_paths` for the tool to do anything useful — that is an operator
@@ -122,6 +123,22 @@ fn tool_run_spec(
     let mut command = Vec::with_capacity(argv.len() + 1);
     command.push(program);
     command.extend(argv);
+    // Sandbox floor (issue #349): a built-in tool honors `execution.require_sandbox`
+    // exactly like raw exec — refuse to build a spec when the resolved backend is
+    // `none`, otherwise the shared gate warns it runs unsandboxed.
+    if crate::exec::check_sandbox_floor(
+        allowance,
+        &crate::exec::SandboxFloorContext::local("tool exec", None),
+    )
+    .is_err()
+    {
+        return Err(ToolError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "execution.require_sandbox is set but the resolved sandbox backend is none",
+        )));
+    }
+    let backend = crate::exec::sandbox_backend(allowance.sandbox);
+    let (run_uid, run_gid) = crate::exec::container_run_identity(backend);
     Ok(RunSpec {
         command,
         cwd,
@@ -130,12 +147,18 @@ fn tool_run_spec(
         stdin: None,
         timeout: allowance.max_runtime_ms.map(Duration::from_millis),
         grace_period: DEFAULT_GRACE_PERIOD,
-        sandbox: crate::exec::sandbox_backend(allowance.sandbox),
+        sandbox: backend,
         network: crate::exec::network_for(allowance.network),
         read_only_paths: allowance.read_only_paths.clone(),
         writable_paths: allowance.writable_paths.clone(),
         container_runtime: crate::exec::container_runtime_for(allowance.sandbox),
         container_image: allowance.container_image.clone(),
+        // Confinement floor (issue #349): built-in tools run under the same
+        // resource caps / seccomp / container uid mapping as raw exec.
+        resources: crate::exec::resource_limits_for(allowance),
+        seccomp: crate::exec::seccomp_for(allowance.seccomp),
+        run_uid,
+        run_gid,
     })
 }
 
@@ -444,6 +467,28 @@ mod tests {
         assert_eq!(spec.network, mx_agent_sandbox::Network::Deny);
         assert!(spec.read_only_paths.is_empty());
         assert!(spec.writable_paths.is_empty());
+    }
+
+    #[test]
+    fn tool_run_spec_denied_when_sandbox_required_but_none() {
+        // Sandbox floor (issue #349): require_sandbox + a resolved `none` backend
+        // must refuse to build a spec rather than run the tool unsandboxed.
+        let allowance = Allowance {
+            require_sandbox: true,
+            sandbox: None, // resolves to Backend::None
+            ..Allowance::default()
+        };
+        let err = tool_run_spec(
+            RUN_TESTS,
+            &json!({ "package": "x" }),
+            &allowance,
+            PathBuf::from("."),
+        )
+        .unwrap_err();
+        match err {
+            ToolError::Spawn(io) => assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied),
+            other => panic!("expected a spawn-refused error, got {other:?}"),
+        }
     }
 
     #[test]

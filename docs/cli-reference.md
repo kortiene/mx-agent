@@ -3132,6 +3132,11 @@ network = "deny"                      # allow | deny
 read_only_paths = ["/usr", "/bin"]   # Absolute paths; mounted read-only in sandbox
 writable_paths = ["/home/me/project"] # Absolute paths; child process may write to these
 env_allowlist = ["CARGO_HOME"]        # Additional safe env vars to pass to child (allowlist-based)
+max_processes = 256                   # Cap process count (RLIMIT_NPROC / --pids-limit); must be > 0
+max_memory_bytes = 2147483648         # Cap address space (RLIMIT_AS / --memory); must be > 0
+max_cpu_seconds = 120                 # Cap CPU-seconds (RLIMIT_CPU / --ulimit cpu); must be > 0
+seccomp = "off"                       # off (default) | default — syscall-filter mode (Linux)
+require_sandbox = false               # true ⇒ deny an execution that resolves to the `none` backend
 
 [rooms."!abc:matrix.org"]
 trusted = true                        # Enable privileged request evaluation in this room
@@ -3162,6 +3167,11 @@ require_verified_device = false       # When true, Matrix device must be verifie
 | `execution.read_only_paths` | workspace | list | Absolute paths; validated |
 | `execution.writable_paths` | workspace | list | Absolute paths; validated |
 | `execution.env_allowlist` | workspace | list | Env var names; non-empty validated |
+| `execution.max_processes` | workspace | u64 | Process-count cap (`RLIMIT_NPROC` / `--pids-limit`); must be > 0 if set (issue #349) |
+| `execution.max_memory_bytes` | workspace | u64 | Address-space cap (`RLIMIT_AS` / `--memory`); must be > 0 if set (issue #349) |
+| `execution.max_cpu_seconds` | workspace | u64 | CPU-seconds cap (`RLIMIT_CPU` / `--ulimit cpu`); must be > 0 if set (issue #349) |
+| `execution.seccomp` | workspace | enum | `off` (default) or `default`; Linux seccomp mode, opt-in (issue #349) |
+| `execution.require_sandbox` | workspace | bool | When true, deny an execution resolving to the `none` backend (`deny:sandbox_required`); default false (issue #349) |
 | `rooms."ROOM_ID".trusted` | room | bool | Must have Matrix room ID starting with `!` |
 | `rooms."ROOM_ID".raw_exec_default` | room | enum | `allow` or `deny`; default when no agent rule applies |
 | `rooms."ROOM_ID".require_verified_device` | room | bool | Room-level override for device verification gate |
@@ -3176,6 +3186,10 @@ require_verified_device = false       # When true, Matrix device must be verifie
 | `rooms."ROOM_ID".agents."AGENT_ID".requires_approval` | agent | bool | Additive gate |
 | `rooms."ROOM_ID".agents."AGENT_ID".sandbox` | agent | enum | Overrides `execution.default_sandbox` |
 | `rooms."ROOM_ID".agents."AGENT_ID".network` | agent | enum | Overrides `execution.network` |
+| `rooms."ROOM_ID".agents."AGENT_ID".max_processes` | agent | u64 | Overrides `execution.max_processes`; must be > 0 if set (issue #349) |
+| `rooms."ROOM_ID".agents."AGENT_ID".max_memory_bytes` | agent | u64 | Overrides `execution.max_memory_bytes`; must be > 0 if set (issue #349) |
+| `rooms."ROOM_ID".agents."AGENT_ID".max_cpu_seconds` | agent | u64 | Overrides `execution.max_cpu_seconds`; must be > 0 if set (issue #349) |
+| `rooms."ROOM_ID".agents."AGENT_ID".seccomp` | agent | enum | Overrides `execution.seccomp` (`off`/`default`) (issue #349) |
 | `rooms."ROOM_ID".agents."AGENT_ID".require_verified_device` | agent | bool | Additive gate (issue #240) |
 
 > **Implemented backends vs. accepted values.** `policy.toml` *parses* all six `sandbox` /
@@ -3198,6 +3212,8 @@ require_verified_device = false       # When true, Matrix device must be verifie
 - `deny_args_regex` values must be valid Rust regex patterns
 - `allow_tools` and `allow_commands` must contain non-empty strings
 - `max_runtime_ms` and `max_output_bytes` must be > 0 if specified
+- `max_processes`, `max_memory_bytes`, and `max_cpu_seconds` must be > 0 if specified (issue #349)
+- `seccomp` must be `off` or `default` (unknown variants are rejected by the parser)
 - Unknown top-level, room, or agent fields are rejected with precise dotted paths (e.g., `rooms."!abc:matrix.org".agents."@a:matrix.org".deny_args_regex[1]`)
 
 ---

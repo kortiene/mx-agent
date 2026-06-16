@@ -2113,17 +2113,52 @@ silent unsandboxed fallthrough.
   `--security-opt no-new-privileges`, `--network none` when denied, explicit
   `--volume` binds, and the sanitized env passed **by name** (`--env KEY`,
   values never in argv). The runtime follows the `sandbox` value and the image
-  is `execution.container_image`. The container backend deliberately does
-  **not** `--cap-drop ALL`: it runs as root, so dropping `CAP_DAC_OVERRIDE`
-  would block writes to a `writable_paths` mount owned by the host operator's
-  non-root uid; full capability dropping is deferred pending a `--user` uid
-  mapping.
+  is `execution.container_image`. The container additionally runs as the
+  daemon's own identity — `--user <uid>:<gid>` under docker, `--userns=keep-id`
+  under rootless podman — so it owns the host-side `writable_paths` mounts, and
+  with that identity in place it drops every capability (`--cap-drop ALL`),
+  reaching bubblewrap parity (issue #349). The identity mapping and the cap-drop
+  always land together.
 
 Across every backend the network is **disabled by default** (`Network::Deny`).
-There is **no `seccomp` filtering and no rlimit/cgroup resource capping yet** —
-isolation is namespace- and filesystem-based only. See the [security hardening
-guide](security-hardening.md) backend table and the cli-reference "Implemented
-backends vs. accepted values" note for the canonical list.
+
+**Resource caps (issue #349).** A *confinement floor* bounds how much of the
+host an already-authorized command may consume. The three caps —
+`execution.max_processes` (process count), `execution.max_memory_bytes` (address
+space), and `execution.max_cpu_seconds` (total CPU-seconds, distinct from the
+wall-clock `max_runtime_ms`) — resolve through the policy engine (agent override,
+else execution default) and are enforced for batch `exec`, named `call`,
+auto-executed task DAGs, the interactive `--pty` path, and the loopback floor.
+The container backend maps them to exact cgroup-backed `run` flags
+(`--pids-limit` / `--memory` / `--ulimit cpu`). The `none` and `bubblewrap`
+backends — which have no runtime to enforce them and cannot use `pre_exec`
+(`unsafe`, which the workspace forbids) — are wrapped in a hidden self-re-exec
+launcher (`mx-agent __sandbox-exec …`) that applies `setrlimit` (safe) before
+`exec`. `RLIMIT_NPROC` under bubblewrap's user namespace is a best-effort
+fork-bomb dampener, not an exact cap; the container `--pids-limit` is exact. On
+macOS `RLIMIT_NPROC` is skipped (documented platform limitation).
+
+**Seccomp (issue #349).** `execution.seccomp` selects the syscall-filtering mode:
+`"off"` (the default) or a curated default-deny `"default"` profile, with the
+usual agent override. Seccomp is Linux-only; it ships **off by default** for the
+first release so existing deployments do not suddenly start `EPERM`-ing syscalls
+their commands rely on. The mode threads end to end through the launcher; the
+actual default-deny BPF profile installation (in-process on the `none` path, via
+`bwrap --seccomp` and container `--security-opt seccomp=`) is a documented
+follow-up — the curated allowlist's breadth and the `bwrap --seccomp` byte format
+are open questions that need a real-Linux acceptance test to settle, and the
+launcher is loud (it warns) when `"default"` is requested rather than silently
+leaving a command unfiltered.
+
+**Loud / gated `sandbox = none`.** When an authorized execution resolves to the
+zero-isolation `none` backend the daemon emits a prominent warning (room /
+requester / target ids only — no secrets). Setting `execution.require_sandbox =
+true` turns that warning into a hard, fail-closed denial
+(`deny:sandbox_required`).
+
+See the [security hardening guide](security-hardening.md) backend table and the
+cli-reference "Implemented backends vs. accepted values" note for the canonical
+list.
 
 Example:
 
@@ -2133,6 +2168,11 @@ default_sandbox = "bubblewrap"
 network = "deny"
 read_only_paths = ["/usr", "/bin", "/lib"]
 writable_paths = ["/home/me/code/project", "/tmp/mx-agent"]
+max_processes   = 256          # RLIMIT_NPROC / container --pids-limit
+max_memory_bytes = 2147483648  # 2 GiB; RLIMIT_AS / container --memory
+max_cpu_seconds = 120          # RLIMIT_CPU (CPU-seconds, not wall clock)
+seccomp = "off"                # "off" (default) | "default"
+require_sandbox = false        # true ⇒ deny an execution resolving to `none`
 ```
 
 These controls apply uniformly to raw `exec` **and** named tools. Built-in tools

@@ -30,6 +30,93 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod launcher;
+
+pub use launcher::{run_launcher, LauncherArgs, LAUNCHER_SUBCOMMAND};
+
+/// Post-authorization resource caps a sandboxed command runs under (issue #349).
+///
+/// These are a *confinement floor* layered under the namespace/filesystem
+/// backends: they bound how much of the host an *already-authorized* command may
+/// consume (process count, memory, CPU time), mitigating a fork bomb or a
+/// memory/CPU exhaustion by a misbehaving command. They never grant execution.
+///
+/// How each cap is enforced depends on the backend (architecture §13.5):
+///
+/// - the **container** backend maps them to cgroup-backed `run` flags
+///   (`--pids-limit`, `--memory`, `--ulimit cpu`), which are exact;
+/// - the **`none`** and **`bubblewrap`** backends have no runtime to enforce
+///   them, so the runner wraps the command in the [`launcher`] re-exec
+///   trampoline, which applies `setrlimit` (safe, no `unsafe`) before `exec`.
+///   `RLIMIT_NPROC` under bubblewrap's user namespace is a best-effort fork-bomb
+///   dampener, not an exact cap — prefer the container backend where exact pid
+///   capping matters.
+///
+/// Every field is `None` by default (no cap), so a command runs unbounded unless
+/// the operator configures a cap in policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Maximum number of processes/threads (`RLIMIT_NPROC` on the host paths,
+    /// `--pids-limit` for the container backend). `None` leaves it uncapped.
+    pub max_processes: Option<u64>,
+    /// Maximum address space in bytes (`RLIMIT_AS` on the host paths, `--memory`
+    /// for the container backend). `None` leaves it uncapped.
+    pub max_memory_bytes: Option<u64>,
+    /// Maximum consumed CPU time in seconds (`RLIMIT_CPU` everywhere, including
+    /// the container backend via `--ulimit cpu`). This is total CPU-seconds,
+    /// distinct from the wall-clock [`Restrictions::timeout`]. `None` leaves it
+    /// uncapped.
+    pub max_cpu_seconds: Option<u64>,
+}
+
+impl ResourceLimits {
+    /// Whether any cap is set, so the runner knows whether the [`launcher`]
+    /// re-exec trampoline is needed for the `none`/`bubblewrap` paths.
+    pub fn is_unset(self) -> bool {
+        self == ResourceLimits::default()
+    }
+}
+
+/// The seccomp-bpf syscall-filtering mode a sandboxed command runs under
+/// (issue #349).
+///
+/// Seccomp is a Linux-only confinement floor that reduces the kernel attack
+/// surface a command can reach. It ships **off by default** for the first
+/// release so existing deployments do not suddenly start `EPERM`-ing syscalls
+/// their commands rely on; flipping the default on once the curated profile is
+/// validated against the real command corpus is a documented follow-up.
+///
+/// On the `none` execution path the filter is installed in-process by the
+/// [`launcher`] trampoline via `seccompiler::apply_filter` (a safe call; the
+/// `unsafe` syscall lives inside that crate) immediately before `exec`. On
+/// macOS, where seccomp does not exist, the launcher's seccomp step is a
+/// documented no-op.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SeccompMode {
+    /// No syscall filtering (the default).
+    #[default]
+    Off,
+    /// The built-in curated default-deny allowlist profile, whose default action
+    /// is `ERRNO(EPERM)` (not `KILL`) so a too-strict profile degrades to a
+    /// recoverable command failure rather than an opaque process death.
+    Default,
+}
+
+impl SeccompMode {
+    /// Whether syscall filtering is requested.
+    pub fn is_on(self) -> bool {
+        matches!(self, SeccompMode::Default)
+    }
+
+    /// The stable, lowercase name of this mode (matches the policy vocabulary).
+    pub fn name(self) -> &'static str {
+        match self {
+            SeccompMode::Off => "off",
+            SeccompMode::Default => "default",
+        }
+    }
+}
+
 /// Available sandbox backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -144,6 +231,25 @@ pub struct Restrictions {
     /// `bubblewrap` backends inherit the parent's PTY slave directly and ignore
     /// this flag. Defaults to `false` (the non-interactive batch path).
     pub interactive: bool,
+    /// Post-authorization resource caps applied around the command (issue #349).
+    ///
+    /// The container backend emits the matching `run` flags; the `none`/`bubblewrap`
+    /// backends are wrapped by the runner in the [`launcher`] trampoline, which
+    /// applies `setrlimit`. Defaults to no caps ([`ResourceLimits::default`]).
+    pub resources: ResourceLimits,
+    /// The seccomp-bpf syscall-filtering mode (issue #349). Only enforced on Linux
+    /// and only on the `none` path for the first release (installed in-process by
+    /// the [`launcher`] trampoline); defaults to [`SeccompMode::Off`].
+    pub seccomp: SeccompMode,
+    /// The uid the container backend runs the command as (`--user <uid>:<gid>`),
+    /// so it owns the host-side `writable_paths` mounts and full `--cap-drop ALL`
+    /// becomes viable without `CAP_DAC_OVERRIDE` (issue #349). Set by the runner to
+    /// the daemon's own uid for the container backend; `None` (the default) leaves
+    /// the runtime's default user, and the other backends ignore it.
+    pub run_uid: Option<u32>,
+    /// The gid paired with [`run_uid`](Restrictions::run_uid) for the container
+    /// `--user <uid>:<gid>` mapping. Ignored unless `run_uid` is also set.
+    pub run_gid: Option<u32>,
 }
 
 /// A command prepared for execution by a [`Sandbox`] backend.
@@ -350,9 +456,15 @@ const DEFAULT_IMAGE: &str = "debian:stable-slim";
 ///   only the names do. Secrets are already scrubbed by the caller (architecture
 ///   §13.4).
 /// - `--security-opt no-new-privileges` blocks privilege escalation inside the
-///   container. (A full `--cap-drop ALL` is deferred: the container runs as root
-///   and dropping `CAP_DAC_OVERRIDE` would block writes to a `writable_paths`
-///   mount owned by the host operator's uid; that needs a `--user` uid mapping.)
+///   container. When the runner populates [`Restrictions::run_uid`] (it does so
+///   for this backend, using the daemon's own uid) the container additionally runs
+///   as that identity — `--user <uid>:<gid>` under docker, `--userns=keep-id`
+///   under rootless podman — so it owns the host-side `writable_paths` mounts and
+///   a full `--cap-drop ALL` becomes viable without `CAP_DAC_OVERRIDE` (issue
+///   #349). The identity mapping and the cap-drop always land together.
+/// - resource caps from [`Restrictions::resources`] become cgroup-backed flags:
+///   `--pids-limit` (process count), `--memory` (address space), and
+///   `--ulimit cpu=<n>:<n>` (total CPU-seconds). Each is omitted when unset.
 /// - when [`Restrictions::interactive`] is set (an `exec --pty` session) the
 ///   command also gets `-i -t`, allocating a controlling TTY inside the
 ///   container so `isatty` is true and full-screen/interactive programs work.
@@ -424,6 +536,51 @@ impl Sandbox for ContainerSandbox {
             "--security-opt".to_string(),
             "no-new-privileges".to_string(),
         ];
+
+        // Identity mapping + full capability drop (issue #349). Running the
+        // container process as the daemon's own uid makes it the owner of the
+        // host-side `writable_paths` mounts, so writes succeed *without*
+        // CAP_DAC_OVERRIDE — which in turn makes `--cap-drop ALL` viable, bringing
+        // the container backend up to bwrap parity. The two MUST land together:
+        // `--cap-drop ALL` without the matching identity mapping would break writes
+        // to the workspace. Under docker `--user <uid>:<gid>` means the real host
+        // uid; under rootless podman the same flag is interpreted inside the
+        // runtime's user namespace, so podman maps the invoking host user with
+        // `--userns=keep-id` instead (open question #3). Only emitted when the
+        // runner populated `run_uid` (it does so for the container backend).
+        if let Some(uid) = restrictions.run_uid {
+            match self.runtime {
+                Runtime::Docker => {
+                    let gid = restrictions.run_gid.unwrap_or(uid);
+                    wrapped.push("--user".to_string());
+                    wrapped.push(format!("{uid}:{gid}"));
+                }
+                Runtime::Podman => {
+                    wrapped.push("--userns=keep-id".to_string());
+                }
+            }
+            wrapped.push("--cap-drop".to_string());
+            wrapped.push("ALL".to_string());
+        }
+
+        // Resource caps as cgroup-backed run flags (issue #349). `--pids-limit`
+        // (cgroup pids controller) is the exact fork-bomb guard; `--memory` caps
+        // the cgroup's memory; CPU is capped as total CPU-seconds via
+        // `--ulimit cpu=<n>:<n>` (RLIMIT_CPU inside the container) — `--cpus` is a
+        // *rate*, not a total, so it is the wrong primitive for a cap. Each flag is
+        // omitted when its cap is `None`.
+        if let Some(n) = restrictions.resources.max_processes {
+            wrapped.push("--pids-limit".to_string());
+            wrapped.push(n.to_string());
+        }
+        if let Some(bytes) = restrictions.resources.max_memory_bytes {
+            wrapped.push("--memory".to_string());
+            wrapped.push(bytes.to_string());
+        }
+        if let Some(secs) = restrictions.resources.max_cpu_seconds {
+            wrapped.push("--ulimit".to_string());
+            wrapped.push(format!("cpu={secs}:{secs}"));
+        }
 
         // Interactive PTY session: allocate a TTY inside the container so the
         // command gets a controlling terminal (`isatty` true), enabling job
@@ -1111,8 +1268,10 @@ mod tests {
 
     #[test]
     fn container_includes_privilege_hardening() {
-        // The container argv blocks privilege escalation (issue #310). A full
-        // `--cap-drop ALL` is intentionally absent — see prepare for why.
+        // The container argv always blocks privilege escalation (issue #310).
+        // `--cap-drop ALL` appears only once the runner pins an identity via
+        // `run_uid` (issue #349): dropping caps without the matching uid mapping
+        // would break writes to operator-owned mounts, so the two land together.
         let prepared = ContainerSandbox::new(Runtime::Docker, "img")
             .prepare(argv(&["true"]), Restrictions::default());
         let flags = container_flags(&prepared, "img").join(" ");
@@ -1122,8 +1281,104 @@ mod tests {
         );
         assert!(
             !flags.contains("--cap-drop"),
-            "container must not --cap-drop while running as root with operator-owned mounts: {flags}"
+            "without an identity mapping the container must not --cap-drop: {flags}"
         );
+    }
+
+    #[test]
+    fn container_user_mapping_enables_cap_drop_all() {
+        // Acceptance (issue #349): with the runner-supplied uid/gid the docker
+        // container runs as that identity (`--user uid:gid`) AND drops every
+        // capability — bringing it up to bwrap parity.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                run_uid: Some(1000),
+                run_gid: Some(1000),
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(flags.contains("--user 1000:1000"), "flags: {flags}");
+        assert!(flags.contains("--cap-drop ALL"), "flags: {flags}");
+    }
+
+    #[test]
+    fn container_podman_uses_keep_id_not_user() {
+        // Under rootless podman the host user is mapped with `--userns=keep-id`
+        // rather than `--user <hostuid>`, which would mean the in-userns uid
+        // (open question #3). The cap-drop still lands alongside it.
+        let prepared = ContainerSandbox::new(Runtime::Podman, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                run_uid: Some(1000),
+                run_gid: Some(1000),
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(flags.contains("--userns=keep-id"), "flags: {flags}");
+        assert!(
+            !flags.contains("--user "),
+            "podman must not --user: {flags}"
+        );
+        assert!(flags.contains("--cap-drop ALL"), "flags: {flags}");
+    }
+
+    #[test]
+    fn container_emits_resource_cap_flags_when_set() {
+        // Acceptance (issue #349): resource caps map to cgroup-backed run flags.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                resources: ResourceLimits {
+                    max_processes: Some(256),
+                    max_memory_bytes: Some(2_147_483_648),
+                    max_cpu_seconds: Some(120),
+                },
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(flags.contains("--pids-limit 256"), "flags: {flags}");
+        assert!(flags.contains("--memory 2147483648"), "flags: {flags}");
+        assert!(flags.contains("--ulimit cpu=120:120"), "flags: {flags}");
+    }
+
+    #[test]
+    fn container_omits_resource_cap_flags_when_unset() {
+        // No cap configured ⇒ none of the resource flags appear.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img")
+            .prepare(argv(&["true"]), Restrictions::default());
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(!flags.contains("--pids-limit"), "flags: {flags}");
+        assert!(!flags.contains("--memory"), "flags: {flags}");
+        assert!(!flags.contains("--ulimit"), "flags: {flags}");
+    }
+
+    #[test]
+    fn bubblewrap_and_none_argv_unchanged_by_resources_and_seccomp() {
+        // Purity regression guard (issue #349): `prepare` must NOT react to
+        // resources/seccomp for the host backends — the launcher prefix is applied
+        // by the runner, not here. The argv is identical with and without caps.
+        let with_caps = Restrictions {
+            resources: ResourceLimits {
+                max_processes: Some(64),
+                max_memory_bytes: Some(1024),
+                max_cpu_seconds: Some(5),
+            },
+            seccomp: SeccompMode::Default,
+            ..Restrictions::default()
+        };
+        for sandbox in [sandbox_for(Backend::None), sandbox_for(Backend::Bubblewrap)] {
+            let plain = sandbox.prepare(argv(&["echo", "hi"]), Restrictions::default());
+            let capped = sandbox.prepare(argv(&["echo", "hi"]), with_caps.clone());
+            assert_eq!(
+                plain.argv, capped.argv,
+                "{:?} prepare must ignore resources/seccomp",
+                plain.backend
+            );
+        }
     }
 
     #[test]
@@ -1528,6 +1783,114 @@ mod tests {
         assert!(
             !out.status.success(),
             "write to a read-only root filesystem unexpectedly succeeded",
+        );
+    }
+
+    // --- type-level property tests (issue #349) --------------------------------
+
+    #[test]
+    fn seccomp_mode_methods() {
+        // is_on() and name() are the stable public API the runner/launcher use
+        // to decide whether to install filtering and what to serialize.
+        assert!(!SeccompMode::Off.is_on(), "Off.is_on() must be false");
+        assert!(SeccompMode::Default.is_on(), "Default.is_on() must be true");
+        assert_eq!(SeccompMode::Off.name(), "off");
+        assert_eq!(SeccompMode::Default.name(), "default");
+    }
+
+    #[test]
+    fn resource_limits_is_unset() {
+        // is_unset() is the guard the runner uses to decide whether to prepend
+        // the launcher trampoline for the none/bubblewrap paths (issue #349).
+        assert!(
+            ResourceLimits::default().is_unset(),
+            "all-None must be unset"
+        );
+        assert!(!ResourceLimits {
+            max_processes: Some(1),
+            ..Default::default()
+        }
+        .is_unset());
+        assert!(!ResourceLimits {
+            max_memory_bytes: Some(1),
+            ..Default::default()
+        }
+        .is_unset());
+        assert!(!ResourceLimits {
+            max_cpu_seconds: Some(1),
+            ..Default::default()
+        }
+        .is_unset());
+        assert!(!ResourceLimits {
+            max_processes: Some(64),
+            max_memory_bytes: Some(1024),
+            max_cpu_seconds: Some(30),
+        }
+        .is_unset());
+    }
+
+    // --- container cap-drop / uid edge cases (issue #349) ----------------------
+
+    #[test]
+    fn container_docker_gid_falls_back_to_uid_when_not_set() {
+        // When run_uid is set but run_gid is None, the docker backend emits
+        // `--user uid:uid` (the gid defaults to the uid value so the mapping is
+        // still symmetric and writes to host-owned mounts succeed). The cap-drop
+        // must also appear, since it always lands together with the identity
+        // mapping (issue #349).
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                run_uid: Some(2000),
+                run_gid: None,
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(flags.contains("--user 2000:2000"), "flags: {flags}");
+        assert!(flags.contains("--cap-drop ALL"), "flags: {flags}");
+    }
+
+    #[test]
+    fn container_podman_without_uid_skips_userns_and_cap_drop() {
+        // Without a run_uid the podman backend must NOT emit --userns=keep-id
+        // or --cap-drop ALL. The two always land together (issue #349); dropping
+        // caps without the matching identity mapping would break writes to
+        // operator-owned writable_paths mounts.
+        let prepared = ContainerSandbox::new(Runtime::Podman, "img")
+            .prepare(argv(&["true"]), Restrictions::default());
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(
+            !flags.contains("--userns"),
+            "podman without uid must not emit --userns=keep-id: {flags}"
+        );
+        assert!(
+            !flags.contains("--cap-drop"),
+            "podman without uid must not --cap-drop ALL: {flags}"
+        );
+    }
+
+    #[test]
+    fn container_seccomp_field_not_emitted_by_prepare() {
+        // Seccomp BPF profile installation for the container backend is a
+        // documented follow-up under issue #349 (profile breadth + format are
+        // open questions). The `prepare` method must NOT emit any
+        // `--security-opt seccomp=…` flag, even when SeccompMode::Default is
+        // set — that would reference a non-existent profile file and break the
+        // container launch. The Restrictions field is carried through so the
+        // runner can inspect it later, but the container argv is not affected.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                seccomp: SeccompMode::Default,
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(
+            !flags.contains("seccomp"),
+            "container prepare must not emit any seccomp flag while installation is deferred: \
+             {flags}"
         );
     }
 }
