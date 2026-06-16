@@ -94,8 +94,9 @@ pub enum VerifyOutcome {
 /// 2. Verify the detached signature over the event's canonical JSON (the
 ///    `signature` field excluded).
 /// 3. Cross-check the embedded `signature.key_id == agent_state.signing_key_id`.
-/// 4. Re-check the `(agent_id, key_id)` pair is locally trusted, so a key
-///    revoked between request and response drops the result.
+/// 4. Re-check the signing key (by `key_id`) is locally trusted — the same
+///    anchor the request plane uses — so a key revoked between request and
+///    response drops the result.
 ///
 /// On a **missing** signature the [`ALLOW_UNSIGNED_RESULTS_ENV`] override
 /// downgrades the result to `Ok(`[`VerifyOutcome::AcceptedUnsigned`]`)` (which
@@ -148,10 +149,16 @@ fn verify_result_signature_with_policy<T: serde::Serialize>(
         return Err(ResultVerifyError::KeyIdMismatch);
     }
 
-    // 4. Re-check the (agent, key) pair is locally trusted now (revocation
-    //    between request and response drops the result — value-add over the
-    //    sender-pin).
-    if !trust.is_trusted(&agent_state.agent_id, &key_id) {
+    // 4. Re-check the signing key is locally trusted now — keyed by `key_id`,
+    //    the same anchor the request plane uses (`TrustStore::is_key_trusted`,
+    //    exec.rs authorize path), NOT the `(agent_id, key_id)` pair: trust is
+    //    approved per key (often recorded under the peer's *requesting* agent_id,
+    //    not the executor's), and `key_id` is `SHA256(pubkey)` so trusting it
+    //    already binds the exact public key. A key revoked between request and
+    //    response is no longer trusted → the result is dropped (value-add over
+    //    the sender-pin), and a hostile homeserver's substituted key is untrusted
+    //    → rejected.
+    if !trust.is_key_trusted(&key_id) {
         return Err(ResultVerifyError::UntrustedKey);
     }
 
