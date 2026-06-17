@@ -204,6 +204,9 @@ mx-agent daemon: running
   uptime:  <SECONDS>s
   socket:  <PATH>
   version: <VERSION>
+  policy:  MALFORMED — authorizing nothing (deny-all) until fixed   (only if policy.toml is malformed)
+    file:  <PATH>
+    error: <ERROR>
   sync:    <STATE>
     syncs:    <COUNT>
     failures: <COUNT>       (only if > 0)
@@ -218,7 +221,7 @@ failure prints `DEGRADED (retrying)` without the `rate-limited` line.
 
 If not running, prints `"mx-agent daemon: not running"`.
 
-With `--json`, emits `{"running":true,"pid":<PID>,"uptime_seconds":<SECONDS>,"socket_path":"<PATH>","version":"<VERSION>"}` when running, or `{"running":false}` when not. The `sync` field is included only if available:
+With `--json`, emits `{"running":true,"pid":<PID>,"uptime_seconds":<SECONDS>,"socket_path":"<PATH>","version":"<VERSION>"}` when running, or `{"running":false}` when not. The `sync` field is included only if available, and a `policy` field — `{"state":"malformed","path":"<PATH>","error":"<ERROR>"}` — is included only when `policy.toml` is malformed (omitted for a healthy or absent policy; issue #350):
 
 ```json
 {
@@ -345,7 +348,7 @@ In human mode, prints whether the workers started; with `--json`, emits `{"start
 
 ## `auth` — Manage Matrix authentication
 
-Authenticate against a Matrix homeserver and manage E2EE device/cross-signing identity. All operations except login and logout are daemon-mediated via IPC and require the daemon to be running.
+Authenticate against a Matrix homeserver and manage E2EE device/cross-signing identity. The `login`, `logout`, and `status` subcommands run CLI-local against the data dir; only the `cross-signing` subcommands are daemon-mediated via IPC and require the daemon to be running.
 
 | Subcommand | Purpose |
 |---|---|
@@ -514,7 +517,7 @@ In `--json`, outputs a `CrossSigningStatusInfo` object with fields `complete`, `
 |---|---|
 | 0 | Cross-signing keys created or already present |
 | 1 | Daemon error or network failure |
-| 3 | Not authenticated (daemon could not contact homeserver) |
+| 3 | Daemon not running / not reachable over IPC |
 
 **Examples**
 
@@ -563,7 +566,7 @@ In `--json`, outputs a `CrossSigningStatusInfo` object.
 |---|---|
 | 0 | Status retrieved |
 | 1 | Daemon error |
-| 3 | Not authenticated |
+| 3 | Daemon not running / not reachable over IPC |
 
 **Examples**
 
@@ -1335,7 +1338,7 @@ When `--room` and `--agent` are specified, the command becomes a signed, Matrix-
 | 128 | Stream protocol failure: stream ended without an `exec.finished` frame. |
 | 128+*n* | Remote process was killed by signal *n* (e.g., 130 = SIGINT = 2, 143 = SIGTERM = 15). |
 | 129 | Timeout: the requester abandoned the remote run after its deadline (requested `--timeout` + grace) and sent a signed `exec.cancel`. |
-| 132 | Stream integrity violation in strict mode (`--strict-stream`): a chunk was missing or could not be decoded (bad base64 encoding). mx-agent producers do not populate the per-chunk `sha256` digest today (`sha256: null`), so the digest-mismatch path is unreachable until they do. |
+| 132 | Stream integrity violation in strict mode (`--strict-stream`): a chunk was missing, could not be decoded (bad base64 encoding), or failed its `sha256` check. mx-agent producers populate the per-chunk `sha256` digest (base64 SHA-256 over the chunk's decoded bytes; an empty EOF marker carries none), so a digest mismatch is also a fatal integrity violation here. |
 | 64 | Input validation error: empty command, bad `--cwd` path, or daemon IPC failure. |
 | 3 | Daemon not running (when `--pty` fails to connect to the daemon socket). |
 
@@ -2005,7 +2008,7 @@ Filters are evaluated on the initial snapshot; subsequent updates that match the
 Human output renders the initial task list followed by incremental change lines prefixed with `+` (added), `-` (removed), or `~` (updated). State transitions are highlighted (e.g., `executing -> succeeded`). JSON output emits two event types:
 
 - `"initial"`: includes the initial task list
-- `"changed"`: includes an array of change objects with `task_id`, `kind` (`Added`/`Removed`/`Updated`), and field-level details
+- `"changed"`: includes a `changes` array of change objects, each internally tagged with a `change` field whose value is `added`, `removed`, or `updated`. `added`/`removed` flatten the `TaskState` fields (including `task_id`) alongside the tag; `updated` carries nested `previous` and `current` task objects
 
 The command runs until interrupted (Ctrl-C), at which point it exits cleanly.
 
@@ -3075,6 +3078,7 @@ mx-agent recovery recover --recovery-key "$(cat /secure/recovery.key)" && mx-age
 
 - `MX_AGENT_PASSWORD` — non-interactive password for `auth login` (read via stdin if not set)
 - `MX_AGENT_RECOVERY_KEY` — fallback recovery key for `recovery recover` (else stdin prompt)
+- `MX_AGENT_ALLOW_UNSIGNED_RESULTS` — when set, downgrades a *missing* result-plane signature to a logged-accept (for mixed-fleet rollout); invalid, wrong-key, or untrusted signatures are still always rejected (issue #348)
 - `MX_AGENT_TASK_DISPATCH` — `local` (default) | `matrix` — route live scheduler task dispatch through the signed Matrix call/exec transport instead of local dispatch
 - `MX_AGENT_TASK_AUTH_TTL` — validity window in whole seconds for daemon-authored task-action authorizations (default: 86400 — 24 hours); set on the daemon, not the CLI
 - `MX_AGENT_LOG` — tracing/EnvFilter directive (e.g. `debug`, `mx_agent=trace`); overrides `-v` flag
@@ -3100,7 +3104,7 @@ Per crates/mx-agent-cli/src/cli.rs, stream.rs, terminal.rs:
 - **64** — input validation: empty `exec`/`call` command, an unusable `--cwd`, malformed arguments, or an IPC setup failure (`EmptyCommand` / `InvalidArgs`)
 - **127** — command, tool, or working directory not found on the target (`ExecErrorKind::NotFound` / `CallErrorKind::NotFound`)
 - **128** — `EXIT_PROTOCOL_FAILURE` — an `exec` stream ended without an `exec.finished` frame
-- **132** — `EXIT_STREAM_INTEGRITY` — `--strict-stream` and a chunk was missing or could not be decoded (bad base64 encoding); mx-agent producers do not populate the per-chunk `sha256` today, so the digest-mismatch path is unreachable until they do
+- **132** — `EXIT_STREAM_INTEGRITY` — `--strict-stream` and a chunk was missing, could not be decoded (bad base64 encoding), or failed its `sha256` check; mx-agent producers populate the per-chunk `sha256` digest (base64 SHA-256 over the chunk's decoded bytes; an empty EOF marker carries none), so a digest mismatch is also fatal here
 - **128 + signum** — `exec` passes the target process's own exit status through (0–255); a process killed by a signal maps to 128+signum per shell convention (e.g. SIGTERM=15 → 143, SIGINT=2 → 130)
 
 > The exact code per command is given in each command's **Exit codes** note above. `exec` is the

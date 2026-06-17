@@ -160,11 +160,15 @@ else
   not_ok "docs/architecture.md: container --cap-drop note is absent"
 fi
 
-# The note must include the reason (CAP_DAC_OVERRIDE / writable_paths / deferred).
-if grep -qE 'CAP_DAC_OVERRIDE|writable_paths.*uid|deferred' "$arch"; then
-  ok "docs/architecture.md: cap-drop note includes deferral rationale"
+# The note must explain WHY the container cap-drop behaves as it does post-#349:
+# the `--user`/uid identity mapping that lets the container own `writable_paths`
+# and reach bubblewrap parity (or the CAP_DAC_OVERRIDE constraint it sidesteps).
+# Keyed on that real rationale rather than a bare "deferred" (which used to match
+# an unrelated follow-up note elsewhere in the file).
+if grep -qiE 'CAP_DAC_OVERRIDE|bubblewrap parity|--user <uid>|writable_paths' "$arch"; then
+  ok "docs/architecture.md: cap-drop note includes the identity/parity rationale"
 else
-  not_ok "docs/architecture.md: cap-drop note missing rationale (CAP_DAC_OVERRIDE / deferred)"
+  not_ok "docs/architecture.md: cap-drop note missing rationale (CAP_DAC_OVERRIDE / --user identity / bubblewrap parity)"
 fi
 
 # ─── 7. Cross-doc consistency: firejail/chroot rejected in all four docs ─────

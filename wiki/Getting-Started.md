@@ -149,7 +149,8 @@ Create:
 mx-agent workspace create \
   --alias my-project \
   --name "my-project orchestration" \
-  --visibility private
+  --visibility private \
+  --e2ee on
 ```
 
 ```text
@@ -211,7 +212,6 @@ claude-local   claude-code   active   plan, review
 mx-agent exec \
   --room "$ROOM" \
   --agent claude-local \
-  --stream \
   -- echo 'Hello World'
 ```
 

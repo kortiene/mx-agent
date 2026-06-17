@@ -528,11 +528,12 @@ impl Sandbox for ContainerSandbox {
             "--read-only".to_string(),
             // Block privilege escalation: a `setuid`/`setcap` binary cannot gain
             // privileges beyond the container's starting set (issue #310). Note
-            // we deliberately do NOT `--cap-drop ALL` here: the container runs as
-            // root and a policy `writable_paths` mount is typically owned by the
-            // host operator's (non-root) uid, so dropping CAP_DAC_OVERRIDE would
-            // block legitimate writes to the workspace. Full cap-drop needs a
-            // matching `--user` uid mapping, which is deferred.
+            // we do NOT `--cap-drop ALL` in this unconditional base set: a policy
+            // `writable_paths` mount is typically owned by the host operator's
+            // (non-root) uid, so dropping CAP_DAC_OVERRIDE without a matching
+            // identity would block legitimate writes to the workspace. The full
+            // `--cap-drop ALL` is added below, paired with the `--user` uid
+            // mapping that makes it viable (issue #349).
             "--security-opt".to_string(),
             "no-new-privileges".to_string(),
         ];

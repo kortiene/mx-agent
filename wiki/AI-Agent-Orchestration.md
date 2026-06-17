@@ -112,7 +112,7 @@ mx-agent share diff --room "$ROOM" --base main --format unified
 
 # Ask the builder to run the test suite, streaming output back live.
 mx-agent exec --room "$ROOM" --agent pi-builder --task "$TEST" \
-  --cwd /home/me/code/project --stream -- npm test
+  --cwd /home/me/code/project -- npm test
 ```
 
 > **Tip — scheduler-driven alternative.** You can embed the exec directly in the task at create time with `--exec`:
