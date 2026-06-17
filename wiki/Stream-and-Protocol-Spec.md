@@ -267,7 +267,7 @@ The local CLI exits with the remote process's exit code when possible; reserved 
 |---:|---|
 | 0 | Remote command succeeded |
 | 1–125 | Remote command's own exit code |
-| 3 | Could not reach the daemon, or the daemon rejected the local request |
+| 3 | Daemon unreachable, or a not-found / not-logged-in sentinel (e.g. `auth status`, `daemon status`, agent/invocation/device lookups) |
 | 64 | Invalid CLI usage (empty command / bad arguments) |
 | 127 | Agent / tool / command not found |
 | 128 | Protocol / network failure; today also covers local policy denial and remote rejection (dedicated codes for those are planned follow-up) |

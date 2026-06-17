@@ -54,9 +54,9 @@ For a privileged action delivered over E2EE, **both must hold**: the event must 
 **Trust precedence — the local store is final authority.** Room-published trust state is purely advisory and is consulted *only* when the local store has no record for an `(agent_id, key_id)` pair. A **local revocation always wins** and can never be undone by a room admin:
 
 ```bash
-mx-agent trust fingerprint --agent developer-pi
+mx-agent trust fingerprint
 mx-agent trust approve --room "$ROOM" --agent developer-pi --key mxagent-ed25519:abc123
-mx-agent trust revoke  --room "$ROOM" --agent developer-pi --key mxagent-ed25519:abc123
+mx-agent trust revoke  --agent developer-pi --key mxagent-ed25519:abc123
 ```
 
 ---
