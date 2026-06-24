@@ -114,7 +114,7 @@ jobs:
         id: cargo
         run: |
           if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
         if: steps.cargo.outputs.present == 'true'
         with:
           # A SHA pin loses the @stable branch's implied default toolchain, so
@@ -160,7 +160,7 @@ jobs:
         id: cargo
         run: |
           if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
         if: steps.cargo.outputs.present == 'true'
         with:
           toolchain: "1.93" # keep in lockstep with Cargo.toml rust-version / clippy.toml msrv
@@ -180,7 +180,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
         with:
           toolchain: stable # SHA pin drops the @stable default toolchain; name it
           components: clippy
@@ -215,7 +215,7 @@ jobs:
         # (issue #310). `|| true` keeps this a no-op on images without the knob.
         if: steps.cargo.outputs.present == 'true'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
         if: steps.cargo.outputs.present == 'true'
         with:
           toolchain: stable # SHA pin drops the @stable default toolchain; name it
@@ -252,7 +252,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master (pinned; dtolnay/rust-toolchain publishes no semver tags)
         with:
           toolchain: stable # SHA pin drops the @stable default toolchain; name it
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
