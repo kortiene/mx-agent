@@ -186,7 +186,7 @@ pub use sync::{
 pub use task::{
     can_transition, cancel_task, cancel_task_for_session, create_task, create_task_for_session,
     is_known_state, is_runnable, list_tasks, list_tasks_for_session, update_task,
-    update_task_for_session, CreateTaskOptions, ListTasksOptions, UpdateTaskOptions,
+    update_task_for_session, CreateTaskOptions, ListTasksOptions, TaskMutation, UpdateTaskOptions,
     DEFAULT_TASK_STATE, STATE_ASSIGNED, STATE_BLOCKED, STATE_CANCELLED, STATE_EXECUTING,
     STATE_FAILED, STATE_PENDING, STATE_PROPOSED, STATE_SUCCEEDED, STATE_SUPERSEDED,
 };

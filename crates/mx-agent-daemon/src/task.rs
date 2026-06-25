@@ -514,16 +514,18 @@ async fn read_all_task_states(room: &Room) -> Result<Vec<TaskState>, WorkspaceEr
 }
 
 /// Publish `state` as a `com.mxagent.task.v1` state event keyed by `task_id`.
+///
+/// Returns the emitted event's Matrix `event_id` (issue #367), so the IPC entry
+/// points can surface it as an audit anchor in the reply.
 async fn publish_task_state(
     room: &Room,
     task_id: &str,
     state: &TaskState,
-) -> Result<(), WorkspaceError> {
+) -> Result<String, WorkspaceError> {
     warn_env_in_encrypted_room_state(room, task_id, state);
     let content = serde_json::to_value(state)
         .map_err(|e| WorkspaceError::from(matrix_sdk::Error::SerdeJson(e)))?;
-    send_workspace_state(room, TASK_STATE_TYPE, task_id, content).await?;
-    Ok(())
+    send_workspace_state(room, TASK_STATE_TYPE, task_id, content).await
 }
 
 /// Warn when a task action carrying a non-empty `env` is published into an
@@ -553,6 +555,25 @@ fn warn_env_in_encrypted_room_state(room: &Room, task_id: &str, state: &TaskStat
     );
 }
 
+/// IPC reply for `task.create` / `task.update`: the resulting [`TaskState`] plus
+/// the **audit anchor** — the Matrix `event_id` of the emitted
+/// `com.mxagent.task.v1` state event — so a caller can correlate the signed task
+/// mutation to the event it produced (issue #367).
+///
+/// The task fields are `#[serde(flatten)]`-ed, so the JSON reply is the prior
+/// `TaskState` shape with a single added top-level `event_id` field (backward
+/// compatible). `previous_event_id` continues to carry the *prior* revision's
+/// event id; `event_id` is the id of *this* emission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskMutation {
+    /// The task state after the create/update.
+    #[serde(flatten)]
+    pub task: TaskState,
+    /// Matrix event id of the `com.mxagent.task.v1` state event this mutation
+    /// emitted.
+    pub event_id: String,
+}
+
 /// Create a task in a workspace room.
 ///
 /// Publishes a `com.mxagent.task.v1` state event keyed by the task ID with
@@ -563,6 +584,19 @@ pub async fn create_task(
     client: &Client,
     options: &CreateTaskOptions,
 ) -> Result<TaskState, WorkspaceError> {
+    create_task_returning_event_id(client, options)
+        .await
+        .map(|(state, _event_id)| state)
+}
+
+/// Like [`create_task`] but also returns the emitted `com.mxagent.task.v1`
+/// event id (issue #367). The public [`create_task`] stays a thin wrapper so its
+/// many callers are unaffected; only the IPC entry point
+/// ([`create_task_for_session`]) needs the audit anchor.
+async fn create_task_returning_event_id(
+    client: &Client,
+    options: &CreateTaskOptions,
+) -> Result<(TaskState, String), WorkspaceError> {
     let room = sync_and_get_room(client, &options.room).await?;
 
     let task_id = options
@@ -579,8 +613,8 @@ pub async fn create_task(
 
     let state = build_new_task(options, task_id.clone(), created_by, now_rfc3339());
     check_known_state(&state.state)?;
-    publish_task_state(&room, &task_id, &state).await?;
-    Ok(state)
+    let event_id = publish_task_state(&room, &task_id, &state).await?;
+    Ok((state, event_id))
 }
 
 /// Create a task, restoring the authenticated client from `session`.
@@ -595,7 +629,7 @@ pub async fn create_task(
 pub async fn create_task_for_session(
     session: &StoredSession,
     options: &CreateTaskOptions,
-) -> Result<TaskState, WorkspaceError> {
+) -> Result<TaskMutation, WorkspaceError> {
     let client = restore_client(session).await?;
     let mut options = options.clone();
 
@@ -620,7 +654,8 @@ pub async fn create_task_for_session(
         }
     }
 
-    create_task(&client, &options).await
+    let (task, event_id) = create_task_returning_event_id(&client, &options).await?;
+    Ok(TaskMutation { task, event_id })
 }
 
 /// Update an existing task in a workspace room.
@@ -640,7 +675,9 @@ pub async fn update_task(
     options: &UpdateTaskOptions,
 ) -> Result<TaskState, WorkspaceError> {
     let room = sync_and_get_room(client, &options.room).await?;
-    update_task_in_room(&room, options).await
+    update_task_in_room(&room, options)
+        .await
+        .map(|(state, _event_id)| state)
 }
 
 /// Update a task against an already-resolved [`Room`], performing no `/sync`.
@@ -654,7 +691,7 @@ pub async fn update_task(
 pub(crate) async fn update_task_in_room(
     room: &Room,
     options: &UpdateTaskOptions,
-) -> Result<TaskState, WorkspaceError> {
+) -> Result<(TaskState, String), WorkspaceError> {
     let (state, event_id) = read_task_state(room, &options.task_id)
         .await?
         .ok_or_else(|| WorkspaceError::TaskNotFound(options.task_id.clone()))?;
@@ -675,7 +712,7 @@ pub(crate) async fn apply_and_publish_task(
     mut current: TaskState,
     previous_event_id: Option<String>,
     options: &UpdateTaskOptions,
-) -> Result<TaskState, WorkspaceError> {
+) -> Result<(TaskState, String), WorkspaceError> {
     check_not_stale(
         &current.task_id,
         current.state_rev,
@@ -685,8 +722,8 @@ pub(crate) async fn apply_and_publish_task(
         check_transition(&current.task_id, &current.state, to)?;
     }
     apply_update(&mut current, options, now_rfc3339(), previous_event_id);
-    publish_task_state(room, &options.task_id, &current).await?;
-    Ok(current)
+    let event_id = publish_task_state(room, &options.task_id, &current).await?;
+    Ok((current, event_id))
 }
 
 /// Update a task, restoring the authenticated client from `session`.
@@ -702,17 +739,22 @@ pub(crate) async fn apply_and_publish_task(
 pub async fn update_task_for_session(
     session: &StoredSession,
     options: &UpdateTaskOptions,
-) -> Result<TaskState, WorkspaceError> {
+) -> Result<TaskMutation, WorkspaceError> {
     let client = restore_client(session).await?;
     // Only an action change or a reassignment can affect the signature; every
     // other update round-trips the existing action untouched, so skip the key
     // load and the extra read entirely.
-    if options.action.is_some() || options.assigned_to.is_some() {
+    let (task, event_id) = if options.action.is_some() || options.assigned_to.is_some() {
         let signing = load_authoring_key()?;
-        update_task_with_signing(&client, options, &signing).await
+        update_task_with_signing(&client, options, &signing).await?
     } else {
-        update_task(&client, options).await
-    }
+        // Inline update_task's body so the emitted event id can be captured for
+        // the audit anchor (issue #367); the public update_task stays a TaskState
+        // wrapper for the scheduler/test callers that do not need the anchor.
+        let room = sync_and_get_room(&client, &options.room).await?;
+        update_task_in_room(&room, options).await?
+    };
+    Ok(TaskMutation { task, event_id })
 }
 
 /// Update a task on behalf of a local IPC caller, (re)signing the action when the
@@ -738,7 +780,7 @@ async fn update_task_with_signing(
     client: &Client,
     options: &UpdateTaskOptions,
     signing: &DaemonSigningKey,
-) -> Result<TaskState, WorkspaceError> {
+) -> Result<(TaskState, String), WorkspaceError> {
     let room = sync_and_get_room(client, &options.room).await?;
     let (current, event_id) = read_task_state(&room, &options.task_id)
         .await?
@@ -1405,6 +1447,41 @@ mod tests {
             "me".to_string(),
             "t".to_string(),
         )
+    }
+
+    #[test]
+    fn task_mutation_reply_flattens_task_and_adds_event_id_anchor() {
+        // Issue #367: the task.create/update reply must carry the emitted event
+        // id as a top-level audit anchor, alongside (not replacing) the flattened
+        // task fields and the existing previous_event_id.
+        let mut task = task_with("task_anchor", "pending", "developer-pi");
+        task.previous_event_id = Some("$prev:server".to_string());
+        let reply = TaskMutation {
+            task,
+            event_id: "$emitted:server".to_string(),
+        };
+        let v = serde_json::to_value(&reply).expect("serializes");
+
+        // Task fields are flattened to the top level (no nested "task" object),
+        // so the reply is the prior TaskState shape with one added field.
+        assert_eq!(v["task_id"], "task_anchor");
+        assert_eq!(v["state"], "pending");
+        assert_eq!(v["assigned_to"], "developer-pi");
+        assert!(
+            v.get("task").is_none(),
+            "task fields must be flattened, not nested"
+        );
+
+        // The new audit anchor is the emitted event id, and it coexists with
+        // previous_event_id (the prior revision's id) rather than replacing it.
+        assert_eq!(v["event_id"], "$emitted:server");
+        assert_eq!(v["previous_event_id"], "$prev:server");
+
+        // The reply still deserializes into a bare TaskState (the extra event_id
+        // lands in TaskState's flatten `extra`), so the CLI — which parses the
+        // reply as TaskState — keeps working.
+        let as_task: TaskState = serde_json::from_value(v).expect("deserializes as TaskState");
+        assert_eq!(as_task.task_id, "task_anchor");
     }
 
     #[test]

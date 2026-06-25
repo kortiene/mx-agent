@@ -591,16 +591,22 @@ pub(crate) fn map_state_write_error(
 /// Every `com.mxagent.*` state write in the daemon routes through here so a
 /// missing workspace power level surfaces uniformly (with the room, event type,
 /// and required power level) instead of a raw Matrix 403.
+///
+/// Returns the Matrix `event_id` of the emitted state event, so callers that
+/// need an audit anchor (e.g. `task.create`/`task.update`, issue #367) can
+/// correlate the write to the event it produced. Callers that don't simply
+/// discard it.
 pub(crate) async fn send_workspace_state(
     room: &Room,
     event_type: &str,
     state_key: &str,
     content: serde_json::Value,
-) -> Result<(), WorkspaceError> {
-    room.send_state_event_raw(event_type, state_key, content)
+) -> Result<String, WorkspaceError> {
+    let response = room
+        .send_state_event_raw(event_type, state_key, content)
         .await
         .map_err(|e| map_state_write_error(room.room_id().as_str(), event_type, e))?;
-    Ok(())
+    Ok(response.event_id.to_string())
 }
 
 /// Create a new workspace room with the given options.
