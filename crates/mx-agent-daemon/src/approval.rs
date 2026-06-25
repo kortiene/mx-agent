@@ -312,6 +312,17 @@ pub struct PendingApproval {
     /// collide. Additive and `#[serde(default)]`, so older queues load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_request: Option<HeldRequest>,
+    /// The homeserver-authenticated Matrix user id (`meta.sender`) of the
+    /// requester, captured when a *live* request was held. The release re-auth
+    /// passes this back into `policy_identity` so the freshly-read
+    /// `matrix_user_id` must still equal it — closing the agent-state identity
+    /// swap that an attacker could otherwise perform during the approval window
+    /// to downgrade the resolved `Allowance` (issue #366). `None` for
+    /// task/legacy holds and for queues written before this field existed (those
+    /// fall back to the no-binding release path). Not a secret (a public Matrix
+    /// user id); additive and `#[serde(default)]`, so older queues load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_user: Option<String>,
 }
 
 impl PendingApproval {
@@ -953,6 +964,11 @@ pub(crate) async fn handle_live_approval_decision(
     let Some(held) = pending.held_request.clone() else {
         return;
     };
+    // The authenticated sender captured when this live request was held; the
+    // release re-auth re-binds the freshly-read `matrix_user_id` to it so an
+    // agent-state identity swap during the approval window is rejected (#366).
+    // `None` for legacy holds → the no-binding release path.
+    let requester_user = pending.requester_user.clone();
 
     // 2. Resolve the room the decision arrived in.
     let room_id = match matrix_sdk::ruma::RoomId::parse(&meta.room_id) {
@@ -1059,10 +1075,25 @@ pub(crate) async fn handle_live_approval_decision(
     //    deny it). The hold is already removed → fail-closed, never re-held.
     match held {
         HeldRequest::Exec(request) => {
-            crate::exec::release_held_exec(client, paths, &room, &meta.room_id, request).await
+            crate::exec::release_held_exec(
+                client,
+                paths,
+                &room,
+                &meta.room_id,
+                request,
+                requester_user.as_deref(),
+            )
+            .await
         }
         HeldRequest::Call(request) => {
-            crate::call::release_held_call(paths, &room, &meta.room_id, request).await
+            crate::call::release_held_call(
+                paths,
+                &room,
+                &meta.room_id,
+                request,
+                requester_user.as_deref(),
+            )
+            .await
         }
     }
 }
@@ -1258,6 +1289,7 @@ mod tests {
             room_id: "!abc:matrix.org".to_string(),
             request: approval,
             held_request: None,
+            requester_user: None,
         });
         queue.save(&paths).unwrap();
 
@@ -1296,6 +1328,7 @@ mod tests {
             room_id: "!abc:matrix.org".to_string(),
             request: approval.clone(),
             held_request: None,
+            requester_user: None,
         };
         queue.enqueue(pending.clone());
         queue.enqueue(pending);
@@ -1314,6 +1347,7 @@ mod tests {
             room_id: "!abc:matrix.org".to_string(),
             request: approval_request_for(&exec_request(), &allowance(true)),
             held_request: None,
+            requester_user: None,
         });
         let removed = queue.remove("req_01HZ").expect("present");
         assert_eq!(removed.request_id(), "req_01HZ");
@@ -1335,6 +1369,7 @@ mod tests {
             room_id: "!abc:matrix.org".to_string(),
             request: approval_request_for(&exec_request(), &allowance(true)),
             held_request: None,
+            requester_user: None,
         });
         queue.save(&paths).unwrap();
 
@@ -1366,11 +1401,13 @@ mod tests {
             room_id: "!one:matrix.org".to_string(),
             request: approval_request_for(&a, &allowance(true)),
             held_request: None,
+            requester_user: None,
         });
         queue.enqueue(PendingApproval {
             room_id: "!two:matrix.org".to_string(),
             request: approval_request_for(&b, &allowance(true)),
             held_request: None,
+            requester_user: None,
         });
         queue.save(&paths).unwrap();
 
@@ -1440,6 +1477,7 @@ mod tests {
             room_id: "!abc:matrix.org".to_string(),
             request: approval_request_for(&original, &allowance(true)),
             held_request: Some(HeldRequest::Exec(original.clone())),
+            requester_user: None,
         });
         queue.save(&paths).unwrap();
 
@@ -1477,6 +1515,7 @@ mod tests {
             room_id: "!abc:matrix.org".to_string(),
             request: approval_request_for(&exec_request(), &allowance(true)),
             held_request: Some(HeldRequest::Call(call)),
+            requester_user: None,
         });
         queue.save(&paths).unwrap();
 
@@ -2194,6 +2233,7 @@ mod tests {
             room_id: "!abc:matrix.org".to_string(),
             request: approval_request_for_call(&original, &allowance(true)),
             held_request: Some(HeldRequest::Call(original.clone())),
+            requester_user: None,
         });
         queue.save(&paths).unwrap();
 
@@ -2364,11 +2404,13 @@ mod tests {
             room_id: "!room:matrix.org".to_string(),
             request: approval_request_for(&task_req, &allowance(true)),
             held_request: None, // task/legacy sentinel: skip in live handler
+            requester_user: None,
         });
         queue.enqueue(PendingApproval {
             room_id: "!room:matrix.org".to_string(),
             request: approval_request_for(&live_req, &allowance(true)),
             held_request: Some(HeldRequest::Exec(live_req.clone())),
+            requester_user: None,
         });
         queue.save(&paths).unwrap();
 

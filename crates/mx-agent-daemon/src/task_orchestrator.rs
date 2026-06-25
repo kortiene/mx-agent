@@ -1523,6 +1523,7 @@ where
                         // decision handler, so they carry no live-resume material
                         // (issue #306).
                         held_request: None,
+                        requester_user: None,
                     });
                     return ApprovalDisposition::Pending(request_id);
                 }
@@ -1563,6 +1564,7 @@ where
                     request,
                     // Task holds carry no live-resume material (issue #306).
                     held_request: None,
+                    requester_user: None,
                 });
                 ApprovalDisposition::Pending(request_id)
             }
@@ -2115,6 +2117,7 @@ requires_approval = true
             room_id: "!room:server".to_string(),
             request,
             held_request: None,
+            requester_user: None,
         });
     }
 

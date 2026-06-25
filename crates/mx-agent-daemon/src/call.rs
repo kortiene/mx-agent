@@ -808,6 +808,7 @@ pub async fn handle_live_call_request(
         request,
         requesting_agent,
         &meta.room_id,
+        Some(&meta.sender),
     )
     .await
     {
@@ -832,8 +833,15 @@ pub async fn handle_live_call_request(
                         target_agent,
                         &allowance,
                     );
-                    hold_call_for_approval(paths, &room, &meta.room_id, &authorized, &approval)
-                        .await;
+                    hold_call_for_approval(
+                        paths,
+                        &room,
+                        &meta.room_id,
+                        &authorized,
+                        &approval,
+                        &meta.sender,
+                    )
+                    .await;
                     return;
                 }
                 crate::approval::CallDisposition::Execute(_) => {
@@ -901,11 +909,17 @@ fn enqueue_call_approval(
     room_id: &str,
     request: &CallRequest,
     approval: &mx_agent_protocol::schema::ApprovalRequest,
+    requester_user: &str,
 ) -> crate::approval::PendingApproval {
     let pending = crate::approval::PendingApproval {
         room_id: room_id.to_string(),
         request: approval.clone(),
         held_request: Some(crate::approval::HeldRequest::Call(request.clone())),
+        // The authenticated sender (== requester.matrix_user_id at hold time, the
+        // binding authorize_live_call already enforced); the release re-auth
+        // re-checks it so an agent-state identity swap during the approval window
+        // is rejected (issue #366).
+        requester_user: Some(requester_user.to_string()),
     };
     let mut queue = crate::approval::ApprovalQueue::load(paths).unwrap_or_default();
     queue.enqueue(pending.clone());
@@ -928,8 +942,9 @@ async fn hold_call_for_approval(
     room_id: &str,
     request: &CallRequest,
     approval: &mx_agent_protocol::schema::ApprovalRequest,
+    requester_user: &str,
 ) {
-    enqueue_call_approval(paths, room_id, request, approval);
+    enqueue_call_approval(paths, room_id, request, approval, requester_user);
     if let Err(e) = crate::approval::emit_approval_request(room, approval).await {
         tracing::warn!(error = %e, request_id = %approval.request_id, "failed to emit call approval request");
     }
@@ -969,6 +984,7 @@ pub(crate) async fn release_held_call(
     room: &Room,
     room_id: &str,
     request: CallRequest,
+    authenticated_sender: Option<&str>,
 ) {
     let requesting_agent = request.requesting_agent.clone().unwrap_or_default();
     let target_agent = request.target_agent.clone().unwrap_or_default();
@@ -988,7 +1004,22 @@ pub(crate) async fn release_held_call(
             return;
         }
     };
-    match authorize_live_call(room, paths, &content, &request, &requesting_agent, room_id).await {
+    // Approval-release re-authorization: re-bind to the authenticated sender
+    // captured when the request was held (`authenticated_sender`), so an
+    // agent-state `matrix_user_id` swap during the approval window is rejected.
+    // `None` only for legacy holds (queues written before the field existed),
+    // which fall back to the no-binding path. See `policy_identity`.
+    match authorize_live_call(
+        room,
+        paths,
+        &content,
+        &request,
+        &requesting_agent,
+        room_id,
+        authenticated_sender,
+    )
+    .await
+    {
         Ok((authorized, allowance)) => {
             audit_call_released(
                 paths,
@@ -1087,6 +1118,57 @@ pub(crate) async fn expire_held_call(
     }
 }
 
+/// Marker error: a privileged request's published Matrix identity did not match
+/// the authenticated event sender, so the request cannot be attributed to a real
+/// Matrix user and is rejected fail-closed. See [`policy_identity`].
+pub(crate) struct IdentityMismatch;
+
+/// Resolve the identity a privileged request's policy is keyed on, binding the
+/// requester's *published* Matrix user id to the *authenticated* event sender.
+///
+/// Policy rules are keyed on the requester's Matrix user id (`@user:server`) —
+/// the namespace the policy parser validates (`mx-agent-policy` `file.rs`
+/// `validate`). The wire `requesting_agent` is instead a derived agent id
+/// (`localpart-device`, no `@`; `crate::agent::derive_agent_id`), a *different*
+/// namespace that can never match a validated policy key. Keying policy on it
+/// therefore made every remote `call`/`exec` authorization unreachable —
+/// deny-all (issue #366). The caller resolves `requester_matrix_user_id` from
+/// the signed-and-trusted `com.mxagent.agent.v1` state, and this returns it as
+/// the policy-lookup key.
+///
+/// Security — the sender binding: `matrix_user_id` is a *self-asserted* field of
+/// a room state event that any power-level-50 member can write, and (unlike the
+/// signing key, which the request must prove possession of) it carries no proof
+/// that the writer controls that Matrix account. On a *live* request we
+/// therefore require it to equal `authenticated_sender`, the
+/// homeserver-authenticated sender of the request event. Without this, a holder
+/// of *any one* trusted key could publish an agent state claiming a *different*
+/// peer's `matrix_user_id` and inherit that peer's (possibly broader) policy.
+/// On the approval-*release* path the live event is gone, so the binding is
+/// re-anchored on the `authenticated_sender` captured when the request was held
+/// ([`crate::approval::PendingApproval::requester_user`]): the freshly-read
+/// `matrix_user_id` must still equal it. This rejects an agent-state
+/// `matrix_user_id` swap performed during the operator's approval window — a
+/// swap that could otherwise re-key the release-time policy lookup onto a
+/// different identity and run the already-approved tool/command under that
+/// identity's looser `Allowance` (sandbox, network, paths, caps). The swap needs
+/// only power-level-50 to overwrite the held requester's `com.mxagent.agent.v1`
+/// state (state key is the non-`@` derived agent id, not owner-restricted) while
+/// preserving the victim's already-trusted signing key, so signature/trust still
+/// pass — which is exactly why the identity binding, not the key, must gate it.
+/// `authenticated_sender` is `None` only for legacy holds (queues written before
+/// `requester_user` existed), which fall back to the no-binding path; that
+/// residual drains as the pre-existing queue is decided.
+pub(crate) fn policy_identity<'a>(
+    requester_matrix_user_id: &'a str,
+    authenticated_sender: Option<&str>,
+) -> Result<&'a str, IdentityMismatch> {
+    match authenticated_sender {
+        Some(sender) if sender != requester_matrix_user_id => Err(IdentityMismatch),
+        _ => Ok(requester_matrix_user_id),
+    }
+}
+
 async fn authorize_live_call(
     room: &Room,
     paths: &SessionPaths,
@@ -1094,6 +1176,7 @@ async fn authorize_live_call(
     request: &CallRequest,
     requesting_agent: &str,
     room_id: &str,
+    authenticated_sender: Option<&str>,
 ) -> Result<(CallRequest, mx_agent_policy::Allowance), CallRejection> {
     let requester = crate::agent::read_agent_state(room, requesting_agent)
         .await
@@ -1107,13 +1190,26 @@ async fn authorize_live_call(
     let verifying_key = verifying_key_from_agent_state(&requester)?;
     let trust = TrustStore::load(paths).unwrap_or_default();
     let policy = policy_for_live_call();
+    // #366: key policy on the requester's Matrix user id (the validated policy
+    // namespace), bound to the authenticated event sender on the live path —
+    // never the wire `requesting_agent` derived agent id. See `policy_identity`.
+    let policy_key = policy_identity(&requester.matrix_user_id, authenticated_sender).map_err(
+        |IdentityMismatch| {
+            tracing::warn!(
+                request_id = %request.request_id,
+                requesting_agent = %requesting_agent,
+                "rejecting call: requester's published matrix_user_id does not match the authenticated event sender"
+            );
+            CallRejection::InvalidSignature
+        },
+    )?;
     let (request, allowance) = authorize_call_request_with_allowance(
         content,
         &verifying_key,
         &trust,
         &policy,
         room_id,
-        requesting_agent,
+        policy_key,
     )?;
 
     // Authoritative gate (signature → trust → policy) has passed. Layer the
@@ -1335,6 +1431,71 @@ allow_tools = ["run_tests", "lint"]
             json!({ "package": "api" }),
         )
         .expect("signs")
+    }
+
+    #[test]
+    fn policy_identity_returns_matrix_user_id_when_live_sender_matches() {
+        assert_eq!(
+            policy_identity("@bob:server", Some("@bob:server")).ok(),
+            Some("@bob:server"),
+        );
+    }
+
+    #[test]
+    fn policy_identity_rejects_when_live_sender_differs_from_published_identity() {
+        // A holder of one trusted key must not be able to inherit another peer's
+        // policy by publishing an agent state that *claims* a different
+        // `matrix_user_id`: on a live request the published identity has to equal
+        // the homeserver-authenticated sender (issue #366 security binding).
+        assert!(policy_identity("@victim:server", Some("@attacker:server")).is_err());
+    }
+
+    #[test]
+    fn policy_identity_skips_binding_on_release_path() {
+        // The approval-release re-authorization has no event sender (`None`); the
+        // binding was already enforced when the request was first authorized.
+        assert_eq!(
+            policy_identity("@bob:server", None).ok(),
+            Some("@bob:server"),
+        );
+    }
+
+    #[test]
+    fn policy_is_keyed_on_matrix_user_id_not_derived_agent_id() {
+        // Regression for issue #366. The daemon stamps `requesting_agent` as the
+        // derived agent id (`localpart-device`, no `@`; see
+        // `crate::agent::derive_agent_id`), but every validated policy agent key
+        // is a Matrix user id (`@user:server`). Authorization therefore has to
+        // key policy on the requester's `matrix_user_id`, never the derived agent
+        // id — otherwise no policy file can ever authorize a remote call
+        // (deny-all), which is exactly the bug.
+        let policy = policy();
+        let matrix_user_id = AGENT; // "@claude:matrix.org" — the policy key.
+        let derived_agent_id = "claude-DEVICE"; // derive_agent_id(@claude.., DEVICE).
+
+        // The derived agent id is in a different namespace from the policy key
+        // and never matches — this is the deny-all that broke remote `call`.
+        let denied = policy.evaluate_call(&CallContext {
+            room_id: ROOM,
+            requesting_agent: derived_agent_id,
+            tool: "run_tests",
+        });
+        assert!(
+            matches!(denied, Outcome::Deny(DenyReason::UnknownAgent)),
+            "derived agent id must not match a Matrix-user-id-keyed policy: {denied:?}",
+        );
+
+        // Keyed on the resolved Matrix user id (what `authorize_live_call` now
+        // passes), the same request is authorized.
+        let allowed = policy.evaluate_call(&CallContext {
+            room_id: ROOM,
+            requesting_agent: matrix_user_id,
+            tool: "run_tests",
+        });
+        assert!(
+            matches!(allowed, Outcome::Allow(_)),
+            "matrix_user_id must match the policy key: {allowed:?}",
+        );
     }
 
     #[test]
@@ -1925,9 +2086,12 @@ allow_tools = ["run_tests", "lint"]
         };
         let approval = approval_request_for_call(&request, &allowance);
 
-        let pending = enqueue_call_approval(&paths, ROOM, &request, &approval);
+        let pending = enqueue_call_approval(&paths, ROOM, &request, &approval, AGENT);
         assert_eq!(pending.room_id, ROOM);
         assert_eq!(pending.request_id(), "req_audit_test");
+        // The authenticated sender is captured for the release-time identity
+        // re-binding (issue #366).
+        assert_eq!(pending.requester_user.as_deref(), Some(AGENT));
 
         // The pending approval is durable on disk and its *emitted* ApprovalRequest
         // names only the tool (no-leak): the args never reach the request content.
@@ -2068,8 +2232,8 @@ requires_approval = true
         };
         let approval = approval_request_for_call(&request, &allowance);
 
-        enqueue_call_approval(&paths, ROOM, &request, &approval);
-        enqueue_call_approval(&paths, ROOM, &request, &approval);
+        enqueue_call_approval(&paths, ROOM, &request, &approval, AGENT);
+        enqueue_call_approval(&paths, ROOM, &request, &approval, AGENT);
 
         let reloaded = ApprovalQueue::load(&paths).unwrap();
         assert_eq!(

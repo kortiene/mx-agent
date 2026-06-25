@@ -560,6 +560,14 @@ async fn decrypted_content(room: &Room, event_id: &EventId) -> Value {
 /// verifies signature/trust/policy before executing the tool and emitting a
 /// response.
 ///
+/// Issue #366: the requester is registered under a production-shaped derived
+/// agent id (`localpart-device`, distinct from its `matrix_user_id`) while the
+/// policy is keyed on the `matrix_user_id`, so the allow-path only succeeds
+/// because `authorize_live_call` keys policy on the resolved Matrix user id —
+/// not the wire `requesting_agent`. This exercises the real production identity
+/// shape that the earlier agent_id == matrix_user_id == policy-key conflation
+/// hid.
+///
 /// Issue #257: the test also sends a second call for an unlisted tool ("deploy")
 /// and asserts that both decisions — allowed and policy-denied — are written as
 /// newline-delimited JSON records to the local audit log, proving that
@@ -601,6 +609,16 @@ async fn live_matrix_backed_remote_call_round_trips() {
         .expect("bob session restore should succeed");
 
     let requester_agent = bob.user_id().expect("bob user id").to_string();
+    // Issue #366 regression: in production the daemon stamps `requesting_agent`
+    // with the requester's *derived* agent id (`localpart-device`, no `@`; see
+    // `derive_agent_id`), which lives in a different namespace from the
+    // Matrix-user-id policy key. Register the requester under such an agent id —
+    // distinct from its `matrix_user_id` — while keying the policy below on the
+    // `matrix_user_id`, so this test drives the real production identity shape.
+    // Conflating the two (agent_id == matrix_user_id == policy key) is exactly
+    // what hid #366: with this split, the call is authorized only because
+    // `authorize_live_call` keys policy on the resolved `matrix_user_id`.
+    let requester_agent_id = "requester-pi-001".to_string();
 
     let room = create_public_room(&bob, "mx-agent live call integration test").await;
     let room_id = room.room_id().to_owned();
@@ -637,7 +655,7 @@ async fn live_matrix_backed_remote_call_round_trips() {
         &bob,
         &RegisterAgentOptions {
             room: room_id.to_string(),
-            agent_id: Some(requester_agent.clone()),
+            agent_id: Some(requester_agent_id.clone()), // #366: production-shaped agent id (!= matrix_user_id)
             kind: "pi".to_string(),
             capabilities: vec!["call".to_string()],
             tools: vec!["run_tests@1.0.0".to_string()],
@@ -849,6 +867,13 @@ async fn live_matrix_backed_remote_exec_round_trips_and_denies() {
         .await
         .expect("bob session restore should succeed");
     let requester_agent = bob.user_id().expect("bob user id").to_string();
+    // Issue #366 regression (exec path): register the requester under a
+    // production-shaped derived agent id (`localpart-device`, no `@`), distinct
+    // from its `matrix_user_id`, while keying the policy below on the
+    // `matrix_user_id`. `start_exec_matrix` stamps `requesting_agent` with this
+    // agent id (exec_ipc.rs), so the remote exec is authorized only because
+    // `authorize_live_exec` keys policy on the resolved `matrix_user_id`.
+    let requester_agent_id = "requester-pi-001".to_string();
 
     let room = create_public_room(&bob, "mx-agent live exec integration test").await;
     let room_id = room.room_id().to_owned();
@@ -883,7 +908,7 @@ async fn live_matrix_backed_remote_exec_round_trips_and_denies() {
         &bob,
         &RegisterAgentOptions {
             room: room_id.to_string(),
-            agent_id: Some(requester_agent.clone()),
+            agent_id: Some(requester_agent_id.clone()), // #366: production-shaped agent id (!= matrix_user_id)
             kind: "pi".to_string(),
             capabilities: vec!["exec".to_string()],
             tools: vec![],
@@ -6615,6 +6640,7 @@ async fn live_exec_held_expiry_never_runs() {
             },
             extra: Default::default(),
         })),
+        requester_user: None,
     });
     pre_queue.save(&paths).expect("save pre-expired live hold");
 
@@ -9341,6 +9367,7 @@ requires_approval = true
         // This is a task-backed hold (released by the scheduler), so it carries
         // no live-resume material (issue #306).
         held_request: None,
+        requester_user: None,
     });
     pre_queue
         .save(&paths)
