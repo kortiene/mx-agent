@@ -881,7 +881,15 @@ pub async fn handle_live_exec_request(
         }
     };
 
-    let authorized = match authorize_live_exec(&room, paths, &content, request, &meta.room_id).await
+    let authorized = match authorize_live_exec(
+        &room,
+        paths,
+        &content,
+        request,
+        &meta.room_id,
+        Some(&meta.sender),
+    )
+    .await
     {
         Ok(value) => value,
         Err(rejection) => {
@@ -958,6 +966,10 @@ pub async fn handle_live_exec_request(
                 room_id: meta.room_id.clone(),
                 request: approval.clone(),
                 held_request: Some(crate::approval::HeldRequest::Exec(request.clone())),
+                // The authenticated sender (== requester.matrix_user_id at hold
+                // time); the release re-auth re-checks it so an agent-state
+                // identity swap during the approval window is rejected (#366).
+                requester_user: Some(meta.sender.clone()),
             });
             if let Err(e) = queue.save(paths) {
                 tracing::warn!(error = %e, request_id = %approval.request_id, "failed to persist approval request");
@@ -1195,6 +1207,7 @@ pub(crate) async fn release_held_exec(
     room: &Room,
     room_id: &str,
     request: ExecRequest,
+    authenticated_sender: Option<&str>,
 ) {
     let content = match serde_json::to_value(&request) {
         Ok(value) => value,
@@ -1212,7 +1225,21 @@ pub(crate) async fn release_held_exec(
             return;
         }
     };
-    match authorize_live_exec(room, paths, &content, &request, room_id).await {
+    // Approval-release re-authorization: re-bind to the authenticated sender
+    // captured when the request was held (`authenticated_sender`), so an
+    // agent-state `matrix_user_id` swap during the approval window is rejected.
+    // `None` only for legacy holds (queues written before the field existed).
+    // See [`crate::call::policy_identity`].
+    match authorize_live_exec(
+        room,
+        paths,
+        &content,
+        &request,
+        room_id,
+        authenticated_sender,
+    )
+    .await
+    {
         Ok((request, allowance)) => {
             audit_exec_released(paths, room_id, &request, &allowance);
             spawn_authorized_live_exec(client, room, request, allowance, signing).await;
@@ -1457,6 +1484,7 @@ async fn authorize_live_exec(
     content: &Value,
     request: &ExecRequest,
     room_id: &str,
+    authenticated_sender: Option<&str>,
 ) -> Result<(ExecRequest, Allowance), ExecRejection> {
     let requester = crate::agent::read_agent_state(room, &request.requesting_agent)
         .await
@@ -1471,13 +1499,26 @@ async fn authorize_live_exec(
         .map_err(|_| ExecRejection::InvalidSignature)?;
     let trust = TrustStore::load(paths).unwrap_or_default();
     let policy = crate::policy::resolve_policy_for_enforcement("exec.authorize");
+    // #366: key policy on the requester's Matrix user id (the validated policy
+    // namespace), bound to the authenticated event sender on the live path —
+    // never the wire `requesting_agent` derived agent id. See
+    // [`crate::call::policy_identity`].
+    let policy_key = crate::call::policy_identity(&requester.matrix_user_id, authenticated_sender)
+        .map_err(|_| {
+            tracing::warn!(
+                invocation_id = %request.invocation_id,
+                requesting_agent = %request.requesting_agent,
+                "rejecting exec: requester's published matrix_user_id does not match the authenticated event sender"
+            );
+            ExecRejection::InvalidSignature
+        })?;
     let (request, allowance) = authorize_exec_request_with_allowance(
         content,
         &verifying_key,
         &trust,
         &policy,
         room_id,
-        &request.requesting_agent,
+        policy_key,
         &request.target_agent,
     )?;
 

@@ -2172,6 +2172,7 @@ requires_approval = true
             room_id: room.to_string(),
             request,
             held_request,
+            requester_user: None,
         }
     }
 
