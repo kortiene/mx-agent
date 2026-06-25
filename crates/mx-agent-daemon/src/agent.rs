@@ -10,14 +10,16 @@
 //! re-registering the same `agent_id` updates the existing entry in place. The
 //! prior `state_rev` is read first so the counter advances monotonically.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::{Client, Room};
 use mx_agent_protocol::events::state::AGENT as AGENT_STATE_TYPE;
-use mx_agent_protocol::schema::{AgentLoad, AgentState, AgentWorkspace, ToolSchema};
+use mx_agent_protocol::schema::{AgentLoad, AgentState, AgentWorkspace, Heartbeat, ToolSchema};
 
 use crate::heartbeat::{
     now_ms, read_latest_heartbeats, Liveness, LivenessConfig, MAX_HEARTBEAT_SCAN_EVENTS,
@@ -442,16 +444,62 @@ pub async fn show_agent_for_session(
 /// [`MAX_HEARTBEAT_SCAN_EVENTS`] events) with each heartbeat sender-pinned to the
 /// registered agent, and the verdict is computed with
 /// [`LivenessConfig::liveness_combined`], so a healthy agent reads `active`
-/// between durable-state refreshes. A timeline read failure degrades to
-/// durable-only liveness (advisory signal, never fail the query): the verdict
-/// falls back to the durable `last_seen_ts`.
-async fn enrich_with_liveness(room: &Room, agents: Vec<AgentState>) -> Vec<AgentListing> {
-    let latest = read_latest_heartbeats(room, &agents, MAX_HEARTBEAT_SCAN_EVENTS)
-        .await
-        .unwrap_or_else(|e| {
+/// between durable-state refreshes. A timeline read failure **or a timeout**
+/// (see [`bounded_latest_heartbeats`], issue #368) degrades to durable-only
+/// liveness (advisory signal, never hang or fail the query): the verdict falls
+/// back to the durable `last_seen_ts`.
+/// Wall-clock bound on the heartbeat-timeline read that backs a liveness verdict.
+///
+/// [`read_latest_heartbeats`] paginates `/messages`, a network round trip that can
+/// block against a slow or unresponsive homeserver. The liveness-enriched IPC
+/// handlers (`task.graph`, `agent.list`, `agent.show`) await it inline, and a
+/// single IPC connection is served serially, so an unbounded read would hang the
+/// handler *and* stall every request multiplexed behind it on that connection
+/// (issue #368). Bounding it keeps those handlers responsive; on timeout the
+/// verdict degrades to durable-only liveness, which is advisory anyway. 5s is the
+/// trade-off: long enough for the heartbeat scan to complete against a healthy
+/// homeserver (the common case exits after the first `/messages` page), short
+/// enough that a stalled read cannot block the handler — or, since one IPC
+/// connection is served serially, the requests multiplexed behind it — for long.
+/// (Scope note: this bounds only the differential read that made task.graph hang
+/// where task.list does not; the shared `sync_once` in `sync_and_get_room` and the
+/// `/messages` scans in approval/context/artifact paths remain unbounded — a
+/// separate, repo-wide hardening.)
+const LIVENESS_ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run the heartbeat-timeline read under `timeout`, degrading to an empty map
+/// (→ durable-only liveness) on either an error **or a timeout**.
+///
+/// `read_latest_heartbeats` already surfaces a failed read as `Err`, but a slow
+/// homeserver makes the future *pend* rather than error, which `unwrap_or_else`
+/// cannot catch — that is the indefinite `task.graph` hang in issue #368. Split
+/// out so the bound is unit-testable without a live homeserver.
+async fn bounded_latest_heartbeats(
+    read: impl Future<Output = Result<HashMap<String, Heartbeat>, WorkspaceError>>,
+    timeout: Duration,
+) -> HashMap<String, Heartbeat> {
+    match tokio::time::timeout(timeout, read).await {
+        Ok(Ok(latest)) => latest,
+        Ok(Err(e)) => {
             tracing::debug!(error = %e, "could not read heartbeats; using durable-only liveness");
-            Default::default()
-        });
+            HashMap::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                "heartbeat timeline read timed out; using durable-only liveness (issue #368)"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+async fn enrich_with_liveness(room: &Room, agents: Vec<AgentState>) -> Vec<AgentListing> {
+    let latest = bounded_latest_heartbeats(
+        read_latest_heartbeats(room, &agents, MAX_HEARTBEAT_SCAN_EVENTS),
+        LIVENESS_ENRICHMENT_TIMEOUT,
+    )
+    .await;
     let cfg = LivenessConfig::default();
     let now = now_ms();
     agents
@@ -543,6 +591,50 @@ mod tests {
     #[test]
     fn derive_agent_id_falls_back_to_full_user_id() {
         assert_eq!(derive_agent_id("weird-id", "DEV"), "weird-id-DEV");
+    }
+
+    // --- liveness-enrichment bound (issue #368) -----------------------------
+
+    fn sample_heartbeat(agent_id: &str) -> Heartbeat {
+        Heartbeat {
+            agent_id: agent_id.to_string(),
+            status: "active".to_string(),
+            load: AgentLoad {
+                running_invocations: 0,
+                max_invocations: 1,
+            },
+            ts: 1,
+            extra: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_latest_heartbeats_returns_value_when_ready() {
+        let mut map = HashMap::new();
+        map.insert("a-1".to_string(), sample_heartbeat("a-1"));
+        let out = bounded_latest_heartbeats(async move { Ok(map) }, Duration::from_secs(5)).await;
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("a-1"));
+    }
+
+    #[tokio::test]
+    async fn bounded_latest_heartbeats_falls_back_on_error() {
+        // A failed timeline read degrades to durable-only liveness (empty map),
+        // never propagating the error to fail the query.
+        let read = async { Err(WorkspaceError::RoomNotFound("nope".to_string())) };
+        let out = bounded_latest_heartbeats(read, Duration::from_secs(5)).await;
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_latest_heartbeats_falls_back_on_timeout() {
+        // Regression for #368: a heartbeat read that never completes must not
+        // hang the liveness-enriched IPC handlers (task.graph / agent.list /
+        // agent.show). It degrades to durable-only liveness within the bound
+        // rather than pending forever — which `unwrap_or_else` could not catch.
+        let never = std::future::pending::<Result<HashMap<String, Heartbeat>, WorkspaceError>>();
+        let out = bounded_latest_heartbeats(never, Duration::from_millis(20)).await;
+        assert!(out.is_empty());
     }
 
     // --- local signing-key trust seed (issue #309) --------------------------

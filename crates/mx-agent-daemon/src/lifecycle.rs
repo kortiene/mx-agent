@@ -765,11 +765,14 @@ fn dispatch(
             Ok(options) => block_on_task_response(req, |session| async move {
                 let tasks = crate::list_tasks_for_session(&session, &options).await?;
                 // Best-effort heartbeat-enriched agent snapshot for agent-dependent
-                // diagnostics; when it cannot be read, agent checks are skipped
-                // rather than failing the graph query. Using the liveness-enriched
-                // path (combined durable + heartbeat verdict) means a healthy,
-                // heartbeating agent never reads as inactive between the slower
-                // durable-state refreshes (issue #312).
+                // diagnostics; when it cannot be read — including a slow/unresponsive
+                // homeserver, which the enrichment now bounds with a wall-clock
+                // timeout so this handler can never hang and stall the IPC connection
+                // (issue #368) — agent checks degrade to durable-only liveness rather
+                // than failing the graph query. Using the liveness-enriched path
+                // (combined durable + heartbeat verdict) means a healthy, heartbeating
+                // agent never reads as inactive between the slower durable-state
+                // refreshes (issue #312).
                 let listings = crate::list_agents_with_liveness_for_session(
                     &session,
                     &crate::ListAgentsOptions {
