@@ -805,7 +805,10 @@ fn scheduler_pass_for_agent(
                 None => return Err(WorkspaceError::TaskNotFound(options.task_id.clone())),
             },
         };
-        let updated =
+        // The emitted event id is returned for the IPC audit anchor (issue #367)
+        // but unused here; the write cache keeps `None` so a later same-pass update
+        // resolves its previous_event_id from the room rather than this cache slot.
+        let (updated, _new_event_id) =
             runtime.block_on(apply_and_publish_task(room, current, event_id, &options))?;
         write_cache.insert(updated.task_id.clone(), (updated.clone(), None));
         Ok(updated)

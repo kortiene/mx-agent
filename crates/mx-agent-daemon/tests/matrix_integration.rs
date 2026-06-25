@@ -2729,7 +2729,7 @@ allow_cwd = ["{cwd}"]
     // `authorization: None`; the daemon signs daemon-side in
     // `create_task_for_session`. No manual `sign_task_action` call here.
     let prod_task_id = "task-302-prod";
-    create_task_for_session(
+    let created = create_task_for_session(
         &alice_session,
         &CreateTaskOptions {
             room: room_id.to_string(),
@@ -2753,6 +2753,17 @@ allow_cwd = ["{cwd}"]
     )
     .await
     .expect("production-path create_task_for_session must succeed");
+
+    // Issue #367: the task.create reply carries the emitted `com.mxagent.task.v1`
+    // event id as an audit anchor (a Matrix event id starts with '$'), alongside
+    // the flattened task state, so a consumer can correlate the signed mutation to
+    // the event it produced.
+    assert!(
+        created.event_id.starts_with('$'),
+        "task.create reply must carry the emitted event id (issue #367), got {:?}",
+        created.event_id
+    );
+    assert_eq!(created.task.task_id, prod_task_id);
 
     // Verify the daemon attached an authorization at authoring time, without
     // any manual sign_task_action call. This is the direct proof of #302.
