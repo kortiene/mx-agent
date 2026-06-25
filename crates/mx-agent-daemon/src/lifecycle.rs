@@ -650,6 +650,98 @@ fn load_daemon_session_response(req: &Request) -> Result<StoredSession, Box<Resp
     }
 }
 
+/// Wall-clock ceiling for a single request/response IPC handler's homeserver
+/// work, after which the handler is abandoned and a bounded JSON-RPC error is
+/// returned instead of hanging the connection (issue #371).
+///
+/// A handler that does `sync_once` plus an unbounded `/messages` pagination can
+/// accumulate matrix-sdk's individually-bounded reads (≈30s each; see
+/// `crate::matrix` `SDK_MAX_RETRY_TIME`) into an effectively unbounded total,
+/// and because one IPC connection is served serially a stalled handler poisons
+/// every request multiplexed behind it (the failure mode that let #368 escape).
+/// This default sits ~2× above the SDK's single-request envelope so a slow but
+/// *working* read is not false-tripped, while a *stalled* one is bounded.
+///
+/// Streaming/interactive handlers (`task.watch`, `exec`/`pty`, `call.start`,
+/// `device.verify.start`) are intentionally long-lived, do not go through
+/// [`block_on_task_response`], and are not bounded here.
+const IPC_REQUEST_BUDGET: Duration = Duration::from_secs(60);
+
+/// Larger ceiling for key-backup restore, which legitimately takes longer than a
+/// status/list read (server-side backup creation plus room-key download).
+const IPC_RECOVERY_BUDGET: Duration = Duration::from_secs(180);
+
+/// Per-method homeserver-read budget (issue #371). Recovery operations get a
+/// larger ceiling; everything else uses [`IPC_REQUEST_BUDGET`].
+fn request_budget(method: &str) -> Duration {
+    match method {
+        "recovery.enable" | "recovery.recover" => IPC_RECOVERY_BUDGET,
+        _ => IPC_REQUEST_BUDGET,
+    }
+}
+
+/// Outcome of running a request/response handler future under a wall-clock
+/// budget (issue #371).
+enum BoundedOutcome<T> {
+    /// The handler finished within budget (carrying its own success or error).
+    Completed(Result<T, crate::WorkspaceError>),
+    /// The handler exceeded the budget and was abandoned.
+    TimedOut,
+}
+
+/// Run a request/response handler future to completion, or abandon it once
+/// `budget` elapses (issue #371).
+///
+/// On timeout the future is dropped, cancelling any in-flight matrix-sdk read.
+/// matrix-sdk reads are cancel-safe: a dropped HTTP request leaves no
+/// half-committed local state (crypto-store writes follow successful responses).
+async fn run_bounded<T>(
+    budget: Duration,
+    fut: impl std::future::Future<Output = Result<T, crate::WorkspaceError>>,
+) -> BoundedOutcome<T> {
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => BoundedOutcome::Completed(result),
+        Err(_) => BoundedOutcome::TimedOut,
+    }
+}
+
+/// Map a [`BoundedOutcome`] to the JSON-RPC [`Response`] for `req` (issue #371).
+///
+/// A timeout surfaces as an `INTERNAL_ERROR` (no new wire code) with a
+/// distinctive, greppable message and a `warn!` that logs only the method and
+/// budget — never request contents or secrets.
+fn bounded_response<T: serde::Serialize>(
+    req: &Request,
+    budget: Duration,
+    outcome: BoundedOutcome<T>,
+) -> Response {
+    match outcome {
+        BoundedOutcome::Completed(Ok(value)) => match serde_json::to_value(value) {
+            Ok(value) => Response::result(req.id.clone(), value),
+            Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
+        },
+        BoundedOutcome::Completed(Err(e)) => {
+            Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string())
+        }
+        BoundedOutcome::TimedOut => {
+            tracing::warn!(
+                method = %req.method,
+                budget_secs = budget.as_secs(),
+                "ipc handler timed out waiting on the homeserver; abandoning (issue #371)"
+            );
+            Response::error(
+                req.id.clone(),
+                INTERNAL_ERROR,
+                format!(
+                    "daemon timed out after {}s waiting on the homeserver while handling {} (issue #371)",
+                    budget.as_secs(),
+                    req.method
+                ),
+            )
+        }
+    }
+}
+
 fn block_on_task_response<F, Fut, T>(req: &Request, f: F) -> Response
 where
     F: FnOnce(StoredSession) -> Fut,
@@ -673,13 +765,13 @@ where
             )
         }
     };
-    match runtime.block_on(f(session)) {
-        Ok(value) => match serde_json::to_value(value) {
-            Ok(value) => Response::result(req.id.clone(), value),
-            Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
-        },
-        Err(e) => Response::error(req.id.clone(), INTERNAL_ERROR, e.to_string()),
-    }
+    // Bound the handler's total homeserver work so a stalled `sync_once` /
+    // `/messages` read returns a JSON-RPC error instead of hanging — and
+    // poisoning — the serially-served connection (issue #371). Streaming
+    // handlers bypass this wrapper and stay unbounded by design.
+    let budget = request_budget(&req.method);
+    let outcome = runtime.block_on(run_bounded(budget, f(session)));
+    bounded_response(req, budget, outcome)
 }
 
 /// Dispatch a single-response IPC request against the running daemon.
@@ -2174,5 +2266,187 @@ mod tests {
             !json.contains("\"policy\""),
             "JSON must not contain policy key when None: {json}"
         );
+    }
+
+    // ── #371: request/response handler homeserver-read timeout ────────────────
+
+    #[test]
+    fn request_budget_uses_recovery_ceiling_only_for_recovery_methods() {
+        assert_eq!(request_budget("recovery.enable"), IPC_RECOVERY_BUDGET);
+        assert_eq!(request_budget("recovery.recover"), IPC_RECOVERY_BUDGET);
+        for method in ["task.graph", "agent.list", "approval.decide", "share.get"] {
+            assert_eq!(request_budget(method), IPC_REQUEST_BUDGET);
+        }
+        // `recovery.status` is a light read, so it keeps the default ceiling.
+        assert_eq!(request_budget("recovery.status"), IPC_REQUEST_BUDGET);
+        // The recovery ceiling must be the larger of the two.
+        assert!(IPC_RECOVERY_BUDGET > IPC_REQUEST_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn run_bounded_abandons_a_stalled_future() {
+        // A handler future that never completes must be abandoned at the budget,
+        // not awaited forever (issue #371).
+        let outcome = run_bounded::<()>(Duration::from_millis(20), async {
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+        .await;
+        assert!(matches!(outcome, BoundedOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn run_bounded_passes_a_ready_future_through() {
+        let outcome = run_bounded(Duration::from_secs(5), async { Ok(7_i32) }).await;
+        match outcome {
+            BoundedOutcome::Completed(Ok(value)) => assert_eq!(value, 7),
+            _ => panic!("a ready future must complete within budget"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_bounded_propagates_a_handler_error() {
+        let outcome = run_bounded::<()>(Duration::from_secs(5), async {
+            Err(crate::WorkspaceError::Io(io::Error::other("boom")))
+        })
+        .await;
+        match outcome {
+            BoundedOutcome::Completed(Err(e)) => assert!(e.to_string().contains("boom")),
+            _ => panic!("a handler error must be propagated, not swallowed"),
+        }
+    }
+
+    #[test]
+    fn bounded_response_maps_timeout_to_error_naming_method_and_budget() {
+        let req = Request::new(json!(1), "task.graph", Value::Null);
+        let response =
+            bounded_response::<()>(&req, Duration::from_secs(60), BoundedOutcome::TimedOut);
+        let error = response.error.expect("a timeout must be an error response");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(
+            error.message.contains("timed out"),
+            "message must say it timed out: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("60s"),
+            "message must name the budget: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("task.graph"),
+            "message must name the method: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn bounded_response_maps_completed_ok_to_result() {
+        let req = Request::new(json!(2), "task.graph", Value::Null);
+        let response = bounded_response(
+            &req,
+            IPC_REQUEST_BUDGET,
+            BoundedOutcome::Completed(Ok(json!({"ok": true}))),
+        );
+        assert!(!response.is_error());
+        assert_eq!(response.result, Some(json!({"ok": true})));
+    }
+
+    #[test]
+    fn bounded_response_maps_completed_err_to_error() {
+        let req = Request::new(json!(3), "task.graph", Value::Null);
+        let outcome: BoundedOutcome<()> =
+            BoundedOutcome::Completed(Err(crate::WorkspaceError::Io(io::Error::other("nope"))));
+        let response = bounded_response(&req, IPC_REQUEST_BUDGET, outcome);
+        let error = response
+            .error
+            .expect("a handler error must be an error response");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(error.message.contains("nope"));
+    }
+
+    /// Real-socket regression (issue #371, acceptance #2): a request/response
+    /// handler that stalls on a homeserver read returns a bounded timeout error
+    /// over the socket, and the connection is NOT poisoned — a subsequent request
+    /// on the same connection is still served (the #368/#258 failure class).
+    #[test]
+    fn stalled_handler_times_out_over_socket_without_poisoning_connection() {
+        use mx_agent_ipc::{read_frame, serve_streaming, write_frame};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CTR: AtomicUsize = AtomicUsize::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let socket_path =
+            std::env::temp_dir().join(format!("mx_ipc_371_{}_{}.sock", std::process::id(), n));
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).ok();
+        }
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        // Route a "stalls" method through the production timeout wrapper around a
+        // never-completing future (a stand-in for a stalled homeserver read) with
+        // a short test budget; "ping" returns immediately.
+        std::thread::spawn(move || {
+            serve_streaming(&listener, move |req, stream| {
+                let response = match req.method.as_str() {
+                    "stalls" => {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        let budget = Duration::from_millis(150);
+                        let outcome = runtime.block_on(run_bounded::<()>(budget, async {
+                            std::future::pending::<()>().await;
+                            Ok(())
+                        }));
+                        bounded_response(req, budget, outcome)
+                    }
+                    "ping" => Response::result(req.id.clone(), json!({"pong": true})),
+                    other => Response::error(
+                        req.id.clone(),
+                        METHOD_NOT_FOUND,
+                        format!("unknown: {other}"),
+                    ),
+                };
+                let bytes = serde_json::to_vec(&response).unwrap();
+                write_frame(stream, &bytes)
+            })
+            .ok();
+        });
+
+        let mut conn = UnixStream::connect(&socket_path).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        // Request 1: the stalled handler must return a bounded *error*, not hang.
+        let req1 = Request::new(json!(1), "stalls", Value::Null);
+        write_frame(&mut conn, &serde_json::to_vec(&req1).unwrap()).unwrap();
+        let frame1 = read_frame(&mut conn)
+            .expect("read error on the stalled request")
+            .expect("a stalled handler must return a bounded response, not hang (issue #371)");
+        let resp1: Response = serde_json::from_slice(&frame1).unwrap();
+        assert!(
+            resp1.is_error(),
+            "the stalled handler must surface a timeout error"
+        );
+        let err1 = resp1.error.unwrap();
+        assert_eq!(err1.code, INTERNAL_ERROR);
+        assert!(
+            err1.message.contains("timed out"),
+            "message: {}",
+            err1.message
+        );
+
+        // Request 2 on the SAME connection: the connection must not be poisoned.
+        let req2 = Request::new(json!(2), "ping", Value::Null);
+        write_frame(&mut conn, &serde_json::to_vec(&req2).unwrap()).unwrap();
+        let frame2 = read_frame(&mut conn)
+            .expect("read error on the follow-up request")
+            .expect("the connection must stay usable after a bounded timeout (issue #368/#258)");
+        let resp2: Response = serde_json::from_slice(&frame2).unwrap();
+        assert!(!resp2.is_error(), "the follow-up request must succeed");
+        assert_eq!(resp2.result, Some(json!({"pong": true})));
+
+        std::fs::remove_file(&socket_path).ok();
     }
 }
