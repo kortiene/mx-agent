@@ -12,7 +12,8 @@
 //! The live orchestration tests (issue #202) run the real daemon paths against
 //! the homeserver: [`live_matrix_backed_remote_call_round_trips`] and
 //! [`live_matrix_backed_remote_exec_round_trips_and_denies`] cover signed
-//! remote `call`/`exec` (streaming, stdin, and policy denial), and
+//! remote `call`/`exec` (streaming, stdin, policy denial, **and the issue #375
+//! env-override gate**), and
 //! [`live_scheduler_executes_signed_task_dag_and_denies`] drives the live
 //! daemon scheduler loop over real `com.mxagent.task.v1` room state — auto
 //! executing a signed, assigned task DAG (honoring dependencies), refusing a
@@ -105,6 +106,17 @@
 //! signing key is locally trusted, while the daemon's own account remains the
 //! authorized default when no allowlist is configured.
 //!
+//! The issue #375 env-override gate is exercised within
+//! [`live_matrix_backed_remote_exec_round_trips_and_denies`]: a signed
+//! `exec.request` carrying a loader-control variable (`LD_PRELOAD`, `PATH`), a
+//! secret-named variable (`GITHUB_TOKEN`), or an un-allowlisted variable
+//! (`MX_AGENT_EVIL`) in its `env` map is rejected by `authorize_live_exec` with
+//! the stable `env_override_not_allowed` reason and the child is never spawned
+//! (proven by a per-case sentinel file that the command would `touch`). A
+//! positive case confirms that a benign, built-in-safe `TERM` override does
+//! reach the child env. This completes the CLI → Matrix → sync → dispatch →
+//! `authorize_live_exec` seam for the env-override constraint.
+//!
 //! It is `#[ignore]`d so the default `cargo test --all` (which has no
 //! homeserver) stays green. Run it through the documented harness:
 //!
@@ -180,15 +192,15 @@ use mx_agent_daemon::{
     run_matrix_sync_with_subscribers, run_scheduler_loop, run_sync_loop, save_session,
     save_sync_token, share_context, show_agent, sign_task_action, start_call_matrix,
     start_exec_matrix, AgentListing, ApprovalQueue, BackoffConfig, CallOutcome, CallStartParams,
-    CallTargeting, CreateTaskOptions, CreateWorkspaceOptions, DaemonSigningKey, ExecFrame,
-    ExecOutcome, ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry, ExecSubscriptionKey,
-    FetchContextOptions, ForwardedExecEvent, GrantWorkspaceOptions, HeartbeatConfig, HeldRequest,
-    ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig, MatrixConfig, PendingApproval,
-    PtyWinsize, RecoveryEnableResult, RegisterAgentOptions, RetrieveArtifactOptions, SasAdvance,
-    SessionPaths, ShareContextOptions, StepError, SyncHealth, SyncState, TaskDiagnostic,
-    TaskDispatchMode, TrustStore, WorkspaceError, WorkspaceVisibility, DECISION_APPROVED,
-    DECISION_DENIED, DEFAULT_ARTIFACT_SCAN_LIMIT, HEARTBEAT_SCAN_LIMIT, MAX_HEARTBEAT_SCAN_EVENTS,
-    WORKSPACE_AGENT_PL,
+    CallTargeting, CreateTaskOptions, CreateWorkspaceOptions, DaemonSigningKey, ExecErrorKind,
+    ExecFrame, ExecOutcome, ExecRequestOptions, ExecStartParams, ExecSubscriberRegistry,
+    ExecSubscriptionKey, FetchContextOptions, ForwardedExecEvent, GrantWorkspaceOptions,
+    HeartbeatConfig, HeldRequest, ListAgentsOptions, ListTasksOptions, Liveness, LivenessConfig,
+    MatrixConfig, PendingApproval, PtyWinsize, RecoveryEnableResult, RegisterAgentOptions,
+    RetrieveArtifactOptions, SasAdvance, SessionPaths, ShareContextOptions, StepError, SyncHealth,
+    SyncState, TaskDiagnostic, TaskDispatchMode, TrustStore, WorkspaceError, WorkspaceVisibility,
+    DECISION_APPROVED, DECISION_DENIED, DEFAULT_ARTIFACT_SCAN_LIMIT, HEARTBEAT_SCAN_LIMIT,
+    MAX_HEARTBEAT_SCAN_EVENTS, WORKSPACE_AGENT_PL,
 };
 use mx_agent_policy::Policy;
 use mx_agent_protocol::events::timeline;
@@ -822,7 +834,12 @@ allow_tools = ["run_tests"]
     );
 }
 
-/// Live Matrix-backed remote exec coverage (issue #196).
+/// Live Matrix-backed remote exec coverage (issues #196, #202, #366, #375).
+///
+/// Covers signed remote exec (streaming, stdin, policy denial, and the issue
+/// #375 env-override gate): loader-control, secret-named, and un-allowlisted
+/// `env` override keys in a signed request are rejected fail-closed by
+/// `authorize_live_exec`; a benign built-in-safe override is permitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a local Matrix homeserver; run via scripts/matrix_integration_test.sh"]
 async fn live_matrix_backed_remote_exec_round_trips_and_denies() {
@@ -1101,6 +1118,99 @@ allow_cwd = ["{cwd}"]
     .await;
     assert!(matches!(denied.outcome, ExecOutcome::Error { .. }));
     assert!(!denied_file.exists(), "policy-denied exec must not spawn");
+
+    // Issue #375: a signed remote `exec.request` whose `env` carries a
+    // loader-control / secret / un-allowlisted override key is rejected fail-closed
+    // at `authorize_live_exec` (the command `sh` is policy-allowed, so the request
+    // clears signature → trust → policy and is denied solely by the env-override
+    // gate) and must never spawn a child. The forwarded `exec.rejected` carries the
+    // stable `env_override_not_allowed` reason; the daemon log names only the
+    // offending variable, never its value. Each case writes a distinct marker the
+    // child would `touch` — its absence proves no child ran.
+    for (label, key, value) in [
+        ("loader LD_PRELOAD", "LD_PRELOAD", "/tmp/evil.so"),
+        ("loader PATH", "PATH", "/tmp/evil-bin"),
+        ("secret GITHUB_TOKEN", "GITHUB_TOKEN", "ghp_should_not_run"),
+        ("unlisted MX_AGENT_EVIL", "MX_AGENT_EVIL", "1"),
+    ] {
+        let marker = cwd.join(format!("env-override-marker-{key}"));
+        let rejected = start_exec_matrix(
+            &ExecStartParams {
+                room: Some(room_id.to_string()),
+                agent: Some(TARGET_AGENT.to_string()),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("touch {}", marker.to_string_lossy()),
+                ],
+                cwd: Some(cwd.clone()),
+                stdin: None,
+                stream: true,
+                pty: false,
+                task: None,
+                strict_stream: false,
+                env: BTreeMap::from([(key.to_string(), value.to_string())]),
+                timeout_ms: None,
+                invocation_id: None,
+            },
+            &subscribers,
+        )
+        .await;
+        match rejected.outcome {
+            ExecOutcome::Error { kind, message } => {
+                assert_eq!(
+                    kind,
+                    ExecErrorKind::Remote,
+                    "{label}: env-override rejection must surface as a remote rejection"
+                );
+                assert_eq!(
+                    message, "env_override_not_allowed",
+                    "{label}: must carry the stable env_override_not_allowed reason"
+                );
+            }
+            other => panic!("{label}: expected env-override rejection, got {other:?}"),
+        }
+        assert!(
+            !marker.exists(),
+            "{label}: a rejected env-override exec must not spawn a child"
+        );
+    }
+
+    // Positive case (issue #375): a benign, built-in-safe `TERM` override is
+    // permitted and reaches the child env on the remote path.
+    let allowed_override = start_exec_matrix(
+        &ExecStartParams {
+            room: Some(room_id.to_string()),
+            agent: Some(TARGET_AGENT.to_string()),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf '%s' \"$TERM\"".to_string(),
+            ],
+            cwd: Some(cwd.clone()),
+            stdin: None,
+            stream: true,
+            pty: false,
+            task: None,
+            strict_stream: false,
+            env: BTreeMap::from([("TERM".to_string(), "xterm-mxagent".to_string())]),
+            timeout_ms: None,
+            invocation_id: None,
+        },
+        &subscribers,
+    )
+    .await;
+    match allowed_override.outcome {
+        ExecOutcome::Ok { frames } => {
+            assert!(
+                frames
+                    .iter()
+                    .any(|f| matches!(f, ExecFrame::Chunk(c) if c.data.contains("xterm-mxagent"))),
+                "a permitted TERM override must reach the child env"
+            );
+        }
+        other => panic!("expected permitted-override output, got {other:?}"),
+    }
 
     running.store(false, Ordering::SeqCst);
     alice_sync

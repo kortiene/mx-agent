@@ -127,7 +127,7 @@ mx-agent is **zero-trust and deny-by-default**: room membership grants nothing o
 - A **malformed `policy.toml` fails loudly**, distinct from an absent one. An absent file is the intended deny-all default and starts silently; a file that is present but unreadable/unparseable/invalid makes the daemon **refuse to start** (non-zero exit with a precise diagnostic) and is flagged by `mx-agent daemon status` (`policy: MALFORMED …`), so a fat-fingered policy can never silently degrade to total denial with no signal. Authorization stays fail-closed in every case (issue #350).
 - The **result plane is sender-pinned** too: stream output, exit status, call responses, and artifacts/shares are accepted only from the executing/producing agent's Matrix identity, so another room member cannot forge a result, fake an exit status, inject output, or shadow an artifact (stream chunks also carry a verified `sha256` integrity digest).
 - The coding agent **never sees** Matrix tokens or device keys — they stay inside the daemon (`0600`, user-owned).
-- Child processes start from an **environment allowlist** with secret scrubbing (`GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_*`, …).
+- Child processes start from an **environment allowlist** with secret scrubbing (`GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_*`, …); a **remote** request's `env` override **keys** are constrained to that allowlist too, with loader-control names (`LD_*`, `DYLD_*`, `PATH`) and secrets always denied so a signed request cannot inject `LD_PRELOAD`/`PATH` into the child.
 - The local IPC socket enforces a **peer-UID check** (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS/BSD) and refuses cross-user or world-accessible runtime dirs.
 - The workspace **forbids `unsafe` Rust** (`unsafe_code = "forbid"`).
 

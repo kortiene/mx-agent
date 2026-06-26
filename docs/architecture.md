@@ -2104,6 +2104,22 @@ AZURE_*
 NPM_TOKEN
 ```
 
+**Remote `env` overrides are allowlist-constrained (issue #375).** The scrub
+above filters the *inherited* daemon environment; caller-supplied `env` overrides
+are layered on top. For a **local** operator (loopback `exec --env`) those
+overrides stay unconditional — a deliberate per-request choice. For a **remote**,
+Ed25519-signed `exec.request`, the override **keys** are screened at the live-exec
+authorization gate (`authorize_live_exec`): a key is honored only when it is in
+`execution.env_allowlist ∪ DEFAULT_ALLOWED_VARS` *and* is neither a secret nor a
+loader-control variable. Loader-control names — `LD_*`, `DYLD_*`, and `PATH` — are
+**always** denied on the remote path (even if allowlisted), because a remote
+requester replacing the loader or `PATH` could redirect execution outside the
+requested argv or defeat sandbox path assumptions; the daemon's own `PATH` still
+reaches the child via the inherited-env scrub. A request carrying any un-permitted
+override key is rejected fail-closed with `com.mxagent.exec.rejected.v1`
+(`reason: env_override_not_allowed`); the daemon logs only the offending variable
+**name**, never its value.
+
 ### 13.5 Sandboxing
 
 Minimum controls:

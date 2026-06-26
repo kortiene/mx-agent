@@ -156,6 +156,55 @@ fn is_allowed_var(name: &str, extra_allowed: &BTreeSet<&str>) -> bool {
     DEFAULT_ALLOWED_VARS.contains(&name) || extra_allowed.contains(name)
 }
 
+/// Whether `name` controls the dynamic loader or binary resolution and must
+/// never be set by a *remote* requester (issue #375).
+///
+/// These variables can redirect code execution outside the requested argv or
+/// defeat sandbox path assumptions: the glibc loader (`LD_*`, e.g. `LD_PRELOAD`,
+/// `LD_LIBRARY_PATH`, `LD_AUDIT`), the macOS dyld loader (`DYLD_*`, e.g.
+/// `DYLD_INSERT_LIBRARIES`), and `PATH` (which changes which binary `argv[0]`
+/// resolves to). Prefix matching on `LD_`/`DYLD_` is used so future loader knobs
+/// are covered automatically (fail-safe: it can only widen what is denied).
+pub fn is_loader_control_var(name: &str) -> bool {
+    name == "PATH" || name.starts_with("LD_") || name.starts_with("DYLD_")
+}
+
+/// Screen caller-supplied `env` override **keys** from a *remote* (signed)
+/// request against what policy permits, returning the first key that must not be
+/// honored (or `None` when all keys are permitted) (issue #375).
+///
+/// Unlike [`sanitize_env`] — which applies overrides unconditionally so the
+/// local operator's deliberate per-request `--env` choice always wins — a remote
+/// override key is permitted only when ALL of the following hold:
+///
+/// 1. it is not a known secret ([`is_secret_var`]) — secrets are never
+///    re-introducible, mirroring the inherited-env scrub;
+/// 2. it is not a loader-control variable ([`is_loader_control_var`]) — these are
+///    denied even if allowlisted, because a remote requester has no legitimate
+///    need to replace the loader / `PATH` the daemon already provides; and
+/// 3. its name is in the policy `extra_allowed` set (`execution.env_allowlist`)
+///    OR a built-in safe default ([`DEFAULT_ALLOWED_VARS`]) — so benign
+///    `TERM`/`LANG`/`TMPDIR`/operator-allowlisted overrides still work, but
+///    anything unlisted is denied.
+///
+/// Deny-by-default: with an empty `extra_allowed`, only the (non-loader,
+/// non-secret) built-in safe names may be overridden by a remote requester.
+/// Keys are iterated in [`BTreeMap`] order, so the returned offending key is
+/// stable across runs (it names the variable in the daemon log / rejection).
+/// Local-operator overrides do not flow through here — only the remote assembly
+/// sites call it.
+pub fn first_disallowed_remote_override<'a>(
+    env: &'a BTreeMap<String, String>,
+    extra_allowed: &[String],
+) -> Option<&'a str> {
+    let extra: BTreeSet<&str> = extra_allowed.iter().map(String::as_str).collect();
+    env.keys().map(String::as_str).find(|name| {
+        is_secret_var(name)
+            || is_loader_control_var(name)
+            || !(DEFAULT_ALLOWED_VARS.contains(name) || extra.contains(name))
+    })
+}
+
 /// What to run and how (the non-protocol view of an authorized exec request).
 ///
 /// This is intentionally small: the runner only needs the argv, the working
@@ -816,6 +865,264 @@ mod tests {
         assert_eq!(
             env.get("GITHUB_TOKEN").map(String::as_str),
             Some("explicit")
+        );
+    }
+
+    // --- remote override screen (issue #375) -------------------------------
+    //
+    // `first_disallowed_remote_override` gates the *remote* signed-request `env`
+    // override keys. It does NOT touch `sanitize_env`, so the local escape hatch
+    // (the two tests above) is unchanged.
+
+    #[test]
+    fn loader_control_vars_are_recognised() {
+        for name in [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            assert!(is_loader_control_var(name), "{name} must be loader-control");
+        }
+        // Benign names that merely live near the loader knobs must not match.
+        for name in ["CARGO_HOME", "TERM", "LANG", "HOME", "LANGUAGE", "PWD"] {
+            assert!(
+                !is_loader_control_var(name),
+                "{name} must not be loader-control"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_override_screen_rejects_loader_secret_and_unlisted_keys() {
+        // Each of these override maps must surface its sole offending key.
+        for name in [
+            "LD_PRELOAD",            // loader-control
+            "DYLD_INSERT_LIBRARIES", // loader-control (macOS)
+            "PATH",                  // loader-control even though a built-in default
+            "GITHUB_TOKEN",          // secret
+            "MY_UNLISTED_VAR",       // not allowlisted, not a default
+        ] {
+            let env = overrides(&[(name, "value")]);
+            assert_eq!(
+                first_disallowed_remote_override(&env, &[]),
+                Some(name),
+                "{name} must be rejected for a remote requester"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_override_screen_permits_safe_and_allowlisted_keys() {
+        // Built-in safe names (non-loader) are overridable with no allowlist.
+        assert_eq!(
+            first_disallowed_remote_override(&overrides(&[("TERM", "xterm"), ("LANG", "C")]), &[]),
+            None
+        );
+        // An empty override map trivially passes.
+        assert_eq!(
+            first_disallowed_remote_override(&BTreeMap::new(), &[]),
+            None
+        );
+        // A name is overridable only once the operator allowlists it
+        // (deny-by-default): rejected with an empty allowlist, permitted once
+        // present.
+        let cargo = overrides(&[("CARGO_HOME", "/home/me/.cargo")]);
+        assert_eq!(
+            first_disallowed_remote_override(&cargo, &[]),
+            Some("CARGO_HOME")
+        );
+        assert_eq!(
+            first_disallowed_remote_override(&cargo, &["CARGO_HOME".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_override_screen_loader_and_secret_beat_the_allowlist() {
+        // Loader-control and secret names are denied even when the operator
+        // explicitly allowlists them — the carve-out mirrors the inherited-env
+        // secret scrub.
+        let loader = overrides(&[("LD_PRELOAD", "/tmp/evil.so")]);
+        assert_eq!(
+            first_disallowed_remote_override(&loader, &["LD_PRELOAD".to_string()]),
+            Some("LD_PRELOAD")
+        );
+        let secret = overrides(&[("GITHUB_TOKEN", "ghp_x")]);
+        assert_eq!(
+            first_disallowed_remote_override(&secret, &["GITHUB_TOKEN".to_string()]),
+            Some("GITHUB_TOKEN")
+        );
+        // `PATH` is a built-in default yet still denied (loader-control carve-out).
+        let path = overrides(&[("PATH", "/tmp/bin")]);
+        assert_eq!(
+            first_disallowed_remote_override(&path, &["PATH".to_string()]),
+            Some("PATH")
+        );
+    }
+
+    #[test]
+    fn sanitize_env_local_path_still_passes_loader_control_vars() {
+        // The local operator override path (sanitize_env) is intentionally
+        // unrestricted: a deliberate per-request choice wins even for loader-control
+        // names. Only the remote signed-request path runs first_disallowed_remote_override.
+        // This test is the regression anchor: if sanitize_env ever starts calling
+        // first_disallowed_remote_override, LD_PRELOAD would disappear from the
+        // local operator's child env — which would be a regression.
+        let env = sanitize_env(
+            vec![("PATH".to_string(), "/usr/bin".to_string())],
+            &overrides(&[("LD_PRELOAD", "/dev/null"), ("PATH", "/sbin")]),
+            &[],
+        );
+        assert_eq!(
+            env.get("LD_PRELOAD").map(String::as_str),
+            Some("/dev/null"),
+            "local override: LD_PRELOAD must still reach the child"
+        );
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/sbin"),
+            "local override: PATH must still reach the child"
+        );
+        // The same keys are denied on the remote path — the two paths diverge here.
+        let remote = overrides(&[("LD_PRELOAD", "/dev/null"), ("PATH", "/sbin")]);
+        assert_eq!(
+            first_disallowed_remote_override(&remote, &[]),
+            Some("LD_PRELOAD"),
+            "remote path: LD_PRELOAD must be rejected"
+        );
+    }
+
+    #[test]
+    fn remote_override_screen_rejects_secret_prefix_vars() {
+        // Secret-prefix variables (AWS_, GOOGLE_, AZURE_) are caught by is_secret_var
+        // and must not be injected via a remote override, regardless of allowlist.
+        for name in [
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "AZURE_CLIENT_SECRET",
+        ] {
+            let env = overrides(&[(name, "value")]);
+            assert_eq!(
+                first_disallowed_remote_override(&env, &[]),
+                Some(name),
+                "{name} (secret-prefix) must be rejected for a remote requester"
+            );
+            // allowlisting must not help either
+            assert_eq!(
+                first_disallowed_remote_override(&env, &[name.to_string()]),
+                Some(name),
+                "{name} must be rejected even when operator-allowlisted"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_override_screen_rejects_mx_agent_credentials() {
+        // The daemon's own credential inputs (issue #311) are in SECRET_VARS and
+        // must not be injected into a spawned child via a remote override.
+        for name in ["MX_AGENT_PASSWORD", "MX_AGENT_RECOVERY_KEY"] {
+            let env = overrides(&[(name, "value")]);
+            assert_eq!(
+                first_disallowed_remote_override(&env, &[]),
+                Some(name),
+                "{name} must be rejected for a remote requester"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_override_screen_rejects_sensitive_key_shape_vars() {
+        // Variables caught only by `is_sensitive_key` (not in SECRET_VARS or
+        // SECRET_PREFIXES) are also denied on the remote path — issue #375.
+        // This exercises the third branch of `is_secret_var`: a future variable
+        // whose name contains a sensitive needle ("secret", "api_key", "password",
+        // "token", "private_key") is denied without needing an explicit registry
+        // entry, making the denylist fail-safe against new credential shapes.
+        for name in [
+            "MY_DEPLOY_SECRET",  // contains "secret"
+            "VENDOR_API_KEY",    // contains "api_key"
+            "DATABASE_PASSWORD", // contains "password"
+            "THIRD_PARTY_TOKEN", // contains "token"
+            "APP_PRIVATE_KEY",   // contains "private_key"
+        ] {
+            let env = overrides(&[(name, "value")]);
+            assert_eq!(
+                first_disallowed_remote_override(&env, &[]),
+                Some(name),
+                "{name} (is_sensitive_key shape) must be rejected for a remote requester"
+            );
+            // Allowlisting must not help — secret-shaped keys are denied regardless.
+            assert_eq!(
+                first_disallowed_remote_override(&env, &[name.to_string()]),
+                Some(name),
+                "{name} must be rejected even when operator-allowlisted"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_override_screen_rejects_novel_loader_prefix_vars() {
+        // The `LD_`/`DYLD_` denylist is prefix-based so future loader knobs are
+        // covered automatically (fail-safe). Verify names that are real (but not
+        // in the explicit test-name list) and hypothetical future knobs are all
+        // caught by the prefix match, not an explicit registry entry.
+        for name in [
+            "LD_BIND_NOW",               // real glibc knob — lazy binding
+            "LD_DEBUG",                  // real glibc knob — verbose linker trace
+            "LD_SOMETHING_FUTURE",       // hypothetical future LD_ knob
+            "DYLD_FORCE_FLAT_NAMESPACE", // real macOS dyld knob
+            "DYLD_SOMETHING_FUTURE",     // hypothetical future DYLD_ knob
+        ] {
+            let env = overrides(&[(name, "value")]);
+            assert_eq!(
+                first_disallowed_remote_override(&env, &[]),
+                Some(name),
+                "{name} (novel LD_/DYLD_ prefix) must be rejected for a remote requester"
+            );
+            // Allowlisting must not help — loader-control beats the allowlist.
+            assert_eq!(
+                first_disallowed_remote_override(&env, &[name.to_string()]),
+                Some(name),
+                "{name} must be rejected even when operator-allowlisted"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_override_screen_mixed_map_returns_first_bad_key_in_sorted_order() {
+        // When a map contains both permitted and denied keys, the predicate returns
+        // the first denied key encountered in BTreeMap (alphabetical) order.
+        //
+        // Key order: "CARGO_HOME" (C) < "LANG" (L) < "LD_PRELOAD" (L-D)
+        let env = overrides(&[
+            ("CARGO_HOME", "/home/.cargo"),
+            ("LANG", "en_US.UTF-8"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+        ]);
+        // Without CARGO_HOME in the allowlist: CARGO_HOME is the first key
+        // alphabetically, and it fails (not a default, not allowlisted).
+        assert_eq!(
+            first_disallowed_remote_override(&env, &[]),
+            Some("CARGO_HOME"),
+            "without allowlist CARGO_HOME is the first bad key"
+        );
+        // With CARGO_HOME allowlisted: CARGO_HOME passes, LANG passes (built-in
+        // default), LD_PRELOAD fails (loader-control beats even the allowlist).
+        assert_eq!(
+            first_disallowed_remote_override(&env, &["CARGO_HOME".to_string()]),
+            Some("LD_PRELOAD"),
+            "with CARGO_HOME allowlisted, LD_PRELOAD is the first bad key"
+        );
+        // With LD_PRELOAD removed: all remaining keys are permitted.
+        let safe = overrides(&[("CARGO_HOME", "/home/.cargo"), ("LANG", "en_US.UTF-8")]);
+        assert_eq!(
+            first_disallowed_remote_override(&safe, &["CARGO_HOME".to_string()]),
+            None,
+            "all permitted keys return None"
         );
     }
 
