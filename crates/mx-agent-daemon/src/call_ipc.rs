@@ -168,6 +168,11 @@ where
         Err(err) => {
             let kind = match &err {
                 ToolError::UnknownTool(_) => CallErrorKind::UnknownTool,
+                // The tool exists but the requested `@version` is not implemented
+                // (issue #378): a usage error, mapped to the same wire kind (and
+                // CLI exit code 64) as bad arguments. The distinct signal is the
+                // `ToolError::UnsupportedVersion` message, surfaced in `message`.
+                ToolError::UnsupportedVersion { .. } => CallErrorKind::InvalidArgs,
                 ToolError::InvalidArgs(_) => CallErrorKind::InvalidArgs,
                 ToolError::Spawn(io) if io.kind() == ErrorKind::NotFound => CallErrorKind::NotFound,
                 ToolError::Spawn(_) => CallErrorKind::Spawn,
@@ -234,6 +239,35 @@ mod tests {
         match result.outcome {
             CallOutcome::Error { kind, .. } => assert_eq!(kind, CallErrorKind::InvalidArgs),
             other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_version_maps_to_invalid_args_kind() {
+        // A request for a version the daemon does not implement is rejected as a
+        // usage error (the tool exists) rather than silently downgraded to 1.0.0
+        // (issue #378). The message names the version mismatch.
+        let result = start_call_loopback(&params("run_tests@2.0.0", json!({ "package": "x" })));
+        match result.outcome {
+            CallOutcome::Error { kind, message } => {
+                assert_eq!(kind, CallErrorKind::InvalidArgs);
+                assert!(
+                    message.contains("2.0.0"),
+                    "message names the version: {message}"
+                );
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supported_version_reference_runs_like_bare_name() {
+        // The advertised `name@version` reference must dispatch identically to the
+        // bare name — only bad args fail it, never UnknownTool/UnsupportedVersion.
+        let result = start_call_loopback(&params("run_tests@1.0.0", json!({})));
+        match result.outcome {
+            CallOutcome::Error { kind, .. } => assert_eq!(kind, CallErrorKind::InvalidArgs),
+            other => panic!("expected an invalid-args error, got {other:?}"),
         }
     }
 

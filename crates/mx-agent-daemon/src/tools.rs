@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 
 use mx_agent_protocol::schema::ToolSchema;
-use serde_json::json;
 
 /// An ordered collection of [`ToolSchema`] records keyed by tool name.
 ///
@@ -82,77 +81,33 @@ impl ToolRegistry {
     ///
     /// Matching is by name only; the version suffix (if present) is ignored so
     /// that an advertised `run_tests@1.0.0` resolves to the registered
-    /// `run_tests` definition.
+    /// `run_tests` definition. This is the **discovery** path — it resolves an
+    /// advertised reference to its schema for display. Version *enforcement*
+    /// happens at **execution** time (`crate::tool_exec`), where a request for a
+    /// version the daemon does not implement is rejected rather than silently
+    /// resolved to a different implementation (issue #378).
     pub fn resolve(&self, reference: &str) -> Option<&ToolSchema> {
         let name = reference.split('@').next().unwrap_or(reference);
         self.get(name)
     }
 }
 
-/// The built-in tools every agent ships with.
+/// The built-in tools every agent ships with, advertised in name order.
 ///
-/// Built-in tools are safe, well-known operations with strict schemas. The
-/// initial set mirrors the roadmap milestone (architecture §15): a `run_tests`
-/// tool plus a `lint` tool.
+/// Built-in tools are safe, well-known operations with strict schemas. The set is
+/// derived from [`crate::tool_exec::builtin_schemas`] — the single source of truth
+/// that pairs each tool's advertised schema with its executor — so the registry can
+/// only advertise tools the daemon can actually run (issue #378). The current set
+/// mirrors the roadmap milestone (architecture §15): a `run_tests` tool and a
+/// `lint` tool.
 pub fn builtin_tools() -> Vec<ToolSchema> {
-    vec![run_tests_tool(), lint_tool()]
-}
-
-/// Built-in `run_tests` tool definition (architecture §5.2).
-fn run_tests_tool() -> ToolSchema {
-    ToolSchema {
-        name: "run_tests".to_string(),
-        version: "1.0.0".to_string(),
-        description: "Run project test suites".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "package": { "type": "string" },
-                "name": { "type": "string" },
-                "coverage": { "type": "boolean" }
-            },
-            "required": ["package"]
-        }),
-        output_schema: json!({
-            "type": "object",
-            "properties": {
-                "exit_code": { "type": "integer" },
-                "summary": { "type": "string" },
-                "log_mxc": { "type": "string" }
-            }
-        }),
-        extra: Default::default(),
-    }
-}
-
-/// Built-in `lint` tool definition.
-fn lint_tool() -> ToolSchema {
-    ToolSchema {
-        name: "lint".to_string(),
-        version: "1.0.0".to_string(),
-        description: "Run project linters".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "fix": { "type": "boolean" }
-            }
-        }),
-        output_schema: json!({
-            "type": "object",
-            "properties": {
-                "exit_code": { "type": "integer" },
-                "summary": { "type": "string" },
-                "log_mxc": { "type": "string" }
-            }
-        }),
-        extra: Default::default(),
-    }
+    crate::tool_exec::builtin_schemas()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn builtin_registry_contains_known_tools() {
@@ -187,10 +142,16 @@ mod tests {
     fn register_replaces_by_name() {
         let mut registry = ToolRegistry::new();
         assert!(registry.is_empty());
-        registry.register(run_tests_tool());
+        // Source a real base schema from the single built-in source of truth
+        // rather than a now-removed private constructor (issue #378).
+        let base = builtin_tools()
+            .into_iter()
+            .find(|t| t.name == "run_tests")
+            .expect("run_tests is a built-in");
+        registry.register(base.clone());
         registry.register(ToolSchema {
             description: "Run tests differently".to_string(),
-            ..run_tests_tool()
+            ..base
         });
         assert_eq!(registry.len(), 1);
         assert_eq!(
