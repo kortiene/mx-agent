@@ -1192,7 +1192,7 @@ mx-agent [GLOBAL] call [OPTIONS]
 |---|---|---|---|---|
 | `--room` | `<ROOM>` | No | — | Workspace room alias (`#name:server`) or room ID (`!id:server`). Required for remote agent targeting; omit for local loopback. |
 | `--agent` | `<AGENT>` | No | — | Target agent identifier. Required for remote agent targeting; omit for local loopback. |
-| `--tool` | `<TOOL>` | Yes | — | Named tool to invoke, e.g. `run_tests`. |
+| `--tool` | `<TOOL>` | Yes | — | Named tool to invoke, e.g. `run_tests`. May be qualified with a version (`run_tests@1.0.0`); a version the daemon does not implement is rejected rather than silently downgraded (issue #378). |
 | `--arg` | `<KEY=VALUE>` | No | — | Tool argument as a `key=value` pair (repeatable). Mutually exclusive with `--input-json`. |
 | `--input-json` | `<FILE>` | No | — | Read the tool input as a JSON object from this file; `-` reads from stdin. Mutually exclusive with `--arg`. |
 
@@ -1202,7 +1202,7 @@ Invokes the named tool with the supplied input and waits for completion. When `-
 
 Tool input is built from either `--arg` key=value pairs (combined into a JSON object) or from `--input-json` (a file containing a JSON object). An empty input is `{}`. The tool runs in the daemon's execution context (local) or the remote agent's execution context (remote).
 
-The tool may exit with any code 0-255; a tool that runs and exits nonzero is a successful invocation (exit code is propagated). Only a failure to invoke the tool (unknown tool, invalid schema, spawn failure, or remote rejection) yields an `Error` outcome.
+The tool may exit with any code 0-255; a tool that runs and exits nonzero is a successful invocation (exit code is propagated). Only a failure to invoke the tool (unknown tool, an unsupported `@version`, invalid schema, spawn failure, or remote rejection) yields an `Error` outcome. In local loopback an unsupported version maps to exit `64` (invalid usage), like invalid arguments; over the remote transport it surfaces as a rejection (exit `128`), like other remote failures.
 
 **Output**
 

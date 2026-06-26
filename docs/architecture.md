@@ -392,6 +392,14 @@ Tool metadata should include:
 }
 ```
 
+A tool reference may carry a version (`run_tests@1.0.0`). Execution **honours** the
+version: a bare name, or the version the daemon implements, runs normally, while a
+request for a version the daemon does not implement returns a clear error rather than
+silently running a different implementation. Declaration and execution share a single
+source of truth, so an advertised tool always has a runnable executor (issue #378).
+Version *enforcement* is an execution-time check; tool *discovery* (`agent tools`)
+still resolves an advertised reference to its schema by name for display.
+
 ### 5.3 Exit Codes
 
 The local CLI should exit with the remote process exit code when possible.

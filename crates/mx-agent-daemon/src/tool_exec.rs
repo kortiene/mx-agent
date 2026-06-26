@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use mx_agent_protocol::schema::ToolSchema;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -66,6 +67,20 @@ impl ToolResult {
 pub enum ToolError {
     /// No built-in tool is registered under this name.
     UnknownTool(String),
+    /// The named tool exists, but the caller requested an `@version` this daemon
+    /// does not implement.
+    ///
+    /// Distinct from [`UnknownTool`] (no such tool) and from a silent downgrade:
+    /// rather than running a different implementation than the one requested, the
+    /// daemon rejects the version it cannot honor (issue #378).
+    UnsupportedVersion {
+        /// The tool name, with the `@version` suffix stripped.
+        tool: String,
+        /// The version the caller requested.
+        requested: String,
+        /// The version this daemon actually implements.
+        supported: String,
+    },
     /// The provided arguments did not satisfy the tool's input schema.
     InvalidArgs(String),
     /// The tool's underlying process could not be spawned.
@@ -76,6 +91,14 @@ impl std::fmt::Display for ToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownTool(name) => write!(f, "unknown tool {name:?}"),
+            Self::UnsupportedVersion {
+                tool,
+                requested,
+                supported,
+            } => write!(
+                f,
+                "unsupported version {requested:?} for tool {tool:?} (this daemon implements {supported:?})"
+            ),
             Self::InvalidArgs(msg) => write!(f, "invalid tool arguments: {msg}"),
             Self::Spawn(err) => write!(f, "could not run tool: {err}"),
         }
@@ -89,6 +112,109 @@ impl std::error::Error for ToolError {
             _ => None,
         }
     }
+}
+
+/// A built-in tool's command builder: validate JSON `args` and produce the
+/// `(program, argv)` to spawn (or a [`ToolError::InvalidArgs`]).
+type ToolCommandFn = fn(&Value) -> Result<(String, Vec<String>), ToolError>;
+
+/// A built-in tool's single source of truth: its advertised identity and schema
+/// **and** the executor that runs it, in one record.
+///
+/// Declaration ([`crate::tools::builtin_tools`], which maps [`schema`](BuiltinTool::schema))
+/// and execution ([`tool_run_spec`]) both read from [`BUILTIN_TOOLS`], so a built-in
+/// can never be advertised without an executor: every entry must supply a `command`
+/// builder and a `label`, or the `const` table fails to compile. This replaces the
+/// previous pair of independent hardcoded `match name` dispatches that let a
+/// registered-but-unmatched tool advertise and then fail `UnknownTool` at call time
+/// (issue #378, the structural form of the one-off #225 `lint` fix).
+#[derive(Debug)]
+struct BuiltinTool {
+    /// The tool name; the registry key (e.g. `run_tests`).
+    name: &'static str,
+    /// The semantic version this daemon implements (e.g. `1.0.0`).
+    version: &'static str,
+    /// Human-readable description advertised in the tool's schema.
+    description: &'static str,
+    /// Short label for execution summaries (e.g. `cargo test`).
+    label: &'static str,
+    /// Build the `(program, argv)` for an invocation from validated JSON args.
+    command: ToolCommandFn,
+    /// Build the advertised `(input_schema, output_schema)` JSON pair.
+    io_schema: fn() -> (Value, Value),
+}
+
+impl BuiltinTool {
+    /// Assemble the advertised [`ToolSchema`] from this descriptor.
+    fn schema(&self) -> ToolSchema {
+        let (input_schema, output_schema) = (self.io_schema)();
+        ToolSchema {
+            name: self.name.to_string(),
+            version: self.version.to_string(),
+            description: self.description.to_string(),
+            input_schema,
+            output_schema,
+            extra: Default::default(),
+        }
+    }
+}
+
+/// Every built-in tool, paired with its executor — the single source of truth for
+/// both advertisement and execution (issue #378).
+const BUILTIN_TOOLS: &[BuiltinTool] = &[
+    BuiltinTool {
+        name: RUN_TESTS,
+        version: "1.0.0",
+        description: "Run project test suites",
+        label: "cargo test",
+        command: run_tests_command,
+        io_schema: run_tests_io_schema,
+    },
+    BuiltinTool {
+        name: LINT,
+        version: "1.0.0",
+        description: "Run project linters",
+        label: "cargo clippy",
+        command: lint_command,
+        io_schema: lint_io_schema,
+    },
+];
+
+/// The advertised [`ToolSchema`] for every built-in tool, in table order.
+///
+/// [`crate::tools::builtin_tools`] re-exports this so the registry advertises
+/// exactly the tools [`BUILTIN_TOOLS`] can execute.
+pub(crate) fn builtin_schemas() -> Vec<ToolSchema> {
+    BUILTIN_TOOLS.iter().map(BuiltinTool::schema).collect()
+}
+
+/// Resolve a `name` or `name@version` reference to its built-in descriptor.
+///
+/// Returns [`ToolError::UnknownTool`] when no built-in has that name, and
+/// [`ToolError::UnsupportedVersion`] when a version suffix is present but does not
+/// match the version this daemon implements — rather than silently downgrading to
+/// the implemented version (issue #378). A bare name, or the implemented version,
+/// resolves successfully. This is the single dispatch entry every execution path
+/// (live `call`, task DAG, loopback) flows through.
+fn resolve_builtin(reference: &str) -> Result<&'static BuiltinTool, ToolError> {
+    let (name, requested_version) = match reference.split_once('@') {
+        Some((name, version)) => (name, Some(version)),
+        None => (reference, None),
+    };
+    let tool = BUILTIN_TOOLS
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| ToolError::UnknownTool(reference.to_string()))?;
+    if let Some(requested) = requested_version {
+        if requested != tool.version {
+            return Err(ToolError::UnsupportedVersion {
+                tool: name.to_string(),
+                requested: requested.to_string(),
+                supported: tool.version.to_string(),
+            });
+        }
+    }
+    Ok(tool)
 }
 
 /// Build the confined [`RunSpec`] for a built-in tool invocation.
@@ -115,11 +241,8 @@ fn tool_run_spec(
     allowance: &mx_agent_policy::Allowance,
     cwd: PathBuf,
 ) -> Result<RunSpec, ToolError> {
-    let (program, argv) = match name {
-        RUN_TESTS => run_tests_command(args)?,
-        LINT => lint_command(args)?,
-        other => return Err(ToolError::UnknownTool(other.to_string())),
-    };
+    let builtin = resolve_builtin(name)?;
+    let (program, argv) = (builtin.command)(args)?;
     let mut command = Vec::with_capacity(argv.len() + 1);
     command.push(program);
     command.extend(argv);
@@ -164,12 +287,15 @@ fn tool_run_spec(
 
 /// The `summarize` label for a built-in tool (e.g. `"cargo test"`), so summaries
 /// read identically regardless of how the tool is spawned.
+///
+/// Reads the label from the same [`BUILTIN_TOOLS`] source the executor dispatches
+/// on, so the label can never drift from the runner (issue #378). Accepts a bare
+/// name or a `name@version` reference; an unresolvable reference falls back to the
+/// generic `"tool"` (execution paths reject those before `summarize` runs).
 fn tool_label(name: &str) -> &'static str {
-    match name {
-        RUN_TESTS => "cargo test",
-        LINT => "cargo clippy",
-        _ => "tool",
-    }
+    resolve_builtin(name)
+        .map(|tool| tool.label)
+        .unwrap_or("tool")
 }
 
 /// Map a [`RunError`] from the shared runner onto a [`ToolError`].
@@ -244,6 +370,32 @@ pub fn execute_tool(
     Ok(ToolResult { exit_code, summary })
 }
 
+/// The advertised `(input_schema, output_schema)` JSON for the `run_tests` tool.
+///
+/// Kept beside [`run_tests_command`] so a `run_tests` schema change and its
+/// executor live together (issue #378). Drives [`BUILTIN_TOOLS`].
+fn run_tests_io_schema() -> (Value, Value) {
+    (
+        json!({
+            "type": "object",
+            "properties": {
+                "package": { "type": "string" },
+                "name": { "type": "string" },
+                "coverage": { "type": "boolean" }
+            },
+            "required": ["package"]
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "exit_code": { "type": "integer" },
+                "summary": { "type": "string" },
+                "log_mxc": { "type": "string" }
+            }
+        }),
+    )
+}
+
 /// Build the program and argument vector for a `run_tests` invocation.
 ///
 /// The built-in test runner shells out to `cargo test`. Supported arguments
@@ -313,6 +465,30 @@ fn summarize(label: &str, code: Option<i32>) -> (i32, String) {
         // is not available here, so use a generic nonzero failure.
         None => (1, format!("{label} terminated by signal")),
     }
+}
+
+/// The advertised `(input_schema, output_schema)` JSON for the `lint` tool.
+///
+/// Kept beside [`lint_command`] so a `lint` schema change and its executor live
+/// together (issue #378). Drives [`BUILTIN_TOOLS`].
+fn lint_io_schema() -> (Value, Value) {
+    (
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "fix": { "type": "boolean" }
+            }
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "exit_code": { "type": "integer" },
+                "summary": { "type": "string" },
+                "log_mxc": { "type": "string" }
+            }
+        }),
+    )
 }
 
 /// Build the program and argument vector for a `lint` invocation.
@@ -659,6 +835,123 @@ mod tests {
         // recognized and fail only on bad arguments, never as unknown.
         let err = execute_tool(LINT, &json!([]), &allowance(), PathBuf::from(".")).unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn every_registered_builtin_is_executable() {
+        // Parity invariant (issue #378): declaration (`ToolRegistry::builtin`) and
+        // execution (`BUILTIN_TOOLS`) share one source, so every advertised tool
+        // must resolve to an executor and never dispatch as `UnknownTool`. A
+        // future registered-but-unmatched tool fails here in CI, not in production
+        // (the #225 instance / #373 untested-seam escape class).
+        let registry = crate::tools::ToolRegistry::builtin();
+        assert!(!registry.is_empty());
+        for schema in registry.iter() {
+            let tool = resolve_builtin(&schema.name)
+                .unwrap_or_else(|_| panic!("registered tool {:?} has no executor", schema.name));
+            assert_eq!(tool.name, schema.name);
+            // The advertised `name@version` reference must resolve too.
+            assert!(
+                resolve_builtin(&schema.qualified_ref()).is_ok(),
+                "advertised reference {:?} must resolve to an executor",
+                schema.qualified_ref()
+            );
+            // tool_run_spec must never reject a registered tool as UnknownTool
+            // (an InvalidArgs/Spawn outcome for empty args is fine).
+            if let Err(ToolError::UnknownTool(_)) =
+                tool_run_spec(&schema.name, &json!({}), &allowance(), PathBuf::from("."))
+            {
+                panic!(
+                    "registered tool {:?} dispatched as UnknownTool",
+                    schema.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_descriptor_name_and_version_match_its_schema() {
+        // The descriptor's identity is the single source for the advertised
+        // schema, so they cannot drift.
+        for tool in BUILTIN_TOOLS {
+            let schema = tool.schema();
+            assert_eq!(tool.name, schema.name);
+            assert_eq!(tool.version, schema.version);
+            assert_eq!(tool.description, schema.description);
+        }
+    }
+
+    #[test]
+    fn builtin_schemas_match_registry_advertisement() {
+        // `tools::builtin_tools()` (advertisement) derives from `builtin_schemas()`
+        // (this module's single source), so they are identical, in table order.
+        assert_eq!(builtin_schemas(), crate::tools::builtin_tools());
+        let schemas = builtin_schemas();
+        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["run_tests", "lint"]);
+    }
+
+    #[test]
+    fn resolve_builtin_accepts_bare_name_and_supported_version() {
+        assert_eq!(resolve_builtin("run_tests").unwrap().name, RUN_TESTS);
+        assert_eq!(resolve_builtin("run_tests@1.0.0").unwrap().name, RUN_TESTS);
+        assert_eq!(resolve_builtin("lint@1.0.0").unwrap().name, LINT);
+    }
+
+    #[test]
+    fn resolve_builtin_rejects_unknown_tool_with_or_without_version() {
+        assert!(matches!(
+            resolve_builtin("nope"),
+            Err(ToolError::UnknownTool(_))
+        ));
+        assert!(matches!(
+            resolve_builtin("nope@1.0.0"),
+            Err(ToolError::UnknownTool(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_builtin_rejects_unsupported_version_instead_of_downgrading() {
+        // `run_tests@2.0.0` must NOT silently resolve to the 1.0.0 impl (issue #378).
+        match resolve_builtin("run_tests@2.0.0").unwrap_err() {
+            ToolError::UnsupportedVersion {
+                tool,
+                requested,
+                supported,
+            } => {
+                assert_eq!(tool, "run_tests");
+                assert_eq!(requested, "2.0.0");
+                assert_eq!(supported, "1.0.0");
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_tool_rejects_unsupported_version_before_spawn() {
+        // The version is enforced at the execution entry point, synchronously,
+        // before any runtime is spun up — never downgraded to 1.0.0.
+        let err = execute_tool(
+            "run_tests@2.0.0",
+            &json!({ "package": "x" }),
+            &allowance(),
+            PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::UnsupportedVersion { .. }));
+    }
+
+    #[test]
+    fn unsupported_version_error_displays_clearly() {
+        let err = ToolError::UnsupportedVersion {
+            tool: "run_tests".to_string(),
+            requested: "2.0.0".to_string(),
+            supported: "1.0.0".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("run_tests"), "{msg}");
+        assert!(msg.contains("2.0.0"), "{msg}");
+        assert!(msg.contains("1.0.0"), "{msg}");
     }
 
     #[test]
