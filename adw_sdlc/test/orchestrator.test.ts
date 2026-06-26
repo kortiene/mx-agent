@@ -141,14 +141,14 @@ describe('finalizeGates', () => {
     const gates = finalizeGates('pytest -q');
     expect(gates[0]).toBe('pytest -q');
     expect(gates).not.toContain('cargo test --all');
-    expect(gates).toContain('cargo fmt --check');
+    expect(gates).toContain('cargo fmt --all --check');
     expect(gates).toContain('cargo build --all');
   });
 
   it('defaults to the cargo set', () => {
     const gates = finalizeGates('');
     expect(gates).toContain('cargo test --all');
-    expect(gates).toContain('cargo fmt --check');
+    expect(gates).toContain('cargo fmt --all --check');
   });
 });
 
@@ -603,7 +603,7 @@ describe('run() integration', () => {
 
   it('aborts before merge when a finalize gate fails', async () => {
     const runCmd = vi.fn((cmd: readonly string[]) =>
-      cmd.join(' ') === 'cargo fmt --check' ? { rc: 1, output: 'fmt diff' } : { rc: 0, output: '' },
+      cmd.join(' ') === 'cargo fmt --all --check' ? { rc: 1, output: 'fmt diff' } : { rc: 0, output: '' },
     );
     const squashMerge = vi.fn(() => ({ ok: true, error: null }));
     const deps = testDeps({
@@ -613,7 +613,7 @@ describe('run() integration', () => {
       runAgentPhase: agentStub(PHASE_RESULTS),
     });
     await expect(run(5, createMockRunner(), { yes: true, noProgress: true }, deps)).rejects.toThrow(
-      /pre-merge gate failed: cargo fmt --check/,
+      /pre-merge gate failed: cargo fmt --all --check/,
     );
     expect(squashMerge).not.toHaveBeenCalled();
   });

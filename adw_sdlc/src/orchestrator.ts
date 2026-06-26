@@ -82,7 +82,13 @@ export const DEFAULT_TEST_CMD = 'cargo test --all';
 /** Pre-merge verification gates (the first is overridden by testCmd). */
 export const DEFAULT_FINALIZE_GATES = [
   DEFAULT_TEST_CMD,
-  'cargo fmt --check',
+  // `--all` is load-bearing: gates run via spawnSync with no cwd, i.e. from the
+  // orchestrator's process.cwd() (`adw_sdlc/`, the npm package dir). The other
+  // cargo gates walk up to the workspace root on their own, but bare
+  // `cargo fmt --check` resolves "the current crate" and dies with
+  // "Failed to find targets" against this repo's virtual workspace manifest.
+  // `cargo fmt --all --check` formats every workspace member regardless of cwd.
+  'cargo fmt --all --check',
   'cargo clippy --all-targets --all-features -- -D warnings',
   'cargo build --all',
 ] as const;
