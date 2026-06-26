@@ -96,6 +96,8 @@ AWS_*    GOOGLE_*    AZURE_*
 
 This means a remote agent cannot exfiltrate your cloud or model-provider credentials by reading the child's environment, even if a policy rule is overly broad.
 
+**Remote `env` overrides are constrained, not just the inherited env (issue #375).** A caller's per-request `env` overrides are layered on top of the scrubbed env. For a **local** operator (loopback `exec --env`) those overrides are unconditional — a deliberate per-request choice. For a **remote**, Ed25519-signed `exec.request`, the override **keys** are screened at the live-exec authorization gate: a key is honored only when it is in `execution.env_allowlist ∪` the built-in defaults *and* is neither a secret nor a loader-control variable. The loader-control names `LD_*`, `DYLD_*`, and `PATH` are **always** denied on the remote path (even if allowlisted), so a trusted-but-malicious or compromised-key requester cannot inject `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`/`PATH` to redirect execution outside the requested argv or defeat sandbox path assumptions. An un-permitted override key **rejects** the whole request fail-closed (`exec.rejected`, `reason: env_override_not_allowed`) rather than silently dropping it; the daemon logs only the offending variable **name**, never its value. Note the asymmetry: allowlisting a name now also lets a remote requester *override* its value (loader-control/secret names stay denied).
+
 ---
 
 ## Hardened Production Configuration
@@ -199,7 +201,7 @@ emitted approval request stays no-leak (no command/args). (Issue #306.)
 | `max_runtime_ms` / `max_output_bytes` | Runaway processes, log-flood DoS | per-agent / `[execution]` |
 | `max_processes` / `max_memory_bytes` / `max_cpu_seconds` | Fork-bomb, memory exhaustion, runaway CPU consumption | per-agent / `[execution]` |
 | `requires_approval` | Unattended privileged actions | per-agent |
-| Environment scrubbing | Credential theft via env | runner (always on) |
+| Environment scrubbing | Credential theft via env; `LD_PRELOAD`/`PATH` injection via signed `env` override | runner (always on; remote override keys screened — issue #375) |
 
 ---
 

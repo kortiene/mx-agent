@@ -62,7 +62,7 @@ doing that deliberately rather than by accident.
 | Tool / command allowlists | empty (`[]`) ⇒ allow nothing | wide lists, or matching `allow_cwd = ["/"]` |
 | Sandbox backend | operator must choose; choose `bubblewrap`/`docker`/`podman` | `none` (zero isolation) |
 | Network in sandbox | `Network::Deny` | `network = "allow"` |
-| Environment | allowlist of 13 benign vars; secrets always scrubbed | large `env_allowlist` |
+| Environment | allowlist of 13 benign vars; secrets always scrubbed; remote `env` override keys screened (loader-control names `LD_*`/`DYLD_*`/`PATH` always denied on remote path) | large `env_allowlist`; note: allowlisting a name also permits a remote requester to override that variable |
 | Token / key files | `0600`, dirs `0700` | loosening file modes |
 | IPC socket | `0600`, peer-UID checked | exposing the socket directory |
 | Workspace power levels | per-event-type PL 50, `state_default` 100, joiners PL 0 | lowering `state_default`, or a wide `events_default` |
@@ -209,11 +209,28 @@ command runs, its environment is built from scratch:
   `mx_agent_telemetry::is_sensitive_key` scrubs any name containing `token`,
   `secret`, `password`, `api_key`, etc., so future mx-agent credential
   variables are covered automatically.
+- **Remote `env` overrides are constrained too (issue #375).** The allowlist
+  above filters the *inherited* environment. A caller's per-request `env`
+  overrides are layered on top — unconditionally for a **local** operator
+  (loopback `exec --env`), but **screened** for a **remote**, signed
+  `exec.request`. On the remote path an override key is honored only when it is in
+  `execution.env_allowlist ∪` the 13 built-in defaults *and* is neither a secret
+  nor a loader-control variable; the loader-control names `LD_*`, `DYLD_*`, and
+  `PATH` are always rejected even if allowlisted (a remote requester has no
+  legitimate need to replace the loader or `PATH`, and doing so could redirect
+  execution or defeat sandbox path assumptions). A request carrying any
+  un-permitted override key is **rejected** fail-closed (`exec.rejected`,
+  `reason: env_override_not_allowed`) rather than silently dropping the key, so a
+  misconfigured requester gets a clear error. The daemon logs only the offending
+  variable **name**, never its value.
 
 > **Safe vs unsafe:** keep `env_allowlist` minimal. Every name you add is a
 > variable the remote agent's command can read. Adding a credential-bearing var
 > here does *not* expose it (the secret scrub still fires), but adding broad
-> application config can still leak internal details.
+> application config can still leak internal details. Note that allowlisting a
+> name now also lets a **remote** requester *override* its value on the child
+> (loader-control names and secrets stay denied regardless), so add only names you
+> are content for a trusted remote caller to set.
 
 **Operational rules.** Anyone who can read `session.json` or
 `signing_key.ed25519` can act as you. Never copy them off-box, never commit
@@ -471,7 +488,7 @@ network = "deny"
 | `network` | none set | `allow` or `deny`. |
 | `read_only_paths` | `[]` | Bound read-only into the sandbox. |
 | `writable_paths` | `[]` | Bound writable — **keep minimal**. |
-| `env_allowlist` | `[]` | Extra env names (still subject to the secret scrub). |
+| `env_allowlist` | `[]` | Extra env names (still subject to the secret scrub). Allowlisting a name also permits a remote requester to override that variable's value on the child; loader-control names (`LD_*`, `DYLD_*`, `PATH`) and secrets are always denied on the remote path regardless. See the note in [Token isolation model](#token-isolation-model). |
 | `container_image` | `debian:stable-slim` | Image the `docker`/`podman` backend runs in. The runtime follows the `sandbox` value. |
 | `max_processes` | none | Process-count cap (`RLIMIT_NPROC` on host paths, `--pids-limit` on containers). Unset ⇒ uncapped. Recommended starting point: `256`. |
 | `max_memory_bytes` | none | Address-space cap in bytes (`RLIMIT_AS` / `--memory`). Unset ⇒ uncapped. Recommended: `2147483648` (2 GiB). |
@@ -630,19 +647,27 @@ backend.
 identifiers so you can alert on them:
 
 ```
-deny:unknown_room        deny:untrusted_room      deny:unknown_agent
-deny:empty_command       deny:exec_not_allowed    deny:command_not_allowed
-deny:cwd_not_allowed     deny:denied_arguments    deny:tool_not_allowed
-deny:unverified_device
+deny:unknown_room           deny:untrusted_room      deny:unknown_agent
+deny:empty_command          deny:exec_not_allowed    deny:command_not_allowed
+deny:cwd_not_allowed        deny:denied_arguments    deny:tool_not_allowed
+deny:unverified_device      deny:env_override_not_allowed
 ```
 
-The policy-engine reasons above are joined by `deny:unverified_device`, recorded
-when the optional `require_verified_device` gate rejects an `exec` or a named
-`call` from an unverified Matrix device (issues #240 and #257). That gate runs
-*after* the policy decision, so its denial is audited in addition to — not
-instead of — the policy outcome. Pre-policy authentication failures (unsigned,
-bad signature, untrusted key, malformed) are deliberately *not* audited for
-either path, since they are not attributable to a trusted requester.
+The policy-engine reasons above are joined by two post-policy-gate identifiers
+that run *after* the policy decision and can only add a denial, never a grant:
+
+- `deny:unverified_device` — the optional `require_verified_device` gate rejects
+  an `exec` or a named `call` from an unverified Matrix device (issues #240 and
+  #257). Its denial is audited in addition to — not instead of — the policy outcome.
+- `deny:env_override_not_allowed` — a signed `exec.request` carried an `env`
+  override key that policy does not permit a remote requester to set: a secret
+  name, a loader-control variable (`LD_*`, `DYLD_*`, `PATH`), or a name absent
+  from `execution.env_allowlist` and the built-in safe defaults. The daemon logs
+  only the offending variable **name**, never its value (issue #375).
+
+Pre-policy authentication failures (unsigned, bad signature, untrusted key,
+malformed) are deliberately *not* audited for either path, since they are not
+attributable to a trusted requester.
 
 **Auto-executed task-DAG decisions are covered too.** The scheduler attaches an
 audit log to every task orchestrator it builds, resolving the same path as the

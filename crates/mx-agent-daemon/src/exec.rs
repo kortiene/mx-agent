@@ -378,6 +378,20 @@ pub enum ExecRejection {
     /// (issue #349). A post-policy gate applied once the concrete backend is
     /// known; like the verified-device gate it can only add a denial.
     SandboxRequired,
+    /// A signed `exec.request` carried an `env` override key that policy does not
+    /// permit a remote requester to set — a secret, a loader-control variable
+    /// (`LD_PRELOAD`/`DYLD_*`/`PATH`), or a name absent from the env allowlist
+    /// (issue #375). A post-policy gate applied once the allowance is known; like
+    /// the verified-device and require-sandbox gates it can only add a denial.
+    EnvOverrideNotAllowed {
+        /// The offending variable **name** (never its value — values may be
+        /// secret-shaped). Carried for the daemon log / [`Display`] only; the
+        /// emitted machine-readable [`reason`] stays generic.
+        ///
+        /// [`Display`]: std::fmt::Display
+        /// [`reason`]: ExecRejection::reason
+        var: String,
+    },
 }
 
 impl ExecRejection {
@@ -394,6 +408,7 @@ impl ExecRejection {
             Self::ApprovalDenied => "approval_denied".to_string(),
             Self::ApprovalExpired => "approval_expired".to_string(),
             Self::SandboxRequired => "sandbox_required".to_string(),
+            Self::EnvOverrideNotAllowed { .. } => "env_override_not_allowed".to_string(),
         }
     }
 }
@@ -422,6 +437,12 @@ impl std::fmt::Display for ExecRejection {
                 write!(
                     f,
                     "policy requires a sandbox but the resolved backend is none"
+                )
+            }
+            Self::EnvOverrideNotAllowed { var } => {
+                write!(
+                    f,
+                    "exec request env override {var:?} is not permitted for a remote requester"
                 )
             }
         }
@@ -902,11 +923,14 @@ pub async fn handle_live_exec_request(
                     request,
                     &Outcome::Deny(reason.clone()),
                 ),
-                // The post-policy verified-device and require-sandbox gate denials
-                // are audited too, so a require_verified_device / require_sandbox
+                // The post-policy verified-device, require-sandbox, and
+                // env-override gate denials are audited too, so a
+                // require_verified_device / require_sandbox / env_override_not_allowed
                 // rejection is "denied … and audited" like any other privileged
-                // denial (issues #240, #349).
-                ExecRejection::UnverifiedDevice | ExecRejection::SandboxRequired => {
+                // denial (issues #240, #349, #375).
+                ExecRejection::UnverifiedDevice
+                | ExecRejection::SandboxRequired
+                | ExecRejection::EnvOverrideNotAllowed { .. } => {
                     audit_exec_rejection(paths, &meta.room_id, request, &rejection)
                 }
                 // Pre-policy authentication failures (unsigned, bad signature,
@@ -1249,7 +1273,9 @@ pub(crate) async fn release_held_exec(
                 ExecRejection::PolicyDenied(reason) => {
                     audit_exec_decision(paths, room_id, &request, &Outcome::Deny(reason.clone()))
                 }
-                ExecRejection::UnverifiedDevice | ExecRejection::SandboxRequired => {
+                ExecRejection::UnverifiedDevice
+                | ExecRejection::SandboxRequired
+                | ExecRejection::EnvOverrideNotAllowed { .. } => {
                     audit_exec_rejection(paths, room_id, &request, &rejection)
                 }
                 _ => {}
@@ -1552,6 +1578,29 @@ async fn authorize_live_exec(
         &request.target_agent,
         &request.invocation_id,
     )?;
+
+    // Post-policy env-override screen (issue #375): a signed remote request may
+    // not inject loader-control (`LD_*`/`DYLD_*`/`PATH`), secret-named, or
+    // un-allowlisted `env` override keys into the child, even from a trusted
+    // signer. The authoritative inherited-env scrub (`sanitize_env`) applies
+    // overrides unconditionally so the local operator's deliberate `--env` choice
+    // stays — so the remote path is screened here, fail-closed, before the request
+    // can spawn. Logs the offending variable *name* only (never its value).
+    if let Some(var) =
+        crate::runner::first_disallowed_remote_override(&request.env, &allowance.env_allowlist)
+    {
+        tracing::warn!(
+            invocation_id = %request.invocation_id,
+            requesting_agent = %request.requesting_agent,
+            target_agent = %request.target_agent,
+            var = %var,
+            "rejecting exec: env override key is not permitted for a remote requester"
+        );
+        return Err(ExecRejection::EnvOverrideNotAllowed {
+            var: var.to_string(),
+        });
+    }
+
     Ok((request, allowance))
 }
 
@@ -3923,6 +3972,143 @@ allow_cwd = ["/home/me/code/project"]
         // Audited as `deny:sandbox_required` (the rejection reason carries the
         // suffix; the audit layer prepends `deny:`).
         assert_eq!(ExecRejection::SandboxRequired.reason(), "sandbox_required");
+    }
+
+    // --- remote env-override screen (issue #375) ---
+
+    #[test]
+    fn env_override_not_allowed_rejection_reason_is_stable() {
+        // The emitted machine-readable reason is generic and value-free: it must
+        // not leak the offending variable name (let alone its value).
+        let rejection = ExecRejection::EnvOverrideNotAllowed {
+            var: "LD_PRELOAD".to_string(),
+        };
+        assert_eq!(rejection.reason(), "env_override_not_allowed");
+        assert!(
+            !rejection.reason().contains("LD_PRELOAD"),
+            "reason must stay generic"
+        );
+    }
+
+    #[test]
+    fn env_override_not_allowed_display_names_var_never_value() {
+        // `Display` (daemon stderr only) names the variable so an operator can
+        // fix the misconfiguration, but never carries the value (which may be
+        // secret-shaped). The variant has no value to begin with — assert the
+        // rendered string is name-only.
+        let rendered = ExecRejection::EnvOverrideNotAllowed {
+            var: "LD_PRELOAD".to_string(),
+        }
+        .to_string();
+        assert!(rendered.contains("LD_PRELOAD"), "got: {rendered}");
+        assert!(rendered.contains("remote requester"), "got: {rendered}");
+    }
+
+    #[test]
+    fn remote_env_override_screen_gates_the_signed_request_env() {
+        // The gate `authorize_live_exec` runs is the pure predicate over
+        // `request.env` and `allowance.env_allowlist`; exercise it directly here
+        // (the end-to-end gate needs a `Room` and is covered by the live suite).
+        // A signed request carrying `LD_PRELOAD` is rejected under an empty
+        // allowlist...
+        let mut opts = options(&["cargo", "test"], "/home/me/code/project");
+        opts.env = BTreeMap::from([("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string())]);
+        let key = test_key();
+        let content = signed_request(&key, &opts);
+        let request: ExecRequest = serde_json::from_value(content).unwrap();
+        let empty_allowlist: Vec<String> = Vec::new();
+        assert_eq!(
+            crate::runner::first_disallowed_remote_override(&request.env, &empty_allowlist),
+            Some("LD_PRELOAD"),
+            "a remote LD_PRELOAD override must be rejected"
+        );
+
+        // ...while a benign built-in-safe override passes the same screen.
+        let mut benign = options(&["cargo", "test"], "/home/me/code/project");
+        benign.env = BTreeMap::from([("TERM".to_string(), "xterm".to_string())]);
+        let content = signed_request(&key, &benign);
+        let request: ExecRequest = serde_json::from_value(content).unwrap();
+        assert_eq!(
+            crate::runner::first_disallowed_remote_override(&request.env, &empty_allowlist),
+            None,
+            "a benign TERM override must pass the screen"
+        );
+    }
+
+    #[test]
+    fn env_allowlist_from_policy_flows_into_remote_override_screen() {
+        // authorize_exec_request_with_allowance produces an Allowance whose
+        // env_allowlist comes from [execution] in the policy TOML. The async
+        // authorize_live_exec then feeds that allowlist to first_disallowed_remote_override.
+        // This test verifies the plumbing by calling both steps synchronously so
+        // a future refactor can't accidentally drop the env_allowlist on the floor.
+        let key = test_key();
+        let trust = trust_with(&key_id_for(&key));
+        let policy_with_allowlist = Policy::parse(
+            r#"
+[execution]
+env_allowlist = ["CARGO_HOME"]
+
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/home/me/code/project"]
+"#,
+        )
+        .expect("policy parses");
+
+        // A request overriding CARGO_HOME — allowlisted by policy, not a secret
+        // or loader-control var — must be accepted by the remote screen.
+        let mut opts = options(&["cargo", "test"], "/home/me/code/project");
+        opts.env = BTreeMap::from([("CARGO_HOME".to_string(), "/home/me/.cargo".to_string())]);
+        let content = signed_request(&key, &opts);
+        let req: ExecRequest = serde_json::from_value(content.clone()).unwrap();
+        let (_, allowance) = authorize_exec_request_with_allowance(
+            &content,
+            &key.verifying_key(),
+            &trust,
+            &policy_with_allowlist,
+            ROOM,
+            AGENT,
+            TARGET,
+        )
+        .expect("authorized");
+        assert_eq!(
+            allowance.env_allowlist,
+            vec!["CARGO_HOME".to_string()],
+            "env_allowlist must propagate from policy to allowance"
+        );
+        assert_eq!(
+            crate::runner::first_disallowed_remote_override(&req.env, &allowance.env_allowlist),
+            None,
+            "CARGO_HOME is allowlisted and must pass the remote screen"
+        );
+
+        // A request overriding LD_PRELOAD must be rejected by the remote screen
+        // even when the policy allowlist contains LD_PRELOAD — loader-control
+        // vars are denied regardless.
+        let mut opts2 = options(&["cargo", "test"], "/home/me/code/project");
+        opts2.env = BTreeMap::from([("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string())]);
+        let content2 = signed_request(&key, &opts2);
+        let req2: ExecRequest = serde_json::from_value(content2.clone()).unwrap();
+        let (_, allowance2) = authorize_exec_request_with_allowance(
+            &content2,
+            &key.verifying_key(),
+            &trust,
+            &policy_with_allowlist,
+            ROOM,
+            AGENT,
+            TARGET,
+        )
+        .expect("authorized at sig/trust/policy level");
+        assert_eq!(
+            crate::runner::first_disallowed_remote_override(&req2.env, &allowance2.env_allowlist),
+            Some("LD_PRELOAD"),
+            "LD_PRELOAD must be rejected by the remote screen regardless of allowlist"
+        );
     }
 
     #[test]
