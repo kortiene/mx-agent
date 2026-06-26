@@ -2449,4 +2449,239 @@ mod tests {
 
         std::fs::remove_file(&socket_path).ok();
     }
+
+    /// Real-socket + real-dispatch composition test (issue #373, Tier 1
+    /// acceptance 1).
+    ///
+    /// Binds a real Unix socket, runs `serve_streaming` with the **real**
+    /// `dispatch_streaming` handler (not a stub), and over a single persistent
+    /// connection issues `task.*` and `agent.*` IPC methods, asserting:
+    ///
+    /// (a) every method ROUTES — no `METHOD_NOT_FOUND` (the
+    ///     `dispatch_streaming` → `dispatch` → method-match seam is wired);
+    /// (b) malformed params surface as `INVALID_PARAMS` over the socket;
+    /// (c) valid params with no stored session surface as `INTERNAL_ERROR`
+    ///     "not logged in" over the socket (the session gate works end-to-end
+    ///     through the real transport);
+    /// (d) an error on one request does **not** poison the next request on the
+    ///     same connection (the multiplexing regression class from issue #368).
+    #[test]
+    fn task_agent_methods_route_through_real_dispatch_over_real_socket() {
+        use mx_agent_ipc::{serve_streaming, Client};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CTR: AtomicUsize = AtomicUsize::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let socket_path =
+            std::env::temp_dir().join(format!("mx_ipc_373_{}_{}.sock", std::process::id(), n));
+        if socket_path.exists() {
+            fs::remove_file(&socket_path).ok();
+        }
+
+        // TempRuntime sets ENV_RUNTIME_DIR to an empty temp dir, so
+        // load_session returns Ok(None) → INTERNAL_ERROR "not logged in" for
+        // every session-gated method. This is the pre-login state that lets us
+        // exercise the full socket → dispatch_streaming → dispatch seam without
+        // a live homeserver.
+        let _rt = TempRuntime::new("373-dispatch");
+
+        let pid = std::process::id();
+        let started = now_unix();
+        let sock_str = socket_path.to_string_lossy().into_owned();
+        let supervisor = test_supervisor();
+        let exec_subs = crate::ExecSubscriberRegistry::new();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        std::thread::spawn(move || {
+            let _ = serve_streaming(&listener, move |req, stream| {
+                dispatch_streaming(
+                    req,
+                    stream,
+                    pid,
+                    started,
+                    &sock_str,
+                    &supervisor,
+                    &exec_subs,
+                )
+            });
+        });
+
+        let mut client = Client::connect(&socket_path).unwrap();
+
+        // Placeholder room; the session gate fires before the room value is
+        // used, so any syntactically valid ID is sufficient.
+        let room = "!test:matrix.org";
+
+        // ── (a) + (c): methods route and session gate surfaces INTERNAL_ERROR ─
+
+        let resp = client
+            .call(
+                "task.list",
+                json!({"room": room, "state": null, "assigned_to": null}),
+            )
+            .unwrap();
+        let err = resp.error.expect("task.list: expected error (no session)");
+        assert_ne!(
+            err.code, METHOD_NOT_FOUND,
+            "task.list must route through dispatch (not METHOD_NOT_FOUND)"
+        );
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "task.list: expected INTERNAL_ERROR"
+        );
+        assert!(
+            err.message.contains("not logged in"),
+            "task.list: session gate message: {}",
+            err.message
+        );
+
+        let resp = client
+            .call(
+                "task.graph",
+                json!({"room": room, "state": null, "assigned_to": null}),
+            )
+            .unwrap();
+        let err = resp.error.expect("task.graph: expected error (no session)");
+        assert_ne!(err.code, METHOD_NOT_FOUND, "task.graph must route");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "task.graph: expected INTERNAL_ERROR"
+        );
+
+        let resp = client
+            .call(
+                "task.create",
+                json!({
+                    "room": room,
+                    "title": "T",
+                    "description": "",
+                    "assigned_to": "",
+                    "depends_on": [],
+                    "blocks": []
+                }),
+            )
+            .unwrap();
+        let err = resp
+            .error
+            .expect("task.create: expected error (no session)");
+        assert_ne!(err.code, METHOD_NOT_FOUND, "task.create must route");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "task.create: expected INTERNAL_ERROR"
+        );
+
+        let resp = client
+            .call("task.update", json!({"room": room, "task_id": "task_01"}))
+            .unwrap();
+        let err = resp
+            .error
+            .expect("task.update: expected error (no session)");
+        assert_ne!(err.code, METHOD_NOT_FOUND, "task.update must route");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "task.update: expected INTERNAL_ERROR"
+        );
+
+        let resp = client
+            .call("task.cancel", json!({"room": room, "task_id": "task_01"}))
+            .unwrap();
+        let err = resp
+            .error
+            .expect("task.cancel: expected error (no session)");
+        assert_ne!(err.code, METHOD_NOT_FOUND, "task.cancel must route");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "task.cancel: expected INTERNAL_ERROR"
+        );
+
+        let resp = client
+            .call("agent.list", json!({"room": room, "capabilities": []}))
+            .unwrap();
+        let err = resp.error.expect("agent.list: expected error (no session)");
+        assert_ne!(err.code, METHOD_NOT_FOUND, "agent.list must route");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "agent.list: expected INTERNAL_ERROR"
+        );
+
+        let resp = client
+            .call("agent.show", json!({"room": room, "agent_id": "dev-agent"}))
+            .unwrap();
+        let err = resp.error.expect("agent.show: expected error (no session)");
+        assert_ne!(err.code, METHOD_NOT_FOUND, "agent.show must route");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "agent.show: expected INTERNAL_ERROR"
+        );
+
+        let resp = client
+            .call(
+                "agent.register",
+                json!({
+                    "room": room,
+                    "kind": "generic",
+                    "capabilities": [],
+                    "tools": [],
+                    "cwd": "/tmp",
+                    "project_id": "",
+                    "max_invocations": 1
+                }),
+            )
+            .unwrap();
+        let err = resp
+            .error
+            .expect("agent.register: expected error (no session)");
+        assert_ne!(err.code, METHOD_NOT_FOUND, "agent.register must route");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "agent.register: expected INTERNAL_ERROR"
+        );
+
+        let resp = client
+            .call(
+                "agent.tools",
+                json!({"room": room, "agent_id": "dev-agent"}),
+            )
+            .unwrap();
+        let err = resp
+            .error
+            .expect("agent.tools: expected error (no session)");
+        assert_ne!(err.code, METHOD_NOT_FOUND, "agent.tools must route");
+        assert_eq!(
+            err.code, INTERNAL_ERROR,
+            "agent.tools: expected INTERNAL_ERROR"
+        );
+
+        // ── (b): malformed params surface as INVALID_PARAMS over the socket ───
+
+        let resp = client.call("task.create", Value::Null).unwrap();
+        let err = resp
+            .error
+            .expect("task.create(null): expected INVALID_PARAMS");
+        assert_eq!(
+            err.code, INVALID_PARAMS,
+            "task.create(null params) must surface INVALID_PARAMS over the socket"
+        );
+
+        let resp = client.call("agent.register", Value::Null).unwrap();
+        let err = resp
+            .error
+            .expect("agent.register(null): expected INVALID_PARAMS");
+        assert_eq!(
+            err.code, INVALID_PARAMS,
+            "agent.register(null params) must surface INVALID_PARAMS over the socket"
+        );
+
+        // ── (d): connection not poisoned — daemon.ping succeeds after errors ──
+
+        let resp = client.call("daemon.ping", Value::Null).unwrap();
+        assert!(
+            resp.error.is_none(),
+            "daemon.ping after errors must succeed (connection not poisoned — issue #368): {resp:?}"
+        );
+        assert_eq!(resp.result, Some(json!({"pong": true})));
+
+        fs::remove_file(&socket_path).ok();
+    }
 }

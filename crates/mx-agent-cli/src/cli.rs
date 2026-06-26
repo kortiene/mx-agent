@@ -2806,20 +2806,20 @@ fn task_create(global: &GlobalArgs, args: &TaskCreateArgs) -> ExitCode {
         blocks: args.blocks.clone(),
         action,
     };
-    match daemon_ipc_call::<_, mx_agent_protocol::schema::TaskState>(
-        global,
-        "task.create",
-        &options,
-    ) {
-        Ok(task) => {
+    // Deserialize as `TaskMutation` (not bare `TaskState`) so the `--json`
+    // output carries the `com.mxagent.task.v1` audit anchor the daemon already
+    // produces (issue #367). `TaskMutation` flattens `TaskState`, so this is
+    // additive/backward-compatible for existing `--json` consumers.
+    match daemon_ipc_call::<_, mx_agent_daemon::TaskMutation>(global, "task.create", &options) {
+        Ok(mutation) => {
             if global.json {
                 println!(
                     "{}",
-                    serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string(&mutation).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
-                println!("mx-agent: created task {}", task.task_id);
-                print_task(&task);
+                println!("mx-agent: created task {}", mutation.task.task_id);
+                print_task(&mutation.task);
             }
             ExitCode::SUCCESS
         }
@@ -2862,20 +2862,20 @@ fn task_update(global: &GlobalArgs, args: &TaskUpdateArgs) -> ExitCode {
         action,
         expected_state_rev: args.expected_state_rev,
     };
-    match daemon_ipc_call::<_, mx_agent_protocol::schema::TaskState>(
-        global,
-        "task.update",
-        &options,
-    ) {
-        Ok(task) => {
+    // Deserialize as `TaskMutation` (not bare `TaskState`) so the `--json`
+    // output carries the `com.mxagent.task.v1` audit anchor the daemon already
+    // produces (issue #367). `TaskMutation` flattens `TaskState`, so this is
+    // additive/backward-compatible for existing `--json` consumers.
+    match daemon_ipc_call::<_, mx_agent_daemon::TaskMutation>(global, "task.update", &options) {
+        Ok(mutation) => {
             if global.json {
                 println!(
                     "{}",
-                    serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string())
+                    serde_json::to_string(&mutation).unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
-                println!("mx-agent: updated task {}", task.task_id);
-                print_task(&task);
+                println!("mx-agent: updated task {}", mutation.task.task_id);
+                print_task(&mutation.task);
             }
             ExitCode::SUCCESS
         }

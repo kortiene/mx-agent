@@ -333,6 +333,15 @@ mx-agent task create --room '#demo:localhost' --title Test \
   --depends-on "$PLAN"
 ```
 
+`task create --json` and `task update --json` include a top-level `event_id` —
+the Matrix event id of the `com.mxagent.task.v1` state event the mutation emitted
+(its audit anchor, issue #367) — alongside the usual `TaskState` fields:
+
+```bash
+mx-agent task create --room '#demo:localhost' --title Plan --json | jq -r .event_id
+# -> $abcdef...:localhost
+```
+
 ### Inspect tasks
 
 `task list` shows tasks (human by default, `--json` for automation):

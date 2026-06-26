@@ -1082,6 +1082,16 @@ state_key: <task_id>
 }
 ```
 
+The `task.create`/`task.update` IPC replies carry a `TaskMutation` — the task
+state above with a single added top-level `event_id`, the Matrix event id of the
+`com.mxagent.task.v1` state event the mutation emitted (issue #367). It is the
+audit anchor for *this* emission (distinct from `previous_event_id`, which points
+at the prior revision). The CLI surfaces it: `mx-agent task create --json` /
+`mx-agent task update --json` now include `event_id` alongside the unchanged
+`TaskState` fields, so automation can correlate a create/update to the room event
+it produced. The field is additive — non-`--json` (human) output is unchanged,
+and existing `--json` consumers that read `TaskState` fields are unaffected.
+
 Task states and common forward transitions:
 
 ```text
@@ -1553,8 +1563,8 @@ publish`/`state` remain fully daemon-IPC-mediated.
 
 | Method | Params | Result |
 |---|---|---|
-| `task.create` | `CreateTaskOptions` | `TaskState` |
-| `task.update` | `UpdateTaskOptions` | `TaskState` |
+| `task.create` | `CreateTaskOptions` | `TaskMutation` (`TaskState` + `event_id`) |
+| `task.update` | `UpdateTaskOptions` | `TaskMutation` (`TaskState` + `event_id`) |
 | `task.list` | `ListTasksOptions` | `TaskState[]` |
 | `task.graph` | `ListTasksOptions` | `TaskGraph` |
 | `task.watch` | `ListTasksOptions` | stream of watch event envelopes |
