@@ -1477,9 +1477,16 @@ mod tests {
         assert_eq!(v["event_id"], "$emitted:server");
         assert_eq!(v["previous_event_id"], "$prev:server");
 
-        // The reply still deserializes into a bare TaskState (the extra event_id
-        // lands in TaskState's flatten `extra`), so the CLI — which parses the
-        // reply as TaskState — keeps working.
+        // The reply round-trips through TaskMutation (the CLI path used by
+        // `task create`/`task update --json` after the issue #373 fix): all task
+        // fields and the event_id anchor are preserved.
+        let as_mutation: TaskMutation =
+            serde_json::from_value(v.clone()).expect("deserializes as TaskMutation");
+        assert_eq!(as_mutation.task.task_id, "task_anchor");
+        assert_eq!(as_mutation.event_id, "$emitted:server");
+
+        // Backward compat: a bare TaskState parse still works; the extra
+        // event_id lands in TaskState's `#[serde(flatten)]` extra map.
         let as_task: TaskState = serde_json::from_value(v).expect("deserializes as TaskState");
         assert_eq!(as_task.task_id, "task_anchor");
     }

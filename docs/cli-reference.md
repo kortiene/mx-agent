@@ -1721,7 +1721,7 @@ The task begins in the specified `--state` (default `pending`). If `--assign` is
 
 **Action signing.** The CLI submits `--tool`/`--exec` actions *unsigned* (it never holds a signing key). Because the live scheduler treats task state as advisory, an action only becomes executable once it carries a signed `authorization`. The **daemon signs the action with its own Ed25519 identity** on the local IPC caller's behalf, addressed to the assigned agent, with a bounded expiry — so no separate signing step is needed. If the task is created **without** `--assign`, the action is left advisory (unsigned) until an assigning `task update` names a target, at which point the daemon signs it. Likewise, a `task update` that changes the action body or reassigns the task re-signs it for the new target. Execution still requires the **executing agent to trust the daemon's signing key** under deny-by-default policy (set up via `trust publish`/`trust approve`); room membership is not execution permission, so an action signed by an untrusted key stays blocked. If the daemon cannot load its signing key, `task create`/`task update` fails with a daemon-side error. The default authorization validity window is 24 hours, overridable via the `MX_AGENT_TASK_AUTH_TTL` environment variable (whole seconds) on the daemon.
 
-Human output prints `created task <ID>` followed by a compact summary (ID, state, title, assignment, dependencies, action, revision). JSON output returns the full `TaskState` object with all fields.
+Human output prints `created task <ID>` followed by a compact summary (ID, state, title, assignment, dependencies, action, revision). JSON output returns the full `TaskState` object with all fields **plus a top-level `event_id`** — the Matrix event id of the `com.mxagent.task.v1` state event this mutation emitted, so automation can correlate the create to its audit anchor (issue #367). The added field is purely additive; every prior `TaskState` field is unchanged.
 
 **Exit codes**
 
@@ -1814,7 +1814,7 @@ If `--expected-state-rev` is provided, the update is applied only if the task's 
 
 Task actions can be replaced independently: providing `--tool` (with arguments) or `--exec` (with command) replaces the entire action payload. The daemon validates state transitions and action compatibility before publishing the update to the room.
 
-Human output prints `updated task <ID>` followed by the updated task summary. JSON output returns the full `TaskState` object.
+Human output prints `updated task <ID>` followed by the updated task summary. JSON output returns the full `TaskState` object **plus a top-level `event_id`** — the Matrix event id of the `com.mxagent.task.v1` state event this update emitted, so automation can correlate the update to its audit anchor (issue #367). The added field is purely additive; every prior `TaskState` field is unchanged.
 
 **Exit codes**
 

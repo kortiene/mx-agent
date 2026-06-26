@@ -606,3 +606,242 @@ fn exec_uses_daemon_ipc_path() {
 
     let _ = std::fs::remove_dir_all(&runtime_dir);
 }
+
+// ── Issue #373: task.* / agent.* CLI → daemon IPC seam tests ─────────────────
+//
+// The daemon_ipc_call helper at cli.rs:2742 is the single seam through which
+// every task.* and agent.* CLI command reaches the daemon. These tests cover
+// the call sites that had zero socket-level test coverage before issue #373:
+//
+//   task.create  (cli.rs:2813)   task.update (cli.rs:2869)
+//   task.list    (cli.rs:2927)   task.graph  (cli.rs:2958)
+//   task.cancel  (cli.rs:2895)   agent.register (cli.rs:2623)
+//   agent.list   (cli.rs:2457)   agent.show  (cli.rs:2497)
+//   agent.tools  (cli.rs:2559)
+//
+// Two tiers:
+//   1. No daemon running → exit 3 (IPC connect fails).
+//   2. Daemon running, no Matrix session → non-zero exit + "not logged in"
+//      in stderr (daemon rejects via INTERNAL_ERROR, CLI maps to exit 1).
+
+/// `mx-agent task *` and `mx-agent agent *` commands exit 3 when no daemon is
+/// running and emit a diagnostic mentioning the daemon (issue #373, CLI seam).
+#[test]
+fn task_agent_subcommands_exit_3_when_no_daemon() {
+    let runtime_dir = unique_runtime_dir();
+    let room = "!test:matrix.org";
+
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["task", "create", "--room", room, "--title", "x"],
+            "task create",
+        ),
+        (
+            &["task", "update", "--room", room, "task_01"],
+            "task update",
+        ),
+        (&["task", "list", "--room", room], "task list"),
+        (&["task", "graph", "--room", room], "task graph"),
+        (
+            &["task", "cancel", "--room", room, "task_01"],
+            "task cancel",
+        ),
+        (&["agent", "register", "--room", room], "agent register"),
+        (&["agent", "list", "--room", room], "agent list"),
+        (
+            &["agent", "show", "--room", room, "--agent-id", "dev"],
+            "agent show",
+        ),
+        (
+            &["agent", "tools", "--room", room, "--agent-id", "dev"],
+            "agent tools",
+        ),
+    ];
+
+    for (args, label) in cases {
+        let out = run(&runtime_dir, args);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{label}: expected exit 3 (no daemon), got {:?}",
+            out.status.code()
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("daemon"),
+            "{label}: stderr should mention 'daemon': {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&runtime_dir);
+}
+
+/// `mx-agent task *` and `mx-agent agent *` commands reach the daemon over IPC
+/// and surface the "not logged in" rejection cleanly — non-zero exit (not 3),
+/// error message in stderr (issue #373, CLI seam, Tier 1 acceptance 2).
+///
+/// No Matrix session is needed; the daemon's `block_on_task_response` session
+/// gate fires before any homeserver work, so this test is fast and
+/// deterministic.
+#[test]
+fn task_agent_subcommands_report_not_logged_in_when_daemon_has_no_session() {
+    let runtime_dir = unique_runtime_dir();
+
+    let out = run(&runtime_dir, &["daemon", "start"]);
+    assert!(out.status.success(), "daemon start should succeed: {out:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if run(&runtime_dir, &["daemon", "status", "--json"])
+            .status
+            .success()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let room = "!test:matrix.org";
+
+    // Verify a command reached the daemon (not exit 3) and that the daemon's
+    // "not logged in" rejection propagates to stderr.
+    let check = |out: &std::process::Output, label: &str| {
+        let code = out.status.code().unwrap_or(0);
+        assert_ne!(
+            code, 3,
+            "{label}: exit 3 means the daemon was not contacted; it should be"
+        );
+        assert_ne!(
+            code, 0,
+            "{label}: expected non-zero exit (daemon rejected with not-logged-in)"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not logged in") || stderr.contains("daemon rejected"),
+            "{label}: expected 'not logged in' or 'daemon rejected' in stderr: {stderr}"
+        );
+    };
+
+    let out = run(
+        &runtime_dir,
+        &["task", "create", "--room", room, "--title", "T"],
+    );
+    check(&out, "task create");
+
+    let out = run(&runtime_dir, &["task", "update", "--room", room, "task_01"]);
+    check(&out, "task update");
+
+    let out = run(&runtime_dir, &["task", "list", "--room", room]);
+    check(&out, "task list");
+
+    let out = run(&runtime_dir, &["task", "graph", "--room", room]);
+    check(&out, "task graph");
+
+    let out = run(&runtime_dir, &["task", "cancel", "--room", room, "task_01"]);
+    check(&out, "task cancel");
+
+    let out = run(&runtime_dir, &["agent", "register", "--room", room]);
+    check(&out, "agent register");
+
+    let out = run(&runtime_dir, &["agent", "list", "--room", room]);
+    check(&out, "agent list");
+
+    let out = run(
+        &runtime_dir,
+        &["agent", "show", "--room", room, "--agent-id", "dev"],
+    );
+    check(&out, "agent show");
+
+    let out = run(
+        &runtime_dir,
+        &["agent", "tools", "--room", room, "--agent-id", "dev"],
+    );
+    check(&out, "agent tools");
+
+    let out = run(&runtime_dir, &["daemon", "stop"]);
+    assert!(out.status.success(), "daemon stop should succeed: {out:?}");
+
+    let _ = std::fs::remove_dir_all(&runtime_dir);
+}
+
+/// `mx-agent task create --json` surfaces the `#367` `event_id` audit anchor.
+///
+/// A fake daemon stub at the CLI's resolved socket path returns a canned
+/// `TaskMutation` carrying a sentinel `event_id`. The test asserts the CLI's
+/// `--json` stdout includes that sentinel — proving the CLI deserializes the
+/// reply as `TaskMutation` (not the pre-fix `TaskState` that silently dropped
+/// the field). Homeserver-free; no real daemon is started. Issue #373 / #367.
+#[test]
+fn task_create_json_surfaces_event_id_anchor() {
+    use mx_agent_ipc::{read_frame, write_frame, Request, Response};
+    use serde_json::json;
+    use std::os::unix::net::UnixListener;
+
+    let runtime_dir = unique_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("create runtime_dir");
+    let socket_path = runtime_dir.join("daemon.sock");
+
+    let sentinel = "$test_anchor_event_id_373:matrix.example.org";
+    let task_mutation = json!({
+        "task_id": "task_test_373",
+        "title": "T",
+        "description": "",
+        "state": "pending",
+        "assigned_to": "",
+        "created_by": "@test:example.org",
+        "depends_on": [],
+        "blocks": [],
+        "invocation_id": null,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "state_rev": 0_u64,
+        "previous_event_id": null,
+        "event_id": sentinel,
+    });
+
+    // Bind the listener before spawning so the socket file exists when the
+    // binary starts. The kernel queues the CLI's connect() until accept() runs.
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+
+    let mutation_clone = task_mutation.clone();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let bytes = read_frame(&mut stream).unwrap().unwrap();
+        let req: Request = serde_json::from_slice(&bytes).unwrap();
+        let resp = Response::result(req.id, mutation_clone);
+        let resp_bytes = serde_json::to_vec(&resp).unwrap();
+        write_frame(&mut stream, &resp_bytes).unwrap();
+    });
+
+    let out = Command::new(BIN)
+        .args([
+            "task",
+            "create",
+            "--room",
+            "!test:matrix.org",
+            "--title",
+            "T",
+            "--json",
+        ])
+        .env("MX_AGENT_RUNTIME_DIR", &runtime_dir)
+        .env("MX_AGENT_LOG", "off")
+        .output()
+        .expect("failed to run mx-agent task create");
+
+    assert!(
+        out.status.success(),
+        "task create --json must succeed against the fake daemon: {out:?}"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"event_id\""),
+        "task create --json stdout must include event_id key: {stdout}"
+    );
+    assert!(
+        stdout.contains(sentinel),
+        "task create --json stdout must contain the sentinel event_id ({sentinel}): {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&runtime_dir);
+}
