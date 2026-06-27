@@ -556,6 +556,24 @@ fn validate_paths(prefix: &str, paths: &[PathBuf]) -> Result<(), PolicyError> {
                 message: format!("path {} must be absolute", path.display()),
             });
         }
+        // Reject non-canonical entries so the prefix the engine compares against
+        // is itself canonical (issue #374). A `..`/`.` segment would make the
+        // component-wise `starts_with` match ambiguous against the (lexically
+        // rejected) requested cwd. Scan raw segments (Unix-only `/`) so an
+        // interior `.` — which `Path::components` normalizes away — is caught.
+        if path
+            .to_string_lossy()
+            .split('/')
+            .any(|seg| seg == ".." || seg == ".")
+        {
+            return Err(PolicyError::Validation {
+                path: format!("{prefix}[{idx}]"),
+                message: format!(
+                    "path {} must be canonical (no \"..\" or \".\" segments)",
+                    path.display()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -856,6 +874,85 @@ sandbox = \"firejail\"
                     "rooms.\"!r:matrix.org\".agents.\"@a:matrix.org\".allow_cwd[1]"
                 );
                 assert!(message.contains("must be absolute"), "got {message}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn noncanonical_cwd_entry_reports_precise_path() {
+        // Issue #374 hardening: a non-canonical `allow_cwd` entry (containing
+        // `..`) fails load with a precise dotted-path error.
+        let input = "[rooms.\"!r:matrix.org\".agents.\"@a:matrix.org\"]\n\
+                     allow_cwd = [\"/abs\", \"/abs/../etc\"]\n";
+        let err = Policy::parse(input).unwrap_err();
+        match err {
+            PolicyError::Validation { path, message } => {
+                assert_eq!(
+                    path,
+                    "rooms.\"!r:matrix.org\".agents.\"@a:matrix.org\".allow_cwd[1]"
+                );
+                assert!(message.contains("must be canonical"), "got {message}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn curdir_in_allow_cwd_entry_reports_precise_path() {
+        // Issue #374: a `.` component in an `allow_cwd` entry must also be
+        // rejected at load time (not just `..`). The engine's raw-segment scan
+        // catches interior `.` that `Path::components` would normalize away.
+        let input = "[rooms.\"!r:matrix.org\".agents.\"@a:matrix.org\"]\n\
+                     allow_cwd = [\"/abs\", \"/abs/./sub\"]\n";
+        let err = Policy::parse(input).unwrap_err();
+        match err {
+            PolicyError::Validation { path, message } => {
+                assert_eq!(
+                    path,
+                    "rooms.\"!r:matrix.org\".agents.\"@a:matrix.org\".allow_cwd[1]"
+                );
+                assert!(message.contains("must be canonical"), "got {message}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn noncanonical_read_only_path_reports_precise_path() {
+        // Issue #374: `validate_paths` is called for `execution.read_only_paths`
+        // too — a `..` entry must be caught with the correct dotted path.
+        let input = "[execution]\nread_only_paths = [\"/usr\", \"/usr/../etc\"]\n";
+        let err = Policy::parse(input).unwrap_err();
+        match err {
+            PolicyError::Validation { path, message } => {
+                assert_eq!(path, "execution.read_only_paths[1]");
+                assert!(message.contains("must be canonical"), "got {message}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn noncanonical_writable_path_reports_precise_path() {
+        // Issue #374: `validate_paths` is called for `execution.writable_paths`
+        // too — a `..` or `.` entry must be caught with the correct dotted path.
+        let input_dotdot = "[execution]\nwritable_paths = [\"/work\", \"/work/../secrets\"]\n";
+        let err = Policy::parse(input_dotdot).unwrap_err();
+        match err {
+            PolicyError::Validation { path, message } => {
+                assert_eq!(path, "execution.writable_paths[1]");
+                assert!(message.contains("must be canonical"), "got {message}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+
+        let input_dot = "[execution]\nwritable_paths = [\"/work\", \"/work/./sub\"]\n";
+        let err2 = Policy::parse(input_dot).unwrap_err();
+        match err2 {
+            PolicyError::Validation { path, message } => {
+                assert_eq!(path, "execution.writable_paths[1]");
+                assert!(message.contains("must be canonical"), "got {message}");
             }
             other => panic!("expected validation error, got {other:?}"),
         }

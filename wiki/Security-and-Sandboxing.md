@@ -148,7 +148,9 @@ raw_exec_default = "deny"           # ...but raw shell exec is STILL denied unle
 allow_exec      = true              # Permit raw exec for THIS agent only.
 allow_tools     = ["run_tests", "lint", "read_file"]   # Named-tool allowlist.
 allow_commands  = ["npm", "pnpm", "pytest", "go", "cargo"]  # argv[0] allowlist.
-allow_cwd       = ["/home/me/code/project"]            # Working-dir allowlist.
+allow_cwd       = ["/home/me/code/project"]            # Working-dir allowlist; the requested
+                                                       # cwd must be a clean absolute path —
+                                                       # any "../"/"./" is denied (issue #374).
 
 # Argument denylist (regex, AND-checked against the full command line). Defense
 # in depth against obvious foot-guns even within allowed commands.
@@ -197,7 +199,7 @@ emitted approval request stays no-leak (no command/args). (Issue #306.)
 | `network = "deny"` | Exfiltration, SSRF, callbacks to metadata endpoints | `[execution]` and per-agent |
 | `read_only_paths` / `writable_paths` | Tampering outside the workspace | `[execution]` |
 | `allow_commands` / `deny_args_regex` | Arbitrary binaries and dangerous argument patterns | per-agent |
-| `allow_cwd` | Running outside the intended project tree | per-agent |
+| `allow_cwd` | Running outside the intended project tree; `..`/`.` components in the requested cwd are denied before the prefix match (issue #374) | per-agent |
 | `max_runtime_ms` / `max_output_bytes` | Runaway processes, log-flood DoS | per-agent / `[execution]` |
 | `max_processes` / `max_memory_bytes` / `max_cpu_seconds` | Fork-bomb, memory exhaustion, runaway CPU consumption | per-agent / `[execution]` |
 | `requires_approval` | Unattended privileged actions | per-agent |

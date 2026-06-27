@@ -414,6 +414,145 @@ fn daemon_drives_tasks_through_policy_dependencies_and_denial() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+// --- issue #374: cwd traversal escape is denied at the orchestration layer --
+
+/// Verify that a task whose `cwd` contains `..` segments (a parent-dir
+/// traversal) is denied by policy at the orchestration layer and never spawns a
+/// process (issue #374).
+///
+/// The unit tests in `mx-agent-policy` cover the `cwd_allowed` helper and
+/// `evaluate_exec` exhaustively.  This test exercises the full orchestration
+/// stack — `TaskOrchestrator` → `ExecTaskDispatcher` → process-spawn gate —
+/// to confirm that:
+///
+/// 1. The raw `cwd` field from `TaskAction::Exec` reaches `evaluate_exec`
+///    unchanged (no silent normalization before the policy call).
+/// 2. A `CwdNotAllowed` denial propagates correctly as `STATE_BLOCKED` with a
+///    `"policy_denied"` result (the same outcome as a command-not-in-allowlist
+///    denial, proving the cwd gate is wired into the same orchestration result
+///    path).
+/// 3. No process is ever spawned with the escaping path — the sentinel file
+///    the command would create must not exist after the tick.
+/// 4. A task with a clean cwd (no `..`) under the same allowlist entry still
+///    succeeds (regression: the fix must not break the happy path).
+///
+/// Backend: `none` (no sandbox configured) — the only backend where the textual
+/// `..` escape would reach real host paths; isolating backends contain it via
+/// bind-mounts.
+#[test]
+fn cwd_traversal_escape_is_denied_by_policy_and_never_spawns() {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let workspace = std::env::temp_dir().join(format!(
+        "mx-agent-cwd374-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let allowed_cwd = workspace.to_string_lossy().into_owned();
+
+    // The sentinel the traversal task would write if it ever ran.
+    let sentinel = workspace.join("traversal-ran");
+
+    // Build an escaping cwd: starts with the allowed prefix (component-wise
+    // `starts_with` would have matched it before the fix), but resolves to
+    // a directory outside the allowlist at spawn time on the `none` backend.
+    let escape_cwd = format!("{allowed_cwd}/../../tmp");
+
+    // Policy: allow only `sh` in the workspace.  No sandbox configured →
+    // Backend::None — the only backend where a textual escape could reach
+    // real host paths.
+    let policy_toml = format!(
+        r#"
+[rooms."{ROOM_ID}"]
+trusted = true
+raw_exec_default = "deny"
+
+[rooms."{ROOM_ID}".agents."{PLANNER}"]
+allow_exec = true
+allow_commands = ["sh"]
+allow_cwd = ["{allowed_cwd}"]
+"#
+    );
+    let p = Policy::parse(&policy_toml).expect("traversal-test policy parses");
+
+    let mut store = RoomTaskStore::default();
+
+    // task-traversal: cwd with `..` that starts with the allowed prefix —
+    // the pre-fix bug would have accepted it.  It tries to create the sentinel.
+    store.insert(task(
+        "task-traversal",
+        &["sh", "-c", &format!("touch {}", sentinel.display())],
+        &escape_cwd,
+    ));
+
+    // task-clean: valid cwd under the allowlist entry (no `..`).  Must still
+    // succeed — regression guard for the happy path.
+    let ok_sentinel = workspace.join("clean-ran");
+    store.insert(task(
+        "task-clean",
+        &["sh", "-c", &format!("touch {}", ok_sentinel.display())],
+        &allowed_cwd,
+    ));
+
+    let scheduler = TaskScheduler::new(LOCAL_AGENT, 4);
+    let orchestrator = TaskOrchestrator::new(LOCAL_AGENT)
+        .with_room_id(ROOM_ID)
+        .with_policy(p);
+    let mut dispatcher = ExecTaskDispatcher::new();
+    tick(&scheduler, &orchestrator, &mut store, &mut dispatcher);
+
+    // 1. Traversal task is blocked — never executed.
+    assert_eq!(
+        store.get("task-traversal").state,
+        STATE_BLOCKED,
+        "a task with a `..`-escaping cwd must be blocked by policy, not executed"
+    );
+
+    // 2. No process was spawned — sentinel must not exist.
+    assert!(
+        !sentinel.exists(),
+        "the traversal task's command must never spawn; \
+         if the sentinel exists the cwd escape was not caught at the policy layer"
+    );
+
+    // 3. Result is tagged `policy_denied` (same path as command-not-in-allowlist).
+    let denied_result = store
+        .get("task-traversal")
+        .result
+        .clone()
+        .expect("blocked task must carry a result");
+    assert_eq!(
+        denied_result.get("reason").and_then(|v| v.as_str()),
+        Some("policy_denied"),
+        "traversal denial must produce a policy_denied result: {denied_result}"
+    );
+    assert!(
+        denied_result
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .is_none(),
+        "a denied task must never produce a process exit code"
+    );
+
+    // 4. Clean cwd task succeeded (no regression on the happy path).
+    assert_eq!(
+        store.get("task-clean").state,
+        STATE_SUCCEEDED,
+        "a task with a canonical cwd under the allowlist entry must still succeed"
+    );
+    assert!(
+        ok_sentinel.exists(),
+        "the clean-cwd task must have run and created its sentinel"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 // --- issue #248: sandbox policy settings flow end to end --------------------
 
 /// Whether a minimal `bwrap` invocation works in this environment.
