@@ -2068,6 +2068,14 @@ Policy recommendations:
 - Apply network deny-by-default for remote execution.
 - Enforce output and runtime caps.
 
+The *requested* working directory is matched against `allow_cwd` only when it is
+a clean absolute path: any `..` or `.` component is denied (`CwdNotAllowed`)
+rather than prefix-matched, since `Path::starts_with` is component-wise and a
+path like `/srv/project/../../etc` would otherwise pass the prefix check yet
+resolve *outside* the allowlist on the `none` backend (issue #374). This is a
+pure lexical check — it does not canonicalize or resolve symlinks. `allow_cwd`
+entries are likewise required to be canonical absolute paths at policy load.
+
 **Absent vs. malformed policy (issue #350).** The daemon distinguishes a
 *missing* `policy.toml` from a *present-but-unusable* one. A missing file is the
 intended deny-all default and is silent (the daemon must run before login, before

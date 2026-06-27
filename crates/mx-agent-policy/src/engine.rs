@@ -348,13 +348,31 @@ fn command_allowed(program: &str, allow_commands: &[String]) -> bool {
         .any(|allowed| allowed == program || basename(allowed) == program_base)
 }
 
-/// Whether `cwd` is within one of the allowed directories. An empty allowlist
-/// permits nothing.
+/// Whether `cwd` is within one of the allowed directories.
+///
+/// Deny-by-default: an empty allowlist permits nothing. The requested cwd must
+/// be an **absolute, canonical** path — any `..` (parent-dir) or `.`
+/// (current-dir) path segment is rejected before the prefix match, because
+/// [`Path::starts_with`] is component-wise and would otherwise accept a path
+/// like `/srv/project/../../etc` that the OS later resolves *outside* the
+/// allowlist when the command is spawned with `current_dir(...)`. The raw
+/// segments are scanned directly (Unix-only `/` separator) rather than via
+/// [`Path::components`], which normalizes interior `.` away and so would miss a
+/// non-canonical `/srv/project/./sub`. This is a pure, filesystem-free check
+/// (no `canonicalize`): it is defense-in-depth for the `none` sandbox backend,
+/// where nothing else constrains the real cwd (issue #374). It closes the
+/// textual `..`/`.` traversal gap only; it does not resolve symlinks.
 fn cwd_allowed(cwd: &str, allow_cwd: &[std::path::PathBuf]) -> bool {
     let cwd_path = Path::new(cwd);
     // Only absolute working directories can be safely matched against the
     // absolute allowlist entries.
     if !cwd_path.is_absolute() {
+        return false;
+    }
+    // Reject non-canonical segments: `..` can escape the allowlisted prefix
+    // under the component-wise `starts_with`, and `.` indicates a non-canonical
+    // path. A genuinely in-bounds absolute cwd has only normal segments.
+    if cwd.split('/').any(|seg| seg == ".." || seg == ".") {
         return false;
     }
     allow_cwd
@@ -603,6 +621,171 @@ writable_paths = ["/work"]
             outcome,
             Outcome::Deny(DenyReason::CwdNotAllowed { .. })
         ));
+    }
+
+    #[test]
+    fn exec_denied_cwd_parentdir_escape() {
+        // Acceptance (issue #374): a cwd that starts with the allowed prefix but
+        // contains `..` resolves *outside* the allowlist when spawned on the
+        // `none` backend; the component-wise `starts_with` check used to accept
+        // it. The lexical `..` reject must deny it.
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project/../../etc"));
+        assert!(matches!(
+            outcome,
+            Outcome::Deny(DenyReason::CwdNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn exec_denied_cwd_trailing_parentdir() {
+        // A trailing `..` escapes the allowed directory to its parent.
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project/.."));
+        assert!(matches!(
+            outcome,
+            Outcome::Deny(DenyReason::CwdNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn exec_denied_cwd_curdir_component() {
+        // A `.` component is non-canonical; the gate over-rejects it fail-closed.
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project/./sub"));
+        assert!(matches!(
+            outcome,
+            Outcome::Deny(DenyReason::CwdNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn exec_still_allows_exact_allowed_cwd() {
+        // No regression: the exact allowed directory (only RootDir + Normal
+        // components) still passes.
+        let p = policy();
+        let cmd = argv(&["cargo", "test"]);
+        let outcome = p.evaluate_exec(&exec(&cmd, "/home/me/code/project"));
+        assert!(outcome.is_allowed(), "got {outcome:?}");
+    }
+
+    #[test]
+    fn cwd_allowed_rejects_traversal_and_keeps_clean_subdir() {
+        // Direct coverage of the private helper: escape and `.`-component denied,
+        // clean subdirectory allowed.
+        let allow = vec![PathBuf::from("/home/me/code/project")];
+        assert!(!cwd_allowed("/home/me/code/project/../../etc", &allow));
+        assert!(!cwd_allowed("/home/me/code/project/./x", &allow));
+        assert!(cwd_allowed("/home/me/code/project/sub", &allow));
+    }
+
+    #[test]
+    fn cwd_allowed_deny_empty_allowlist() {
+        // Deny-by-default: an empty allow list must reject even a clean absolute path.
+        let allow: Vec<PathBuf> = vec![];
+        assert!(!cwd_allowed("/home/me/code/project", &allow));
+        assert!(!cwd_allowed("/", &allow));
+    }
+
+    #[test]
+    fn cwd_allowed_deny_leading_parentdir() {
+        // `/../etc` is absolute, but the `..` component immediately after root
+        // must be caught. `starts_with` would not match our allowlist here anyway,
+        // but the segment check must fire first for defense-in-depth.
+        let allow = vec![PathBuf::from("/home/me/code/project")];
+        assert!(!cwd_allowed("/../etc", &allow));
+        assert!(!cwd_allowed("/..", &allow));
+        assert!(!cwd_allowed("/.", &allow));
+    }
+
+    #[test]
+    fn cwd_allowed_deny_parentdir_before_prefix() {
+        // A `..` component that happens to resolve back to the allowed prefix
+        // (e.g. `/home/../home/me/code/project`) must still be denied: the
+        // lexical check fires on the raw segment before any resolution.
+        let allow = vec![PathBuf::from("/home/me/code/project")];
+        assert!(!cwd_allowed("/home/../home/me/code/project", &allow));
+        assert!(!cwd_allowed("/home/me/code/project/../project", &allow));
+    }
+
+    #[test]
+    fn cwd_allowed_allows_second_of_multiple_entries() {
+        // With multiple allowed cwds the helper must allow a path under any entry.
+        let allow = vec![
+            PathBuf::from("/srv/alpha"),
+            PathBuf::from("/home/me/code/project"),
+        ];
+        assert!(cwd_allowed("/home/me/code/project/sub", &allow));
+        assert!(cwd_allowed("/srv/alpha/data", &allow));
+        // Still deny a path not under any entry.
+        assert!(!cwd_allowed("/srv/beta", &allow));
+    }
+
+    #[test]
+    fn cwd_allowed_three_dots_segment_is_not_traversal() {
+        // A directory named `...` (three dots) is a valid normal segment; it must
+        // not be confused with the `..` parent-dir traversal marker.
+        let allow = vec![PathBuf::from("/home/me/code/project")];
+        assert!(cwd_allowed("/home/me/code/project/.../work", &allow));
+    }
+
+    #[test]
+    fn cwd_allowed_deny_superpath_of_allowlist_entry() {
+        // A cwd that is a PARENT of the allowlist entry must be denied:
+        // starts_with is directional (cwd ⊆ allowed), not transitive upwards.
+        let allow = vec![PathBuf::from("/home/me/code/project")];
+        assert!(!cwd_allowed("/home/me", &allow));
+        assert!(!cwd_allowed("/home/me/code", &allow));
+        assert!(!cwd_allowed("/", &allow));
+    }
+
+    #[test]
+    fn cwd_allowed_deny_adjacent_component() {
+        // A path that shares a string prefix but differs at a component boundary
+        // must be denied — Path::starts_with is component-wise, not substring.
+        // Issue #374: ensures we never use raw string prefix matching.
+        let allow = vec![PathBuf::from("/srv/project")];
+        assert!(!cwd_allowed("/srv/project2", &allow));
+        assert!(!cwd_allowed("/srv/projects", &allow));
+        assert!(!cwd_allowed("/srv/projectx/sub", &allow));
+        // The exact entry and a clean subdir must still be allowed.
+        assert!(cwd_allowed("/srv/project", &allow));
+        assert!(cwd_allowed("/srv/project/sub", &allow));
+    }
+
+    #[test]
+    fn exec_denied_cwd_parentdir_escape_with_no_sandbox() {
+        // Issue #374 primary scenario: with no execution.default_sandbox set
+        // (Backend::None at spawn time, the only backend where a textual `..`
+        // escape reaches real host filesystem paths), the policy layer must
+        // deny the traversal before it ever reaches the runner.
+        let toml = r#"
+[rooms."!abc:matrix.org"]
+trusted = true
+
+[rooms."!abc:matrix.org".agents."@claude:matrix.org"]
+allow_exec = true
+allow_commands = ["cargo"]
+allow_cwd = ["/srv/project"]
+"#;
+        let p = Policy::parse(toml).expect("policy parses");
+        let cmd = argv(&["cargo", "build"]);
+        // Starts with the allowed prefix at the component level but resolves to
+        // /etc on the host when spawned without sandbox containment.
+        let outcome = p.evaluate_exec(&exec(&cmd, "/srv/project/../../etc"));
+        assert!(
+            matches!(outcome, Outcome::Deny(DenyReason::CwdNotAllowed { .. })),
+            "traversal escape was not denied on none-sandbox policy: {outcome:?}"
+        );
+        // A clean subdir under the same allowlist entry still works.
+        let allow_outcome = p.evaluate_exec(&exec(&cmd, "/srv/project/sub"));
+        assert!(
+            allow_outcome.is_allowed(),
+            "clean subdir was unexpectedly denied: {allow_outcome:?}"
+        );
     }
 
     #[test]
