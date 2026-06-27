@@ -3078,7 +3078,6 @@ mx-agent recovery recover --recovery-key "$(cat /secure/recovery.key)" && mx-age
 
 - `MX_AGENT_PASSWORD` — non-interactive password for `auth login` (read via stdin if not set)
 - `MX_AGENT_RECOVERY_KEY` — fallback recovery key for `recovery recover` (else stdin prompt)
-- `MX_AGENT_ALLOW_UNSIGNED_RESULTS` — when set, downgrades a *missing* result-plane signature to a logged-accept (for mixed-fleet rollout); invalid, wrong-key, or untrusted signatures are still always rejected (issue #348)
 - `MX_AGENT_TASK_DISPATCH` — `local` (default) | `matrix` — route live scheduler task dispatch through the signed Matrix call/exec transport instead of local dispatch
 - `MX_AGENT_TASK_AUTH_TTL` — validity window in whole seconds for daemon-authored task-action authorizations (default: 86400 — 24 hours); set on the daemon, not the CLI
 - `MX_AGENT_LOG` — tracing/EnvFilter directive (e.g. `debug`, `mx_agent=trace`); overrides `-v` flag

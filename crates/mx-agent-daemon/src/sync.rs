@@ -632,16 +632,7 @@ async fn publish_forwarded(
     // signature over the executor's trusted key, so a forged/tampered/unsigned
     // result is dropped here and the caller's waiter times out.
     match verify_forwarded_event(client, paths, meta, &event).await {
-        Ok(crate::result_verify::VerifyOutcome::Verified) => {}
-        Ok(crate::result_verify::VerifyOutcome::AcceptedUnsigned) => {
-            tracing::warn!(
-                event_type = %meta.event_type,
-                room = %meta.room_id,
-                sender = %meta.sender,
-                invocation_id = %forwarded_correlation_id(&event),
-                "accepting an UNSIGNED result-plane event because MX_AGENT_ALLOW_UNSIGNED_RESULTS is set"
-            );
-        }
+        Ok(()) => {}
         Err(err) => {
             tracing::warn!(
                 event_type = %meta.event_type,
@@ -692,14 +683,14 @@ fn forwarded_correlation_id(event: &ForwardedExecEvent) -> String {
 /// from `meta.sender` (the already-pinned executing Matrix user) in the event's
 /// room, then applies the centralized fail-closed policy in
 /// [`crate::result_verify::verify_result_signature`] (verify → key-id match →
-/// trust re-check, with the `MX_AGENT_ALLOW_UNSIGNED_RESULTS` override applying
-/// only to a *missing* signature).
+/// trust re-check). A missing, invalid, wrong-key, or untrusted signature is
+/// always rejected.
 async fn verify_forwarded_event(
     client: &matrix_sdk::Client,
     paths: &SessionPaths,
     meta: &EventMeta,
     event: &ForwardedExecEvent,
-) -> Result<crate::result_verify::VerifyOutcome, crate::result_verify::ResultVerifyError> {
+) -> Result<(), crate::result_verify::ResultVerifyError> {
     use crate::result_verify::{verify_result_signature, ResultVerifyError};
 
     // Resolve the executor's AgentState by its Matrix user id (`meta.sender`),
@@ -720,7 +711,7 @@ async fn verify_forwarded_event(
     let trust = crate::trust::TrustStore::load(paths).unwrap_or_default();
 
     // Verify the typed inner event (its serialized form carries the embedded
-    // `signature`). The policy helper handles the unsigned-results override.
+    // `signature`). A missing signature is always rejected (fail-closed).
     match event {
         ForwardedExecEvent::StreamChunk(ev) => verify_result_signature(ev, &agent_state, &trust),
         ForwardedExecEvent::StreamArtifact(ev) => verify_result_signature(ev, &agent_state, &trust),
