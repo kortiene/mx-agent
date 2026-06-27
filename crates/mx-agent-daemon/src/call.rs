@@ -691,15 +691,15 @@ async fn wait_for_call_response(
 /// id (`expected_sender`, the already-pinned executing agent), then applies the
 /// centralized fail-closed policy in
 /// [`crate::result_verify::verify_result_signature`]. Returns a stable,
-/// non-sensitive reason label on failure (logged by the caller); the
-/// `MX_AGENT_ALLOW_UNSIGNED_RESULTS` override applies only to a *missing*
-/// signature. Never logs key bytes or payloads.
+/// non-sensitive reason label on failure (logged by the caller); a missing,
+/// invalid, wrong-key, or untrusted signature is always rejected. Never logs key
+/// bytes or payloads.
 async fn verify_call_response_signature(
     client: &matrix_sdk::Client,
     event: &crate::event_router::IncomingEvent,
     expected_sender: &str,
 ) -> Result<(), &'static str> {
-    use crate::result_verify::{verify_result_signature, ResultVerifyError, VerifyOutcome};
+    use crate::result_verify::{verify_result_signature, ResultVerifyError};
 
     let response: CallResponse =
         serde_json::from_value(event.content.clone()).map_err(|_| "malformed")?;
@@ -719,18 +719,7 @@ async fn verify_call_response_signature(
     let paths = SessionPaths::resolve();
     let trust = TrustStore::load(&paths).unwrap_or_default();
 
-    match verify_result_signature(&response, &agent_state, &trust) {
-        Ok(VerifyOutcome::Verified) => Ok(()),
-        Ok(VerifyOutcome::AcceptedUnsigned) => {
-            tracing::warn!(
-                sender = %expected_sender,
-                request_id = %response.request_id,
-                "accepting an UNSIGNED call.response because MX_AGENT_ALLOW_UNSIGNED_RESULTS is set"
-            );
-            Ok(())
-        }
-        Err(err) => Err(err.reason()),
-    }
+    verify_result_signature(&response, &agent_state, &trust).map_err(|err| err.reason())
 }
 
 /// Handle a routed live call request on the target daemon.

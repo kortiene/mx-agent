@@ -71,6 +71,22 @@
 //! subscriber sender-pin → consumer, proving "room membership ≠ execution
 //! permission" for the result plane (fake exit status **and** injected output).
 //!
+//! [`live_result_plane_unsigned_or_misigned_is_rejected`] (issues #348, #381)
+//! proves the result-plane **Ed25519 signature** gate end-to-end against a real
+//! homeserver. Every forge in this test originates from Alice's own Matrix sender
+//! (the pinned executor), so each event clears the sender-pin and reaches the
+//! signature check — directly exercising the #348 verify path. Three cases are
+//! proven: (a) Alice's genuine, daemon-signed `exec.finished` (exit 77) is
+//! verified and delivered, proving the gate does not reject legitimate results.
+//! (b) An unsigned `exec.finished` (exit 42, NO `signature` field) is always
+//! dropped (`Unsigned`) — there is no environment override; issue #381 retired the
+//! mixed-fleet `MX_AGENT_ALLOW_UNSIGNED_RESULTS` rollout hatch, making the
+//! fail-closed behavior unconditional. (c) A wrong-key forge (exit 43) — signed
+//! by a throwaway Ed25519 key not in Alice's published `AgentState` or trust store
+//! — is dropped (`Invalid`). The full path exercised is: Matrix SDK event delivery
+//! → sync loop routing → `publish_forwarded` → `verify_forwarded_event` →
+//! `result_verify::verify_result_signature` → subscriber delivery.
+//!
 //! Five tests (issue #306) prove the live `exec`/`call` approval-release path
 //! end-to-end against a real homeserver:
 //! [`live_exec_held_approval_approve_releases_and_runs`] — approve a held live
@@ -8283,8 +8299,8 @@ allow_cwd = ["{cwd}"]
 /// (resolve the executor's `AgentState` key by `meta.sender`, verify the detached
 /// signature, cross-check `signature.key_id`, re-check trust) *in series* with
 /// the sender-pin, and **fails closed** on the Matrix transport (spec D5). A
-/// missing signature is rejected (`Unsigned`) unless `MX_AGENT_ALLOW_UNSIGNED_RESULTS`
-/// is set (it is not here); an invalid/wrong-key signature is *always* rejected.
+/// missing signature is *always* rejected (`Unsigned`, no environment override);
+/// an invalid/wrong-key signature is *always* rejected too.
 ///
 /// This complements [`live_result_plane_forge_is_rejected`]: that test sends the
 /// forge from a *different* sender (Bob), so the sender-pin drops it before
@@ -8305,8 +8321,8 @@ allow_cwd = ["{cwd}"]
 /// - (a) POSITIVE: Alice's genuine, daemon-signed `exec.finished` (exit 77) is
 ///   verified, delivered, and resolves the waiter.
 /// - (b) UNSIGNED forge: an `exec.finished` with NO `signature`, from Alice's
-///   sender (exit 42), is dropped (`Unsigned`, override off) and never resolves
-///   the waiter.
+///   sender (exit 42), is always dropped (`Unsigned`) and never resolves the
+///   waiter.
 /// - (c) WRONG-KEY forge: an `exec.finished` signed by a *different* Ed25519 key
 ///   than Alice's published one, from Alice's sender (exit 43), is dropped
 ///   (`Invalid`) and never resolves the waiter.
@@ -8323,10 +8339,6 @@ async fn live_result_plane_unsigned_or_misigned_is_rejected() {
         .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
         .try_init();
-
-    // The unsigned-results escape hatch must be OFF so the missing-signature
-    // forge is rejected rather than logged-accepted (spec D5).
-    std::env::remove_var(mx_agent_daemon::result_verify::ALLOW_UNSIGNED_RESULTS_ENV);
 
     let homeserver = required_env("MX_AGENT_TEST_HOMESERVER");
     let alice_user = required_env("MX_AGENT_TEST_USER");
@@ -8533,8 +8545,8 @@ allow_cwd = ["{cwd}"]
     // ── Case (b): UNSIGNED forge from the executor's own sender ──
     // An `exec.finished` with NO `signature` field (exit 42). The sender-pin
     // passes (sender == alice_id), so `verify_forwarded_event` must reject it as
-    // `Unsigned` (the MX_AGENT_ALLOW_UNSIGNED_RESULTS override is off) and it
-    // must never resolve the waiter.
+    // `Unsigned` (always, no environment override) and it must never resolve the
+    // waiter.
     alice_room
         .send_raw(
             timeline::EXEC_FINISHED,
@@ -8616,13 +8628,15 @@ allow_cwd = ["{cwd}"]
     );
     // Security assertion (b): the UNSIGNED forge (exit 42) must never have been
     // delivered. It cleared the sender-pin (Alice's own sender), so only the
-    // #348 signature check (missing signature → `Unsigned`) can have dropped it.
+    // #348 signature gate (missing signature → `Unsigned`, fail-closed always —
+    // issue #381 retired the mixed-fleet `MX_AGENT_ALLOW_UNSIGNED_RESULTS` env
+    // hatch so the rejection is now unconditional) can have dropped it.
     assert_ne!(
         exit_code,
         Some(42),
         "UNSIGNED forged exec.finished (exit 42) from the executor's OWN sender must be \
          dropped by signature verification — result-plane signing gate is broken for the \
-         missing-signature case (issue #348)"
+         missing-signature case (issues #348 / #381)"
     );
     // Security assertion (c): the WRONG-KEY forge (exit 43) must never have been
     // delivered. It cleared the sender-pin, so only the #348 signature check

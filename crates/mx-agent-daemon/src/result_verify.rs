@@ -12,11 +12,10 @@
 //! The verification policy is centralized in [`verify_result_signature`] so the
 //! exec/stream verify locus ([`crate::sync::publish_forwarded`]) and the
 //! `call.response` wait ([`crate::call::wait_for_call_response`]) apply the
-//! exact same rule. The single removable escape hatch
-//! ([`MX_AGENT_ALLOW_UNSIGNED_RESULTS`](ALLOW_UNSIGNED_RESULTS_ENV)) downgrades
-//! **only** a *missing* signature to a logged-accept (for mixed-fleet rollout);
-//! invalid / wrong-key / untrusted signatures are always rejected (Decision
-//! D5).
+//! exact same rule. A missing, invalid, wrong-key, untrusted, or
+//! key-id-mismatched signature is **always** rejected; there is no environment
+//! override (issue #381 retired the mixed-fleet `MX_AGENT_ALLOW_UNSIGNED_RESULTS`
+//! rollout hatch) (Decision D5).
 
 use ed25519_dalek::VerifyingKey;
 use mx_agent_protocol::schema::AgentState;
@@ -24,12 +23,6 @@ use mx_agent_protocol::signing::{self, SignatureError};
 
 use crate::call::verifying_key_from_agent_state;
 use crate::trust::TrustStore;
-
-/// Environment override that downgrades a *missing* result-plane signature to a
-/// logged-accept (default off). Mirrors the `MX_AGENT_REQUIRE_BWRAP`
-/// explicit-gate convention. Removable at the first stable release; it never
-/// accepts an *invalid* signature.
-pub const ALLOW_UNSIGNED_RESULTS_ENV: &str = "MX_AGENT_ALLOW_UNSIGNED_RESULTS";
 
 /// Why a signed result-plane event was rejected on receipt.
 ///
@@ -40,7 +33,7 @@ pub enum ResultVerifyError {
     /// The executor's `AgentState` could not be resolved, or its published key
     /// is missing/malformed/does not match its declared `signing_key_id`.
     UnresolvableKey,
-    /// The event carried no signature and the unsigned-results override is off.
+    /// The event carried no signature; a missing signature is always rejected.
     Unsigned,
     /// The embedded `signature.key_id` did not match the executor's declared
     /// `AgentState.signing_key_id`.
@@ -65,24 +58,6 @@ impl ResultVerifyError {
     }
 }
 
-/// Whether the unsigned-results escape hatch is enabled this run.
-fn allow_unsigned_results() -> bool {
-    std::env::var(ALLOW_UNSIGNED_RESULTS_ENV)
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
-/// Outcome of a successful result-plane verification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifyOutcome {
-    /// The signature was present, valid, key-id-matched, and trusted.
-    Verified,
-    /// The signature was *missing* but accepted because the
-    /// [`ALLOW_UNSIGNED_RESULTS_ENV`] override is set. The caller should log a
-    /// one-per-event warning that an unsigned result was accepted.
-    AcceptedUnsigned,
-}
-
 /// Verify a signed result-plane `event` against the executor's `agent_state`,
 /// applying the full fail-closed policy (Decision D5).
 ///
@@ -98,43 +73,25 @@ pub enum VerifyOutcome {
 ///    anchor the request plane uses — so a key revoked between request and
 ///    response drops the result.
 ///
-/// On a **missing** signature the [`ALLOW_UNSIGNED_RESULTS_ENV`] override
-/// downgrades the result to `Ok(`[`VerifyOutcome::AcceptedUnsigned`]`)` (which
-/// the caller logs); every other failure (invalid, wrong key, untrusted, key-id
-/// mismatch) is **always** rejected regardless of the override. Never logs key
-/// bytes or payloads.
+/// A **missing** signature is always rejected with [`ResultVerifyError::Unsigned`];
+/// every other failure (invalid, wrong key, untrusted, key-id mismatch) is
+/// likewise always rejected. There is no environment override (issue #381 retired
+/// the mixed-fleet `MX_AGENT_ALLOW_UNSIGNED_RESULTS` hatch). Never logs key bytes
+/// or payloads.
 pub fn verify_result_signature<T: serde::Serialize>(
     event: &T,
     agent_state: &AgentState,
     trust: &TrustStore,
-) -> Result<VerifyOutcome, ResultVerifyError> {
-    verify_result_signature_with_policy(event, agent_state, trust, allow_unsigned_results())
-}
-
-/// The result-plane verification policy with the unsigned-results allowance
-/// supplied explicitly, so it is deterministically unit-testable.
-/// [`verify_result_signature`] wraps this with the value read from the
-/// [`ALLOW_UNSIGNED_RESULTS_ENV`] environment override.
-fn verify_result_signature_with_policy<T: serde::Serialize>(
-    event: &T,
-    agent_state: &AgentState,
-    trust: &TrustStore,
-    allow_unsigned: bool,
-) -> Result<VerifyOutcome, ResultVerifyError> {
+) -> Result<(), ResultVerifyError> {
     // 1. Resolve the executor's published, key-id-matched verifying key.
     let verifying_key: VerifyingKey = verifying_key_from_agent_state(agent_state)
         .map_err(|_| ResultVerifyError::UnresolvableKey)?;
 
-    // 2. Verify the detached signature. A missing signature is the only case the
-    //    escape hatch may downgrade; invalid / non-canonical fail closed always.
+    // 2. Verify the detached signature. A missing signature is rejected as
+    //    `Unsigned`; invalid / non-canonical signatures fail closed as `Invalid`.
     match signing::verify_signed(&verifying_key, event) {
         Ok(()) => {}
-        Err(SignatureError::MissingSignature) => {
-            if allow_unsigned {
-                return Ok(VerifyOutcome::AcceptedUnsigned);
-            }
-            return Err(ResultVerifyError::Unsigned);
-        }
+        Err(SignatureError::MissingSignature) => return Err(ResultVerifyError::Unsigned),
         Err(_) => return Err(ResultVerifyError::Invalid),
     }
 
@@ -162,7 +119,7 @@ fn verify_result_signature_with_policy<T: serde::Serialize>(
         return Err(ResultVerifyError::UntrustedKey);
     }
 
-    Ok(VerifyOutcome::Verified)
+    Ok(())
 }
 
 /// Extract the embedded `signature.key_id` from a serializable result event,
@@ -181,7 +138,9 @@ mod tests {
     use super::*;
     use crate::signing::{encode_verifying_key, key_id_for_verifying_key};
     use ed25519_dalek::SigningKey;
-    use mx_agent_protocol::schema::{AgentLoad, AgentWorkspace, ExecFinished};
+    use mx_agent_protocol::schema::{
+        AgentLoad, AgentWorkspace, CallResponse, ExecFinished, ExecRejected,
+    };
     use mx_agent_protocol::signing::sign_into;
 
     const AGENT: &str = "agent:executor";
@@ -253,13 +212,8 @@ mod tests {
     fn verified_when_signed_keyid_matches_and_trusted() {
         let k = key();
         assert_eq!(
-            verify_result_signature_with_policy(
-                &signed_finished(&k),
-                &agent_state(&k),
-                &trusted_store(&k),
-                false
-            ),
-            Ok(VerifyOutcome::Verified)
+            verify_result_signature(&signed_finished(&k), &agent_state(&k), &trusted_store(&k)),
+            Ok(())
         );
     }
 
@@ -267,38 +221,18 @@ mod tests {
     fn missing_signature_rejected_by_default() {
         let k = key();
         assert_eq!(
-            verify_result_signature_with_policy(
-                &finished(),
-                &agent_state(&k),
-                &trusted_store(&k),
-                false
-            ),
+            verify_result_signature(&finished(), &agent_state(&k), &trusted_store(&k)),
             Err(ResultVerifyError::Unsigned)
         );
     }
 
     #[test]
-    fn missing_signature_downgraded_only_when_override_on() {
-        let k = key();
-        assert_eq!(
-            verify_result_signature_with_policy(
-                &finished(),
-                &agent_state(&k),
-                &trusted_store(&k),
-                true
-            ),
-            Ok(VerifyOutcome::AcceptedUnsigned)
-        );
-    }
-
-    #[test]
-    fn tampered_result_rejected_even_with_override() {
+    fn tampered_result_rejected() {
         let k = key();
         let mut ev = signed_finished(&k);
         ev.exit_code = Some(1); // attacker flips success -> failure
-                                // the override never downgrades an *invalid* signature
         assert_eq!(
-            verify_result_signature_with_policy(&ev, &agent_state(&k), &trusted_store(&k), true),
+            verify_result_signature(&ev, &agent_state(&k), &trusted_store(&k)),
             Err(ResultVerifyError::Invalid)
         );
     }
@@ -309,11 +243,10 @@ mod tests {
         let other = SigningKey::from_bytes(&[7u8; 32]);
         // signed by `other`, but agent_state/trust are for `k`
         assert_eq!(
-            verify_result_signature_with_policy(
+            verify_result_signature(
                 &signed_finished(&other),
                 &agent_state(&k),
-                &trusted_store(&k),
-                false
+                &trusted_store(&k)
             ),
             Err(ResultVerifyError::Invalid)
         );
@@ -324,11 +257,10 @@ mod tests {
         let k = key();
         // valid signature + key-id match, but the key is not in the trust store
         assert_eq!(
-            verify_result_signature_with_policy(
+            verify_result_signature(
                 &signed_finished(&k),
                 &agent_state(&k),
-                &TrustStore::default(),
-                false
+                &TrustStore::default()
             ),
             Err(ResultVerifyError::UntrustedKey)
         );
@@ -344,8 +276,86 @@ mod tests {
         v["signature"]["key_id"] = serde_json::json!("mxagent-ed25519:somethingelse");
         let ev: ExecFinished = serde_json::from_value(v).unwrap();
         assert_eq!(
-            verify_result_signature_with_policy(&ev, &agent_state(&k), &trusted_store(&k), false),
+            verify_result_signature(&ev, &agent_state(&k), &trusted_store(&k)),
             Err(ResultVerifyError::KeyIdMismatch)
+        );
+    }
+
+    // --- issue #381 regression tests: MX_AGENT_ALLOW_UNSIGNED_RESULTS hatch retired ---
+
+    #[test]
+    fn env_override_retired_missing_signature_always_rejected() {
+        // issue #381: ALLOW_UNSIGNED_RESULTS_ENV, allow_unsigned_results(), and
+        // VerifyOutcome::AcceptedUnsigned are removed. Even if the (now-retired)
+        // env var is present in the process environment, verify_result_signature
+        // never reads it — a missing signature is always rejected (fail-closed).
+        std::env::set_var("MX_AGENT_ALLOW_UNSIGNED_RESULTS", "1");
+        let k = key();
+        let result = verify_result_signature(&finished(), &agent_state(&k), &trusted_store(&k));
+        std::env::remove_var("MX_AGENT_ALLOW_UNSIGNED_RESULTS");
+        assert_eq!(result, Err(ResultVerifyError::Unsigned));
+    }
+
+    #[test]
+    fn error_reason_labels_are_stable() {
+        // These strings appear in tracing::warn! log lines and are used as
+        // machine-readable reason keys; pin them against accidental rename.
+        assert_eq!(
+            ResultVerifyError::UnresolvableKey.reason(),
+            "unresolvable_executor_key"
+        );
+        assert_eq!(ResultVerifyError::Unsigned.reason(), "unsigned");
+        assert_eq!(ResultVerifyError::KeyIdMismatch.reason(), "key_id_mismatch");
+        assert_eq!(ResultVerifyError::UntrustedKey.reason(), "untrusted_key");
+        assert_eq!(ResultVerifyError::Invalid.reason(), "invalid_signature");
+    }
+
+    #[test]
+    fn unresolvable_key_when_signing_public_key_absent() {
+        // When the executor's AgentState has no signing_public_key the key
+        // cannot be resolved and the event must be rejected.
+        let k = key();
+        let mut state = agent_state(&k);
+        state.signing_public_key = None;
+        assert_eq!(
+            verify_result_signature(&signed_finished(&k), &state, &trusted_store(&k)),
+            Err(ResultVerifyError::UnresolvableKey)
+        );
+    }
+
+    #[test]
+    fn missing_signature_rejected_for_exec_rejected() {
+        // The fail-closed policy applies to every result-plane event type, not
+        // only ExecFinished. ExecRejected is one of the other covered types.
+        let k = key();
+        let ev = ExecRejected {
+            invocation_id: "inv_rej".to_string(),
+            reason: "policy".to_string(),
+            signature: None,
+            extra: Default::default(),
+        };
+        assert_eq!(
+            verify_result_signature(&ev, &agent_state(&k), &trusted_store(&k)),
+            Err(ResultVerifyError::Unsigned)
+        );
+    }
+
+    #[test]
+    fn missing_signature_rejected_for_call_response() {
+        // CallResponse is the result-plane type consumed by call.rs; its
+        // downgrade warn-and-accept branch was also removed by issue #381.
+        let k = key();
+        let response = CallResponse {
+            request_id: "req_1".to_string(),
+            ok: true,
+            result: None,
+            error: None,
+            signature: None,
+            extra: Default::default(),
+        };
+        assert_eq!(
+            verify_result_signature(&response, &agent_state(&k), &trusted_store(&k)),
+            Err(ResultVerifyError::Unsigned)
         );
     }
 }

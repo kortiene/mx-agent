@@ -118,12 +118,11 @@ published, locally-trusted verifying key — mirroring the request plane and
 `ApprovalDecision` (§12), so authority never rests on the homeserver-asserted
 `sender` even against a hostile/compromised homeserver that spoofs it (issue
 #348). Result verification **fails closed** on the Matrix transport: a missing,
-invalid, wrong-key, or untrusted-key signature is dropped and the consumer's wait
-times out. The lone escape hatch `MX_AGENT_ALLOW_UNSIGNED_RESULTS=1` (default off)
-downgrades only a *missing* signature to a logged-accept for a mixed-fleet upgrade
-window; an *invalid* signature is always rejected, and the hatch is removable at
-the first stable release. Loopback / local-IPC results are not signed (no
-untrusted hop and no separate identity to verify).
+invalid, wrong-key, or untrusted-key signature is always dropped and the
+consumer's wait times out — there is no environment override (issue #381 retired
+the mixed-fleet `MX_AGENT_ALLOW_UNSIGNED_RESULTS` rollout hatch). Loopback /
+local-IPC results are not signed (no untrusted hop and no separate identity to
+verify).
 
 ---
 
