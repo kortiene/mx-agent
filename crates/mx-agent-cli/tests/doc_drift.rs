@@ -666,3 +666,30 @@ fn readme_drops_no_resource_caps_claim() {
         "README sandbox row must not claim there are no resource caps (issue #349)"
     );
 }
+
+// ── Issue #377: the task.create/task.update reply now carries a top-level ──────
+// `event_id` audit anchor (issue #367). cli-reference.md must keep documenting it
+// so the docs cannot silently drift back to the bare-`TaskState` wording.
+
+/// `docs/cli-reference.md` must document the `event_id` audit-anchor reply field
+/// for `task create --json` / `task update --json` (the `TaskMutation` shape from
+/// issue #367), and must do so for *both* sections — not just one.
+#[test]
+fn cli_reference_documents_task_event_id_audit_anchor() {
+    // Positive: the field, the audit-anchor framing, and the issue reference are
+    // all present, so a reader can learn the reply is `TaskState` + `event_id`.
+    for needle in ["event_id", "audit anchor", "#367"] {
+        assert!(
+            CLI_REFERENCE.contains(needle),
+            "cli-reference task section must document the event_id audit anchor \
+             ({needle:?} missing) (issue #377)"
+        );
+    }
+    // Both the `task create` and `task update` output paragraphs must carry it,
+    // so a future edit cannot drop one and leave the other to satisfy the guard.
+    assert!(
+        CLI_REFERENCE.matches("audit anchor").count() >= 2,
+        "both task create and task update must document the event_id audit anchor \
+         (issue #377)"
+    );
+}

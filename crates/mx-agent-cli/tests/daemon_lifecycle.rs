@@ -845,3 +845,81 @@ fn task_create_json_surfaces_event_id_anchor() {
 
     let _ = std::fs::remove_dir_all(&runtime_dir);
 }
+
+/// `mx-agent task update --json` surfaces the `#367` `event_id` audit anchor.
+///
+/// Mirrors `task_create_json_surfaces_event_id_anchor` for the update path: a
+/// fake daemon stub returns a canned `TaskMutation` and the test asserts the
+/// CLI's `--json` stdout carries the sentinel `event_id`. Homeserver-free; no
+/// real daemon is started. Issue #377 / #367.
+#[test]
+fn task_update_json_surfaces_event_id_anchor() {
+    use mx_agent_ipc::{read_frame, write_frame, Request, Response};
+    use serde_json::json;
+    use std::os::unix::net::UnixListener;
+
+    let runtime_dir = unique_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("create runtime_dir");
+    let socket_path = runtime_dir.join("daemon.sock");
+
+    let sentinel = "$test_anchor_event_id_update_377:matrix.example.org";
+    let task_mutation = json!({
+        "task_id": "task_test_377",
+        "title": "U",
+        "description": "",
+        "state": "pending",
+        "assigned_to": "",
+        "created_by": "@test:example.org",
+        "depends_on": [],
+        "blocks": [],
+        "invocation_id": null,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "state_rev": 1_u64,
+        "previous_event_id": "$prev:matrix.example.org",
+        "event_id": sentinel,
+    });
+
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+
+    let mutation_clone = task_mutation.clone();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let bytes = read_frame(&mut stream).unwrap().unwrap();
+        let req: Request = serde_json::from_slice(&bytes).unwrap();
+        let resp = Response::result(req.id, mutation_clone);
+        let resp_bytes = serde_json::to_vec(&resp).unwrap();
+        write_frame(&mut stream, &resp_bytes).unwrap();
+    });
+
+    let out = Command::new(BIN)
+        .args([
+            "task",
+            "update",
+            "--room",
+            "!test:matrix.org",
+            "task_test_377",
+            "--json",
+        ])
+        .env("MX_AGENT_RUNTIME_DIR", &runtime_dir)
+        .env("MX_AGENT_LOG", "off")
+        .output()
+        .expect("failed to run mx-agent task update");
+
+    assert!(
+        out.status.success(),
+        "task update --json must succeed against the fake daemon: {out:?}"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"event_id\""),
+        "task update --json stdout must include event_id key: {stdout}"
+    );
+    assert!(
+        stdout.contains(sentinel),
+        "task update --json stdout must contain the sentinel event_id ({sentinel}): {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&runtime_dir);
+}
