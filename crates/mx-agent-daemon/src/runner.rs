@@ -412,6 +412,11 @@ pub(crate) fn restrictions_for(spec: &RunSpec, env: BTreeMap<String, String>) ->
         // consumed by the container backend.
         resources: spec.resources,
         seccomp: spec.seccomp,
+        // The container seccomp profile path is an impure value resolved (and the
+        // profile written) by `build_command` for the container backend on Linux
+        // (issue #380); left `None` here so this stays pure and so the other
+        // backends — which install seccomp by other means — emit no flag.
+        seccomp_profile_path: None,
         run_uid: spec.run_uid,
         run_gid: spec.run_gid,
     }
@@ -490,6 +495,86 @@ pub(crate) fn launcher_wrap(
     Ok(argv)
 }
 
+/// Resolve the OCI seccomp profile path the container backend installs with
+/// `--security-opt seccomp=<path>`, writing the curated default-deny profile to a
+/// daemon-owned file on first need (issue #380).
+///
+/// Returns `None` — so no seccomp flag is emitted — for any non-container backend,
+/// when seccomp is off, or on non-Linux (where seccomp does not exist). For the
+/// container backend with seccomp on it writes the profile under the daemon data
+/// dir (`0644`, owner-write only, readable by the runtime process — rootless
+/// podman runs as the invoking uid) and returns its path. The file is rewritten
+/// each call so a stale or missing profile self-heals. Mirrors how `run_uid` is an
+/// impure value the runner resolves and [`Sandbox::prepare`] then reads purely.
+#[cfg(target_os = "linux")]
+pub(crate) fn container_seccomp_profile_path(spec: &RunSpec) -> Result<Option<PathBuf>, RunError> {
+    if spec.sandbox != Backend::Container || !spec.seccomp.is_on() {
+        return Ok(None);
+    }
+    let paths = crate::session::SessionPaths::resolve();
+    paths.ensure_data_dir().map_err(RunError::Spawn)?;
+    let path = mx_agent_sandbox::seccomp::write_default_profile(&paths.data_dir)
+        .map_err(|e| RunError::Spawn(std::io::Error::other(e.to_string())))?;
+    Ok(Some(path))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn container_seccomp_profile_path(_spec: &RunSpec) -> Result<Option<PathBuf>, RunError> {
+    Ok(None)
+}
+
+/// Inject `bwrap --seccomp <fd>` for the bubblewrap+seccomp path (issue #380),
+/// returning the (possibly rewritten) argv and the non-`CLOEXEC` fd holding the
+/// compiled BPF program.
+///
+/// The caller **must** keep the returned fd open until after `Command::spawn()`,
+/// so the child inherits it: `bwrap` reads the program from the fd and installs the
+/// filter after its own namespace setup, just before `exec` of the target. A no-op
+/// — returns the argv unchanged and `None` — for any non-bubblewrap backend, when
+/// seccomp is off, or on non-Linux.
+///
+/// The fd is an anonymous `memfd` created **without** `MemfdFlags::CLOEXEC`, so it
+/// survives the daemon→`__sandbox-exec` launcher spawn and the launcher→`bwrap`
+/// `exec` (both preserve non-`CLOEXEC` fds, and Tokio inherits them into the
+/// child). Only safe APIs are used, preserving the workspace `forbid(unsafe)`.
+#[cfg(target_os = "linux")]
+pub(crate) fn inject_bubblewrap_seccomp(
+    spec: &RunSpec,
+    argv: Vec<String>,
+) -> Result<(Vec<String>, Option<std::os::fd::OwnedFd>), RunError> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::os::fd::{AsRawFd as _, OwnedFd};
+
+    if spec.sandbox != Backend::Bubblewrap || !spec.seccomp.is_on() {
+        return Ok((argv, None));
+    }
+
+    let program = mx_agent_sandbox::seccomp::default_bpf_program()
+        .map_err(|e| RunError::Spawn(std::io::Error::other(e.to_string())))?;
+    let bytes = mx_agent_sandbox::seccomp::serialize_bpf_program(&program);
+
+    // Anonymous fd WITHOUT MemfdFlags::CLOEXEC so it survives the exec chain.
+    let memfd: OwnedFd =
+        rustix::fs::memfd_create("mx-agent-seccomp", rustix::fs::MemfdFlags::empty())
+            .map_err(|e| RunError::Spawn(std::io::Error::from(e)))?;
+    // Write the program and rewind: `bwrap` reads from the fd's current offset.
+    let mut file = std::fs::File::from(memfd);
+    file.write_all(&bytes).map_err(RunError::Spawn)?;
+    file.seek(SeekFrom::Start(0)).map_err(RunError::Spawn)?;
+    let memfd: OwnedFd = file.into();
+
+    let argv = mx_agent_sandbox::bubblewrap_with_seccomp_fd(argv, memfd.as_raw_fd());
+    Ok((argv, Some(memfd)))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn inject_bubblewrap_seccomp(
+    _spec: &RunSpec,
+    argv: Vec<String>,
+) -> Result<(Vec<String>, Option<std::os::fd::OwnedFd>), RunError> {
+    Ok((argv, None))
+}
+
 /// Build a configured [`Command`] from a [`RunSpec`].
 ///
 /// Validates the argv and cwd, applies the sanitized environment, sets the
@@ -498,9 +583,17 @@ pub(crate) fn launcher_wrap(
 /// spec carries input bytes (so they can be written and the pipe closed),
 /// otherwise it is connected to `/dev/null` for the non-interactive path.
 ///
+/// Returns the [`Command`] plus an optional seccomp fd guard: on the
+/// bubblewrap+seccomp path (Linux) it is the non-`CLOEXEC` fd holding the BPF
+/// program that `bwrap --seccomp` reads, which the caller must keep alive until
+/// after `spawn()` so the child inherits it (issue #380); `None` on every other
+/// path.
+///
 /// Kept separate from [`run`] so the command construction is testable without
 /// actually waiting on a child.
-pub(crate) fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
+pub(crate) fn build_command(
+    spec: &RunSpec,
+) -> Result<(Command, Option<std::os::fd::OwnedFd>), RunError> {
     if spec.command.is_empty() {
         return Err(RunError::EmptyCommand);
     }
@@ -523,13 +616,20 @@ pub(crate) fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
     // and returns the argv to actually spawn plus the controls to enforce. The
     // baseline `none` backend returns both unchanged; stronger backends rewrite
     // the argv to launch the command inside their wrapper.
-    let restrictions = restrictions_for(spec, env);
+    let mut restrictions = restrictions_for(spec, env);
+    // Container backend (Linux): write the OCI seccomp profile and point the
+    // backend at it so `prepare` emits `--security-opt seccomp=<path>` (issue #380).
+    restrictions.seccomp_profile_path = container_seccomp_profile_path(spec)?;
     let prepared = resolve_sandbox(spec).prepare(spec.command.clone(), restrictions);
+    // Bubblewrap backend (Linux): inject `bwrap --seccomp <fd>` into the *bare*
+    // bwrap argv before `launcher_wrap`, so the resource launcher (if any) carries
+    // it verbatim; the returned fd is held until after spawn (issue #380).
+    let (prepared_argv, seccomp_fd) = inject_bubblewrap_seccomp(spec, prepared.argv)?;
     // For the `none`/`bubblewrap` paths, wrap the prepared argv in the self-re-exec
     // launcher when a resource cap (or, on the `none` path, seccomp) must be
     // enforced — there is no runtime to do it for them and `pre_exec` is `unsafe`
     // (issue #349). The container backend enforces caps via its own `run` flags.
-    let argv = launcher_wrap(spec, prepared.argv)?;
+    let argv = launcher_wrap(spec, prepared_argv)?;
     let (program, args) = argv.split_first().ok_or(RunError::EmptyCommand)?;
     let Restrictions { cwd, env, .. } = prepared.restrictions;
 
@@ -557,7 +657,7 @@ pub(crate) fn build_command(spec: &RunSpec) -> Result<Command, RunError> {
     #[cfg(unix)]
     command.process_group(0);
 
-    Ok(command)
+    Ok((command, seccomp_fd))
 }
 
 /// Whether `path` exists and is a directory.
@@ -577,8 +677,11 @@ fn is_existing_dir(path: &Path) -> bool {
 pub async fn run(spec: &RunSpec) -> Result<RunOutput, RunError> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let mut command = build_command(spec)?;
+    let (mut command, seccomp_fd) = build_command(spec)?;
     let mut child = command.spawn().map_err(RunError::Spawn)?;
+    // The child inherited the bwrap seccomp fd (if any) at fork; release the
+    // parent's copy now that spawn has returned (issue #380).
+    drop(seccomp_fd);
     // Capture the pid up front: once the child exits we still want it to signal
     // the (now possibly-orphaned) process group, and after `wait` the handle no
     // longer reports an id.
@@ -1382,7 +1485,7 @@ mod tests {
         // command spawns a long-lived grandchild and prints its pid, then
         // sleeps. Signalling the whole group must tear the grandchild down too
         // rather than leave it orphaned.
-        let mut child = build_command(&RunSpec {
+        let (mut command, _seccomp_fd) = build_command(&RunSpec {
             command: vec![
                 "sh".to_string(),
                 "-c".to_string(),
@@ -1391,9 +1494,8 @@ mod tests {
             cwd: std::env::temp_dir(),
             ..RunSpec::default()
         })
-        .expect("builds")
-        .spawn()
-        .expect("spawns");
+        .expect("builds");
+        let mut child = command.spawn().expect("spawns");
 
         // The child leads its own process group (id == its pid).
         let pid = child.id().expect("running child has a pid");
@@ -1883,5 +1985,126 @@ mod tests {
         let r = restrictions_for(&spec, BTreeMap::new());
         assert_eq!(r.run_uid, Some(500), "run_uid must thread through");
         assert_eq!(r.run_gid, None, "run_gid must pass through as None");
+    }
+
+    // --- seccomp wiring: pure early-exit guards (issue #380) -------------------
+
+    #[test]
+    fn restrictions_for_seccomp_profile_path_is_always_none() {
+        // The pure `restrictions_for` must always return `seccomp_profile_path =
+        // None` regardless of the backend or seccomp mode: the OCI profile path is
+        // an impure value resolved by `build_command` for the container backend on
+        // Linux (issue #380); leaving it None here is the purity invariant.
+        for (sandbox, seccomp) in [
+            (Backend::None, mx_agent_sandbox::SeccompMode::Default),
+            (Backend::Bubblewrap, mx_agent_sandbox::SeccompMode::Default),
+            (Backend::Container, mx_agent_sandbox::SeccompMode::Default),
+            (Backend::Container, mx_agent_sandbox::SeccompMode::Off),
+        ] {
+            let spec = RunSpec {
+                command: vec!["true".to_string()],
+                cwd: std::env::temp_dir(),
+                sandbox,
+                seccomp,
+                ..RunSpec::default()
+            };
+            let r = restrictions_for(&spec, BTreeMap::new());
+            assert!(
+                r.seccomp_profile_path.is_none(),
+                "restrictions_for must always return seccomp_profile_path=None \
+                 (backend={sandbox:?}, seccomp={seccomp:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn container_seccomp_profile_path_returns_none_for_non_container() {
+        // `container_seccomp_profile_path` must short-circuit to `Ok(None)`
+        // for any non-container backend — no filesystem access, no Linux-only
+        // code is reached. Ensures the function has correct early-exit coverage
+        // on every backend (issue #380).
+        for sandbox in [Backend::None, Backend::Bubblewrap] {
+            let spec = RunSpec {
+                command: vec!["true".to_string()],
+                cwd: std::env::temp_dir(),
+                sandbox,
+                seccomp: mx_agent_sandbox::SeccompMode::Default,
+                ..RunSpec::default()
+            };
+            let result = container_seccomp_profile_path(&spec).expect("early exit succeeds");
+            assert!(
+                result.is_none(),
+                "non-container backend must yield None (backend={sandbox:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn container_seccomp_profile_path_returns_none_when_seccomp_off() {
+        // When `seccomp = Off` the function must return `Ok(None)` even for the
+        // container backend — nothing is written and no `--security-opt seccomp=`
+        // is ever emitted (issue #380).
+        let spec = RunSpec {
+            command: vec!["true".to_string()],
+            cwd: std::env::temp_dir(),
+            sandbox: Backend::Container,
+            seccomp: mx_agent_sandbox::SeccompMode::Off,
+            ..RunSpec::default()
+        };
+        let result = container_seccomp_profile_path(&spec).expect("early exit succeeds");
+        assert!(
+            result.is_none(),
+            "seccomp=Off must yield None for the container backend"
+        );
+    }
+
+    #[test]
+    fn inject_bubblewrap_seccomp_passthrough_for_non_bubblewrap() {
+        // For the `none` and `container` backends `inject_bubblewrap_seccomp`
+        // must return the argv unchanged and no fd — the function's early exit
+        // must not modify the argv or open any fd for non-bwrap backends, even
+        // when seccomp is on (issue #380).
+        let cmd = vec!["echo".to_string(), "hi".to_string()];
+        for sandbox in [Backend::None, Backend::Container] {
+            let spec = RunSpec {
+                command: cmd.clone(),
+                cwd: std::env::temp_dir(),
+                sandbox,
+                seccomp: mx_agent_sandbox::SeccompMode::Default,
+                ..RunSpec::default()
+            };
+            let (returned_argv, fd) =
+                inject_bubblewrap_seccomp(&spec, cmd.clone()).expect("early exit succeeds");
+            assert_eq!(
+                returned_argv, cmd,
+                "argv must be returned unchanged for non-bwrap backend ({sandbox:?})"
+            );
+            assert!(
+                fd.is_none(),
+                "no fd must be opened for non-bwrap backend ({sandbox:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_bubblewrap_seccomp_passthrough_when_seccomp_off() {
+        // Even on the bubblewrap backend, `inject_bubblewrap_seccomp` must be a
+        // no-op when `seccomp = Off`: the argv is returned unchanged and no fd is
+        // opened (issue #380).
+        let cmd = vec!["bwrap".to_string(), "--".to_string(), "echo".to_string()];
+        let spec = RunSpec {
+            command: cmd.clone(),
+            cwd: std::env::temp_dir(),
+            sandbox: Backend::Bubblewrap,
+            seccomp: mx_agent_sandbox::SeccompMode::Off,
+            ..RunSpec::default()
+        };
+        let (returned_argv, fd) =
+            inject_bubblewrap_seccomp(&spec, cmd.clone()).expect("early exit succeeds");
+        assert_eq!(
+            returned_argv, cmd,
+            "argv must be unchanged when seccomp is off"
+        );
+        assert!(fd.is_none(), "no fd must be opened when seccomp is off");
     }
 }

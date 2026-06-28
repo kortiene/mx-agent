@@ -33,7 +33,8 @@ use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 use rustix::termios::{tcgetwinsize, tcsetwinsize, Winsize};
 
 use crate::runner::{
-    launcher_wrap, resolve_sandbox, restrictions_for, sanitize_env, RunError, RunSpec,
+    container_seccomp_profile_path, inject_bubblewrap_seccomp, launcher_wrap, resolve_sandbox,
+    restrictions_for, sanitize_env, RunError, RunSpec,
 };
 
 /// A terminal window size: character grid plus optional pixel dimensions.
@@ -183,11 +184,20 @@ impl PtySession {
         // inside the container. The `none`/`bubblewrap` backends inherit the
         // parent's PTY slave directly and ignore this flag.
         restrictions.interactive = true;
+        // Container backend (Linux): write the OCI seccomp profile and point the
+        // backend at it so `prepare` emits `--security-opt seccomp=<path>` (issue
+        // #380); `None` on every other path.
+        restrictions.seccomp_profile_path = container_seccomp_profile_path(spec)?;
         let prepared = resolve_sandbox(spec).prepare(spec.command.clone(), restrictions);
+        // Bubblewrap backend (Linux): inject `bwrap --seccomp <fd>` into the bare
+        // bwrap argv before `launcher_wrap` (issue #380). The returned fd must stay
+        // open until after `spawn()` below so the child inherits it; it is dropped
+        // when this function returns.
+        let (prepared_argv, _seccomp_fd) = inject_bubblewrap_seccomp(spec, prepared.argv)?;
         // Resource caps confine the interactive session too: wrap the prepared
         // argv in the launcher trampoline for the `none`/`bubblewrap` paths when a
         // cap (or seccomp, on the `none` path) is set (issue #349).
-        let argv = launcher_wrap(spec, prepared.argv)?;
+        let argv = launcher_wrap(spec, prepared_argv)?;
         let (program, args) = argv.split_first().ok_or(RunError::EmptyCommand)?;
         let Restrictions { cwd, env, .. } = prepared.restrictions;
         let mut command = Command::new(program);

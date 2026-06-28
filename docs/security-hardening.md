@@ -66,6 +66,7 @@ doing that deliberately rather than by accident.
 | Token / key files | `0600`, dirs `0700` | loosening file modes |
 | IPC socket | `0600`, peer-UID checked | exposing the socket directory |
 | Workspace power levels | per-event-type PL 50, `state_default` 100, joiners PL 0 | lowering `state_default`, or a wide `events_default` |
+| Syscall filtering (Linux) | `seccomp = "off"` (default — no disruption to existing commands) | `seccomp = "default"` is the opt-in curated default-deny profile (recommended on Linux as defence-in-depth; fail-closed, `ERRNO(EPERM)`) |
 
 The single most important fact: **with no `policy.toml`, the engine denies every
 *remote* `exec` and `call`.** You opt into remote-execution risk explicitly, never
@@ -500,7 +501,7 @@ network = "deny"
 | `max_processes` | none | Process-count cap (`RLIMIT_NPROC` on host paths, `--pids-limit` on containers). Unset ⇒ uncapped. Recommended starting point: `256`. |
 | `max_memory_bytes` | none | Address-space cap in bytes (`RLIMIT_AS` / `--memory`). Unset ⇒ uncapped. Recommended: `2147483648` (2 GiB). |
 | `max_cpu_seconds` | none | Total CPU-seconds cap (`RLIMIT_CPU` / `--ulimit cpu`). Distinct from wall-clock `max_runtime_ms`. Unset ⇒ uncapped. Recommended: `120`. |
-| `seccomp` | `"off"` | Syscall-filtering mode: `"off"` (default) or `"default"` (opt-in curated default-deny profile, Linux-only; BPF profile installation is a documented follow-up — selecting `"default"` today logs a loud enforcement-pending warning rather than silently leaving the command unfiltered). |
+| `seccomp` | `"off"` | Syscall-filtering mode: `"off"` (default) or `"default"` (opt-in curated default-deny profile, Linux-only). Selecting `"default"` installs the curated default-deny BPF profile (default action `ERRNO(EPERM)`) on every backend — in-process on `none`, `bwrap --seccomp <fd>` on bubblewrap, `--security-opt seccomp=<path>` on containers; fail-closed; a documented no-op on macOS (issue #380). |
 | `require_sandbox` | `false` | Deny any execution that resolves to the `none` backend, fail-closed (`deny:sandbox_required`). Set `true` in environments where falling back to zero isolation is unacceptable. |
 
 `[rooms."<room>"]`:
@@ -603,15 +604,18 @@ points: `max_processes = 256`, `max_memory_bytes = 2 GiB`, `max_cpu_seconds = 12
 For exact process capping prefer a container backend (`--pids-limit` is cgroup-
 enforced); on macOS `RLIMIT_NPROC` is skipped.
 
-**Syscall filtering (seccomp, issue #349).** `execution.seccomp` selects `"off"`
-(default) or a curated default-deny `"default"` profile (Linux-only, agent
+**Syscall filtering (seccomp, issues #349, #380).** `execution.seccomp` selects
+`"off"` (default) or a curated default-deny `"default"` profile (Linux-only, agent
 override available). It ships **off by default** so deployments do not suddenly
-`EPERM` syscalls their commands rely on. The mode threads end to end through the
-launcher; installing the default-deny BPF profile (in-process for `none`, via
-`bwrap --seccomp` / container `--security-opt seccomp=`) is a documented follow-up
-(the allowlist breadth and the `bwrap --seccomp` byte format are open questions
-pending a real-Linux acceptance test), so selecting `"default"` today logs a loud
-"enforcement pending" notice rather than silently leaving the command unfiltered.
+`EPERM` syscalls their commands rely on. When `"default"` is selected the
+default-deny BPF profile is installed on every backend (issue #380): in-process via
+the safe `seccompiler::apply_filter` just before `exec` on `none`, via
+`bwrap --seccomp <fd>` on bubblewrap, and via `--security-opt seccomp=<path>` on
+containers. The default action is `ERRNO(EPERM)` (not `KILL`), so a too-strict
+allowlist degrades to a recoverable failure; the install is **fail-closed** (a
+build/apply failure refuses to run the command unfiltered rather than silently
+leaving it unconfined). The allowlist is a single source of truth modeled on the
+Docker/Podman default, broad enough for the real build/test corpus.
 
 **Require a sandbox (issue #349).** When an authorized execution resolves to the
 `none` backend the daemon emits a prominent warning naming the room / requester /
@@ -623,9 +627,10 @@ namespace (`--unshare-user`, so it is not the daemon's privileged identity) and
 drops all capabilities; containers block privilege escalation
 (`no-new-privileges`), run as the daemon's identity, and `--cap-drop ALL`.
 Resource caps mitigate host exhaustion but do not defend against a kernel
-vulnerability, and the default-deny seccomp profile installation is still pending
-(see above). For the strongest isolation, prefer a container backend, set the
-resource caps, and consider `require_sandbox = true`.
+vulnerability; the opt-in default-deny seccomp profile (see above) narrows the
+kernel attack surface as defence-in-depth on top of that isolation. For the
+strongest isolation, prefer a container backend, set the resource caps, enable
+`seccomp = "default"`, and consider `require_sandbox = true`.
 
 > **Safe vs unsafe:** `sandbox = "bubblewrap"` (or a container) + `network =
 > "deny"` + tight `writable_paths` is the safe baseline. `sandbox = "none"`,
@@ -719,6 +724,7 @@ the rest of the daemon's private state.
 - [ ] Non-daemon approvers added to `approvers` in `policy.toml` **only after** running `trust approve` for each; `approvers` is necessary-not-sufficient — an approver still needs a locally-trusted signing key (issue #309).
 - [ ] `default_sandbox` set to `bubblewrap`/`docker`/`podman`; `none` avoided.
 - [ ] `execution.require_sandbox = true` in environments where resolving to `none` is unacceptable.
+- [ ] `seccomp = "default"` (Linux) considered to add syscall filtering as defence-in-depth; ships off by default so existing commands are not disrupted — opt in once validated against your command corpus.
 - [ ] `network = "deny"` except where a command genuinely needs it.
 - [ ] `writable_paths` minimal; secrets kept out of `read_only_paths` too.
 - [ ] `env_allowlist` short; rely on the built-in secret scrub.

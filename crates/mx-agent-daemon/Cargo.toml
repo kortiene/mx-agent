@@ -22,7 +22,11 @@ serde_json = { workspace = true }
 # signing-key creation so a CLI-local `auth login` cannot lost-update a running
 # daemon's data dir (issue #269). It composes with the workspace feature set.
 nix = { workspace = true, features = ["fs"] }
-rustix = { workspace = true }
+# `fs` gates `rustix::fs::memfd_create`, used on the bubblewrap+seccomp path to
+# write the compiled BPF program to a non-`CLOEXEC` anonymous fd that `bwrap
+# --seccomp <fd>` reads and installs after its own namespace setup (issue #380).
+# It composes with the workspace `pty`/`termios` features.
+rustix = { workspace = true, features = ["fs"] }
 signal-hook = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }

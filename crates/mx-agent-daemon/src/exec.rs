@@ -1952,8 +1952,11 @@ async fn run_controlled_exec(
         run_gid,
         ..Default::default()
     };
-    let mut command = build_command(&spec)?;
+    let (mut command, seccomp_fd) = build_command(&spec)?;
     let mut child = command.spawn().map_err(crate::runner::RunError::Spawn)?;
+    // The child inherited the bwrap seccomp fd (if any) at fork; release the
+    // parent's copy now that spawn has returned (issue #380).
+    drop(seccomp_fd);
     let pid = child.id();
     // Register the child's process group so a daemon shutdown/force-kill can reap
     // it instead of orphaning it (issue #316). Dropped when this function returns
