@@ -1695,10 +1695,14 @@ Daemon behavior:
   existing `exec.accepted` instead of spawning a second child.
 - Persist invocation state before starting local child process.
 - On restart, reconcile running child processes and Matrix invocation state. The
-  daemon records each in-flight `exec` child's process group in a `0600`
-  `live-pgids` sidecar and reaps any groups left alive by a previous run on the
-  next startup (and on `daemon stop`'s force-kill escalation), so a crash or
-  SIGKILL does not orphan children.
+  daemon records each in-flight `exec` child's process group (with its spawn time)
+  in a `0600` `live-pgids` sidecar and reaps any groups left alive by a previous
+  run on the next startup (and on `daemon stop`'s force-kill escalation), so a
+  crash or SIGKILL does not orphan children. Before signaling on the restart path,
+  the janitor verifies each live group leader's OS-reported start time against the
+  recorded spawn time and skips (fails closed) on a mismatch or when the start time
+  cannot be determined — so a pgid the OS recycled onto an unrelated same-uid
+  process during the daemon's downtime is not killed.
 
 ### 11.3 Reconnect and Recovery
 
@@ -1724,7 +1728,7 @@ On daemon startup or reconnect:
 | Target agent offline | request remains pending until timeout or is rejected by caller policy |
 | Homeserver rate limit | the daemon's `/sync` loop honors the homeserver's `Retry-After` (HTTP 429 / `M_LIMIT_EXCEEDED`) to size its backoff — clamped to a ceiling so a hostile/misconfigured server cannot wedge it, and interruptible so `daemon stop` still wakes promptly; `daemon status` shows the rate-limited pause. matrix-sdk additionally retries individual rate-limited requests (bounded `max_retry_time`) honoring `retry_after_ms`. The per-invocation stream rate cap and large-output artifact offload are **static** and are not driven by sync 429s (see §8.4 future work). |
 | Missing stream chunk | receiver buffers then marks degraded or fails in strict mode |
-| Daemon crashes while child runs | no child supervisor runs between crashes; the live-pgid sidecar lets the restart janitor reap orphaned process groups on next startup or `daemon stop` |
+| Daemon crashes while child runs | no child supervisor runs between crashes; the live-pgid sidecar lets the restart janitor reap orphaned process groups on next startup or `daemon stop`. The restart janitor first confirms each live group leader's OS-reported start time matches the recorded spawn time and fails closed (skips the kill) on a mismatch, so a pgid recycled onto an innocent same-uid process during downtime is spared |
 | Request arrives after expiry | target rejects without execution |
 | E2EE decryption fails | event ignored or marked undecryptable; no execution |
 | Policy changes during run | new requests use new policy; running invocations follow configured behavior |

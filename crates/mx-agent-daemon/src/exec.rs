@@ -130,17 +130,22 @@ fn admit_control_nonce(control: &LiveExecControl, nonce: &str) -> bool {
         .insert(nonce.to_string())
 }
 
-/// A live exec child's process-group id plus a cheap liveness discriminator.
+/// A live exec child's process-group id plus a start-time identity discriminator.
 ///
 /// The pgid equals the child's pid (children are spawned in their own process
 /// group; see [`crate::runner::build_command`]). `started_unix` records when the
-/// child was spawned so a reaper has a discriminator against the pgid-reuse
-/// race (a pgid could be recycled by an unrelated process after the child dies).
+/// child was spawned so a reaper can distinguish the recorded child from a
+/// pgid-reuse impostor: between a daemon crash and the next boot the OS can
+/// recycle a recorded pgid onto an unrelated same-uid process. The restart
+/// janitor [`reap_orphaned_live_exec_children`] consults it — comparing it
+/// against the live leader's OS-reported start time — before signaling.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct LivePgid {
     /// Process-group id (== child pid) to signal with `killpg`.
     pgid: u32,
-    /// Spawn time in Unix seconds (liveness discriminator / forensics).
+    /// Spawn time in wall-clock Unix seconds. The restart janitor compares this
+    /// against the live group leader's OS-reported start time to defend against
+    /// the pgid-reuse race (see [`pgid_leader_matches_record`]).
     started_unix: u64,
 }
 
@@ -264,6 +269,82 @@ fn process_group_alive(pgid: u32) -> bool {
     )
 }
 
+/// Parse a `ps -o etime=` elapsed-time string (`[[DD-]HH:]MM:SS`) into whole
+/// seconds. Returns `None` on any shape `ps` would not produce.
+///
+/// `ps` renders process age as `MM:SS`, `HH:MM:SS`, or `DD-HH:MM:SS`; the field
+/// is portable across Linux (procps) and macOS (BSD ps), unlike the Linux-only
+/// `etimes` raw-seconds keyword.
+fn parse_etime_seconds(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    let (days, hms) = match raw.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, raw),
+    };
+    let mut it = hms.split(':').rev(); // ss, mm, [hh]
+    let secs = it.next()?.parse::<u64>().ok()?;
+    let mins = it.next()?.parse::<u64>().ok()?;
+    let hours = match it.next() {
+        Some(h) => h.parse::<u64>().ok()?,
+        None => 0,
+    };
+    if it.next().is_some() {
+        return None; // more than 3 colon-separated fields → not an etime
+    }
+    if secs >= 60 || mins >= 60 {
+        return None; // reject malformed components
+    }
+    Some(days * 86_400 + hours * 3_600 + mins * 60 + secs)
+}
+
+/// The OS-reported start time of `pid` in wall-clock Unix seconds, or `None`
+/// when it cannot be determined (process gone, `ps` unavailable/failed, or
+/// unparseable output). Derived as `now - elapsed` from `ps -o etime=`.
+///
+/// Comparable to [`LivePgid::started_unix`] (also wall-clock seconds). Used by
+/// the restart janitor to defend against the pgid-reuse race: a recycled pgid
+/// belongs to a *recently* started process, whose derived start time will be far
+/// from the recorded child's. `now - elapsed` (rather than a parsed absolute
+/// `lstart`) keeps the derived start ≈ the true start regardless of how long the
+/// daemon was down or how long the janitor takes, and needs no date parser.
+#[cfg(unix)]
+fn process_start_unix(pid: u32) -> Option<u64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // pid gone, or ps refused
+    }
+    let elapsed = parse_etime_seconds(std::str::from_utf8(&out.stdout).ok()?)?;
+    // `saturating_sub` guards the (impossible-in-practice) case where the system
+    // clock moved backward between the child's spawn and this call.
+    Some(now_unix().saturating_sub(elapsed))
+}
+
+/// Wall-clock-second slack allowed between a recorded child's `started_unix` and
+/// the OS-reported start time of its pgid leader.
+///
+/// Absorbs measurement skew only: `started_unix` is stamped on the parent side
+/// just *after* fork, while `ps` reports `etime` truncated to whole seconds, so
+/// the two can differ by ~1–2s. It need not (and must not) absorb the orphan's
+/// *age*: we compare start *times*, not ages, so a long-lived orphan still
+/// matches. A recycled pgid's leader started long after the crash, far outside
+/// this window, so it is rejected.
+const PGID_START_TOLERANCE_SECS: u64 = 5;
+
+/// Whether the live group leader `rec.pgid` is the child we recorded — i.e. its
+/// OS start time matches `rec.started_unix` within [`PGID_START_TOLERANCE_SECS`].
+/// Fails closed (`false`) when the start time cannot be established, so the
+/// restart janitor never signals a process whose identity it could not confirm.
+#[cfg(unix)]
+fn pgid_leader_matches_record(rec: &LivePgid) -> bool {
+    match process_start_unix(rec.pgid) {
+        Some(started) => started.abs_diff(rec.started_unix) <= PGID_START_TOLERANCE_SECS,
+        None => false, // fail closed: cannot confirm identity → do not signal
+    }
+}
+
 /// Terminate every live exec child process group registered in *this* process,
 /// SIGTERM then SIGKILL after `grace`, for the graceful daemon-shutdown path
 /// (issue #316).
@@ -310,13 +391,22 @@ pub fn kill_persisted_live_exec_children(paths: &crate::SessionPaths) {
 }
 
 /// Restart janitor: reap any exec child process groups left alive by a previous
-/// daemon run, then clear the sidecar (issue #316).
+/// daemon run, then clear the sidecar (issue #316, identity-gated in issue #379).
 ///
-/// Best-effort and reconcile-first: it only signals a recorded pgid whose group
-/// leader is still alive, accepting the documented pgid-reuse caveat (a recycled
-/// pgid could belong to an unrelated process). The authoritative teardown is the
-/// graceful in-process path ([`terminate_live_exec_children`]); this only mops up
-/// after a crash or force-kill.
+/// Best-effort and reconcile-first. Before signaling a recorded pgid it confirms
+/// the live group leader is actually the child we recorded — comparing the
+/// leader's OS-reported start time against `rec.started_unix` (see
+/// [`pgid_leader_matches_record`]) — and **fails closed** (skips the kill) on a
+/// mismatch or when the start time cannot be established. This defends against
+/// the pgid-reuse race: between a daemon crash and this boot the OS can recycle a
+/// recorded pgid onto an unrelated same-uid process, and an unconditional
+/// `SIGKILL` would be a local self-inflicted DoS on that innocent group. The
+/// authoritative teardown is the graceful in-process path
+/// ([`terminate_live_exec_children`]); this only mops up after a crash or
+/// force-kill. (The `daemon stop` SIGKILL-escalation path,
+/// [`kill_persisted_live_exec_children`], deliberately keeps no identity check —
+/// the daemon is force-killed in the same breath, so its reuse window is
+/// negligible.)
 pub fn reap_orphaned_live_exec_children(paths: &crate::SessionPaths) {
     let records = load_live_pgids(paths);
     if records.is_empty() {
@@ -328,10 +418,30 @@ pub fn reap_orphaned_live_exec_children(paths: &crate::SessionPaths) {
     );
     for rec in &records {
         #[cfg(unix)]
-        if process_group_alive(rec.pgid) {
-            kill_process_group(rec.pgid);
+        {
+            // Cheap liveness probe first: avoids spawning `ps` for already-dead
+            // groups, the common boot case.
+            if !process_group_alive(rec.pgid) {
+                continue; // leader already gone; nothing to reap
+            }
+            // Identity gate: only the recorded child, never a pgid-reuse impostor.
+            if pgid_leader_matches_record(rec) {
+                kill_process_group(rec.pgid);
+            } else {
+                tracing::warn!(
+                    pgid = rec.pgid,
+                    started_unix = rec.started_unix,
+                    "skipping reap of live pgid: leader identity does not match \
+                     the recorded child (possible pgid reuse); failing closed"
+                );
+            }
         }
     }
+    // Clear unconditionally (matching today): the sidecar is a snapshot of the
+    // *previous* run's in-flight children; once the janitor has decided what to
+    // reap, those records are spent. A skipped impostor record is intentionally
+    // dropped — re-attempting it on a later boot would only re-risk the same
+    // innocent kill.
     clear_live_pgids_file(paths);
 }
 
@@ -4354,6 +4464,450 @@ allow_cwd = ["/home/me/code/project"]
         assert!(
             load_live_pgids(&paths).is_empty(),
             "live-pgids sidecar must be cleared after kill_persisted_live_exec_children"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Issue #379: restart-janitor identity gate (`started_unix`) ──────────────
+
+    /// `parse_etime_seconds` decodes every shape `ps -o etime=` emits and rejects
+    /// anything else, so `process_start_unix` cannot derive a bogus start time
+    /// (issue #379).
+    #[test]
+    fn parse_etime_seconds_handles_all_ps_shapes_and_rejects_garbage() {
+        // MM:SS
+        assert_eq!(parse_etime_seconds("00:00"), Some(0));
+        assert_eq!(parse_etime_seconds("05:42"), Some(342));
+        assert_eq!(parse_etime_seconds("00:59"), Some(59));
+        // HH:MM:SS
+        assert_eq!(parse_etime_seconds("01:02:03"), Some(3723));
+        // DD-HH:MM:SS (the value observed on the target host)
+        assert_eq!(
+            parse_etime_seconds("23-14:41:54"),
+            Some(23 * 86_400 + 14 * 3_600 + 41 * 60 + 54)
+        );
+        // Whitespace tolerance: `ps` right-pads the field.
+        assert_eq!(parse_etime_seconds("  05:42  "), Some(342));
+        assert_eq!(parse_etime_seconds("01:02:03\n"), Some(3723));
+
+        // Malformed → None.
+        assert_eq!(parse_etime_seconds(""), None);
+        assert_eq!(parse_etime_seconds("abc"), None);
+        assert_eq!(parse_etime_seconds("1:2:3:4"), None); // too many fields
+        assert_eq!(parse_etime_seconds("99:99"), None); // minutes out of range
+        assert_eq!(parse_etime_seconds("00:99"), None); // seconds out of range
+        assert_eq!(parse_etime_seconds("x-01:02:03"), None); // non-numeric days
+    }
+
+    /// `process_start_unix` reports a plausible start time for a live pid and
+    /// fails closed (`None`) for a reaped one (issue #379).
+    #[test]
+    #[cfg(unix)]
+    fn process_start_unix_reports_live_pid_and_fails_closed_on_dead() {
+        use std::process::Command;
+
+        // The test process is young; its derived start time must be in the past
+        // and within a sane bound (one hour) of now.
+        let now = now_unix();
+        let started = process_start_unix(std::process::id())
+            .expect("ps must report a start time for the running test process");
+        assert!(
+            started <= now,
+            "derived start ({started}) must not be in the future (now={now})"
+        );
+        assert!(
+            now - started <= 3_600,
+            "derived start ({started}) must be within the last hour (now={now})"
+        );
+
+        // A reaped pid (spawn `true`, wait it) must fail closed: `ps` exits
+        // non-zero for a pid that no longer exists.
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let gone_pid = child.id();
+        child.wait().expect("wait true");
+        assert_eq!(
+            process_start_unix(gone_pid),
+            None,
+            "process_start_unix must return None for a reaped pid (fail closed)"
+        );
+    }
+
+    /// `pgid_leader_matches_record` accepts a truthful `started_unix` and rejects
+    /// a stale one against the same live leader (issue #379).
+    #[test]
+    #[cfg(unix)]
+    fn pgid_leader_matches_record_accepts_truthful_rejects_stale() {
+        use nix::sys::signal;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Command;
+
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep 300 for identity-check test");
+        let pgid = child.id();
+
+        // Truthful record (stamped ≈ now) matches the live leader.
+        let truthful = LivePgid {
+            pgid,
+            started_unix: now_unix(),
+        };
+        assert!(
+            pgid_leader_matches_record(&truthful),
+            "a truthful started_unix must match the live leader"
+        );
+
+        // A stale record (an hour older than the real start) does not match —
+        // this is the pgid-reuse impostor case.
+        let stale = LivePgid {
+            pgid,
+            started_unix: now_unix().saturating_sub(3_600),
+        };
+        assert!(
+            !pgid_leader_matches_record(&stale),
+            "a stale started_unix must not match the live leader"
+        );
+
+        // Clean up the child.
+        let target = Pid::from_raw(pgid as i32);
+        let _ = signal::kill(target, signal::Signal::SIGKILL);
+        let _ = child.wait();
+        let _ = waitpid(target, None);
+    }
+
+    /// The restart janitor reaps a real surviving orphan whose recorded
+    /// `started_unix` is truthful, and clears the sidecar (issue #379).
+    ///
+    /// This is the process-level proof the issue requested: it mirrors
+    /// `kill_persisted_live_exec_children_kills_real_process_group` but exercises
+    /// the *restart janitor* (`reap_orphaned_live_exec_children`), which previously
+    /// had no real-process test.
+    #[test]
+    #[cfg(unix)]
+    fn reap_orphaned_live_exec_children_kills_matching_real_process_group() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Command;
+
+        let dir = unique_temp_dir("pgid-reap-match");
+        let paths = crate::session::SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        // Spawn `sleep 300` in its own process group (pgid == child pid).
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep 300 for janitor reap test");
+        let child_pid = child.id();
+        let pgid = child_pid;
+
+        // Persist a sidecar with a *truthful* started_unix, as the live exec
+        // runner does at spawn.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "inv_janitor_match".to_string(),
+            LivePgid {
+                pgid,
+                started_unix: now_unix(),
+            },
+        );
+        persist_live_pgids(&paths, &map);
+
+        assert!(
+            process_group_alive(pgid),
+            "child must be alive before the janitor runs"
+        );
+
+        // The restart janitor: must confirm identity (start time matches) and
+        // SIGKILL the orphan.
+        reap_orphaned_live_exec_children(&paths);
+
+        let target = Pid::from_raw(child_pid as i32);
+        let _ = child.wait();
+        match waitpid(target, None) {
+            Ok(_) | Err(nix::errno::Errno::ECHILD) => {}
+            Err(e) => panic!("unexpected waitpid error: {e}"),
+        }
+
+        assert!(
+            !process_group_alive(pgid),
+            "matching orphan (pgid={pgid}) must be dead after the janitor runs"
+        );
+        assert!(
+            load_live_pgids(&paths).is_empty(),
+            "live-pgids sidecar must be cleared after the janitor runs"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The restart janitor does NOT signal a live pgid whose recorded
+    /// `started_unix` does not match the leader's OS start time — the pgid-reuse
+    /// impostor case — yet still clears the spent sidecar (issue #379).
+    #[test]
+    #[cfg(unix)]
+    fn reap_orphaned_live_exec_children_spares_pgid_with_mismatched_start_time() {
+        use nix::sys::signal;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Command;
+
+        let dir = unique_temp_dir("pgid-reap-impostor");
+        let paths = crate::session::SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        // A real `sleep 300` (OS start ≈ now) stands in for a recycled pgid now
+        // owned by an innocent same-uid process.
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep 300 for janitor impostor test");
+        let pgid = child.id();
+
+        // Persist a *stale* recorded time (the dead original child), an hour
+        // before the real start — far outside PGID_START_TOLERANCE_SECS.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "inv_janitor_impostor".to_string(),
+            LivePgid {
+                pgid,
+                started_unix: now_unix().saturating_sub(3_600),
+            },
+        );
+        persist_live_pgids(&paths, &map);
+
+        // The janitor must fail closed: spare the impostor.
+        reap_orphaned_live_exec_children(&paths);
+
+        assert!(
+            process_group_alive(pgid),
+            "start-time impostor (pgid={pgid}) must survive the janitor (fail closed)"
+        );
+        assert!(
+            load_live_pgids(&paths).is_empty(),
+            "spent sidecar must be cleared even when a record is spared"
+        );
+
+        // Explicit cleanup: kill the process we deliberately spared.
+        let target = Pid::from_raw(pgid as i32);
+        let _ = signal::kill(target, signal::Signal::SIGKILL);
+        let _ = child.wait();
+        let _ = waitpid(target, None);
+        assert!(
+            !process_group_alive(pgid),
+            "cleanup kill must terminate the spared process (pgid={pgid})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pgid_leader_matches_record` fails closed (`false`) when the group leader
+    /// is already gone — i.e. when `process_start_unix` returns `None` (issue #379).
+    ///
+    /// This covers the third branch of the identity gate: neither "truthful match"
+    /// nor "stale mismatch" but "start time undeterminable". Failing closed means
+    /// the janitor will not signal an unknowable leader, never an innocent kill.
+    #[test]
+    #[cfg(unix)]
+    fn pgid_leader_matches_record_fails_closed_when_leader_is_gone() {
+        use nix::sys::signal;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Command;
+
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep 300 for gone-leader test");
+        let pgid = child.id();
+        let started = now_unix();
+
+        // Kill the leader so ps reports nothing.
+        let target = Pid::from_raw(pgid as i32);
+        let _ = signal::kill(target, signal::Signal::SIGKILL);
+        let _ = child.wait();
+        let _ = waitpid(target, None);
+
+        // The leader is gone — process_start_unix must return None.
+        // pgid_leader_matches_record must therefore return false (fail closed).
+        let rec = LivePgid {
+            pgid,
+            started_unix: started,
+        };
+        assert!(
+            !pgid_leader_matches_record(&rec),
+            "pgid_leader_matches_record must fail closed (false) for a dead leader"
+        );
+    }
+
+    /// The restart janitor silently skips a recorded pgid whose leader is already
+    /// dead (fast path via `!process_group_alive`), and still clears the sidecar
+    /// (issue #379).
+    ///
+    /// This exercises the early-exit branch in `reap_orphaned_live_exec_children`:
+    /// when `process_group_alive` returns `false`, the janitor skips the record
+    /// without spawning `ps`, and clears the sidecar at the end. Dead leaders in
+    /// the sidecar are the common boot case.
+    #[test]
+    #[cfg(unix)]
+    fn reap_orphaned_live_exec_children_skips_dead_leaders_and_clears_sidecar() {
+        use nix::sys::signal;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Command;
+
+        let dir = unique_temp_dir("pgid-reap-dead-leader");
+        let paths = crate::session::SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep 300 for dead-leader test");
+        let pgid = child.id();
+
+        // Persist a truthful sidecar record before killing the child.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "inv_dead_leader".to_string(),
+            LivePgid {
+                pgid,
+                started_unix: now_unix(),
+            },
+        );
+        persist_live_pgids(&paths, &map);
+
+        // Kill the leader before the janitor runs (simulates a crash where the
+        // orphan exited naturally by the time the daemon restarts).
+        let target = Pid::from_raw(pgid as i32);
+        let _ = signal::kill(target, signal::Signal::SIGKILL);
+        let _ = child.wait();
+        let _ = waitpid(target, None);
+
+        assert!(
+            !process_group_alive(pgid),
+            "leader must be dead before the janitor runs"
+        );
+
+        // The janitor must skip the dead leader (no kill attempt) and clear the sidecar.
+        reap_orphaned_live_exec_children(&paths);
+
+        assert!(
+            load_live_pgids(&paths).is_empty(),
+            "sidecar must be cleared even when all recorded leaders are already dead"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The restart janitor kills only the matching orphan and spares the impostor
+    /// when the sidecar contains a mix of records (issue #379).
+    ///
+    /// Two real `sleep 300` processes are spawned: one recorded with a truthful
+    /// `started_unix` (the genuine orphan) and one recorded with a stale
+    /// `started_unix` (the impostor / recycled-pgid stand-in). After the janitor
+    /// runs the orphan must be dead, the impostor must still be alive, and the
+    /// sidecar must be cleared.
+    #[test]
+    #[cfg(unix)]
+    fn reap_orphaned_live_exec_children_mixed_records_kills_match_spares_impostor() {
+        use nix::sys::signal;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Command;
+
+        let dir = unique_temp_dir("pgid-reap-mixed");
+        let paths = crate::session::SessionPaths::for_data_dir(dir.clone());
+        paths.ensure_data_dir().unwrap();
+
+        // Orphan: truthful timestamp — must be killed by the janitor.
+        let mut orphan = Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn orphan sleep 300");
+        let orphan_pgid = orphan.id();
+
+        // Impostor: the same pid namespace produces a second process. We use a
+        // stale timestamp (an hour off) to simulate a recycled pgid whose new
+        // owner started long after the recorded crash.
+        let mut impostor = Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn impostor sleep 300");
+        let impostor_pgid = impostor.id();
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "inv_orphan".to_string(),
+            LivePgid {
+                pgid: orphan_pgid,
+                started_unix: now_unix(), // truthful → must be killed
+            },
+        );
+        map.insert(
+            "inv_impostor".to_string(),
+            LivePgid {
+                pgid: impostor_pgid,
+                started_unix: now_unix().saturating_sub(3_600), // stale → must be spared
+            },
+        );
+        persist_live_pgids(&paths, &map);
+
+        assert!(
+            process_group_alive(orphan_pgid),
+            "orphan must be alive before the janitor runs"
+        );
+        assert!(
+            process_group_alive(impostor_pgid),
+            "impostor must be alive before the janitor runs"
+        );
+
+        reap_orphaned_live_exec_children(&paths);
+
+        // Reap the orphan's zombie so waitpid doesn't block.
+        let orphan_target = Pid::from_raw(orphan_pgid as i32);
+        let _ = orphan.wait();
+        match waitpid(orphan_target, None) {
+            Ok(_) | Err(nix::errno::Errno::ECHILD) => {}
+            Err(e) => panic!("unexpected waitpid error for orphan: {e}"),
+        }
+
+        assert!(
+            !process_group_alive(orphan_pgid),
+            "orphan (pgid={orphan_pgid}) must be dead after the janitor"
+        );
+        assert!(
+            process_group_alive(impostor_pgid),
+            "impostor (pgid={impostor_pgid}) must survive the janitor (fail closed)"
+        );
+        assert!(
+            load_live_pgids(&paths).is_empty(),
+            "sidecar must be cleared after the mixed-record janitor run"
+        );
+
+        // Clean up the impostor we deliberately spared.
+        let impostor_target = Pid::from_raw(impostor_pgid as i32);
+        let _ = signal::kill(impostor_target, signal::Signal::SIGKILL);
+        let _ = impostor.wait();
+        let _ = waitpid(impostor_target, None);
+        assert!(
+            !process_group_alive(impostor_pgid),
+            "cleanup kill must terminate the spared impostor (pgid={impostor_pgid})"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
