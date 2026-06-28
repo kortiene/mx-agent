@@ -208,6 +208,7 @@ fn allowlist() -> Vec<Allowed> {
     allow!("set_robust_list", libc::SYS_set_robust_list);
     allow!("get_robust_list", libc::SYS_get_robust_list);
     allow!("futex", libc::SYS_futex);
+    allow!("futex_waitv", libc::SYS_futex_waitv);
     allow!("rseq", libc::SYS_rseq);
     allow!("membarrier", libc::SYS_membarrier);
     allow!("restart_syscall", libc::SYS_restart_syscall);
@@ -257,6 +258,7 @@ fn allowlist() -> Vec<Allowed> {
     allow!("getrusage", libc::SYS_getrusage);
     allow!("times", libc::SYS_times);
     allow!("capget", libc::SYS_capget);
+    allow!("capset", libc::SYS_capset);
     // real/effective/saved credential queries (dash and other shells call these
     // during startup to check whether they are running setuid/setgid)
     allow!("getresuid", libc::SYS_getresuid);
@@ -330,6 +332,10 @@ fn allowlist() -> Vec<Allowed> {
     //     the modern variants already in the common set above ------------------
     #[cfg(target_arch = "x86_64")]
     {
+        // Legacy fork/vfork syscalls (replaced by clone/clone3 in modern glibc,
+        // but some libc paths or statically-linked tools still invoke them directly).
+        allow!("fork", libc::SYS_fork);
+        allow!("vfork", libc::SYS_vfork);
         allow!("open", libc::SYS_open);
         allow!("stat", libc::SYS_stat);
         allow!("lstat", libc::SYS_lstat);
@@ -401,7 +407,7 @@ pub fn default_bpf_program() -> Result<BpfProgram, SeccompError> {
     let arch = target_arch()?;
     let rules: BTreeMap<i64, Vec<SeccompRule>> = allowlist()
         .into_iter()
-        .map(|s| (s.number as i64, Vec::new()))
+        .map(|s| (s.number, Vec::new()))
         .collect();
     let filter = SeccompFilter::new(
         rules,
