@@ -17,5 +17,23 @@ tracing = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["resource"] }
 
+# The curated default-deny seccomp BPF profile (issue #380) is Linux-only: seccomp
+# does not exist on macOS. `seccompiler` compiles the syscall allowlist into a BPF
+# program and installs it via the safe `apply_filter` (the `unsafe` syscall lives
+# inside the crate, preserving the workspace `forbid(unsafe)`); `libc` supplies the
+# per-arch `SYS_*` numbers and `EPERM`; `serde_json` renders the equivalent OCI
+# profile for the container backend. seccompiler is Apache-2.0 / crates.io and has
+# no declared MSRV, so it builds on the workspace floor (1.93) and passes cargo-deny.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+libc = "0.2"
+serde_json = { workspace = true }
+
+# The bwrap live seccomp integration test (target_os = "linux") creates a
+# non-CLOEXEC memfd via rustix::fs::memfd_create (safe API, no unsafe) to pass
+# the compiled BPF program to `bwrap --seccomp <fd>` (issue #380).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [lints]
 workspace = true

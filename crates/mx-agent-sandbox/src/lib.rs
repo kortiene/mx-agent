@@ -32,6 +32,13 @@ use std::time::Duration;
 
 pub mod launcher;
 
+/// The curated default-deny seccomp-bpf profile (issue #380). Linux-only —
+/// seccomp does not exist on macOS, where the launcher's seccomp step is a
+/// documented no-op — so the module is absent on other targets and callers
+/// `cfg`-gate to a no-op.
+#[cfg(target_os = "linux")]
+pub mod seccomp;
+
 pub use launcher::{run_launcher, LauncherArgs, LAUNCHER_SUBCOMMAND};
 
 /// Post-authorization resource caps a sandboxed command runs under (issue #349).
@@ -86,11 +93,22 @@ impl ResourceLimits {
 /// their commands rely on; flipping the default on once the curated profile is
 /// validated against the real command corpus is a documented follow-up.
 ///
-/// On the `none` execution path the filter is installed in-process by the
-/// [`launcher`] trampoline via `seccompiler::apply_filter` (a safe call; the
-/// `unsafe` syscall lives inside that crate) immediately before `exec`. On
-/// macOS, where seccomp does not exist, the launcher's seccomp step is a
-/// documented no-op.
+/// When [`SeccompMode::Default`] is selected the curated default-deny BPF profile
+/// (see [`crate::seccomp`]) is installed on Linux on **every** backend (issue
+/// #380):
+///
+/// - the **`none`** path installs it in-process in the [`launcher`] trampoline
+///   via `seccompiler::apply_filter` (a safe call; the `unsafe` syscall lives
+///   inside that crate) immediately before `exec`;
+/// - the **bubblewrap** path passes the compiled program to `bwrap --seccomp
+///   <fd>` so `bwrap` installs it after its own namespace setup (the runner wires
+///   the fd, see [`bubblewrap_with_seccomp_fd`]);
+/// - the **container** path writes the equivalent OCI profile and runs with
+///   `--security-opt seccomp=<path>` (the runner provides the path via
+///   [`Restrictions::seccomp_profile_path`]).
+///
+/// On macOS, where seccomp does not exist, every backend's seccomp step is a
+/// documented no-op (bubblewrap/containers do not run there anyway).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SeccompMode {
     /// No syscall filtering (the default).
@@ -103,7 +121,9 @@ pub enum SeccompMode {
 }
 
 impl SeccompMode {
-    /// Whether syscall filtering is requested.
+    /// Whether syscall filtering is installed for this mode — i.e. the curated
+    /// default-deny BPF profile is applied where the platform supports it (Linux,
+    /// on all three backends); a documented no-op on macOS.
     pub fn is_on(self) -> bool {
         matches!(self, SeccompMode::Default)
     }
@@ -237,10 +257,24 @@ pub struct Restrictions {
     /// backends are wrapped by the runner in the [`launcher`] trampoline, which
     /// applies `setrlimit`. Defaults to no caps ([`ResourceLimits::default`]).
     pub resources: ResourceLimits,
-    /// The seccomp-bpf syscall-filtering mode (issue #349). Only enforced on Linux
-    /// and only on the `none` path for the first release (installed in-process by
-    /// the [`launcher`] trampoline); defaults to [`SeccompMode::Off`].
+    /// The seccomp-bpf syscall-filtering mode (issue #349, #380). Enforced on
+    /// Linux on every backend when [`SeccompMode::Default`]: in-process on the
+    /// `none` path (the [`launcher`] trampoline), via `bwrap --seccomp <fd>` on
+    /// bubblewrap, and via `--security-opt seccomp=<path>` on the container
+    /// backend. A documented no-op on macOS. Defaults to [`SeccompMode::Off`].
     pub seccomp: SeccompMode,
+    /// Host path of the OCI seccomp profile the container backend installs with
+    /// `--security-opt seccomp=<path>` (issue #380).
+    ///
+    /// Resolved and written by the runner for the container backend when
+    /// [`seccomp`](Restrictions::seccomp) is on (mirroring how [`run_uid`] is an
+    /// impure value the runner resolves and [`prepare`][Sandbox::prepare] reads
+    /// purely). `None` (the default) — un-provisioned, or macOS, or another
+    /// backend — emits no seccomp flag, so an absent path can never reference a
+    /// missing file and break the launch. The other backends ignore it.
+    ///
+    /// [`run_uid`]: Restrictions::run_uid
+    pub seccomp_profile_path: Option<PathBuf>,
     /// The uid the container backend runs the command as (`--user <uid>:<gid>`),
     /// so it owns the host-side `writable_paths` mounts and full `--cap-drop ALL`
     /// becomes viable without `CAP_DAC_OVERRIDE` (issue #349). Set by the runner to
@@ -425,6 +459,30 @@ fn path_arg(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Inject `--seccomp <fd>` into a prepared `bwrap` argv so `bwrap` installs the
+/// curated default-deny BPF program — read from `fd` — after its own namespace
+/// setup and immediately before `exec` of the target (issue #380).
+///
+/// The flag is placed among the `bwrap` flags, *before* the `--` that separates
+/// them from the target command, so the command after `--` is left byte-for-byte
+/// unchanged (if there is no `--`, defensively, the flag is appended). The runner
+/// is responsible for the impure half: it compiles [`crate::seccomp::default_bpf_program`],
+/// serializes it with [`crate::seccomp::serialize_bpf_program`], writes it to a
+/// non-`CLOEXEC` file descriptor, passes that fd number here, and keeps the fd
+/// open until after the child is spawned so `bwrap` inherits it. Keeping this step
+/// out of [`BubblewrapSandbox::prepare`] preserves `prepare`'s purity (it only
+/// computes an argv) and is unit-testable with any fake fd number.
+///
+/// `bwrap` — not the [`launcher`] trampoline — must install the filter, because
+/// filtering `bwrap`'s own `unshare`/`mount`/`pivot_root` setup syscalls would
+/// break the sandbox before the target ever runs.
+#[cfg(unix)]
+pub fn bubblewrap_with_seccomp_fd(mut argv: Vec<String>, fd: std::os::fd::RawFd) -> Vec<String> {
+    let sep = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    argv.splice(sep..sep, ["--seccomp".to_string(), fd.to_string()]);
+    argv
+}
+
 /// The default image [`ContainerSandbox`] runs in until an operator configures
 /// one. A minimal Debian base is a reasonable starting point for running shell
 /// commands; the image is meant to be overridden via [`ContainerSandbox::new`].
@@ -537,6 +595,21 @@ impl Sandbox for ContainerSandbox {
             "--security-opt".to_string(),
             "no-new-privileges".to_string(),
         ];
+
+        // Syscall filtering (issue #380): install the curated default-deny profile
+        // the runner wrote to a daemon-owned file. Emitted only when seccomp is on
+        // AND the runner provided a path — `None` (un-provisioned, macOS, or
+        // another backend) emits nothing, so an absent path can never reference a
+        // missing file and break the launch. Docker/Podman already apply a built-in
+        // default profile unless `--privileged`; this explicit profile makes the
+        // filter independent of the host runtime's default and consistent with the
+        // `none`/bubblewrap paths.
+        if restrictions.seccomp.is_on() {
+            if let Some(path) = &restrictions.seccomp_profile_path {
+                wrapped.push("--security-opt".to_string());
+                wrapped.push(format!("seccomp={}", path_arg(path)));
+            }
+        }
 
         // Identity mapping + full capability drop (issue #349). Running the
         // container process as the daemon's own uid makes it the owner of the
@@ -1097,6 +1170,103 @@ mod tests {
         assert_eq!(
             count, "0",
             "expected no non-loopback interfaces under network deny"
+        );
+    }
+
+    // Acceptance (issue #380): the full bwrap seccomp pipeline.
+    //
+    // The `none`-path seccomp is already covered end-to-end by
+    // `sandbox_exec_seccomp_filter_mode_active_after_exec` in
+    // `crates/mx-agent-cli/tests/sandbox_exec.rs` (the launcher installs the
+    // filter in-process before `exec`). The bwrap path is distinct: `bwrap`
+    // reads the BPF program from a file descriptor and installs the filter
+    // *itself*, after its own namespace setup, via `--seccomp <fd>`. This test
+    // covers the full pipeline for that path:
+    //
+    //   `default_bpf_program()` → `serialize_bpf_program()` → memfd →
+    //   `bubblewrap_with_seccomp_fd` → `bwrap --seccomp <fd>` → bwrap installs
+    //   → child sees SECCOMP_MODE_FILTER (mode 2) in `/proc/self/status`
+    //
+    // Linux-only: seccomp BPF does not exist on macOS (and bwrap does not run
+    // there anyway). The CI `sandbox-linux` job (MX_AGENT_REQUIRE_BWRAP) is the
+    // authoritative gate for this test; on developer machines without bwrap it
+    // skips gracefully.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_with_seccomp_fd_filter_active_in_child() {
+        // Acceptance (issue #380): running a command inside bubblewrap with the
+        // curated default-deny BPF profile installed via `--seccomp <fd>` must
+        // produce a child whose Seccomp field in /proc/self/status equals 2
+        // (SECCOMP_MODE_FILTER), proving the filter was installed by bwrap and
+        // survived the execve into the target shell.
+        if !bwrap_available_or_required() {
+            return;
+        }
+
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        use std::os::fd::{AsRawFd as _, OwnedFd};
+
+        // Compile and serialize the curated default-deny BPF profile.
+        let program = crate::seccomp::default_bpf_program()
+            .expect("default BPF program must compile on Linux");
+        let bytes = crate::seccomp::serialize_bpf_program(&program);
+
+        // Create a non-CLOEXEC anonymous fd. MFD_CLOEXEC must NOT be set:
+        // bwrap reads the fd after fork, so the fd must be inherited by the
+        // child. `rustix::fs::memfd_create` is a safe (no-unsafe) wrapper
+        // around memfd_create(2) (workspace forbids unsafe_code).
+        let memfd: OwnedFd =
+            rustix::fs::memfd_create("mx-agent-seccomp-test", rustix::fs::MemfdFlags::empty())
+                .expect("memfd_create must succeed on Linux 3.17+");
+        let raw_fd = memfd.as_raw_fd();
+
+        // Write the serialized BPF program and rewind: bwrap reads from the
+        // fd's current position; a missing seek causes bwrap to read 0 bytes
+        // and install an empty filter (which would deny every syscall including
+        // exit_group, hanging the child).
+        let mut file = std::fs::File::from(memfd);
+        file.write_all(&bytes).expect("write BPF bytes to memfd");
+        file.seek(SeekFrom::Start(0))
+            .expect("rewind memfd to offset 0");
+
+        // Prepare a bwrap argv for a shell that reads /proc/self/status and
+        // exits 0 iff Seccomp: 2 (SECCOMP_MODE_FILTER), then inject
+        // --seccomp <fd> among the bwrap flags.
+        let tmp = std::env::temp_dir();
+        let prepared = BubblewrapSandbox.prepare(
+            argv(&[
+                "/bin/sh",
+                "-c",
+                "awk '/^Seccomp:/ { exit($2 == 2 ? 0 : 1) }' /proc/self/status",
+            ]),
+            Restrictions {
+                cwd: tmp.clone(),
+                read_only_paths: base_ro_paths(),
+                writable_paths: vec![tmp],
+                network: Network::Deny,
+                ..Restrictions::default()
+            },
+        );
+        let injected = bubblewrap_with_seccomp_fd(prepared.argv, raw_fd);
+
+        // Spawn bwrap and wait. `file` must remain alive until `output()`
+        // returns so bwrap can read the fd before it closes it.
+        let (bwrap, bwrap_args) = injected.split_first().expect("non-empty argv");
+        let out = std::process::Command::new(bwrap)
+            .args(bwrap_args)
+            .output()
+            .expect("spawn bwrap with --seccomp fd");
+        drop(file);
+
+        assert!(
+            out.status.success(),
+            "the bwrap child must see Seccomp: 2 (SECCOMP_MODE_FILTER) in \
+             /proc/self/status, confirming the curated BPF profile was \
+             installed by bwrap from --seccomp <fd> and survived execve: \
+             exit={:?} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
@@ -1872,26 +2042,220 @@ mod tests {
     }
 
     #[test]
-    fn container_seccomp_field_not_emitted_by_prepare() {
-        // Seccomp BPF profile installation for the container backend is a
-        // documented follow-up under issue #349 (profile breadth + format are
-        // open questions). The `prepare` method must NOT emit any
-        // `--security-opt seccomp=…` flag, even when SeccompMode::Default is
-        // set — that would reference a non-existent profile file and break the
-        // container launch. The Restrictions field is carried through so the
-        // runner can inspect it later, but the container argv is not affected.
+    fn container_emits_seccomp_opt_when_profile_path_set() {
+        // Acceptance (issue #380): with seccomp on AND the runner-provided OCI
+        // profile path set, the container argv carries `--security-opt
+        // seccomp=<path>` so the curated default-deny profile is installed.
         let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
             argv(&["true"]),
             Restrictions {
                 seccomp: SeccompMode::Default,
+                seccomp_profile_path: Some(PathBuf::from("/run/mx-agent/seccomp-default.json")),
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(
+            flags.contains("--security-opt seccomp=/run/mx-agent/seccomp-default.json"),
+            "container prepare must emit the seccomp profile flag when the path is set: {flags}"
+        );
+    }
+
+    #[test]
+    fn container_omits_seccomp_opt_when_profile_path_unset() {
+        // The flag must be emitted ONLY when the runner provisioned a path: with
+        // seccomp on but no `seccomp_profile_path` (un-provisioned, or macOS), no
+        // seccomp flag is emitted, so an absent path can never reference a
+        // non-existent file and break the container launch (issue #380).
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                seccomp: SeccompMode::Default,
+                seccomp_profile_path: None,
                 ..Restrictions::default()
             },
         );
         let flags = container_flags(&prepared, "img").join(" ");
         assert!(
             !flags.contains("seccomp"),
-            "container prepare must not emit any seccomp flag while installation is deferred: \
-             {flags}"
+            "container prepare must not emit a seccomp flag without a provisioned path: {flags}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bubblewrap_with_seccomp_fd_inserts_flag_before_separator() {
+        // The runner-injected `--seccomp <fd>` must land among the bwrap flags,
+        // before the `--` separator, leaving the post-`--` command verbatim
+        // (issue #380).
+        let prepared = BubblewrapSandbox.prepare(argv(&["echo", "hi"]), Restrictions::default());
+        let injected = bubblewrap_with_seccomp_fd(prepared.argv, 7);
+        let sep = injected
+            .iter()
+            .position(|a| a == "--")
+            .expect("the `--` separator survives injection");
+        // The flag is in the bwrap flags, immediately before the separator.
+        assert_eq!(injected[sep - 2], "--seccomp");
+        assert_eq!(injected[sep - 1], "7");
+        // The command after `--` is untouched.
+        assert_eq!(&injected[sep + 1..], argv(&["echo", "hi"]).as_slice());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bubblewrap_with_seccomp_fd_no_separator_appends_flag() {
+        // Defensive fallback (issue #380): if `bwrap` argv has no `--` separator
+        // (an argv that's not from BubblewrapSandbox::prepare), the flag is
+        // appended at the end rather than silently discarded.
+        let no_sep = argv(&["bwrap", "--ro-bind", "/", "/"]);
+        let injected = bubblewrap_with_seccomp_fd(no_sep, 5);
+        assert!(
+            injected.windows(2).any(|w| w == ["--seccomp", "5"]),
+            "the --seccomp flag must be present even without a -- separator: {injected:?}"
+        );
+    }
+
+    #[test]
+    fn container_omits_seccomp_opt_when_seccomp_is_off_even_with_path_set() {
+        // Security regression guard (issue #380): `seccomp.is_on()` must gate the
+        // flag. If seccomp=Off but `seccomp_profile_path` happens to be populated
+        // (e.g. a stale value on the Restrictions), the flag must NOT be emitted —
+        // the is_on() check is the authoritative gate.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                seccomp: SeccompMode::Off,
+                seccomp_profile_path: Some(PathBuf::from("/run/mx-agent/seccomp-default.json")),
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(
+            !flags.contains("seccomp"),
+            "seccomp=Off must suppress the --security-opt seccomp flag \
+             even when seccomp_profile_path is set: {flags}"
+        );
+    }
+
+    #[test]
+    fn container_podman_emits_seccomp_opt_when_profile_path_set() {
+        // Podman and Docker must both emit `--security-opt seccomp=<path>` when
+        // seccomp is on and the runner has provisioned a profile path (issue #380).
+        let prepared = ContainerSandbox::new(Runtime::Podman, "img").prepare(
+            argv(&["true"]),
+            Restrictions {
+                seccomp: SeccompMode::Default,
+                seccomp_profile_path: Some(PathBuf::from("/run/mx-agent/seccomp-default.json")),
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(
+            flags.contains("--security-opt seccomp=/run/mx-agent/seccomp-default.json"),
+            "podman container must emit the seccomp profile flag when the path is set: {flags}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bubblewrap_with_seccomp_fd_preserves_all_other_flags() {
+        // Injecting `--seccomp <fd>` must add exactly two tokens and must not
+        // remove, reorder, or duplicate any pre-existing token (issue #380):
+        // only the two new tokens appear; the bwrap flags and the command are
+        // otherwise byte-for-byte unchanged. Tested with a non-trivial
+        // restrictions set to exercise multiple bwrap flag categories.
+        let prepared = BubblewrapSandbox.prepare(
+            argv(&["echo", "hi"]),
+            Restrictions {
+                cwd: PathBuf::from("/work"),
+                network: Network::Deny,
+                read_only_paths: vec![PathBuf::from("/usr")],
+                writable_paths: vec![PathBuf::from("/work")],
+                ..Restrictions::default()
+            },
+        );
+        let original = prepared.argv.clone();
+        let injected = bubblewrap_with_seccomp_fd(original.clone(), 9);
+        assert_eq!(
+            injected.len(),
+            original.len() + 2,
+            "injection must add exactly 2 tokens (--seccomp and the fd number)"
+        );
+        for tok in &original {
+            let orig_count = original.iter().filter(|t| *t == tok).count();
+            let new_count = injected.iter().filter(|t| *t == tok).count();
+            assert_eq!(
+                orig_count, new_count,
+                "token {tok:?} must not be removed or duplicated by seccomp-fd injection"
+            );
+        }
+        assert!(
+            injected.windows(2).any(|w| w == ["--seccomp", "9"]),
+            "--seccomp 9 pair must be present after injection: {injected:?}"
+        );
+    }
+
+    #[test]
+    fn container_seccomp_opt_appears_before_image_not_in_command() {
+        // `--security-opt seccomp=<path>` must be in the `<runtime> run` flags
+        // prefix (before the image name), not in the command portion after it
+        // (issue #380). Flags after the image are passed to the command, not the
+        // runtime, so a misplaced flag would be silently ignored by the runtime.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "myimage").prepare(
+            argv(&["true"]),
+            Restrictions {
+                seccomp: SeccompMode::Default,
+                seccomp_profile_path: Some(PathBuf::from("/run/mx-agent/seccomp-default.json")),
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "myimage").join(" ");
+        let command = container_command(&prepared, "myimage").join(" ");
+        assert!(
+            flags.contains("--security-opt")
+                && flags.contains("seccomp=/run/mx-agent/seccomp-default.json"),
+            "--security-opt seccomp=... must be in the run-flags prefix: {flags}"
+        );
+        assert!(
+            !command.contains("seccomp"),
+            "--security-opt seccomp must not appear in the command portion: {command}"
+        );
+    }
+
+    #[test]
+    fn container_full_hardening_flags_with_seccomp() {
+        // Acceptance (issue #380 + #349): all security-hardening flags must coexist
+        // correctly when seccomp, uid mapping, and network deny are all enabled.
+        // This guards against accidental flag ordering regressions where one group
+        // silently clobbers another.
+        let prepared = ContainerSandbox::new(Runtime::Docker, "img").prepare(
+            argv(&["make", "test"]),
+            Restrictions {
+                seccomp: SeccompMode::Default,
+                seccomp_profile_path: Some(PathBuf::from("/run/mx-agent/seccomp.json")),
+                run_uid: Some(1000),
+                run_gid: Some(1000),
+                network: Network::Deny,
+                ..Restrictions::default()
+            },
+        );
+        let flags = container_flags(&prepared, "img").join(" ");
+        assert!(flags.contains("--read-only"), "flags: {flags}");
+        assert!(
+            flags.contains("--security-opt no-new-privileges"),
+            "flags: {flags}"
+        );
+        assert!(
+            flags.contains("--security-opt seccomp=/run/mx-agent/seccomp.json"),
+            "flags: {flags}"
+        );
+        assert!(flags.contains("--user 1000:1000"), "flags: {flags}");
+        assert!(flags.contains("--cap-drop ALL"), "flags: {flags}");
+        assert!(flags.contains("--network none"), "flags: {flags}");
+        assert_eq!(
+            container_command(&prepared, "img"),
+            argv(&["make", "test"]).as_slice(),
+            "the command argv must be unchanged"
         );
     }
 }

@@ -598,9 +598,10 @@ fn wiki_exec_finished_and_chunk_examples_deserialize() {
 // seccomp filtering and no rlimit/cgroup resource capping". Slice (A)/(C)/(D)
 // shipped the container `--user`/`--cap-drop ALL`, the policy-driven resource caps
 // (RLIMIT/cgroup), and the `require_sandbox` gate, so those stale claims must not
-// drift back. The seccomp *profile installation* remains a documented follow-up,
-// so we do NOT assert seccomp is fully enforced — only that the now-shipped
-// controls are described.
+// drift back. Issue #380 then shipped the curated default-deny seccomp BPF profile
+// install on every backend (in-process on `none`, `bwrap --seccomp` on bubblewrap,
+// `--security-opt seccomp=` on containers), so the docs no longer describe seccomp
+// installation as a follow-up.
 
 /// architecture §13.5 must no longer claim the container cap-drop is deferred.
 #[test]

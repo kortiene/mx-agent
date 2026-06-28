@@ -159,9 +159,11 @@ it here before release.
   (`--user`/`--userns=keep-id`), and `--cap-drop ALL` (issue #349). Policy-driven
   resource caps (`max_processes` / `max_memory_bytes` / `max_cpu_seconds`) bound
   host fork-bomb/memory/CPU exhaustion — exact cgroup flags in containers,
-  `setrlimit` via a re-exec launcher on the host paths. Seccomp ships as opt-in
-  machinery (`seccomp = "off"` default); the curated default-deny BPF profile
-  installation is still a follow-up. The built-in
+  `setrlimit` via a re-exec launcher on the host paths. The curated default-deny
+  seccomp BPF profile ships, opt-in (`seccomp = "off"` default); selecting
+  `"default"` installs it (default action `ERRNO(EPERM)`, fail-closed) on every
+  Linux backend — in-process on `none`, `bwrap --seccomp` on bubblewrap,
+  `--security-opt seccomp=` on containers (issue #380). The built-in
   fallback backend is `none` (zero isolation) — operators must choose
   `bubblewrap`/`docker`/`podman`, and can set `execution.require_sandbox = true`
   to deny any execution that would resolve to `none`. Bound the blast radius with

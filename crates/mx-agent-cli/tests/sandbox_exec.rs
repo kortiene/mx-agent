@@ -140,6 +140,124 @@ fn sandbox_exec_subcommand_is_hidden_from_help() {
     );
 }
 
+// --- Seccomp filter installation (issue #380) --------------------------------
+//
+// These tests verify that `--seccomp default` actually installs the curated
+// default-deny BPF profile — not just that it is declared in the allowance.
+// They span two levels:
+//
+//  - Cross-platform: the flag is accepted and the command runs (on macOS the
+//    seccomp step is a documented no-op; on Linux it is the real filter).
+//  - Linux-only: the filter survives `execve` and is active in the child
+//    (SECCOMP_MODE_FILTER = 2), verified via `/proc/self/status`; and the
+//    allowlist is broad enough that real shell pipelines complete without
+//    triggering the default-deny action.
+//
+// The CI `sandbox-linux` job (ubuntu + sysctl userns) is the authoritative gate
+// for the Linux-only tests; the cross-platform test also runs on macOS CI.
+
+#[test]
+fn sandbox_exec_seccomp_default_runs_command() {
+    // Acceptance (issue #380): `--seccomp default` must not prevent a simple
+    // command from running. On Linux the curated BPF filter is installed and
+    // the allowlist must include `execve`/`read`/`write`/`exit_group`; on macOS
+    // the step is a documented no-op. Either way the launcher must not fail on
+    // this flag and the command must succeed.
+    //
+    // No resource cap is set alongside seccomp, exercising the path where the
+    // launcher is engaged *only* for the seccomp filter (none path, Linux) or
+    // is a pure no-op (macOS).
+    let out = sandbox_exec(&[
+        "--seccomp",
+        "default",
+        "--",
+        "/bin/echo",
+        "seccomp-default-ok",
+    ]);
+    assert!(
+        out.status.success(),
+        "echo must succeed with --seccomp default: exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "seccomp-default-ok",
+        "stdout must pass through the exec unchanged"
+    );
+}
+
+// The following two tests are Linux-only: seccomp BPF does not exist on macOS
+// (the step is a no-op there), so SECCOMP_MODE_FILTER cannot be observed and
+// the tests are compiled out.
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_exec_seccomp_filter_mode_active_after_exec() {
+    // Acceptance (issue #380): after the launcher installs the BPF filter and
+    // replaces its own image with the target via `exec`, the target process must
+    // run under SECCOMP_MODE_FILTER (mode 2). Reading `/proc/self/status` from
+    // *within* the filtered child confirms:
+    //   (a) the filter survived `execve` (seccomp filters are inherited across exec),
+    //   (b) the filter is active in the child, not just declared by the launcher.
+    //
+    // `/proc/self/status` field values:
+    //   Seccomp: 0  = SECCOMP_MODE_DISABLED
+    //   Seccomp: 1  = SECCOMP_MODE_STRICT
+    //   Seccomp: 2  = SECCOMP_MODE_FILTER  ← expected when the BPF profile is installed
+    //
+    // `awk` is used instead of `grep -P` for portability (no Perl-regex dep).
+    let out = sandbox_exec(&[
+        "--seccomp",
+        "default",
+        "--",
+        "/bin/sh",
+        "-c",
+        "awk '/^Seccomp:/ { exit($2 == 2 ? 0 : 1) }' /proc/self/status",
+    ]);
+    assert!(
+        out.status.success(),
+        "awk must find Seccomp mode 2 (FILTER) in /proc/self/status of the \
+         filtered child, confirming the BPF profile survived execve: \
+         exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_exec_seccomp_default_allowlist_permits_shell_pipeline() {
+    // Acceptance (issue #380): the curated allowlist must be broad enough that
+    // a realistic shell pipeline completes without triggering the default-deny
+    // action. A simple `echo hi | cat` exercises `clone`/`clone3` (fork),
+    // `pipe2`, `dup3`/`dup`, `execve`, `read`, `write`, and `exit_group` —
+    // all of which must be present in the allowlist for the pipeline to work.
+    //
+    // The default-deny action is ERRNO(EPERM) (not KILL), so a too-strict
+    // allowlist causes a recoverable command failure rather than a silent hang.
+    let out = sandbox_exec(&[
+        "--seccomp",
+        "default",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo 'pipeline-ok' | cat",
+    ]);
+    assert!(
+        out.status.success(),
+        "shell pipeline must complete under the default seccomp filter: \
+         exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "pipeline-ok",
+        "pipeline output must reach stdout"
+    );
+}
+
 // --- Resource-cap enforcement (Unix, issue #349) ----------------------------
 //
 // These tests verify that the kernel actually enforces the resource caps the

@@ -22,16 +22,23 @@
 //!
 //! ## Seccomp
 //!
-//! The launcher threads [`SeccompMode`] so the syscall-filtering machinery is in
-//! place end to end. Installing the actual default-deny BPF profile (in-process
-//! here for the `none` path, and via `bwrap --seccomp` / container
-//! `--security-opt seccomp=`) is a documented follow-up under issue #349: the
-//! curated allowlist's breadth and the `bwrap --seccomp` byte format are open
-//! questions that need a real-Linux acceptance test to settle, and shipping a
-//! too-strict profile would break arbitrary build/test commands. Until then a
-//! request for `seccomp = "default"` is honoured loudly: the launcher records
-//! that enforcement is still pending rather than silently pretending the command
-//! is syscall-filtered. seccomp does not exist on macOS in any case.
+//! On the `none` path the launcher installs the curated default-deny BPF profile
+//! (see [`crate::seccomp`]) in-process when [`SeccompMode::Default`] is requested:
+//! after `setrlimit` and immediately before `exec`, it compiles the allowlist and
+//! applies it with the safe `seccompiler::apply_filter` (issue #380). seccomp
+//! filters survive `execve`, so the target command — and anything it spawns — runs
+//! syscall-filtered. The install is **fail-closed**: if the program cannot be
+//! built or applied, the launcher returns an error and does *not* `exec` the
+//! command unfiltered, mirroring the fail-closed `setrlimit` handling.
+//!
+//! The launcher deliberately does **not** carry seccomp on the bubblewrap path:
+//! `bwrap` installs the filter itself via `--seccomp <fd>` (wired by the runner)
+//! *after* its own namespace setup, so the launcher filtering `bwrap`'s
+//! `unshare`/`mount`/`pivot_root` calls would break the sandbox. The container
+//! backend installs the equivalent OCI profile with `--security-opt seccomp=`.
+//!
+//! seccomp does not exist on macOS; there the launcher's seccomp step is a
+//! documented no-op (and `bwrap`/containers do not run there anyway).
 
 use crate::{ResourceLimits, SeccompMode};
 
@@ -72,9 +79,15 @@ impl LauncherArgs {
     /// Whether wrapping a command in the launcher would actually do anything for
     /// the given `backend` — i.e. whether the runner should prepend the prefix.
     ///
-    /// A resource cap is enforced on every host path; seccomp only matters on the
-    /// `none` path (on the bubblewrap path seccomp must be installed by `bwrap`
-    /// itself, not the launcher, or it would filter `bwrap`'s own namespace setup).
+    /// A resource cap is enforced on every host path; seccomp only engages the
+    /// launcher on the `none` path, where the filter is installed in-process by
+    /// [`run_launcher`]. On the bubblewrap path seccomp is handled **out of band**:
+    /// the runner injects `bwrap --seccomp <fd>` (see
+    /// [`bubblewrap_with_seccomp_fd`][crate::bubblewrap_with_seccomp_fd]) so `bwrap`
+    /// installs the filter itself after its own namespace setup — the launcher must
+    /// not, or it would filter `bwrap`'s `unshare`/`mount`/`pivot_root` calls. So
+    /// the bwrap path only needs the launcher for *resource caps*, never for
+    /// seccomp.
     pub fn is_needed(
         resources: ResourceLimits,
         seccomp: SeccompMode,
@@ -167,33 +180,35 @@ fn parse_u64(flag: &str, value: Option<&String>) -> Result<u64, String> {
         .map_err(|_| format!("{flag} expects a non-negative integer, got {value:?}"))
 }
 
-/// Apply the resource caps (and, in a future release, the seccomp filter) and
-/// then `exec` the target command, replacing this process image.
+/// Apply the resource caps and the seccomp filter, then `exec` the target
+/// command, replacing this process image.
 ///
 /// Returns only on failure (a successful `exec` never returns): the returned
-/// [`std::io::Error`] describes why the caps could not be applied or the command
-/// could not be executed, so the caller can surface a diagnostic and exit
-/// non-zero. The caps are applied **fail-closed**: if a `setrlimit` fails, the
-/// command is *not* run rather than running unconfined.
+/// [`std::io::Error`] describes why the caps or filter could not be applied or the
+/// command could not be executed, so the caller can surface a diagnostic and exit
+/// non-zero. Both are applied **fail-closed**: if a `setrlimit` or the seccomp
+/// install fails, the command is *not* run rather than running unconfined.
 ///
-/// All work uses safe APIs: [`nix::sys::resource::setrlimit`] and
-/// [`std::os::unix::process::CommandExt::exec`] (only `pre_exec` is `unsafe`).
+/// On Linux, when [`SeccompMode::Default`] is requested, the curated default-deny
+/// BPF profile (see [`crate::seccomp`]) is installed in-process here — after the
+/// resource caps and immediately before `exec` — with the safe
+/// `seccompiler::apply_filter`; the allowlist includes `execve`/`execveat` so
+/// the subsequent `exec` and the target's own startup succeed, and the filter
+/// survives `execve` so the target runs syscall-filtered. On macOS seccomp does
+/// not exist, so the step is a logged no-op.
+///
+/// All work uses safe APIs: [`nix::sys::resource::setrlimit`],
+/// `seccompiler::apply_filter` (the `unsafe` syscall lives inside that crate),
+/// and [`std::os::unix::process::CommandExt::exec`] (only `pre_exec` is `unsafe`).
 pub fn run_launcher(args: LauncherArgs) -> std::io::Error {
     if let Err(e) = apply_resource_limits(args.resources) {
         return e;
     }
 
     if args.seccomp.is_on() {
-        // The syscall-filtering machinery is threaded end to end, but installing
-        // the curated default-deny BPF profile is a documented follow-up under
-        // issue #349 (profile breadth + `bwrap --seccomp` byte format are open
-        // questions needing a real-Linux acceptance test). Be loud rather than
-        // silently leaving the command unfiltered while policy says "default".
-        tracing::warn!(
-            "seccomp = \"default\" was requested but syscall-filter installation is not yet \
-             active (issue #349 follow-up); the command runs with resource limits but no seccomp \
-             filter"
-        );
+        if let Err(e) = apply_seccomp_filter() {
+            return e;
+        }
     }
 
     let (program, rest) = match args.command.split_first() {
@@ -255,6 +270,40 @@ fn apply_resource_limits(resources: ResourceLimits) -> Result<(), std::io::Error
 
 #[cfg(not(unix))]
 fn apply_resource_limits(_resources: ResourceLimits) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+/// Install the curated default-deny seccomp filter in-process (the `none` path),
+/// fail-closed.
+///
+/// On Linux this compiles [`crate::seccomp::default_bpf_program`] and applies it
+/// with the safe [`seccompiler::apply_filter`]. It runs after the resource caps
+/// and immediately before `exec`; the filter survives `execve`, so the target
+/// command runs syscall-filtered. A build or apply failure is returned (the caller
+/// then refuses to `exec`) rather than silently leaving the command unfiltered.
+///
+/// On non-Linux targets seccomp does not exist, so this is a logged no-op.
+#[cfg(target_os = "linux")]
+fn apply_seccomp_filter() -> Result<(), std::io::Error> {
+    let program = crate::seccomp::default_bpf_program().map_err(|e| {
+        std::io::Error::other(format!(
+            "could not build the seccomp filter before exec: {e}"
+        ))
+    })?;
+    seccompiler::apply_filter(&program).map_err(|e| {
+        std::io::Error::other(format!(
+            "could not install the seccomp filter before exec: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_seccomp_filter() -> Result<(), std::io::Error> {
+    tracing::debug!(
+        "seccomp = \"default\" was requested but seccomp is unavailable on this platform; \
+         the command runs without a syscall filter"
+    );
     Ok(())
 }
 
@@ -410,5 +459,18 @@ mod tests {
         assert_eq!(parsed.resources.max_cpu_seconds, Some(30));
         assert_eq!(parsed.resources.max_processes, None);
         assert_eq!(parsed.resources.max_memory_bytes, None);
+    }
+
+    #[test]
+    fn parse_seccomp_off_explicitly() {
+        // `--seccomp off` must round-trip back to SeccompMode::Off — i.e. the
+        // serialisation and parse are consistent even when the mode is the default.
+        // This covers the branch in parse() that sets SeccompMode::Off explicitly,
+        // which the to_args_and_parse_round_trip test never exercises (off is
+        // omitted by to_args when the mode is default/off).
+        let parsed =
+            LauncherArgs::parse(&argv(&["--seccomp", "off", "--", "true"])).expect("parses off");
+        assert_eq!(parsed.seccomp, SeccompMode::Off);
+        assert_eq!(parsed.command, argv(&["true"]));
     }
 }

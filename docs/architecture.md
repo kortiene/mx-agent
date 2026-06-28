@@ -2183,17 +2183,24 @@ launcher (`mx-agent __sandbox-exec …`) that applies `setrlimit` (safe) before
 fork-bomb dampener, not an exact cap; the container `--pids-limit` is exact. On
 macOS `RLIMIT_NPROC` is skipped (documented platform limitation).
 
-**Seccomp (issue #349).** `execution.seccomp` selects the syscall-filtering mode:
-`"off"` (the default) or a curated default-deny `"default"` profile, with the
+**Seccomp (issues #349, #380).** `execution.seccomp` selects the syscall-filtering
+mode: `"off"` (the default) or a curated default-deny `"default"` profile, with the
 usual agent override. Seccomp is Linux-only; it ships **off by default** for the
 first release so existing deployments do not suddenly start `EPERM`-ing syscalls
-their commands rely on. The mode threads end to end through the launcher; the
-actual default-deny BPF profile installation (in-process on the `none` path, via
-`bwrap --seccomp` and container `--security-opt seccomp=`) is a documented
-follow-up — the curated allowlist's breadth and the `bwrap --seccomp` byte format
-are open questions that need a real-Linux acceptance test to settle, and the
-launcher is loud (it warns) when `"default"` is requested rather than silently
-leaving a command unfiltered.
+their commands rely on. When `"default"` is selected the curated default-deny BPF
+profile is installed on **every** backend (issue #380): in-process via the safe
+`seccompiler::apply_filter` immediately before `exec` on the `none` path, through
+`bwrap --seccomp <fd>` on bubblewrap (the runner writes the compiled program to a
+non-`CLOEXEC` fd `bwrap` reads after its own namespace setup), and through
+`--security-opt seccomp=<path>` on containers (the runner writes the equivalent OCI
+profile to a daemon-owned file). The profile's default action is `ERRNO(EPERM)`
+(not `KILL`), so a too-strict allowlist degrades to a recoverable command failure;
+the single source-of-truth allowlist is modeled on the Docker/Podman default and
+is broad enough for the real build/test corpus. The install is **fail-closed** —
+if the program cannot be built or applied, the command is not run unfiltered — and
+on macOS seccomp does not exist, so the step is a documented no-op. Flipping the
+default on once the profile is validated against the full command corpus is a
+later rollout.
 
 **Loud / gated `sandbox = none`.** When an authorized execution resolves to the
 zero-isolation `none` backend the daemon emits a prominent warning (room /
