@@ -175,14 +175,21 @@ into the shared bounded request-plane cache. They are replay-checked **per live
 session** in their handlers using an in-memory seen-nonce set scoped to the
 invocation lifetime (architecture §7.5–§7.7).
 
-**Tokens never leak into output.** Access and refresh tokens are wrapped in a
-`Secret` type whose `Debug` and `Display` render `***redacted***`. As a backstop
-for accidental `tracing` field leaks, the telemetry subscriber independently
-redacts the value of any structured field whose key looks sensitive (`token`,
-`secret`, `password`, `api_key`, `private_key`, `credential`, `authorization`,
-…), substituting `***redacted***` in both the human and JSON output formats. The
-redaction is a safety net, not a licence to log secrets: the `Secret` wrappers
-and the "never log raw tokens/keys" discipline still apply.
+**Tokens never leak into output.** The **primary** no-secrets-in-logs guarantee
+is the `Secret` type (and the daemon's `session::Secret`), which wraps access and
+refresh tokens, the login password, and the recovery key; its `Debug` and
+`Display` always render `***redacted***`. As a **backstop** — behind `Secret`,
+not beside it — for accidental `tracing` field leaks, the telemetry subscriber
+independently redacts the value of any structured field whose key looks sensitive
+(`token`, `secret`, `password`, `api_key`, `private_key`, `credential`,
+`authorization`, `recovery`, `passphrase`, or a name ending in `_key`),
+substituting `***redacted***` in both the human and JSON output formats. The
+backstop matches on the field **name** only: it does not scan a format message's
+interpolated text, so a secret spliced into a message
+(`tracing::info!("recovered with {k}")`) is **not** caught. Never rely on the
+redactor for that — wrap the value in `Secret` instead. The field-name redaction
+is a safety net, not a licence to log secrets: the `Secret` wrappers and the
+"never log raw tokens/keys" discipline are the load-bearing guarantee.
 
 **CLI ⇄ daemon isolation.** The CLI talks to the daemon over a Unix domain
 socket created with mode `0600` in a directory that must not have group/world
@@ -685,8 +692,10 @@ so the audit trail records *that* a command ran without recording its secrets.
 
 **Operational logs** are separate from the audit log and go to stderr. Control
 them with `MX_AGENT_LOG` (filter directives, falls back to `RUST_LOG`) and
-`MX_AGENT_LOG_FORMAT` (`human` or `json`). The same secret-key redaction applies
-to structured fields here, in both formats. When the daemon runs in the
+`MX_AGENT_LOG_FORMAT` (`human` or `json`). The same field-name redaction backstop
+applies to structured fields here, in both formats — but, as above, it is a net
+behind `Secret`, never a substitute for it, and does not scan message text. When
+the daemon runs in the
 background its stdout/stderr are captured to `daemon.log` in the runtime
 directory; that file is created `0600` (owner-only) regardless of the umask, like
 the rest of the daemon's private state.
