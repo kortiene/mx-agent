@@ -137,6 +137,10 @@ fn allowlist() -> Vec<Allowed> {
     allow!("splice", libc::SYS_splice);
     allow!("tee", libc::SYS_tee);
     allow!("ioctl", libc::SYS_ioctl);
+    allow!("readahead", libc::SYS_readahead);
+    allow!("fadvise64", libc::SYS_fadvise64);
+    allow!("copy_file_range", libc::SYS_copy_file_range);
+    allow!("fallocate", libc::SYS_fallocate);
 
     // --- filesystem metadata / namespace -------------------------------------
     allow!("getcwd", libc::SYS_getcwd);
@@ -172,6 +176,10 @@ fn allowlist() -> Vec<Allowed> {
     allow!("msync", libc::SYS_msync);
     allow!("mlock", libc::SYS_mlock);
     allow!("munlock", libc::SYS_munlock);
+    allow!("mlock2", libc::SYS_mlock2);
+    allow!("mlockall", libc::SYS_mlockall);
+    allow!("munlockall", libc::SYS_munlockall);
+    allow!("mincore", libc::SYS_mincore);
     allow!("brk", libc::SYS_brk);
 
     // --- signals --------------------------------------------------------------
@@ -211,6 +219,15 @@ fn allowlist() -> Vec<Allowed> {
     allow!("clock_getres", libc::SYS_clock_getres);
     allow!("gettimeofday", libc::SYS_gettimeofday);
     allow!("getrandom", libc::SYS_getrandom);
+    // interval timers and POSIX per-process timers (shells and some glibc
+    // startup paths use these; also needed for `setitimer`-based profiling)
+    allow!("setitimer", libc::SYS_setitimer);
+    allow!("getitimer", libc::SYS_getitimer);
+    allow!("timer_create", libc::SYS_timer_create);
+    allow!("timer_settime", libc::SYS_timer_settime);
+    allow!("timer_gettime", libc::SYS_timer_gettime);
+    allow!("timer_getoverrun", libc::SYS_timer_getoverrun);
+    allow!("timer_delete", libc::SYS_timer_delete);
 
     // --- process / system introspection --------------------------------------
     allow!("uname", libc::SYS_uname);
@@ -240,6 +257,34 @@ fn allowlist() -> Vec<Allowed> {
     allow!("getrusage", libc::SYS_getrusage);
     allow!("times", libc::SYS_times);
     allow!("capget", libc::SYS_capget);
+    // real/effective/saved credential queries (dash and other shells call these
+    // during startup to check whether they are running setuid/setgid)
+    allow!("getresuid", libc::SYS_getresuid);
+    allow!("getresgid", libc::SYS_getresgid);
+    // credential setters (required by daemons that drop privileges after startup
+    // and by shells running setuid commands)
+    allow!("setuid", libc::SYS_setuid);
+    allow!("setgid", libc::SYS_setgid);
+    allow!("setreuid", libc::SYS_setreuid);
+    allow!("setregid", libc::SYS_setregid);
+    allow!("setresuid", libc::SYS_setresuid);
+    allow!("setresgid", libc::SYS_setresgid);
+    allow!("setfsuid", libc::SYS_setfsuid);
+    allow!("setfsgid", libc::SYS_setfsgid);
+    // extended scheduler (glibc 2.35+ queries scheduling attributes during
+    // thread/rseq initialisation; scheduler mutations needed for build tools)
+    allow!("sched_setparam", libc::SYS_sched_setparam);
+    allow!("sched_setscheduler", libc::SYS_sched_setscheduler);
+    allow!("sched_get_priority_max", libc::SYS_sched_get_priority_max);
+    allow!("sched_get_priority_min", libc::SYS_sched_get_priority_min);
+    allow!("sched_rr_get_interval", libc::SYS_sched_rr_get_interval);
+    allow!("sched_getattr", libc::SYS_sched_getattr);
+    allow!("sched_setattr", libc::SYS_sched_setattr);
+    // thread-group signal queuing (used internally by glibc signal machinery)
+    allow!("rt_tgsigqueueinfo", libc::SYS_rt_tgsigqueueinfo);
+    // CPU identification (VDSO fallback path; kernel path needed when VDSO
+    // is unavailable or the vvar mapping is unreadable in a user namespace)
+    allow!("getcpu", libc::SYS_getcpu);
 
     // --- poll / event fds -----------------------------------------------------
     allow!("epoll_create1", libc::SYS_epoll_create1);
@@ -259,6 +304,7 @@ fn allowlist() -> Vec<Allowed> {
     allow!("memfd_create", libc::SYS_memfd_create);
     allow!("pidfd_open", libc::SYS_pidfd_open);
     allow!("pidfd_send_signal", libc::SYS_pidfd_send_signal);
+    allow!("pidfd_getfd", libc::SYS_pidfd_getfd);
 
     // --- local sockets (build tooling talks to local daemons over AF_UNIX) ---
     allow!("socket", libc::SYS_socket);
@@ -276,6 +322,8 @@ fn allowlist() -> Vec<Allowed> {
     allow!("recvfrom", libc::SYS_recvfrom);
     allow!("sendmsg", libc::SYS_sendmsg);
     allow!("recvmsg", libc::SYS_recvmsg);
+    allow!("sendmmsg", libc::SYS_sendmmsg);
+    allow!("recvmmsg", libc::SYS_recvmmsg);
     allow!("shutdown", libc::SYS_shutdown);
 
     // --- legacy (non-`*at`) variants that exist only on x86_64; aarch64 uses
@@ -317,6 +365,11 @@ fn allowlist() -> Vec<Allowed> {
         // `sendfile` exists on aarch64 too, but libc only binds `SYS_sendfile`
         // for x86_64; reference it only where the constant is defined.
         allow!("sendfile", libc::SYS_sendfile);
+        // lchown/utime/getrlimit were replaced on aarch64 by fchownat/utimensat/
+        // prlimit64; keep the old variants on x86_64 for glibc compat-layer use.
+        allow!("lchown", libc::SYS_lchown);
+        allow!("utime", libc::SYS_utime);
+        allow!("getrlimit", libc::SYS_getrlimit);
     }
 
     v
