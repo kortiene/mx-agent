@@ -308,6 +308,46 @@ fn allowlist() -> Vec<Allowed> {
     allow!("pidfd_send_signal", libc::SYS_pidfd_send_signal);
     allow!("pidfd_getfd", libc::SYS_pidfd_getfd);
 
+    // --- extended file attributes (security frameworks and tools need these) --
+    allow!("getxattr", libc::SYS_getxattr);
+    allow!("lgetxattr", libc::SYS_lgetxattr);
+    allow!("fgetxattr", libc::SYS_fgetxattr);
+    allow!("listxattr", libc::SYS_listxattr);
+    allow!("llistxattr", libc::SYS_llistxattr);
+    allow!("flistxattr", libc::SYS_flistxattr);
+    allow!("setxattr", libc::SYS_setxattr);
+    allow!("lsetxattr", libc::SYS_lsetxattr);
+    allow!("fsetxattr", libc::SYS_fsetxattr);
+    allow!("removexattr", libc::SYS_removexattr);
+    allow!("lremovexattr", libc::SYS_lremovexattr);
+    allow!("fremovexattr", libc::SYS_fremovexattr);
+
+    // --- System V IPC (used by some legacy and build tools) ------------------
+    allow!("semget", libc::SYS_semget);
+    allow!("semop", libc::SYS_semop);
+    allow!("semtimedop", libc::SYS_semtimedop);
+    allow!("semctl", libc::SYS_semctl);
+    allow!("shmget", libc::SYS_shmget);
+    allow!("shmat", libc::SYS_shmat);
+    allow!("shmdt", libc::SYS_shmdt);
+    allow!("shmctl", libc::SYS_shmctl);
+    allow!("msgget", libc::SYS_msgget);
+    allow!("msgsnd", libc::SYS_msgsnd);
+    allow!("msgrcv", libc::SYS_msgrcv);
+    allow!("msgctl", libc::SYS_msgctl);
+
+    // --- io_uring (glibc 2.38+ may probe; tooling may use directly) ----------
+    allow!("io_uring_setup", libc::SYS_io_uring_setup);
+    allow!("io_uring_enter", libc::SYS_io_uring_enter);
+    allow!("io_uring_register", libc::SYS_io_uring_register);
+
+    // --- misc syscalls from Docker/Podman default profile --------------------
+    // `personality` is probed by some glibc init paths and build tools.
+    allow!("personality", libc::SYS_personality);
+    // `process_vm_readv`/`writev` are used by debuggers and some profilers.
+    allow!("process_vm_readv", libc::SYS_process_vm_readv);
+    allow!("process_vm_writev", libc::SYS_process_vm_writev);
+
     // --- local sockets (build tooling talks to local daemons over AF_UNIX) ---
     allow!("socket", libc::SYS_socket);
     allow!("socketpair", libc::SYS_socketpair);
@@ -376,6 +416,8 @@ fn allowlist() -> Vec<Allowed> {
         allow!("lchown", libc::SYS_lchown);
         allow!("utime", libc::SYS_utime);
         allow!("getrlimit", libc::SYS_getrlimit);
+        // `mknod` (legacy, replaced by mknodat on aarch64).
+        allow!("mknod", libc::SYS_mknod);
     }
 
     v
