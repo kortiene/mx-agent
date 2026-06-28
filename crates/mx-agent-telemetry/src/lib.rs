@@ -88,10 +88,13 @@ pub fn init(default_directive: &str) -> Result<(), Box<dyn std::error::Error + S
 
     // Install a field-redaction backstop so any structured field whose key looks
     // sensitive (see [`is_sensitive_key`]) is written as [`REDACTED`] instead of
-    // its real value, in both the human and JSON output formats. This is the
-    // operational-log counterpart to the [`Secret`] wrapper and makes the
-    // redaction guarantee in `docs/security-hardening.md` real: a stray
-    // `tracing::debug!(token = …)` can no longer leak a credential in the clear.
+    // its real value, in both the human and JSON output formats. This is a
+    // backstop *behind* the [`Secret`] wrapper, which is the primary
+    // no-secrets-in-logs guarantee: a stray `tracing::debug!(token = …)` can no
+    // longer leak a credential in the clear, but code must still wrap secrets in
+    // [`Secret`] and must never interpolate one into a format message
+    // (`debug!("token={t}")`), which this layer does not scan. See
+    // `docs/security-hardening.md`.
     match LogFormat::from_env() {
         // The built-in JSON event formatter serializes an event's own fields
         // with `tracing-serde`, bypassing the configured field formatter, so a
@@ -138,7 +141,8 @@ where
 /// its original value type. Numeric and boolean secrets are coerced to the
 /// placeholder string, which renders consistently in both output formats; the
 /// `message` pseudo-field is never sensitive by name, so log messages are
-/// untouched.
+/// untouched — meaning a secret interpolated into a format message is **not**
+/// redacted here. Wrap it in [`Secret`] instead.
 struct RedactingVisitor<V>(V);
 
 /// Generate a `Visit` method that records [`REDACTED`] for a sensitive key and
@@ -260,8 +264,20 @@ fn write_json_string(writer: &mut Writer<'_>, value: &str) -> fmt::Result {
 
 /// Returns true if `key` names an obviously sensitive field.
 ///
-/// Matching is case-insensitive and substring-based so variants like
-/// `GITHUB_TOKEN`, `access_token`, or `Authorization` are all caught.
+/// This is a **backstop, not the primary guarantee.** The real no-secrets-in-logs
+/// guarantee is the [`Secret`] wrapper (and the daemon's `session::Secret`), whose
+/// `Debug`/`Display` always render [`REDACTED`]. Field-name redaction only catches
+/// a value recorded under a recognised key; it does **not** scan a format
+/// message's interpolated text, nor a secret recorded under an unrecognised key.
+/// Never interpolate a secret into a `tracing` message (`debug!("key={k}")`) and
+/// rely on this function to catch it — wrap the secret in [`Secret`] instead.
+///
+/// Matching is case-insensitive. Most needles match as a substring (so
+/// `GITHUB_TOKEN`, `access_token`, `Authorization`, `recovery_key`, and
+/// `recovery_passphrase` are all caught). A bare `key` matches only on a token
+/// boundary — the whole name is `key`, or it ends in `_key` — so `signing_key`
+/// and `recovery_key` are redacted while `keyspace`, `monkey`, `key_count`, and
+/// `key_id` are not.
 pub fn is_sensitive_key(key: &str) -> bool {
     const NEEDLES: &[&str] = &[
         "token",
@@ -274,9 +290,17 @@ pub fn is_sensitive_key(key: &str) -> bool {
         "private_key",
         "credential",
         "authorization",
+        "recovery",
+        "passphrase",
     ];
     let lower = key.to_ascii_lowercase();
     NEEDLES.iter().any(|needle| lower.contains(needle))
+        // Bare `key`, on a token boundary only: the whole name is `key`, or it
+        // ends in `_key` (e.g. `signing_key`, `device_key`, `recovery_key`).
+        // Deliberately NOT a raw `contains("key")`, which would also redact
+        // `keyspace`, `monkey`, `key_count`, and `key_id`.
+        || lower == "key"
+        || lower.ends_with("_key")
 }
 
 /// Redact `value` when `key` is sensitive; otherwise return it unchanged.
@@ -377,11 +401,22 @@ mod tests {
             .fmt_fields(Redacting(DefaultFields::new()))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(token = "syt_leakme", user = "@a:hs", "hello world");
+            tracing::info!(
+                token = "syt_leakme",
+                recovery_key = "EsTe recovery clear",
+                user = "@a:hs",
+                "hello world"
+            );
         });
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(out.contains(REDACTED), "must redact the token: {out}");
         assert!(!out.contains("syt_leakme"), "secret leaked into log: {out}");
+        // The widened needle set (issue #376) redacts `recovery_key` end-to-end
+        // through the live visitor, not just the predicate.
+        assert!(
+            !out.contains("EsTe recovery clear"),
+            "recovery key leaked into log: {out}"
+        );
         assert!(out.contains("@a:hs"), "non-secret field was dropped: {out}");
         assert!(out.contains("hello world"), "message was dropped: {out}");
     }
@@ -397,10 +432,19 @@ mod tests {
             .event_format(RedactingJson)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(token = "syt_leakme", user = "@a:hs", "hello world");
+            tracing::info!(
+                token = "syt_leakme",
+                recovery_key = "EsTe recovery clear",
+                user = "@a:hs",
+                "hello world"
+            );
         });
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(!out.contains("syt_leakme"), "secret leaked into log: {out}");
+        assert!(
+            !out.contains("EsTe recovery clear"),
+            "recovery key leaked into log: {out}"
+        );
 
         let line = out.lines().next().expect("at least one JSON line");
         let v: serde_json::Value = serde_json::from_str(line).expect("output must be valid JSON");
@@ -408,6 +452,13 @@ mod tests {
             v["fields"]["token"],
             serde_json::json!(REDACTED),
             "token field must be redacted in JSON: {line}"
+        );
+        // The widened needle set (issue #376) redacts `recovery_key` through the
+        // JSON visitor too.
+        assert_eq!(
+            v["fields"]["recovery_key"],
+            serde_json::json!(REDACTED),
+            "recovery_key field must be redacted in JSON: {line}"
         );
         assert_eq!(
             v["fields"]["user"],
@@ -441,6 +492,17 @@ mod tests {
             "api_key",
             "user_password",
             "private_key",
+            // Recovery surface (issue #376): the recovery key/passphrase field
+            // names are caught by the widened needle set as a backstop, even
+            // though the primary guarantee is the `Secret` wrapper.
+            "recovery_key",
+            "recovery",
+            "passphrase",
+            "recovery_passphrase",
+            // Bare-`key` token-boundary heuristic.
+            "signing_key",
+            "key",
+            "KEY",
         ] {
             assert!(is_sensitive_key(key), "{key} should be sensitive");
         }
@@ -450,9 +512,34 @@ mod tests {
     }
 
     #[test]
+    fn bare_key_heuristic_avoids_false_positives() {
+        // The bare-`key` rule matches only the exact name `key` or a `_key`
+        // suffix, so names that merely contain the letters `key` (or use `key`
+        // as a prefix for metadata about a key) are NOT redacted. This pins the
+        // chosen boundary so a future broadening to raw `contains("key")` — which
+        // would redact all of these — fails the test.
+        for key in [
+            "keyspace",
+            "monkey",
+            "key_count",
+            "key_id",
+            "keyfile",
+            "keyring",
+        ] {
+            assert!(!is_sensitive_key(key), "{key} should not be sensitive");
+        }
+    }
+
+    #[test]
     fn redacts_only_sensitive_values() {
         assert_eq!(redact("agent", "developer-pi"), "developer-pi");
         assert_eq!(redact("access_token", "syt_abc123"), REDACTED);
+        // Issue #376: widened needles flow through `redact()` too.
+        assert_eq!(redact("recovery_key", "EsEr cleartext"), REDACTED);
+        assert_eq!(redact("passphrase", "my passphrase"), REDACTED);
+        assert_eq!(redact("signing_key", "signing material"), REDACTED);
+        // `RECOVERY_KEY` is case-insensitive.
+        assert_eq!(redact("RECOVERY_KEY", "cleartext"), REDACTED);
     }
 
     #[test]

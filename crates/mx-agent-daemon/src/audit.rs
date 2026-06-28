@@ -641,6 +641,37 @@ mod tests {
     }
 
     #[test]
+    fn redacts_recovery_and_passphrase_flag_values() {
+        // Issue #376: widened needles flow through `redact_command` so
+        // `--recovery-key`/`SIGNING_KEY` argv shapes are also masked in audit.
+        let cmd = argv(&["recover", "--recovery-key=EsEr_cleartext", "--user=@me:hs"]);
+        let red = redact_command(&cmd);
+        assert_eq!(red[1], format!("--recovery-key={REDACTED}"));
+        assert_eq!(red[2], "--user=@me:hs");
+        assert!(!red.join(" ").contains("EsEr_cleartext"));
+
+        let cmd2 = argv(&["env", "SIGNING_KEY=ed25519_val", "PATH=/usr/bin"]);
+        let red2 = redact_command(&cmd2);
+        assert_eq!(red2[1], format!("SIGNING_KEY={REDACTED}"));
+        assert_eq!(red2[2], "PATH=/usr/bin");
+        assert!(!red2.join(" ").contains("ed25519_val"));
+
+        let cmd3 = argv(&[
+            "unlock",
+            "--passphrase",
+            "my secret phrase",
+            "--room",
+            "!r:hs",
+        ]);
+        let red3 = redact_command(&cmd3);
+        assert_eq!(
+            red3,
+            argv(&["unlock", "--passphrase", REDACTED, "--room", "!r:hs"])
+        );
+        assert!(!red3.join(" ").contains("my secret phrase"));
+    }
+
+    #[test]
     fn exec_record_serializes_expected_fields() {
         let cmd = argv(&["cargo", "test"]);
         let record = AuditRecord::for_exec(

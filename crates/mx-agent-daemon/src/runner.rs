@@ -68,9 +68,10 @@ const SECRET_VARS: &[&str] = &[
     "MATRIX_ACCESS_TOKEN",
     "MX_AGENT_TOKEN",
     // mx-agent's own credential inputs: an operator must never be able to leak
-    // these to a spawned child, even by explicitly allowlisting them. The login
-    // password is also caught by `is_sensitive_key` (it contains `password`),
-    // but the recovery key matches no needle, so the explicit entry is required.
+    // these to a spawned child, even by explicitly allowlisting them. Both are
+    // now also caught by `is_sensitive_key` (the `password`/`recovery` needles,
+    // issue #376); the explicit entries are retained as a stable,
+    // telemetry-independent guarantee that does not depend on needle-list tuning.
     "MX_AGENT_PASSWORD",
     "MX_AGENT_RECOVERY_KEY",
     "SSH_AUTH_SOCK",
@@ -103,8 +104,9 @@ pub const DEFAULT_ALLOWED_VARS: &[&str] = &[
 /// A name is considered secret if it matches one of [`SECRET_VARS`] exactly
 /// (including mx-agent's own `MX_AGENT_PASSWORD` / `MX_AGENT_RECOVERY_KEY`),
 /// begins with one of [`SECRET_PREFIXES`], or has a key that looks sensitive per
-/// [`mx_agent_telemetry::is_sensitive_key`] (e.g. a future `MX_AGENT_*_TOKEN` or
-/// `*_SECRET`). The `is_sensitive_key` fallback is substring/case-insensitive,
+/// [`mx_agent_telemetry::is_sensitive_key`] (e.g. a future `MX_AGENT_*_TOKEN`,
+/// `*_SECRET`, `*_RECOVERY_*`, or a name ending in `_KEY`). The `is_sensitive_key`
+/// fallback is substring/case-insensitive (with a token-bounded bare-`key` rule),
 /// so it can only ever *widen* what is scrubbed (fail-safe). This is the
 /// predicate used to scrub the inherited environment before spawning a child.
 pub fn is_secret_var(name: &str) -> bool {
@@ -746,6 +748,10 @@ mod tests {
         // `is_sensitive_key` fallback catches future names by shape.
         assert!(is_secret_var("MX_AGENT_SOMETHING_TOKEN"));
         assert!(is_secret_var("SOME_PASSWORD"));
+        // Issue #376: widened needles now catch recovery/passphrase/bare-key shapes.
+        assert!(is_secret_var("MY_RECOVERY_KEY"));
+        assert!(is_secret_var("APP_PASSPHRASE"));
+        assert!(is_secret_var("SIGNING_KEY"));
     }
 
     #[test]
